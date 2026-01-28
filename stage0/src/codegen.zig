@@ -242,6 +242,8 @@ pub const CWriter = struct {
 /// The main C code generator
 pub const CodeGenerator = struct {
     allocator: Allocator,
+    /// Arena for temporary strings (mangled names, temps, etc.)
+    string_arena: std.heap.ArenaAllocator,
     writer: CWriter,
     type_context: ?*types.TypeContext,
 
@@ -280,6 +282,7 @@ pub const CodeGenerator = struct {
     pub fn init(allocator: Allocator) Self {
         return .{
             .allocator = allocator,
+            .string_arena = std.heap.ArenaAllocator.init(allocator),
             .writer = CWriter.init(allocator),
             .type_context = null,
             .generated_structs = std.StringHashMap(void).init(allocator),
@@ -294,14 +297,20 @@ pub const CodeGenerator = struct {
         };
     }
 
-    /// Clean up resources
+    /// Clean up resources - arena frees all temporary strings
     pub fn deinit(self: *Self) void {
+        self.string_arena.deinit();
         self.writer.deinit();
         self.generated_structs.deinit();
         self.generated_enums.deinit();
         self.forward_declarations.deinit();
         self.impl_methods.deinit();
         self.region_stack.deinit();
+    }
+
+    /// Get arena allocator for temporary strings
+    fn stringAllocator(self: *Self) Allocator {
+        return self.string_arena.allocator();
     }
 
     /// Set the type context for type resolution
@@ -311,7 +320,7 @@ pub const CodeGenerator = struct {
 
     /// Generate a unique temporary variable name
     fn freshTemp(self: *Self) ![]const u8 {
-        const name = try std.fmt.allocPrint(self.allocator, "_dm_tmp_{d}", .{self.temp_counter});
+        const name = try std.fmt.allocPrint(self.stringAllocator(), "_dm_tmp_{d}", .{self.temp_counter});
         self.temp_counter += 1;
         return name;
     }
@@ -710,7 +719,7 @@ pub const CodeGenerator = struct {
             if (named.generic_args) |args| {
                 if (args.len > 0) {
                     const inner = try self.mapType(args[0]);
-                    return try std.fmt.allocPrint(self.allocator, "{s}*", .{inner});
+                    return try std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{inner});
                 }
             }
             return "void*";
@@ -731,33 +740,33 @@ pub const CodeGenerator = struct {
         }
 
         const ret_type = try self.mapType(func.return_type);
-        return try std.fmt.allocPrint(self.allocator, "{s} (*)({s})", .{ ret_type, params_str.items });
+        return try std.fmt.allocPrint(self.stringAllocator(), "{s} (*)({s})", .{ ret_type, params_str.items });
     }
 
     /// Map array type to C
     fn mapArrayType(self: *Self, arr: *ArrayType) CodeGenError![]const u8 {
         const elem_type = try self.mapType(arr.element_type);
         // C arrays are tricky in function signatures, use pointer
-        return try std.fmt.allocPrint(self.allocator, "{s}*", .{elem_type});
+        return try std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{elem_type});
     }
 
     /// Map slice type to C
     fn mapSliceType(self: *Self, slice: *SliceType) CodeGenError![]const u8 {
         const elem_type = try self.mapType(slice.element_type);
         // Slices are fat pointers (pointer + length)
-        return try std.fmt.allocPrint(self.allocator, "struct {{ {s}* data; size_t len; }}", .{elem_type});
+        return try std.fmt.allocPrint(self.stringAllocator(), "struct {{ {s}* data; size_t len; }}", .{elem_type});
     }
 
     /// Map pointer type to C
     fn mapPointerType(self: *Self, ptr: *PointerType) CodeGenError![]const u8 {
         const pointee = try self.mapType(ptr.pointee_type);
-        return try std.fmt.allocPrint(self.allocator, "{s}*", .{pointee});
+        return try std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{pointee});
     }
 
     /// Map reference type to C (just a pointer in C)
     fn mapReferenceType(self: *Self, ref: *ReferenceType) CodeGenError![]const u8 {
         const referenced = try self.mapType(ref.referenced_type);
-        return try std.fmt.allocPrint(self.allocator, "{s}*", .{referenced});
+        return try std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{referenced});
     }
 
     /// Map tuple type to C struct
@@ -770,7 +779,7 @@ pub const CodeGenerator = struct {
             try fields.writer().print("{s} _{d}; ", .{ elem_type, i });
         }
 
-        return try std.fmt.allocPrint(self.allocator, "struct {{ {s}}}", .{fields.items});
+        return try std.fmt.allocPrint(self.stringAllocator(), "struct {{ {s}}}", .{fields.items});
     }
 
     /// Map Option type to C
@@ -787,7 +796,7 @@ pub const CodeGenerator = struct {
     fn generateOptionType(self: *Self, inner: *TypeExpr) CodeGenError![]const u8 {
         const inner_name = try self.mapType(inner);
         const safe_name = try self.sanitizeTypeName(inner_name);
-        return try std.fmt.allocPrint(self.allocator, "dm_option_{s}", .{safe_name});
+        return try std.fmt.allocPrint(self.stringAllocator(), "dm_option_{s}", .{safe_name});
     }
 
     /// Generate Result type name
@@ -797,21 +806,21 @@ pub const CodeGenerator = struct {
         if (err) |e| {
             const err_name = try self.mapType(e);
             const safe_err = try self.sanitizeTypeName(err_name);
-            return try std.fmt.allocPrint(self.allocator, "dm_result_{s}_{s}", .{ safe_ok, safe_err });
+            return try std.fmt.allocPrint(self.stringAllocator(), "dm_result_{s}_{s}", .{ safe_ok, safe_err });
         }
-        return try std.fmt.allocPrint(self.allocator, "dm_result_{s}", .{safe_ok});
+        return try std.fmt.allocPrint(self.stringAllocator(), "dm_result_{s}", .{safe_ok});
     }
 
     /// Generate List type name
     fn generateListType(self: *Self, elem: *TypeExpr) CodeGenError![]const u8 {
         const elem_name = try self.mapType(elem);
         const safe_name = try self.sanitizeTypeName(elem_name);
-        return try std.fmt.allocPrint(self.allocator, "dm_list_{s}", .{safe_name});
+        return try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_name});
     }
 
     /// Sanitize type name for use in identifier
     fn sanitizeTypeName(self: *Self, name: []const u8) ![]const u8 {
-        var result = std.ArrayList(u8).init(self.allocator);
+        var result = std.ArrayList(u8).init(self.stringAllocator());
         for (name) |c| {
             if (std.ascii.isAlphanumeric(c) or c == '_') {
                 try result.append(c);
@@ -826,15 +835,15 @@ pub const CodeGenerator = struct {
 
     /// Mangle a type name
     fn mangleTypeName(self: *Self, name: []const u8) ![]const u8 {
-        return try std.fmt.allocPrint(self.allocator, "dm_{s}", .{name});
+        return try std.fmt.allocPrint(self.stringAllocator(), "dm_{s}", .{name});
     }
 
     /// Mangle a function name (with optional type prefix for methods)
     fn mangleFunctionName(self: *Self, name: []const u8, type_prefix: ?[]const u8) ![]const u8 {
         if (type_prefix) |prefix| {
-            return try std.fmt.allocPrint(self.allocator, "dm_{s}_{s}", .{ prefix, name });
+            return try std.fmt.allocPrint(self.stringAllocator(), "dm_{s}_{s}", .{ prefix, name });
         }
-        return try std.fmt.allocPrint(self.allocator, "dm_{s}", .{name});
+        return try std.fmt.allocPrint(self.stringAllocator(), "dm_{s}", .{name});
     }
 
     // ========================================================================
@@ -1511,7 +1520,7 @@ pub const CodeGenerator = struct {
 
     /// Generate region block (arena scope)
     fn generateRegionBlock(self: *Self, region: *RegionBlock) anyerror!void {
-        const arena_name = try std.fmt.allocPrint(self.allocator, "_dm_arena_{s}", .{region.name.name});
+        const arena_name = try std.fmt.allocPrint(self.stringAllocator(), "_dm_arena_{s}", .{region.name.name});
         try self.region_stack.append(arena_name);
         defer _ = self.region_stack.pop();
 

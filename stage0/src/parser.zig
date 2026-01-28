@@ -191,9 +191,14 @@ pub const Parser = struct {
         };
     }
 
-    /// Clean up parser resources
+    /// Clean up parser resources (AST nodes use allocator, caller manages their lifetime)
     pub fn deinit(self: *Self) void {
         self.errors.deinit();
+    }
+
+    /// Get the allocator for AST node allocation (caller-provided allocator)
+    fn astAllocator(self: *Self) Allocator {
+        return self.allocator;
     }
 
     // ========================================================================
@@ -202,8 +207,8 @@ pub const Parser = struct {
 
     /// Parse the entire source into a SourceFile AST
     pub fn parse(self: *Self) !*SourceFile {
-        var imports = std.ArrayList(*ImportDecl).init(self.allocator);
-        var declarations = std.ArrayList(*Declaration).init(self.allocator);
+        var imports = std.ArrayList(*ImportDecl).init(self.astAllocator());
+        var declarations = std.ArrayList(*Declaration).init(self.astAllocator());
         errdefer imports.deinit();
         errdefer declarations.deinit();
 
@@ -230,7 +235,7 @@ pub const Parser = struct {
             }
         }
 
-        const source_file = try self.allocator.create(SourceFile);
+        const source_file = try self.astAllocator().create(SourceFile);
         source_file.* = .{
             .module_decl = module_decl,
             .imports = try imports.toOwnedSlice(),
@@ -245,7 +250,7 @@ pub const Parser = struct {
         const start_loc = self.currentLocation();
 
         // Parse the module path (e.g., "tests.generics" or just "hello")
-        var segments = std.ArrayList(Identifier).init(self.allocator);
+        var segments = std.ArrayList(Identifier).init(self.astAllocator());
         const first = try self.expectIdentifier("module name");
         try segments.append(makeIdentifier(first, self.previousLocation()));
 
@@ -260,7 +265,7 @@ pub const Parser = struct {
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const module_decl = try self.allocator.create(ModuleDecl);
+        const module_decl = try self.astAllocator().create(ModuleDecl);
         module_decl.* = .{
             .name = path,
             .span = makeSpan(start_loc, self.previousLocation()),
@@ -277,7 +282,7 @@ pub const Parser = struct {
         const start_loc = self.currentLocation();
         const visibility: Declaration.Visibility = if (self.match(.kw_private)) .private else .public;
 
-        const decl = try self.allocator.create(Declaration);
+        const decl = try self.astAllocator().create(Declaration);
 
         if (self.match(.kw_fn)) {
             decl.* = .{
@@ -347,7 +352,7 @@ pub const Parser = struct {
         var effects: ?[]const *TypeExpr = null;
         if (self.match(.kw_with)) {
             try self.expect(.lbracket, "'[' after 'with'");
-            var effect_list = std.ArrayList(*TypeExpr).init(self.allocator);
+            var effect_list = std.ArrayList(*TypeExpr).init(self.astAllocator());
             while (!self.check(.rbracket) and !self.isAtEnd()) {
                 const effect = try self.parseTypeExpr();
                 try effect_list.append(effect);
@@ -359,8 +364,8 @@ pub const Parser = struct {
 
         // Contracts
         var contracts: ?FunctionDecl.Contracts = null;
-        var requires_list = std.ArrayList(*Expr).init(self.allocator);
-        var ensures_list = std.ArrayList(*Expr).init(self.allocator);
+        var requires_list = std.ArrayList(*Expr).init(self.astAllocator());
+        var ensures_list = std.ArrayList(*Expr).init(self.astAllocator());
 
         while (self.match(.kw_requires) or self.match(.kw_ensures)) {
             const is_requires = self.previous().type == .kw_requires;
@@ -388,7 +393,7 @@ pub const Parser = struct {
             body = .{ .expression = try self.parseExpr() };
         }
 
-        const func = try self.allocator.create(FunctionDecl);
+        const func = try self.astAllocator().create(FunctionDecl);
         func.* = .{
             .name = name_ident,
             .generic_params = generic_params,
@@ -407,14 +412,14 @@ pub const Parser = struct {
     fn parseGenericParams(self: *Self) !?[]const *GenericParam {
         if (!self.match(.lbracket)) return null;
 
-        var params = std.ArrayList(*GenericParam).init(self.allocator);
+        var params = std.ArrayList(*GenericParam).init(self.astAllocator());
 
         while (!self.check(.rbracket) and !self.isAtEnd()) {
             const start_loc = self.currentLocation();
             const name = try self.expectIdentifier("generic parameter name");
             const name_ident = makeIdentifier(name, start_loc);
 
-            var bounds = std.ArrayList(*TypeExpr).init(self.allocator);
+            var bounds = std.ArrayList(*TypeExpr).init(self.astAllocator());
             var default: ?*TypeExpr = null;
 
             if (self.match(.colon)) {
@@ -432,7 +437,7 @@ pub const Parser = struct {
                 default = try self.parseTypeExpr();
             }
 
-            const param = try self.allocator.create(GenericParam);
+            const param = try self.astAllocator().create(GenericParam);
             param.* = .{
                 .name = name_ident,
                 .bounds = try bounds.toOwnedSlice(),
@@ -450,7 +455,7 @@ pub const Parser = struct {
 
     /// Parse function parameters
     fn parseFunctionParams(self: *Self) !std.ArrayList(*FunctionParam) {
-        var params = std.ArrayList(*FunctionParam).init(self.allocator);
+        var params = std.ArrayList(*FunctionParam).init(self.astAllocator());
 
         while (!self.check(.rparen) and !self.isAtEnd()) {
             const start_loc = self.currentLocation();
@@ -466,7 +471,7 @@ pub const Parser = struct {
                 default_val = try self.parseExpr();
             }
 
-            const param = try self.allocator.create(FunctionParam);
+            const param = try self.astAllocator().create(FunctionParam);
             param.* = .{
                 .name = name_ident,
                 .type_expr = type_ann,
@@ -491,7 +496,7 @@ pub const Parser = struct {
 
         try self.expect(.lbrace, "'{' after struct name");
 
-        var fields = std.ArrayList(*StructField).init(self.allocator);
+        var fields = std.ArrayList(*StructField).init(self.astAllocator());
         while (!self.check(.rbrace) and !self.isAtEnd()) {
             const field_start = self.currentLocation();
             const field_visibility: Declaration.Visibility = if (self.match(.kw_private)) .private else .public;
@@ -506,7 +511,7 @@ pub const Parser = struct {
                 default_val = try self.parseExpr();
             }
 
-            const field = try self.allocator.create(StructField);
+            const field = try self.astAllocator().create(StructField);
             field.* = .{
                 .name = field_name_ident,
                 .type_expr = field_type,
@@ -525,7 +530,7 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after struct fields");
 
-        const s = try self.allocator.create(StructDecl);
+        const s = try self.astAllocator().create(StructDecl);
         s.* = .{
             .name = name_ident,
             .generic_params = generic_params,
@@ -544,7 +549,7 @@ pub const Parser = struct {
 
         try self.expect(.lbrace, "'{' after enum name");
 
-        var variants = std.ArrayList(*EnumVariant).init(self.allocator);
+        var variants = std.ArrayList(*EnumVariant).init(self.astAllocator());
         while (!self.check(.rbrace) and !self.isAtEnd()) {
             const variant_start = self.currentLocation();
             const variant_name = try self.expectIdentifier("variant name");
@@ -554,7 +559,7 @@ pub const Parser = struct {
 
             if (self.match(.lparen)) {
                 // Tuple-style variant: Some(T)
-                var types = std.ArrayList(*TypeExpr).init(self.allocator);
+                var types = std.ArrayList(*TypeExpr).init(self.astAllocator());
                 while (!self.check(.rparen) and !self.isAtEnd()) {
                     const field_type = try self.parseTypeExpr();
                     try types.append(field_type);
@@ -564,7 +569,7 @@ pub const Parser = struct {
                 payload = .{ .tuple = try types.toOwnedSlice() };
             } else if (self.match(.lbrace)) {
                 // Struct-style variant
-                var fields = std.ArrayList(*StructField).init(self.allocator);
+                var fields = std.ArrayList(*StructField).init(self.astAllocator());
                 while (!self.check(.rbrace) and !self.isAtEnd()) {
                     const field_start = self.currentLocation();
                     const field_name = try self.expectIdentifier("field name");
@@ -572,7 +577,7 @@ pub const Parser = struct {
                     try self.expect(.colon, "':' after field name");
                     const field_type = try self.parseTypeExpr();
 
-                    const field = try self.allocator.create(StructField);
+                    const field = try self.astAllocator().create(StructField);
                     field.* = .{
                         .name = field_name_ident,
                         .type_expr = field_type,
@@ -587,7 +592,7 @@ pub const Parser = struct {
                 payload = .{ .struct_fields = try fields.toOwnedSlice() };
             }
 
-            const variant = try self.allocator.create(EnumVariant);
+            const variant = try self.astAllocator().create(EnumVariant);
             variant.* = .{
                 .name = variant_name_ident,
                 .payload = payload,
@@ -604,7 +609,7 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after enum variants");
 
-        const e = try self.allocator.create(EnumDecl);
+        const e = try self.astAllocator().create(EnumDecl);
         e.* = .{
             .name = name_ident,
             .generic_params = generic_params,
@@ -622,7 +627,7 @@ pub const Parser = struct {
         const generic_params = try self.parseGenericParams();
 
         // Super traits: trait Child: Parent1 + Parent2
-        var super_traits = std.ArrayList(*TypeExpr).init(self.allocator);
+        var super_traits = std.ArrayList(*TypeExpr).init(self.astAllocator());
         if (self.match(.colon)) {
             const first = try self.parseTypeExpr();
             try super_traits.append(first);
@@ -634,13 +639,13 @@ pub const Parser = struct {
 
         try self.expect(.lbrace, "'{' after trait name");
 
-        var items = std.ArrayList(*TraitItem).init(self.allocator);
+        var items = std.ArrayList(*TraitItem).init(self.astAllocator());
         while (!self.check(.rbrace) and !self.isAtEnd()) {
             const item_start = self.currentLocation();
 
             if (self.match(.kw_fn)) {
                 const func = try self.parseFunction();
-                const item = try self.allocator.create(TraitItem);
+                const item = try self.astAllocator().create(TraitItem);
                 item.* = .{
                     .kind = .{ .function = func },
                     .span = makeSpan(item_start, self.previousLocation()),
@@ -648,7 +653,7 @@ pub const Parser = struct {
                 try items.append(item);
             } else if (self.match(.kw_const)) {
                 const const_decl = try self.parseConstDecl();
-                const item = try self.allocator.create(TraitItem);
+                const item = try self.astAllocator().create(TraitItem);
                 item.* = .{
                     .kind = .{ .constant = const_decl },
                     .span = makeSpan(item_start, self.previousLocation()),
@@ -664,7 +669,7 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after trait body");
 
-        const t = try self.allocator.create(TraitDecl);
+        const t = try self.astAllocator().create(TraitDecl);
         t.* = .{
             .name = name_ident,
             .generic_params = generic_params,
@@ -693,14 +698,14 @@ pub const Parser = struct {
 
         try self.expect(.lbrace, "'{' after impl target");
 
-        var items = std.ArrayList(*ImplItem).init(self.allocator);
+        var items = std.ArrayList(*ImplItem).init(self.astAllocator());
         while (!self.check(.rbrace) and !self.isAtEnd()) {
             const item_start = self.currentLocation();
             const visibility: Declaration.Visibility = if (self.match(.kw_private)) .private else .public;
 
             if (self.match(.kw_fn)) {
                 const func = try self.parseFunction();
-                const item = try self.allocator.create(ImplItem);
+                const item = try self.astAllocator().create(ImplItem);
                 item.* = .{
                     .kind = .{ .function = func },
                     .visibility = visibility,
@@ -709,7 +714,7 @@ pub const Parser = struct {
                 try items.append(item);
             } else if (self.match(.kw_const)) {
                 const const_decl = try self.parseConstDecl();
-                const item = try self.allocator.create(ImplItem);
+                const item = try self.astAllocator().create(ImplItem);
                 item.* = .{
                     .kind = .{ .constant = const_decl },
                     .visibility = visibility,
@@ -723,7 +728,7 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after impl body");
 
-        const impl = try self.allocator.create(ImplBlock);
+        const impl = try self.astAllocator().create(ImplBlock);
         impl.* = .{
             .generic_params = generic_params,
             .trait_type = trait_type,
@@ -740,7 +745,7 @@ pub const Parser = struct {
         const start_loc = self.currentLocation();
         try self.expect(.kw_import, "'import'");
 
-        var segments = std.ArrayList(Identifier).init(self.allocator);
+        var segments = std.ArrayList(Identifier).init(self.astAllocator());
         const first = try self.expectIdentifier("module path");
         try segments.append(makeIdentifier(first, self.previousLocation()));
 
@@ -757,7 +762,7 @@ pub const Parser = struct {
 
         var items: ?[]const ImportDecl.ImportItem = null;
         if (self.match(.lbrace)) {
-            var import_items = std.ArrayList(ImportDecl.ImportItem).init(self.allocator);
+            var import_items = std.ArrayList(ImportDecl.ImportItem).init(self.astAllocator());
             while (!self.check(.rbrace) and !self.isAtEnd()) {
                 const item_name = try self.expectIdentifier("import item");
                 const item_ident = makeIdentifier(item_name, self.previousLocation());
@@ -773,7 +778,7 @@ pub const Parser = struct {
             items = try import_items.toOwnedSlice();
         }
 
-        const imp = try self.allocator.create(ImportDecl);
+        const imp = try self.astAllocator().create(ImportDecl);
         imp.* = .{
             .path = path,
             .items = items,
@@ -798,7 +803,7 @@ pub const Parser = struct {
             value = try self.parseExpr();
         }
 
-        const const_decl = try self.allocator.create(ConstDecl);
+        const const_decl = try self.astAllocator().create(ConstDecl);
         const_decl.* = .{
             .name = name_ident,
             .type_expr = type_ann,
@@ -815,12 +820,12 @@ pub const Parser = struct {
     /// Parse a type expression
     pub fn parseTypeExpr(self: *Self) anyerror!*TypeExpr {
         const start_loc = self.currentLocation();
-        const type_expr = try self.allocator.create(TypeExpr);
+        const type_expr = try self.astAllocator().create(TypeExpr);
 
         // Optional type: ?T
         if (self.match(.question)) {
             const inner = try self.parseTypeExpr();
-            const opt_type = try self.allocator.create(OptionType);
+            const opt_type = try self.astAllocator().create(OptionType);
             opt_type.* = .{
                 .inner_type = inner,
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -836,7 +841,7 @@ pub const Parser = struct {
         if (self.match(.ampersand)) {
             const is_mut = self.match(.kw_mut);
             const inner = try self.parseTypeExpr();
-            const ref_type = try self.allocator.create(ReferenceType);
+            const ref_type = try self.astAllocator().create(ReferenceType);
             ref_type.* = .{
                 .referenced_type = inner,
                 .is_mut = is_mut,
@@ -852,7 +857,7 @@ pub const Parser = struct {
         // Function type: fn(T, U) -> V
         if (self.match(.kw_fn)) {
             try self.expect(.lparen, "'(' after 'fn' in type");
-            var param_types = std.ArrayList(*TypeExpr).init(self.allocator);
+            var param_types = std.ArrayList(*TypeExpr).init(self.astAllocator());
             while (!self.check(.rparen) and !self.isAtEnd()) {
                 const param_type = try self.parseTypeExpr();
                 try param_types.append(param_type);
@@ -865,12 +870,12 @@ pub const Parser = struct {
                 ret_type = try self.parseTypeExpr();
             } else {
                 // Default void return
-                ret_type = try self.allocator.create(TypeExpr);
-                const named = try self.allocator.create(NamedType);
+                ret_type = try self.astAllocator().create(TypeExpr);
+                const named = try self.astAllocator().create(NamedType);
                 const void_ident = makeIdentifier("void", start_loc);
                 named.* = .{
                     .path = .{
-                        .segments = try self.allocator.dupe(Identifier, &[_]Identifier{void_ident}),
+                        .segments = try self.astAllocator().dupe(Identifier, &[_]Identifier{void_ident}),
                         .span = makeSpan(start_loc, start_loc),
                     },
                     .generic_args = null,
@@ -885,7 +890,7 @@ pub const Parser = struct {
             var effects: ?[]const *TypeExpr = null;
             if (self.match(.kw_with)) {
                 try self.expect(.lbracket, "'[' after 'with' in type");
-                var effect_list = std.ArrayList(*TypeExpr).init(self.allocator);
+                var effect_list = std.ArrayList(*TypeExpr).init(self.astAllocator());
                 while (!self.check(.rbracket) and !self.isAtEnd()) {
                     const effect = try self.parseTypeExpr();
                     try effect_list.append(effect);
@@ -895,7 +900,7 @@ pub const Parser = struct {
                 effects = try effect_list.toOwnedSlice();
             }
 
-            const func_type = try self.allocator.create(FunctionType);
+            const func_type = try self.astAllocator().create(FunctionType);
             func_type.* = .{
                 .params = try param_types.toOwnedSlice(),
                 .return_type = ret_type,
@@ -911,7 +916,7 @@ pub const Parser = struct {
 
         // Tuple type: (T, U, V)
         if (self.match(.lparen)) {
-            var types = std.ArrayList(*TypeExpr).init(self.allocator);
+            var types = std.ArrayList(*TypeExpr).init(self.astAllocator());
             if (!self.check(.rparen)) {
                 const first = try self.parseTypeExpr();
                 try types.append(first);
@@ -922,7 +927,7 @@ pub const Parser = struct {
             }
             try self.expect(.rparen, "')' after tuple type");
 
-            const tuple_type = try self.allocator.create(TupleType);
+            const tuple_type = try self.astAllocator().create(TupleType);
             tuple_type.* = .{
                 .elements = try types.toOwnedSlice(),
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -942,7 +947,7 @@ pub const Parser = struct {
                 const size = try self.parseExpr();
                 try self.expect(.rbracket, "']' after array type");
 
-                const arr_type = try self.allocator.create(ArrayType);
+                const arr_type = try self.astAllocator().create(ArrayType);
                 arr_type.* = .{
                     .element_type = elem_type,
                     .size = size,
@@ -956,7 +961,7 @@ pub const Parser = struct {
                 // Slice type: [T]
                 try self.expect(.rbracket, "']' after slice type");
 
-                const slice_type = try self.allocator.create(SliceType);
+                const slice_type = try self.astAllocator().create(SliceType);
                 slice_type.* = .{
                     .element_type = elem_type,
                     .span = makeSpan(start_loc, self.previousLocation()),
@@ -982,7 +987,7 @@ pub const Parser = struct {
         const name = try self.expectIdentifier("type name");
         const name_ident = makeIdentifier(name, start_loc);
 
-        var segments = std.ArrayList(Identifier).init(self.allocator);
+        var segments = std.ArrayList(Identifier).init(self.astAllocator());
         try segments.append(name_ident);
 
         // Handle paths: Foo::Bar::Baz
@@ -999,7 +1004,7 @@ pub const Parser = struct {
         // Check for generic arguments
         var generic_args: ?[]const *TypeExpr = null;
         if (self.match(.lbracket)) {
-            var args = std.ArrayList(*TypeExpr).init(self.allocator);
+            var args = std.ArrayList(*TypeExpr).init(self.astAllocator());
             while (!self.check(.rbracket) and !self.isAtEnd()) {
                 const arg = try self.parseTypeExpr();
                 try args.append(arg);
@@ -1009,7 +1014,7 @@ pub const Parser = struct {
             generic_args = try args.toOwnedSlice();
         }
 
-        const named = try self.allocator.create(NamedType);
+        const named = try self.astAllocator().create(NamedType);
         named.* = .{
             .path = path,
             .generic_args = generic_args,
@@ -1044,14 +1049,14 @@ pub const Parser = struct {
                 null;
             _ = self.match(.semicolon);
 
-            const break_stmt = try self.allocator.create(BreakStmt);
+            const break_stmt = try self.astAllocator().create(BreakStmt);
             break_stmt.* = .{
                 .label = null,
                 .value = value,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const stmt = try self.allocator.create(Statement);
+            const stmt = try self.astAllocator().create(Statement);
             stmt.* = .{
                 .kind = .{ .break_stmt = break_stmt },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -1061,13 +1066,13 @@ pub const Parser = struct {
         if (self.match(.kw_continue)) {
             _ = self.match(.semicolon);
 
-            const continue_stmt = try self.allocator.create(ContinueStmt);
+            const continue_stmt = try self.astAllocator().create(ContinueStmt);
             continue_stmt.* = .{
                 .label = null,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const stmt = try self.allocator.create(Statement);
+            const stmt = try self.astAllocator().create(Statement);
             stmt.* = .{
                 .kind = .{ .continue_stmt = continue_stmt },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -1087,13 +1092,13 @@ pub const Parser = struct {
             const expr = try self.parseExpr();
             _ = self.match(.semicolon);
 
-            const discard = try self.allocator.create(DiscardStmt);
+            const discard = try self.astAllocator().create(DiscardStmt);
             discard.* = .{
                 .value = expr,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const stmt = try self.allocator.create(Statement);
+            const stmt = try self.astAllocator().create(Statement);
             stmt.* = .{
                 .kind = .{ .discard = discard },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -1109,7 +1114,7 @@ pub const Parser = struct {
             const value = try self.parseExpr();
             _ = self.match(.semicolon);
 
-            const assignment = try self.allocator.create(Assignment);
+            const assignment = try self.astAllocator().create(Assignment);
             assignment.* = .{
                 .target = expr,
                 .op = .assign,
@@ -1117,7 +1122,7 @@ pub const Parser = struct {
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const stmt = try self.allocator.create(Statement);
+            const stmt = try self.astAllocator().create(Statement);
             stmt.* = .{
                 .kind = .{ .assignment = assignment },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -1130,7 +1135,7 @@ pub const Parser = struct {
             const value = try self.parseExpr();
             _ = self.match(.semicolon);
 
-            const assignment = try self.allocator.create(Assignment);
+            const assignment = try self.astAllocator().create(Assignment);
             assignment.* = .{
                 .target = expr,
                 .op = op,
@@ -1138,7 +1143,7 @@ pub const Parser = struct {
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const stmt = try self.allocator.create(Statement);
+            const stmt = try self.astAllocator().create(Statement);
             stmt.* = .{
                 .kind = .{ .assignment = assignment },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -1147,7 +1152,7 @@ pub const Parser = struct {
         }
 
         _ = self.match(.semicolon);
-        const stmt = try self.allocator.create(Statement);
+        const stmt = try self.astAllocator().create(Statement);
         stmt.* = .{
             .kind = .{ .expression = expr },
             .span = makeSpan(start_loc, self.previousLocation()),
@@ -1172,7 +1177,7 @@ pub const Parser = struct {
 
         _ = self.match(.semicolon);
 
-        const let_binding = try self.allocator.create(LetBinding);
+        const let_binding = try self.astAllocator().create(LetBinding);
         let_binding.* = .{
             .pattern = pattern,
             .type_annotation = type_ann,
@@ -1181,7 +1186,7 @@ pub const Parser = struct {
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const stmt = try self.allocator.create(Statement);
+        const stmt = try self.astAllocator().create(Statement);
         stmt.* = .{
             .kind = .{ .let_binding = let_binding },
             .span = makeSpan(start_loc, self.previousLocation()),
@@ -1197,13 +1202,13 @@ pub const Parser = struct {
         }
         _ = self.match(.semicolon);
 
-        const return_stmt = try self.allocator.create(ReturnStmt);
+        const return_stmt = try self.astAllocator().create(ReturnStmt);
         return_stmt.* = .{
             .value = value,
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const stmt = try self.allocator.create(Statement);
+        const stmt = try self.astAllocator().create(Statement);
         stmt.* = .{
             .kind = .{ .return_stmt = return_stmt },
             .span = makeSpan(start_loc, self.previousLocation()),
@@ -1216,7 +1221,7 @@ pub const Parser = struct {
         const condition = try self.parseExpr();
         const body = try self.parseBlockExpr();
 
-        const while_loop = try self.allocator.create(WhileLoop);
+        const while_loop = try self.astAllocator().create(WhileLoop);
         while_loop.* = .{
             .label = null,
             .condition = condition,
@@ -1224,7 +1229,7 @@ pub const Parser = struct {
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const stmt = try self.allocator.create(Statement);
+        const stmt = try self.astAllocator().create(Statement);
         stmt.* = .{
             .kind = .{ .while_loop = while_loop },
             .span = makeSpan(start_loc, self.previousLocation()),
@@ -1239,7 +1244,7 @@ pub const Parser = struct {
         const iterable = try self.parseExpr();
         const body = try self.parseBlockExpr();
 
-        const for_loop = try self.allocator.create(ForLoop);
+        const for_loop = try self.astAllocator().create(ForLoop);
         for_loop.* = .{
             .label = null,
             .pattern = pattern,
@@ -1248,7 +1253,7 @@ pub const Parser = struct {
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const stmt = try self.allocator.create(Statement);
+        const stmt = try self.astAllocator().create(Statement);
         stmt.* = .{
             .kind = .{ .for_loop = for_loop },
             .span = makeSpan(start_loc, self.previousLocation()),
@@ -1260,14 +1265,14 @@ pub const Parser = struct {
     pub fn parseLoop(self: *Self, start_loc: SourceLocation) !*Statement {
         const body = try self.parseBlockExpr();
 
-        const loop_stmt = try self.allocator.create(LoopStmt);
+        const loop_stmt = try self.astAllocator().create(LoopStmt);
         loop_stmt.* = .{
             .label = null,
             .body = body,
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const stmt = try self.allocator.create(Statement);
+        const stmt = try self.astAllocator().create(Statement);
         stmt.* = .{
             .kind = .{ .loop_stmt = loop_stmt },
             .span = makeSpan(start_loc, self.previousLocation()),
@@ -1280,7 +1285,7 @@ pub const Parser = struct {
         const start_loc = self.currentLocation();
         try self.expect(.lbrace, "'{'");
 
-        var statements = std.ArrayList(*Statement).init(self.allocator);
+        var statements = std.ArrayList(*Statement).init(self.astAllocator());
         var trailing_expr: ?*Expr = null;
 
         while (!self.check(.rbrace) and !self.isAtEnd()) {
@@ -1301,7 +1306,7 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}'");
 
-        const block = try self.allocator.create(BlockExpr);
+        const block = try self.astAllocator().create(BlockExpr);
         block.* = .{
             .statements = try statements.toOwnedSlice(),
             .result = trailing_expr,
@@ -1340,7 +1345,7 @@ pub const Parser = struct {
                     end_expr = try self.parsePrecedence(op_prec.next());
                 }
 
-                const range = try self.allocator.create(RangeExpr);
+                const range = try self.astAllocator().create(RangeExpr);
                 range.* = .{
                     .start = left,
                     .end = end_expr,
@@ -1348,7 +1353,7 @@ pub const Parser = struct {
                     .span = Span.merge(left.span, if (end_expr) |e| e.span else left.span),
                 };
 
-                const new_left = try self.allocator.create(Expr);
+                const new_left = try self.astAllocator().create(Expr);
                 new_left.* = .{
                     .kind = .{ .range = range },
                     .span = range.span,
@@ -1362,14 +1367,14 @@ pub const Parser = struct {
                 _ = self.advance();
                 const right = try self.parsePrecedence(op_prec.next());
 
-                const pipeline = try self.allocator.create(PipelineExpr);
+                const pipeline = try self.astAllocator().create(PipelineExpr);
                 pipeline.* = .{
                     .left = left,
                     .right = right,
                     .span = Span.merge(left.span, right.span),
                 };
 
-                const new_left = try self.allocator.create(Expr);
+                const new_left = try self.astAllocator().create(Expr);
                 new_left.* = .{
                     .kind = .{ .pipeline = pipeline },
                     .span = pipeline.span,
@@ -1386,7 +1391,7 @@ pub const Parser = struct {
             const next_prec = op_prec.next();
             const right = try self.parsePrecedence(next_prec);
 
-            const binary = try self.allocator.create(BinaryExpr);
+            const binary = try self.astAllocator().create(BinaryExpr);
             binary.* = .{
                 .left = left,
                 .op = op,
@@ -1394,7 +1399,7 @@ pub const Parser = struct {
                 .span = Span.merge(left.span, right.span),
             };
 
-            const new_left = try self.allocator.create(Expr);
+            const new_left = try self.astAllocator().create(Expr);
             new_left.* = .{
                 .kind = .{ .binary = binary },
                 .span = binary.span,
@@ -1413,14 +1418,14 @@ pub const Parser = struct {
         if (self.match(.minus)) {
             const operand = try self.parseUnary();
 
-            const unary = try self.allocator.create(UnaryExpr);
+            const unary = try self.astAllocator().create(UnaryExpr);
             unary.* = .{
                 .op = .neg,
                 .operand = operand,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .unary = unary },
                 .span = unary.span,
@@ -1430,14 +1435,14 @@ pub const Parser = struct {
         if (self.match(.kw_not) or self.match(.bang)) {
             const operand = try self.parseUnary();
 
-            const unary = try self.allocator.create(UnaryExpr);
+            const unary = try self.astAllocator().create(UnaryExpr);
             unary.* = .{
                 .op = .not,
                 .operand = operand,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .unary = unary },
                 .span = unary.span,
@@ -1447,14 +1452,14 @@ pub const Parser = struct {
         if (self.match(.tilde)) {
             const operand = try self.parseUnary();
 
-            const unary = try self.allocator.create(UnaryExpr);
+            const unary = try self.astAllocator().create(UnaryExpr);
             unary.* = .{
                 .op = .bit_not,
                 .operand = operand,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .unary = unary },
                 .span = unary.span,
@@ -1478,14 +1483,14 @@ pub const Parser = struct {
                 const index = try self.parseExpr();
                 try self.expect(.rbracket, "']' after index");
 
-                const index_access = try self.allocator.create(IndexAccess);
+                const index_access = try self.astAllocator().create(IndexAccess);
                 index_access.* = .{
                     .object = expr,
                     .index = index,
                     .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
                 };
 
-                const new_expr = try self.allocator.create(Expr);
+                const new_expr = try self.astAllocator().create(Expr);
                 new_expr.* = .{
                     .kind = .{ .index_access = index_access },
                     .span = index_access.span,
@@ -1499,7 +1504,7 @@ pub const Parser = struct {
 
                 if (self.match(.lparen)) {
                     // Method call
-                    var args = std.ArrayList(*Expr).init(self.allocator);
+                    var args = std.ArrayList(*Expr).init(self.astAllocator());
                     if (!self.check(.rparen)) {
                         const first = try self.parseExpr();
                         try args.append(first);
@@ -1510,7 +1515,7 @@ pub const Parser = struct {
                     }
                     try self.expect(.rparen, "')' after method arguments");
 
-                    const method_call = try self.allocator.create(MethodCall);
+                    const method_call = try self.astAllocator().create(MethodCall);
                     method_call.* = .{
                         .object = expr,
                         .method = field_ident,
@@ -1519,7 +1524,7 @@ pub const Parser = struct {
                         .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
                     };
 
-                    const new_expr = try self.allocator.create(Expr);
+                    const new_expr = try self.astAllocator().create(Expr);
                     new_expr.* = .{
                         .kind = .{ .method_call = method_call },
                         .span = method_call.span,
@@ -1527,14 +1532,14 @@ pub const Parser = struct {
                     expr = new_expr;
                 } else {
                     // Field access
-                    const field_access = try self.allocator.create(FieldAccess);
+                    const field_access = try self.astAllocator().create(FieldAccess);
                     field_access.* = .{
                         .object = expr,
                         .field = field_ident,
                         .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
                     };
 
-                    const new_expr = try self.allocator.create(Expr);
+                    const new_expr = try self.astAllocator().create(Expr);
                     new_expr.* = .{
                         .kind = .{ .field_access = field_access },
                         .span = field_access.span,
@@ -1543,13 +1548,13 @@ pub const Parser = struct {
                 }
             } else if (self.match(.question)) {
                 // Error propagation: expr?
-                const error_prop = try self.allocator.create(ErrorPropagateExpr);
+                const error_prop = try self.astAllocator().create(ErrorPropagateExpr);
                 error_prop.* = .{
                     .operand = expr,
                     .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
                 };
 
-                const new_expr = try self.allocator.create(Expr);
+                const new_expr = try self.astAllocator().create(Expr);
                 new_expr.* = .{
                     .kind = .{ .error_propagate = error_prop },
                     .span = error_prop.span,
@@ -1559,14 +1564,14 @@ pub const Parser = struct {
                 // Null coalescing: expr ?? default
                 const default = try self.parsePrecedence(.@"or");
 
-                const coalesce = try self.allocator.create(CoalesceExpr);
+                const coalesce = try self.astAllocator().create(CoalesceExpr);
                 coalesce.* = .{
                     .left = expr,
                     .right = default,
                     .span = Span.merge(expr.span, default.span),
                 };
 
-                const new_expr = try self.allocator.create(Expr);
+                const new_expr = try self.astAllocator().create(Expr);
                 new_expr.* = .{
                     .kind = .{ .coalesce = coalesce },
                     .span = coalesce.span,
@@ -1582,13 +1587,13 @@ pub const Parser = struct {
 
     /// Finish parsing a function call
     fn finishCall(self: *Self, callee: *Expr) !*Expr {
-        var args = std.ArrayList(*FunctionCall.CallArg).init(self.allocator);
+        var args = std.ArrayList(*FunctionCall.CallArg).init(self.astAllocator());
 
         if (!self.check(.rparen)) {
             while (true) {
                 const arg_expr = try self.parseExpr();
 
-                const call_arg = try self.allocator.create(FunctionCall.CallArg);
+                const call_arg = try self.astAllocator().create(FunctionCall.CallArg);
                 call_arg.* = .{
                     .name = null,
                     .value = arg_expr,
@@ -1601,7 +1606,7 @@ pub const Parser = struct {
 
         try self.expect(.rparen, "')' after arguments");
 
-        const call = try self.allocator.create(FunctionCall);
+        const call = try self.astAllocator().create(FunctionCall);
         call.* = .{
             .function = callee,
             .generic_args = null,
@@ -1609,7 +1614,7 @@ pub const Parser = struct {
             .span = Span.merge(callee.span, makeSpan(self.previousLocation(), self.previousLocation())),
         };
 
-        const expr = try self.allocator.create(Expr);
+        const expr = try self.astAllocator().create(Expr);
         expr.* = .{
             .kind = .{ .function_call = call },
             .span = call.span,
@@ -1625,13 +1630,13 @@ pub const Parser = struct {
         if (self.match(.integer)) {
             const lexeme = self.previous().lexeme;
 
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .int = .{ .value = lexeme, .suffix = null } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1643,13 +1648,13 @@ pub const Parser = struct {
         if (self.match(.float)) {
             const lexeme = self.previous().lexeme;
 
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .float = .{ .value = lexeme, .suffix = null } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1663,13 +1668,13 @@ pub const Parser = struct {
             // Strip surrounding quotes from "..."
             const value = if (lexeme.len >= 2) lexeme[1 .. lexeme.len - 1] else lexeme;
 
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .string = .{ .value = value, .kind = .regular } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1683,13 +1688,13 @@ pub const Parser = struct {
             // Strip r"..." prefix and suffix
             const value = if (lexeme.len >= 3) lexeme[2 .. lexeme.len - 1] else lexeme;
 
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .string = .{ .value = value, .kind = .raw } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1703,13 +1708,13 @@ pub const Parser = struct {
             // Strip b"..." prefix and suffix
             const value = if (lexeme.len >= 3) lexeme[2 .. lexeme.len - 1] else lexeme;
 
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .string = .{ .value = value, .kind = .byte } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1721,13 +1726,13 @@ pub const Parser = struct {
         if (self.match(.char_literal)) {
             const lexeme = self.previous().lexeme;
 
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .char = .{ .value = lexeme } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1737,13 +1742,13 @@ pub const Parser = struct {
 
         // Boolean literals
         if (self.match(.kw_true)) {
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .bool = true },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1751,13 +1756,13 @@ pub const Parser = struct {
             return expr;
         }
         if (self.match(.kw_false)) {
-            const lit = try self.allocator.create(Literal);
+            const lit = try self.astAllocator().create(Literal);
             lit.* = .{
                 .kind = .{ .bool = false },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .literal = lit },
                 .span = lit.span,
@@ -1779,13 +1784,13 @@ pub const Parser = struct {
         if (self.match(.kw_comptime)) {
             const inner = try self.parseExpr();
 
-            const comptime_expr = try self.allocator.create(ComptimeExpr);
+            const comptime_expr = try self.astAllocator().create(ComptimeExpr);
             comptime_expr.* = .{
                 .expr = inner,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .comptime_expr = comptime_expr },
                 .span = comptime_expr.span,
@@ -1796,7 +1801,7 @@ pub const Parser = struct {
         // Block expression
         if (self.check(.lbrace)) {
             const block = try self.parseBlockExpr();
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .block = block },
                 .span = block.span,
@@ -1806,7 +1811,7 @@ pub const Parser = struct {
 
         // Array literal
         if (self.match(.lbracket)) {
-            var elements = std.ArrayList(*Expr).init(self.allocator);
+            var elements = std.ArrayList(*Expr).init(self.astAllocator());
             if (!self.check(.rbracket)) {
                 const first = try self.parseExpr();
 
@@ -1815,13 +1820,13 @@ pub const Parser = struct {
                     const count = try self.parseExpr();
                     try self.expect(.rbracket, "']' after array repeat");
 
-                    const arr = try self.allocator.create(ArrayLiteral);
+                    const arr = try self.astAllocator().create(ArrayLiteral);
                     arr.* = .{
                         .kind = .{ .repeat = .{ .value = first, .count = count } },
                         .span = makeSpan(start_loc, self.previousLocation()),
                     };
 
-                    const expr = try self.allocator.create(Expr);
+                    const expr = try self.astAllocator().create(Expr);
                     expr.* = .{
                         .kind = .{ .array_literal = arr },
                         .span = arr.span,
@@ -1838,13 +1843,13 @@ pub const Parser = struct {
             }
             try self.expect(.rbracket, "']' after array elements");
 
-            const arr = try self.allocator.create(ArrayLiteral);
+            const arr = try self.astAllocator().create(ArrayLiteral);
             arr.* = .{
                 .kind = .{ .elements = try elements.toOwnedSlice() },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .array_literal = arr },
                 .span = arr.span,
@@ -1863,13 +1868,13 @@ pub const Parser = struct {
                 // Empty tuple
                 _ = self.advance();
 
-                const tuple = try self.allocator.create(TupleLiteral);
+                const tuple = try self.astAllocator().create(TupleLiteral);
                 tuple.* = .{
                     .elements = &[_]*Expr{},
                     .span = makeSpan(start_loc, self.previousLocation()),
                 };
 
-                const expr = try self.allocator.create(Expr);
+                const expr = try self.astAllocator().create(Expr);
                 expr.* = .{
                     .kind = .{ .tuple_literal = tuple },
                     .span = tuple.span,
@@ -1881,7 +1886,7 @@ pub const Parser = struct {
 
             if (self.match(.comma)) {
                 // Tuple literal
-                var elements = std.ArrayList(*Expr).init(self.allocator);
+                var elements = std.ArrayList(*Expr).init(self.astAllocator());
                 try elements.append(first);
                 if (!self.check(.rparen)) {
                     const second = try self.parseExpr();
@@ -1894,13 +1899,13 @@ pub const Parser = struct {
                 }
                 try self.expect(.rparen, "')' after tuple elements");
 
-                const tuple = try self.allocator.create(TupleLiteral);
+                const tuple = try self.astAllocator().create(TupleLiteral);
                 tuple.* = .{
                     .elements = try elements.toOwnedSlice(),
                     .span = makeSpan(start_loc, self.previousLocation()),
                 };
 
-                const expr = try self.allocator.create(Expr);
+                const expr = try self.astAllocator().create(Expr);
                 expr.* = .{
                     .kind = .{ .tuple_literal = tuple },
                     .span = tuple.span,
@@ -1909,7 +1914,7 @@ pub const Parser = struct {
             }
 
             try self.expect(.rparen, "')' after expression");
-            const expr = try self.allocator.create(Expr);
+            const expr = try self.astAllocator().create(Expr);
             expr.* = .{
                 .kind = .{ .grouped = first },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -1923,7 +1928,7 @@ pub const Parser = struct {
             const name_ident = makeIdentifier(name, start_loc);
 
             // Build path if needed
-            var segments = std.ArrayList(Identifier).init(self.allocator);
+            var segments = std.ArrayList(Identifier).init(self.astAllocator());
             try segments.append(name_ident);
 
             while (self.match(.colon_colon)) {
@@ -1942,7 +1947,7 @@ pub const Parser = struct {
 
             // Just an identifier or path
             if (segments.items.len == 1) {
-                const expr = try self.allocator.create(Expr);
+                const expr = try self.astAllocator().create(Expr);
                 expr.* = .{
                     .kind = .{ .identifier = name_ident },
                     .span = makeSpan(start_loc, self.previousLocation()),
@@ -1953,7 +1958,7 @@ pub const Parser = struct {
                     .segments = try segments.toOwnedSlice(),
                     .span = makeSpan(start_loc, self.previousLocation()),
                 };
-                const expr = try self.allocator.create(Expr);
+                const expr = try self.astAllocator().create(Expr);
                 expr.* = .{
                     .kind = .{ .path = path },
                     .span = path.span,
@@ -1986,7 +1991,7 @@ pub const Parser = struct {
             }
         }
 
-        const if_expr = try self.allocator.create(IfExpr);
+        const if_expr = try self.astAllocator().create(IfExpr);
         if_expr.* = .{
             .condition = condition,
             .then_branch = then_branch,
@@ -1994,7 +1999,7 @@ pub const Parser = struct {
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const expr = try self.allocator.create(Expr);
+        const expr = try self.astAllocator().create(Expr);
         expr.* = .{
             .kind = .{ .if_expr = if_expr },
             .span = if_expr.span,
@@ -2007,7 +2012,7 @@ pub const Parser = struct {
         const scrutinee = try self.parseExpr();
         try self.expect(.lbrace, "'{' after match scrutinee");
 
-        var arms = std.ArrayList(*MatchArm).init(self.allocator);
+        var arms = std.ArrayList(*MatchArm).init(self.astAllocator());
         while (!self.check(.rbrace) and !self.isAtEnd()) {
             const arm_start = self.currentLocation();
             const pattern = try self.parsePattern();
@@ -2021,7 +2026,7 @@ pub const Parser = struct {
             const body_expr = try self.parseExpr();
             _ = self.match(.comma);
 
-            const arm = try self.allocator.create(MatchArm);
+            const arm = try self.astAllocator().create(MatchArm);
             arm.* = .{
                 .pattern = pattern,
                 .guard = guard,
@@ -2033,14 +2038,14 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after match arms");
 
-        const match_expr = try self.allocator.create(MatchExpr);
+        const match_expr = try self.astAllocator().create(MatchExpr);
         match_expr.* = .{
             .scrutinee = scrutinee,
             .arms = try arms.toOwnedSlice(),
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const expr = try self.allocator.create(Expr);
+        const expr = try self.astAllocator().create(Expr);
         expr.* = .{
             .kind = .{ .match_expr = match_expr },
             .span = match_expr.span,
@@ -2050,7 +2055,7 @@ pub const Parser = struct {
 
     /// Parse lambda expression
     fn parseLambda(self: *Self, start_loc: SourceLocation) !*Expr {
-        var params = std.ArrayList(*LambdaParam).init(self.allocator);
+        var params = std.ArrayList(*LambdaParam).init(self.astAllocator());
 
         if (!self.check(.pipe)) {
             while (true) {
@@ -2063,7 +2068,7 @@ pub const Parser = struct {
                     type_ann = try self.parseTypeExpr();
                 }
 
-                const param = try self.allocator.create(LambdaParam);
+                const param = try self.astAllocator().create(LambdaParam);
                 param.* = .{
                     .name = param_ident,
                     .type_expr = type_ann,
@@ -2089,7 +2094,7 @@ pub const Parser = struct {
             body = .{ .expression = try self.parseExpr() };
         }
 
-        const lambda = try self.allocator.create(LambdaExpr);
+        const lambda = try self.astAllocator().create(LambdaExpr);
         lambda.* = .{
             .params = try params.toOwnedSlice(),
             .return_type = return_type,
@@ -2097,7 +2102,7 @@ pub const Parser = struct {
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const expr = try self.allocator.create(Expr);
+        const expr = try self.astAllocator().create(Expr);
         expr.* = .{
             .kind = .{ .lambda = lambda },
             .span = lambda.span,
@@ -2109,7 +2114,7 @@ pub const Parser = struct {
     fn parseStructLiteral(self: *Self, start_loc: SourceLocation, path: Path) !*Expr {
         try self.expect(.lbrace, "'{' for struct literal");
 
-        var fields = std.ArrayList(*StructLiteral.FieldInit).init(self.allocator);
+        var fields = std.ArrayList(*StructLiteral.FieldInit).init(self.astAllocator());
         while (!self.check(.rbrace) and !self.isAtEnd()) {
             const field_start = self.currentLocation();
             const field_name = try self.expectIdentifier("field name");
@@ -2118,7 +2123,7 @@ pub const Parser = struct {
             try self.expect(.colon, "':' after field name");
             const field_value = try self.parseExpr();
 
-            const field_init = try self.allocator.create(StructLiteral.FieldInit);
+            const field_init = try self.astAllocator().create(StructLiteral.FieldInit);
             field_init.* = .{
                 .name = field_ident,
                 .value = field_value,
@@ -2135,7 +2140,7 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after struct fields");
 
-        const struct_lit = try self.allocator.create(StructLiteral);
+        const struct_lit = try self.astAllocator().create(StructLiteral);
         struct_lit.* = .{
             .type_path = path,
             .fields = try fields.toOwnedSlice(),
@@ -2143,7 +2148,7 @@ pub const Parser = struct {
             .span = makeSpan(start_loc, self.previousLocation()),
         };
 
-        const expr = try self.allocator.create(Expr);
+        const expr = try self.astAllocator().create(Expr);
         expr.* = .{
             .kind = .{ .struct_literal = struct_lit },
             .span = struct_lit.span,
@@ -2161,7 +2166,7 @@ pub const Parser = struct {
 
         // Wildcard pattern
         if (self.match(.underscore)) {
-            const pattern = try self.allocator.create(Pattern);
+            const pattern = try self.astAllocator().create(Pattern);
             pattern.* = .{
                 .kind = .wildcard,
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -2182,7 +2187,7 @@ pub const Parser = struct {
                 else => return self.errorAtCurrent("Expected literal pattern"),
             };
 
-            const pattern = try self.allocator.create(Pattern);
+            const pattern = try self.astAllocator().create(Pattern);
             pattern.* = .{
                 .kind = .{ .literal = lit },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -2192,7 +2197,7 @@ pub const Parser = struct {
 
         // Tuple pattern: (a, b, c)
         if (self.match(.lparen)) {
-            var elements = std.ArrayList(*Pattern).init(self.allocator);
+            var elements = std.ArrayList(*Pattern).init(self.astAllocator());
             if (!self.check(.rparen)) {
                 const first = try self.parsePattern();
                 try elements.append(first);
@@ -2204,13 +2209,13 @@ pub const Parser = struct {
             }
             try self.expect(.rparen, "')' after tuple pattern");
 
-            const tuple_pattern = try self.allocator.create(TuplePattern);
+            const tuple_pattern = try self.astAllocator().create(TuplePattern);
             tuple_pattern.* = .{
                 .elements = try elements.toOwnedSlice(),
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const pattern = try self.allocator.create(Pattern);
+            const pattern = try self.astAllocator().create(Pattern);
             pattern.* = .{
                 .kind = .{ .tuple = tuple_pattern },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -2220,7 +2225,7 @@ pub const Parser = struct {
 
         // Slice pattern: [a, b, ..rest]
         if (self.match(.lbracket)) {
-            var elements = std.ArrayList(*Pattern).init(self.allocator);
+            var elements = std.ArrayList(*Pattern).init(self.astAllocator());
             var rest: ?SlicePattern.RestPattern = null;
             var rest_position: usize = 0;
 
@@ -2245,14 +2250,14 @@ pub const Parser = struct {
             }
             try self.expect(.rbracket, "']' after slice pattern");
 
-            const slice_pattern = try self.allocator.create(SlicePattern);
+            const slice_pattern = try self.astAllocator().create(SlicePattern);
             slice_pattern.* = .{
                 .elements = try elements.toOwnedSlice(),
                 .rest = rest,
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
-            const pattern = try self.allocator.create(Pattern);
+            const pattern = try self.astAllocator().create(Pattern);
             pattern.* = .{
                 .kind = .{ .slice = slice_pattern },
                 .span = makeSpan(start_loc, self.previousLocation()),
@@ -2266,7 +2271,7 @@ pub const Parser = struct {
             const name_ident = makeIdentifier(name, start_loc);
 
             // Build path if needed
-            var segments = std.ArrayList(Identifier).init(self.allocator);
+            var segments = std.ArrayList(Identifier).init(self.astAllocator());
             try segments.append(name_ident);
 
             while (self.match(.colon_colon)) {
@@ -2283,7 +2288,7 @@ pub const Parser = struct {
             if (self.match(.lparen)) {
                 var payload: EnumVariantPattern.Payload = .none;
                 if (!self.check(.rparen)) {
-                    var payload_patterns = std.ArrayList(*Pattern).init(self.allocator);
+                    var payload_patterns = std.ArrayList(*Pattern).init(self.astAllocator());
                     const first = try self.parsePattern();
                     try payload_patterns.append(first);
                     while (self.match(.comma)) {
@@ -2295,7 +2300,7 @@ pub const Parser = struct {
                 }
                 try self.expect(.rparen, "')' after variant payload");
 
-                const variant_pattern = try self.allocator.create(EnumVariantPattern);
+                const variant_pattern = try self.astAllocator().create(EnumVariantPattern);
                 variant_pattern.* = .{
                     .type_path = path,
                     .variant = name_ident,
@@ -2303,7 +2308,7 @@ pub const Parser = struct {
                     .span = makeSpan(start_loc, self.previousLocation()),
                 };
 
-                const pattern = try self.allocator.create(Pattern);
+                const pattern = try self.astAllocator().create(Pattern);
                 pattern.* = .{
                     .kind = .{ .enum_variant = variant_pattern },
                     .span = makeSpan(start_loc, self.previousLocation()),
@@ -2313,7 +2318,7 @@ pub const Parser = struct {
 
             // Check for struct pattern: Point { x, y }
             if (self.match(.lbrace)) {
-                var fields = std.ArrayList(*FieldPattern).init(self.allocator);
+                var fields = std.ArrayList(*FieldPattern).init(self.astAllocator());
                 var has_rest = false;
 
                 while (!self.check(.rbrace) and !self.isAtEnd()) {
@@ -2331,7 +2336,7 @@ pub const Parser = struct {
                         field_pattern = try self.parsePattern();
                     }
 
-                    const fp = try self.allocator.create(FieldPattern);
+                    const fp = try self.astAllocator().create(FieldPattern);
                     fp.* = .{
                         .name = field_ident,
                         .pattern = field_pattern,
@@ -2343,7 +2348,7 @@ pub const Parser = struct {
                 }
                 try self.expect(.rbrace, "'}' after struct pattern");
 
-                const struct_pattern = try self.allocator.create(StructPattern);
+                const struct_pattern = try self.astAllocator().create(StructPattern);
                 struct_pattern.* = .{
                     .type_path = path,
                     .fields = try fields.toOwnedSlice(),
@@ -2351,7 +2356,7 @@ pub const Parser = struct {
                     .span = makeSpan(start_loc, self.previousLocation()),
                 };
 
-                const pattern = try self.allocator.create(Pattern);
+                const pattern = try self.astAllocator().create(Pattern);
                 pattern.* = .{
                     .kind = .{ .struct_pattern = struct_pattern },
                     .span = makeSpan(start_loc, self.previousLocation()),
@@ -2360,7 +2365,7 @@ pub const Parser = struct {
             }
 
             // Simple identifier binding
-            const pattern = try self.allocator.create(Pattern);
+            const pattern = try self.astAllocator().create(Pattern);
             pattern.* = .{
                 .kind = .{
                     .identifier = .{
@@ -2383,7 +2388,7 @@ pub const Parser = struct {
             return first;
         }
 
-        var patterns = std.ArrayList(*Pattern).init(self.allocator);
+        var patterns = std.ArrayList(*Pattern).init(self.astAllocator());
         try patterns.append(first);
 
         while (true) {
@@ -2392,13 +2397,13 @@ pub const Parser = struct {
             if (!self.match(.pipe)) break;
         }
 
-        const or_pattern = try self.allocator.create(OrPattern);
+        const or_pattern = try self.astAllocator().create(OrPattern);
         or_pattern.* = .{
             .patterns = try patterns.toOwnedSlice(),
             .span = Span.merge(first.span, patterns.items[patterns.items.len - 1].span),
         };
 
-        const pattern = try self.allocator.create(Pattern);
+        const pattern = try self.astAllocator().create(Pattern);
         pattern.* = .{
             .kind = .{ .or_pattern = or_pattern },
             .span = or_pattern.span,
