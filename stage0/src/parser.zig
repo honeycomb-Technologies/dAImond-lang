@@ -11,473 +11,74 @@ const Lexer = lexer_mod.Lexer;
 const Token = lexer_mod.Token;
 const TokenType = lexer_mod.TokenType;
 const SourceLocation = lexer_mod.SourceLocation;
+const ast = @import("ast.zig");
 
-// ============================================================================
-// AST Node Definitions (inline until ast.zig is created)
-// ============================================================================
-
-/// Unique identifier for AST nodes
-pub const NodeId = u32;
-
-/// Span in source code
-pub const Span = struct {
-    start: SourceLocation,
-    end: SourceLocation,
-
-    pub fn merge(a: Span, b: Span) Span {
-        return .{
-            .start = if (a.start.offset < b.start.offset) a.start else b.start,
-            .end = if (a.end.offset > b.end.offset) a.end else b.end,
-        };
-    }
-};
-
-/// Binary operators
-pub const BinaryOp = enum {
-    // Arithmetic
-    add,
-    sub,
-    mul,
-    div,
-    mod,
-    power,
-    // Comparison
-    eq,
-    neq,
-    lt,
-    gt,
-    lte,
-    gte,
-    // Logical
-    @"and",
-    @"or",
-    // Bitwise
-    bit_and,
-    bit_or,
-    bit_xor,
-    shl,
-    shr,
-    // Pipeline
-    pipeline,
-    // Range
-    range,
-    range_inclusive,
-};
-
-/// Unary operators
-pub const UnaryOp = enum {
-    neg,
-    not,
-    bit_not,
-    try_op, // ?
-    unwrap, // ??
-};
-
-/// Pattern kinds for pattern matching
-pub const PatternKind = union(enum) {
-    /// Wildcard pattern: _
-    wildcard,
-    /// Identifier binding: x
-    identifier: []const u8,
-    /// Literal pattern: 42, "hello", true
-    literal: *const Expr,
-    /// Tuple pattern: (a, b, c)
-    tuple: []const *Pattern,
-    /// Struct pattern: Point { x, y }
-    @"struct": struct {
-        name: []const u8,
-        fields: []const FieldPattern,
-    },
-    /// Variant pattern: Some(x), None
-    variant: struct {
-        name: []const u8,
-        payload: ?*Pattern,
-    },
-    /// Array/slice pattern: [first, second, ..rest]
-    array: struct {
-        elements: []const *Pattern,
-        rest: ?[]const u8, // rest binding name
-    },
-    /// Or pattern: a | b
-    @"or": []const *Pattern,
-    /// Guard pattern: pattern if condition
-    guard: struct {
-        pattern: *Pattern,
-        condition: *Expr,
-    },
-    /// Range pattern: 1..10
-    range: struct {
-        start: ?*Expr,
-        end: ?*Expr,
-        inclusive: bool,
-    },
-};
-
-/// Field pattern for struct destructuring
-pub const FieldPattern = struct {
-    name: []const u8,
-    pattern: ?*Pattern, // null means bind to same name
-};
-
-/// Pattern node
-pub const Pattern = struct {
-    kind: PatternKind,
-    span: Span,
-};
-
-/// Type expression kinds
-pub const TypeExprKind = union(enum) {
-    /// Simple type name: int, String
-    name: []const u8,
-    /// Generic type: List[T], Map[K, V]
-    generic: struct {
-        name: []const u8,
-        args: []const *TypeExpr,
-    },
-    /// Function type: fn(int, int) -> int
-    function: struct {
-        params: []const *TypeExpr,
-        ret: *TypeExpr,
-        effects: []const []const u8,
-    },
-    /// Tuple type: (int, String, bool)
-    tuple: []const *TypeExpr,
-    /// Array type: [int]
-    array: struct {
-        element: *TypeExpr,
-        size: ?*Expr,
-    },
-    /// Optional type: ?int
-    optional: *TypeExpr,
-    /// Reference type: &T, &mut T
-    reference: struct {
-        inner: *TypeExpr,
-        mutable: bool,
-    },
-    /// Inferred type: _
-    inferred,
-};
-
-/// Type expression node
-pub const TypeExpr = struct {
-    kind: TypeExprKind,
-    span: Span,
-};
-
-/// Expression kinds
-pub const ExprKind = union(enum) {
-    /// Integer literal: 42
-    int_literal: i128,
-    /// Float literal: 3.14
-    float_literal: f64,
-    /// String literal: "hello"
-    string_literal: []const u8,
-    /// Character literal: 'a'
-    char_literal: u8,
-    /// Boolean literal: true, false
-    bool_literal: bool,
-    /// Identifier: foo
-    identifier: []const u8,
-    /// Binary operation: a + b
-    binary: struct {
-        op: BinaryOp,
-        left: *Expr,
-        right: *Expr,
-    },
-    /// Unary operation: -x, not x
-    unary: struct {
-        op: UnaryOp,
-        operand: *Expr,
-    },
-    /// Function call: foo(a, b)
-    call: struct {
-        callee: *Expr,
-        args: []const *Expr,
-    },
-    /// Method call: obj.method(args)
-    method_call: struct {
-        receiver: *Expr,
-        method: []const u8,
-        args: []const *Expr,
-    },
-    /// Field access: obj.field
-    field_access: struct {
-        object: *Expr,
-        field: []const u8,
-    },
-    /// Index access: arr[i]
-    index: struct {
-        object: *Expr,
-        index: *Expr,
-    },
-    /// Array literal: [1, 2, 3]
-    array_literal: []const *Expr,
-    /// Tuple literal: (1, "hello", true)
-    tuple_literal: []const *Expr,
-    /// Struct literal: Point { x: 1, y: 2 }
-    struct_literal: struct {
-        name: ?[]const u8,
-        fields: []const FieldInit,
-    },
-    /// Block expression: { ... }
-    block: *Block,
-    /// If expression: if cond { ... } else { ... }
-    @"if": struct {
-        condition: *Expr,
-        then_branch: *Block,
-        else_branch: ?*Expr,
-    },
-    /// Match expression
-    match: struct {
-        scrutinee: *Expr,
-        arms: []const MatchArm,
-    },
-    /// Lambda: |x, y| x + y
-    lambda: struct {
-        params: []const LambdaParam,
-        body: *Expr,
-    },
-    /// Return expression
-    @"return": ?*Expr,
-    /// Break expression
-    @"break": ?*Expr,
-    /// Continue expression
-    @"continue",
-    /// Comptime expression
-    comptime_expr: *Expr,
-    /// Error propagation: expr?
-    try_expr: *Expr,
-    /// Null coalescing: expr ?? default
-    coalesce: struct {
-        value: *Expr,
-        default: *Expr,
-    },
-    /// Grouped expression (parentheses): (expr)
-    grouped: *Expr,
-};
-
-/// Field initialization in struct literal
-pub const FieldInit = struct {
-    name: []const u8,
-    value: *Expr,
-};
-
-/// Match arm
-pub const MatchArm = struct {
-    pattern: *Pattern,
-    guard: ?*Expr,
-    body: *Expr,
-};
-
-/// Lambda parameter
-pub const LambdaParam = struct {
-    name: []const u8,
-    type_annotation: ?*TypeExpr,
-};
-
-/// Expression node
-pub const Expr = struct {
-    kind: ExprKind,
-    span: Span,
-};
-
-/// Statement kinds
-pub const StmtKind = union(enum) {
-    /// Expression statement
-    expr: *Expr,
-    /// Let binding: let x = value, let mut x: Type = value
-    let_binding: struct {
-        pattern: *Pattern,
-        type_annotation: ?*TypeExpr,
-        value: ?*Expr,
-        mutable: bool,
-    },
-    /// Assignment: x = value
-    assignment: struct {
-        target: *Expr,
-        value: *Expr,
-    },
-    /// Compound assignment: x += value
-    compound_assignment: struct {
-        target: *Expr,
-        op: BinaryOp,
-        value: *Expr,
-    },
-    /// While loop
-    while_loop: struct {
-        condition: *Expr,
-        body: *Block,
-    },
-    /// For loop
-    for_loop: struct {
-        pattern: *Pattern,
-        iterable: *Expr,
-        body: *Block,
-    },
-    /// Loop (infinite)
-    loop: *Block,
-    /// Return statement
-    @"return": ?*Expr,
-    /// Break statement
-    @"break": ?*Expr,
-    /// Continue statement
-    @"continue",
-    /// Discard statement: discard expr
-    discard: *Expr,
-    /// Expect statement: expect condition
-    expect: *Expr,
-};
-
-/// Statement node
-pub const Stmt = struct {
-    kind: StmtKind,
-    span: Span,
-};
-
-/// Block of statements with optional trailing expression
-pub const Block = struct {
-    statements: []const *Stmt,
-    expr: ?*Expr, // trailing expression (block value)
-    span: Span,
-};
-
-/// Function parameter
-pub const Param = struct {
-    name: []const u8,
-    type_annotation: *TypeExpr,
-    default_value: ?*Expr,
-    mutable: bool,
-};
-
-/// Generic parameter
-pub const GenericParam = struct {
-    name: []const u8,
-    bounds: []const *TypeExpr,
-};
-
-/// Contract clause (requires/ensures)
-pub const Contract = struct {
-    kind: enum { requires, ensures },
-    condition: *Expr,
-    message: ?[]const u8,
-};
-
-/// Function definition
-pub const Function = struct {
-    name: []const u8,
-    generic_params: []const GenericParam,
-    params: []const Param,
-    return_type: ?*TypeExpr,
-    effects: []const []const u8,
-    contracts: []const Contract,
-    body: ?*Block,
-    is_private: bool,
-    span: Span,
-};
-
-/// Struct field
-pub const StructField = struct {
-    name: []const u8,
-    type_annotation: *TypeExpr,
-    default_value: ?*Expr,
-    is_private: bool,
-};
-
-/// Struct definition
-pub const Struct = struct {
-    name: []const u8,
-    generic_params: []const GenericParam,
-    fields: []const StructField,
-    is_private: bool,
-    span: Span,
-};
-
-/// Enum variant
-pub const EnumVariant = struct {
-    name: []const u8,
-    fields: ?[]const StructField, // for tuple/struct variants
-    discriminant: ?*Expr,
-};
-
-/// Enum definition
-pub const Enum = struct {
-    name: []const u8,
-    generic_params: []const GenericParam,
-    variants: []const EnumVariant,
-    is_private: bool,
-    span: Span,
-};
-
-/// Trait method signature
-pub const TraitMethod = struct {
-    name: []const u8,
-    generic_params: []const GenericParam,
-    params: []const Param,
-    return_type: ?*TypeExpr,
-    effects: []const []const u8,
-    default_impl: ?*Block,
-};
-
-/// Trait definition
-pub const Trait = struct {
-    name: []const u8,
-    generic_params: []const GenericParam,
-    super_traits: []const *TypeExpr,
-    methods: []const TraitMethod,
-    is_private: bool,
-    span: Span,
-};
-
-/// Impl block
-pub const Impl = struct {
-    generic_params: []const GenericParam,
-    trait_type: ?*TypeExpr, // null for inherent impl
-    target_type: *TypeExpr,
-    methods: []const *Function,
-    span: Span,
-};
-
-/// Import item
-pub const ImportItem = struct {
-    name: []const u8,
-    alias: ?[]const u8,
-};
-
-/// Import declaration
-pub const Import = struct {
-    path: []const []const u8,
-    items: ?[]const ImportItem, // null means import all (*)
-    span: Span,
-};
-
-/// Top-level declaration kinds
-pub const DeclKind = union(enum) {
-    function: *Function,
-    @"struct": *Struct,
-    @"enum": *Enum,
-    trait: *Trait,
-    impl: *Impl,
-    import: *Import,
-    constant: struct {
-        name: []const u8,
-        type_annotation: ?*TypeExpr,
-        value: *Expr,
-        is_private: bool,
-    },
-};
-
-/// Top-level declaration
-pub const Decl = struct {
-    kind: DeclKind,
-    span: Span,
-};
-
-/// Module/Program AST root
-pub const Module = struct {
-    name: ?[]const u8,
-    declarations: []const *Decl,
-    span: Span,
-};
+// Re-export AST types for convenience
+pub const Span = ast.Span;
+pub const Identifier = ast.Identifier;
+pub const Path = ast.Path;
+pub const SourceFile = ast.SourceFile;
+pub const Declaration = ast.Declaration;
+pub const FunctionDecl = ast.FunctionDecl;
+pub const FunctionParam = ast.FunctionParam;
+pub const GenericParam = ast.GenericParam;
+pub const StructDecl = ast.StructDecl;
+pub const StructField = ast.StructField;
+pub const EnumDecl = ast.EnumDecl;
+pub const EnumVariant = ast.EnumVariant;
+pub const TraitDecl = ast.TraitDecl;
+pub const TraitItem = ast.TraitItem;
+pub const ImplBlock = ast.ImplBlock;
+pub const ImplItem = ast.ImplItem;
+pub const ConstDecl = ast.ConstDecl;
+pub const Statement = ast.Statement;
+pub const LetBinding = ast.LetBinding;
+pub const Assignment = ast.Assignment;
+pub const ReturnStmt = ast.ReturnStmt;
+pub const ForLoop = ast.ForLoop;
+pub const WhileLoop = ast.WhileLoop;
+pub const LoopStmt = ast.LoopStmt;
+pub const BreakStmt = ast.BreakStmt;
+pub const ContinueStmt = ast.ContinueStmt;
+pub const DiscardStmt = ast.DiscardStmt;
+pub const Expr = ast.Expr;
+pub const Literal = ast.Literal;
+pub const BinaryExpr = ast.BinaryExpr;
+pub const UnaryExpr = ast.UnaryExpr;
+pub const FieldAccess = ast.FieldAccess;
+pub const IndexAccess = ast.IndexAccess;
+pub const MethodCall = ast.MethodCall;
+pub const FunctionCall = ast.FunctionCall;
+pub const StructLiteral = ast.StructLiteral;
+pub const ArrayLiteral = ast.ArrayLiteral;
+pub const TupleLiteral = ast.TupleLiteral;
+pub const IfExpr = ast.IfExpr;
+pub const MatchExpr = ast.MatchExpr;
+pub const MatchArm = ast.MatchArm;
+pub const BlockExpr = ast.BlockExpr;
+pub const LambdaExpr = ast.LambdaExpr;
+pub const LambdaParam = ast.LambdaParam;
+pub const PipelineExpr = ast.PipelineExpr;
+pub const ErrorPropagateExpr = ast.ErrorPropagateExpr;
+pub const CoalesceExpr = ast.CoalesceExpr;
+pub const RangeExpr = ast.RangeExpr;
+pub const ComptimeExpr = ast.ComptimeExpr;
+pub const Pattern = ast.Pattern;
+pub const TuplePattern = ast.TuplePattern;
+pub const StructPattern = ast.StructPattern;
+pub const FieldPattern = ast.FieldPattern;
+pub const EnumVariantPattern = ast.EnumVariantPattern;
+pub const SlicePattern = ast.SlicePattern;
+pub const OrPattern = ast.OrPattern;
+pub const TypeExpr = ast.TypeExpr;
+pub const NamedType = ast.NamedType;
+pub const FunctionType = ast.FunctionType;
+pub const ArrayType = ast.ArrayType;
+pub const SliceType = ast.SliceType;
+pub const ReferenceType = ast.ReferenceType;
+pub const TupleType = ast.TupleType;
+pub const OptionType = ast.OptionType;
+pub const ImportDecl = ast.ImportDecl;
 
 // ============================================================================
 // Parser Error Types
@@ -513,6 +114,32 @@ pub const ParseError = struct {
 };
 
 // ============================================================================
+// Helper: Convert SourceLocation to Span.Position
+// ============================================================================
+
+fn toPosition(loc: SourceLocation) Span.Position {
+    return .{
+        .line = loc.line,
+        .column = loc.column,
+        .offset = loc.offset,
+    };
+}
+
+fn makeSpan(start: SourceLocation, end: SourceLocation) Span {
+    return .{
+        .start = toPosition(start),
+        .end = toPosition(end),
+    };
+}
+
+fn makeIdentifier(name: []const u8, loc: SourceLocation) Identifier {
+    return .{
+        .name = name,
+        .span = makeSpan(loc, loc),
+    };
+}
+
+// ============================================================================
 // Parser Implementation
 // ============================================================================
 
@@ -530,7 +157,7 @@ const Precedence = enum(u8) {
     shift = 9, // << >>
     term = 10, // + -
     factor = 11, // * / %
-    power = 12, // ^ (right associative)
+    power = 12, // ^ (right associative - note: same as bit_xor in most langs)
     unary = 13, // - not !
     postfix = 14, // calls, field access, indexing, ?, ??
 
@@ -572,31 +199,38 @@ pub const Parser = struct {
     // Entry Point
     // ========================================================================
 
-    /// Parse the entire source into a Module AST
-    pub fn parse(self: *Self) !*Module {
-        var declarations = std.ArrayList(*Decl).init(self.allocator);
+    /// Parse the entire source into a SourceFile AST
+    pub fn parse(self: *Self) !*SourceFile {
+        var imports = std.ArrayList(*ImportDecl).init(self.allocator);
+        var declarations = std.ArrayList(*Declaration).init(self.allocator);
+        errdefer imports.deinit();
         errdefer declarations.deinit();
 
         const start_loc = self.currentLocation();
 
         while (!self.isAtEnd()) {
-            if (self.parseDeclaration()) |decl| {
+            // Handle imports first
+            if (self.check(.kw_import)) {
+                if (self.parseImportDecl()) |imp| {
+                    try imports.append(imp);
+                } else |_| {
+                    self.synchronize();
+                }
+            } else if (self.parseDeclaration()) |decl| {
                 try declarations.append(decl);
             } else |_| {
                 self.synchronize();
             }
         }
 
-        const module = try self.allocator.create(Module);
-        module.* = .{
-            .name = null,
+        const source_file = try self.allocator.create(SourceFile);
+        source_file.* = .{
+            .module_decl = null,
+            .imports = try imports.toOwnedSlice(),
             .declarations = try declarations.toOwnedSlice(),
-            .span = .{
-                .start = start_loc,
-                .end = self.previousLocation(),
-            },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
-        return module;
+        return source_file;
     }
 
     // ========================================================================
@@ -604,69 +238,61 @@ pub const Parser = struct {
     // ========================================================================
 
     /// Parse a top-level declaration
-    pub fn parseDeclaration(self: *Self) !*Decl {
+    pub fn parseDeclaration(self: *Self) !*Declaration {
         const start_loc = self.currentLocation();
-        const is_private = self.match(.kw_private);
+        const visibility: Declaration.Visibility = if (self.match(.kw_private)) .private else .public;
 
-        const decl = try self.allocator.create(Decl);
+        const decl = try self.allocator.create(Declaration);
 
         if (self.match(.kw_fn)) {
             decl.* = .{
-                .kind = .{ .function = try self.parseFunction(is_private) },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .function = try self.parseFunction() },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
         } else if (self.match(.kw_struct)) {
             decl.* = .{
-                .kind = .{ .@"struct" = try self.parseStruct(is_private) },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .struct_def = try self.parseStruct() },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
         } else if (self.match(.kw_enum)) {
             decl.* = .{
-                .kind = .{ .@"enum" = try self.parseEnum(is_private) },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .enum_def = try self.parseEnum() },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
         } else if (self.match(.kw_trait)) {
             decl.* = .{
-                .kind = .{ .trait = try self.parseTrait(is_private) },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .trait_def = try self.parseTrait() },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
         } else if (self.match(.kw_impl)) {
             decl.* = .{
-                .kind = .{ .impl = try self.parseImpl() },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
-        } else if (self.match(.kw_import)) {
-            decl.* = .{
-                .kind = .{ .import = try self.parseImport() },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .impl_block = try self.parseImpl() },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
         } else if (self.match(.kw_const)) {
-            const name = try self.expectIdentifier("constant name");
-            const type_ann = if (self.match(.colon)) try self.parseTypeExpr() else null;
-            try self.expect(.eq, "'=' after constant name");
-            const value = try self.parseExpr();
             decl.* = .{
-                .kind = .{
-                    .constant = .{
-                        .name = name,
-                        .type_annotation = type_ann,
-                        .value = value,
-                        .is_private = is_private,
-                    },
-                },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .constant = try self.parseConstDecl() },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
         } else {
-            return self.errorAtCurrent("Expected declaration (fn, struct, enum, trait, impl, import, or const)");
+            return self.errorAtCurrent("Expected declaration (fn, struct, enum, trait, impl, or const)");
         }
 
         return decl;
     }
 
     /// Parse a function definition
-    pub fn parseFunction(self: *Self, is_private: bool) !*Function {
+    pub fn parseFunction(self: *Self) !*FunctionDecl {
         const start_loc = self.currentLocation();
+        const is_comptime = self.match(.kw_comptime);
         const name = try self.expectIdentifier("function name");
+        const name_ident = makeIdentifier(name, start_loc);
 
         // Generic parameters
         const generic_params = try self.parseGenericParams();
@@ -683,64 +309,78 @@ pub const Parser = struct {
         }
 
         // Effects
-        var effects = std.ArrayList([]const u8).init(self.allocator);
+        var effects: ?[]const *TypeExpr = null;
         if (self.match(.kw_with)) {
             try self.expect(.lbracket, "'[' after 'with'");
+            var effect_list = std.ArrayList(*TypeExpr).init(self.allocator);
             while (!self.check(.rbracket) and !self.isAtEnd()) {
-                const effect = try self.expectIdentifier("effect name");
-                try effects.append(effect);
+                const effect = try self.parseTypeExpr();
+                try effect_list.append(effect);
                 if (!self.match(.comma)) break;
             }
             try self.expect(.rbracket, "']' after effects");
+            effects = try effect_list.toOwnedSlice();
         }
 
         // Contracts
-        var contracts = std.ArrayList(Contract).init(self.allocator);
+        var contracts: ?FunctionDecl.Contracts = null;
+        var requires_list = std.ArrayList(*Expr).init(self.allocator);
+        var ensures_list = std.ArrayList(*Expr).init(self.allocator);
+
         while (self.match(.kw_requires) or self.match(.kw_ensures)) {
-            const kind: @TypeOf(contracts.items[0].kind) = if (self.previous().type == .kw_requires) .requires else .ensures;
+            const is_requires = self.previous().type == .kw_requires;
             const condition = try self.parseExpr();
-            var message: ?[]const u8 = null;
-            if (self.match(.comma)) {
-                if (self.match(.string)) {
-                    message = self.previous().lexeme;
-                }
+            if (is_requires) {
+                try requires_list.append(condition);
+            } else {
+                try ensures_list.append(condition);
             }
-            try contracts.append(.{
-                .kind = kind,
-                .condition = condition,
-                .message = message,
-            });
+        }
+
+        if (requires_list.items.len > 0 or ensures_list.items.len > 0) {
+            contracts = .{
+                .requires = try requires_list.toOwnedSlice(),
+                .ensures = try ensures_list.toOwnedSlice(),
+            };
         }
 
         // Body (optional for trait method signatures)
-        var body: ?*Block = null;
+        var body: ?FunctionDecl.FunctionBody = null;
         if (self.check(.lbrace)) {
-            body = try self.parseBlock();
+            body = .{ .block = try self.parseBlockExpr() };
+        } else if (self.match(.eq)) {
+            // Expression body: fn foo() -> int = 42
+            body = .{ .expression = try self.parseExpr() };
         }
 
-        const func = try self.allocator.create(Function);
+        const func = try self.allocator.create(FunctionDecl);
         func.* = .{
-            .name = name,
-            .generic_params = try generic_params.toOwnedSlice(),
+            .name = name_ident,
+            .generic_params = generic_params,
             .params = try params.toOwnedSlice(),
             .return_type = return_type,
-            .effects = try effects.toOwnedSlice(),
-            .contracts = try contracts.toOwnedSlice(),
+            .effects = effects,
+            .contracts = contracts,
             .body = body,
-            .is_private = is_private,
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .is_comptime = is_comptime,
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return func;
     }
 
     /// Parse generic parameters: [T, U: Trait]
-    fn parseGenericParams(self: *Self) !std.ArrayList(GenericParam) {
-        var params = std.ArrayList(GenericParam).init(self.allocator);
-        if (!self.match(.lbracket)) return params;
+    fn parseGenericParams(self: *Self) !?[]const *GenericParam {
+        if (!self.match(.lbracket)) return null;
+
+        var params = std.ArrayList(*GenericParam).init(self.allocator);
 
         while (!self.check(.rbracket) and !self.isAtEnd()) {
+            const start_loc = self.currentLocation();
             const name = try self.expectIdentifier("generic parameter name");
+            const name_ident = makeIdentifier(name, start_loc);
+
             var bounds = std.ArrayList(*TypeExpr).init(self.allocator);
+            var default: ?*TypeExpr = null;
 
             if (self.match(.colon)) {
                 // Parse trait bounds
@@ -752,25 +392,37 @@ pub const Parser = struct {
                 }
             }
 
-            try params.append(.{
-                .name = name,
+            if (self.match(.eq)) {
+                // Default type
+                default = try self.parseTypeExpr();
+            }
+
+            const param = try self.allocator.create(GenericParam);
+            param.* = .{
+                .name = name_ident,
                 .bounds = try bounds.toOwnedSlice(),
-            });
+                .default = default,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+            try params.append(param);
 
             if (!self.match(.comma)) break;
         }
 
         try self.expect(.rbracket, "']' after generic parameters");
-        return params;
+        return try params.toOwnedSlice();
     }
 
     /// Parse function parameters
-    fn parseFunctionParams(self: *Self) !std.ArrayList(Param) {
-        var params = std.ArrayList(Param).init(self.allocator);
+    fn parseFunctionParams(self: *Self) !std.ArrayList(*FunctionParam) {
+        var params = std.ArrayList(*FunctionParam).init(self.allocator);
 
         while (!self.check(.rparen) and !self.isAtEnd()) {
-            const mutable = self.match(.kw_mut);
+            const start_loc = self.currentLocation();
+            const is_mut = self.match(.kw_mut);
             const name = try self.expectIdentifier("parameter name");
+            const name_ident = makeIdentifier(name, start_loc);
+
             try self.expect(.colon, "':' after parameter name");
             const type_ann = try self.parseTypeExpr();
 
@@ -779,12 +431,15 @@ pub const Parser = struct {
                 default_val = try self.parseExpr();
             }
 
-            try params.append(.{
-                .name = name,
-                .type_annotation = type_ann,
+            const param = try self.allocator.create(FunctionParam);
+            param.* = .{
+                .name = name_ident,
+                .type_expr = type_ann,
                 .default_value = default_val,
-                .mutable = mutable,
-            });
+                .is_mut = is_mut,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+            try params.append(param);
 
             if (!self.match(.comma)) break;
         }
@@ -793,17 +448,21 @@ pub const Parser = struct {
     }
 
     /// Parse a struct definition
-    pub fn parseStruct(self: *Self, is_private: bool) !*Struct {
+    pub fn parseStruct(self: *Self) !*StructDecl {
         const start_loc = self.currentLocation();
         const name = try self.expectIdentifier("struct name");
+        const name_ident = makeIdentifier(name, start_loc);
         const generic_params = try self.parseGenericParams();
 
         try self.expect(.lbrace, "'{' after struct name");
 
-        var fields = std.ArrayList(StructField).init(self.allocator);
+        var fields = std.ArrayList(*StructField).init(self.allocator);
         while (!self.check(.rbrace) and !self.isAtEnd()) {
-            const field_private = self.match(.kw_private);
+            const field_start = self.currentLocation();
+            const field_visibility: Declaration.Visibility = if (self.match(.kw_private)) .private else .public;
             const field_name = try self.expectIdentifier("field name");
+            const field_name_ident = makeIdentifier(field_name, field_start);
+
             try self.expect(.colon, "':' after field name");
             const field_type = try self.parseTypeExpr();
 
@@ -812,15 +471,17 @@ pub const Parser = struct {
                 default_val = try self.parseExpr();
             }
 
-            try fields.append(.{
-                .name = field_name,
-                .type_annotation = field_type,
+            const field = try self.allocator.create(StructField);
+            field.* = .{
+                .name = field_name_ident,
+                .type_expr = field_type,
                 .default_value = default_val,
-                .is_private = field_private,
-            });
+                .visibility = field_visibility,
+                .span = makeSpan(field_start, self.previousLocation()),
+            };
+            try fields.append(field);
 
             if (!self.match(.comma)) {
-                // Allow trailing comma or no comma before }
                 if (!self.check(.rbrace)) {
                     return self.errorAtCurrent("Expected ',' or '}' after field");
                 }
@@ -829,79 +490,75 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after struct fields");
 
-        const s = try self.allocator.create(Struct);
+        const s = try self.allocator.create(StructDecl);
         s.* = .{
-            .name = name,
-            .generic_params = try generic_params.toOwnedSlice(),
+            .name = name_ident,
+            .generic_params = generic_params,
             .fields = try fields.toOwnedSlice(),
-            .is_private = is_private,
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return s;
     }
 
     /// Parse an enum definition
-    pub fn parseEnum(self: *Self, is_private: bool) !*Enum {
+    pub fn parseEnum(self: *Self) !*EnumDecl {
         const start_loc = self.currentLocation();
         const name = try self.expectIdentifier("enum name");
+        const name_ident = makeIdentifier(name, start_loc);
         const generic_params = try self.parseGenericParams();
 
         try self.expect(.lbrace, "'{' after enum name");
 
-        var variants = std.ArrayList(EnumVariant).init(self.allocator);
+        var variants = std.ArrayList(*EnumVariant).init(self.allocator);
         while (!self.check(.rbrace) and !self.isAtEnd()) {
+            const variant_start = self.currentLocation();
             const variant_name = try self.expectIdentifier("variant name");
+            const variant_name_ident = makeIdentifier(variant_name, variant_start);
 
-            var variant_fields: ?[]const StructField = null;
-            var discriminant: ?*Expr = null;
+            var payload: EnumVariant.Payload = .none;
 
             if (self.match(.lparen)) {
                 // Tuple-style variant: Some(T)
-                var fields = std.ArrayList(StructField).init(self.allocator);
-                var idx: usize = 0;
+                var types = std.ArrayList(*TypeExpr).init(self.allocator);
                 while (!self.check(.rparen) and !self.isAtEnd()) {
                     const field_type = try self.parseTypeExpr();
-                    var field_name_buf: [32]u8 = undefined;
-                    const field_name = std.fmt.bufPrint(&field_name_buf, "_{}", .{idx}) catch "field";
-                    try fields.append(.{
-                        .name = try self.allocator.dupe(u8, field_name),
-                        .type_annotation = field_type,
-                        .default_value = null,
-                        .is_private = false,
-                    });
-                    idx += 1;
+                    try types.append(field_type);
                     if (!self.match(.comma)) break;
                 }
-                try self.expect(.rparen, "')' after variant fields");
-                variant_fields = try fields.toOwnedSlice();
+                try self.expect(.rparen, "')' after variant types");
+                payload = .{ .tuple = try types.toOwnedSlice() };
             } else if (self.match(.lbrace)) {
                 // Struct-style variant
-                var fields = std.ArrayList(StructField).init(self.allocator);
+                var fields = std.ArrayList(*StructField).init(self.allocator);
                 while (!self.check(.rbrace) and !self.isAtEnd()) {
+                    const field_start = self.currentLocation();
                     const field_name = try self.expectIdentifier("field name");
+                    const field_name_ident = makeIdentifier(field_name, field_start);
                     try self.expect(.colon, "':' after field name");
                     const field_type = try self.parseTypeExpr();
-                    try fields.append(.{
-                        .name = field_name,
-                        .type_annotation = field_type,
+
+                    const field = try self.allocator.create(StructField);
+                    field.* = .{
+                        .name = field_name_ident,
+                        .type_expr = field_type,
                         .default_value = null,
-                        .is_private = false,
-                    });
+                        .visibility = .public,
+                        .span = makeSpan(field_start, self.previousLocation()),
+                    };
+                    try fields.append(field);
                     if (!self.match(.comma)) break;
                 }
                 try self.expect(.rbrace, "'}' after variant fields");
-                variant_fields = try fields.toOwnedSlice();
+                payload = .{ .struct_fields = try fields.toOwnedSlice() };
             }
 
-            if (self.match(.eq)) {
-                discriminant = try self.parseExpr();
-            }
-
-            try variants.append(.{
-                .name = variant_name,
-                .fields = variant_fields,
-                .discriminant = discriminant,
-            });
+            const variant = try self.allocator.create(EnumVariant);
+            variant.* = .{
+                .name = variant_name_ident,
+                .payload = payload,
+                .span = makeSpan(variant_start, self.previousLocation()),
+            };
+            try variants.append(variant);
 
             if (!self.match(.comma)) {
                 if (!self.check(.rbrace)) {
@@ -912,21 +569,21 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after enum variants");
 
-        const e = try self.allocator.create(Enum);
+        const e = try self.allocator.create(EnumDecl);
         e.* = .{
-            .name = name,
-            .generic_params = try generic_params.toOwnedSlice(),
+            .name = name_ident,
+            .generic_params = generic_params,
             .variants = try variants.toOwnedSlice(),
-            .is_private = is_private,
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return e;
     }
 
     /// Parse a trait definition
-    pub fn parseTrait(self: *Self, is_private: bool) !*Trait {
+    pub fn parseTrait(self: *Self) !*TraitDecl {
         const start_loc = self.currentLocation();
         const name = try self.expectIdentifier("trait name");
+        const name_ident = makeIdentifier(name, start_loc);
         const generic_params = try self.parseGenericParams();
 
         // Super traits: trait Child: Parent1 + Parent2
@@ -935,52 +592,36 @@ pub const Parser = struct {
             const first = try self.parseTypeExpr();
             try super_traits.append(first);
             while (self.match(.plus)) {
-                const next = try self.parseTypeExpr();
-                try super_traits.append(next);
+                const next_trait = try self.parseTypeExpr();
+                try super_traits.append(next_trait);
             }
         }
 
         try self.expect(.lbrace, "'{' after trait name");
 
-        var methods = std.ArrayList(TraitMethod).init(self.allocator);
+        var items = std.ArrayList(*TraitItem).init(self.allocator);
         while (!self.check(.rbrace) and !self.isAtEnd()) {
-            try self.expect(.kw_fn, "'fn' for trait method");
-            const method_name = try self.expectIdentifier("method name");
-            const method_generics = try self.parseGenericParams();
+            const item_start = self.currentLocation();
 
-            try self.expect(.lparen, "'(' after method name");
-            const params = try self.parseFunctionParams();
-            try self.expect(.rparen, "')' after parameters");
-
-            var return_type: ?*TypeExpr = null;
-            if (self.match(.arrow)) {
-                return_type = try self.parseTypeExpr();
+            if (self.match(.kw_fn)) {
+                const func = try self.parseFunction();
+                const item = try self.allocator.create(TraitItem);
+                item.* = .{
+                    .kind = .{ .function = func },
+                    .span = makeSpan(item_start, self.previousLocation()),
+                };
+                try items.append(item);
+            } else if (self.match(.kw_const)) {
+                const const_decl = try self.parseConstDecl();
+                const item = try self.allocator.create(TraitItem);
+                item.* = .{
+                    .kind = .{ .constant = const_decl },
+                    .span = makeSpan(item_start, self.previousLocation()),
+                };
+                try items.append(item);
+            } else {
+                return self.errorAtCurrent("Expected 'fn' or 'const' in trait body");
             }
-
-            var effects = std.ArrayList([]const u8).init(self.allocator);
-            if (self.match(.kw_with)) {
-                try self.expect(.lbracket, "'[' after 'with'");
-                while (!self.check(.rbracket) and !self.isAtEnd()) {
-                    const effect = try self.expectIdentifier("effect name");
-                    try effects.append(effect);
-                    if (!self.match(.comma)) break;
-                }
-                try self.expect(.rbracket, "']' after effects");
-            }
-
-            var default_impl: ?*Block = null;
-            if (self.check(.lbrace)) {
-                default_impl = try self.parseBlock();
-            }
-
-            try methods.append(.{
-                .name = method_name,
-                .generic_params = try method_generics.toOwnedSlice(),
-                .params = try params.toOwnedSlice(),
-                .return_type = return_type,
-                .effects = try effects.toOwnedSlice(),
-                .default_impl = default_impl,
-            });
 
             // Allow optional comma/semicolon between methods
             _ = self.match(.comma) or self.match(.semicolon);
@@ -988,20 +629,19 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after trait body");
 
-        const t = try self.allocator.create(Trait);
+        const t = try self.allocator.create(TraitDecl);
         t.* = .{
-            .name = name,
-            .generic_params = try generic_params.toOwnedSlice(),
+            .name = name_ident,
+            .generic_params = generic_params,
             .super_traits = try super_traits.toOwnedSlice(),
-            .methods = try methods.toOwnedSlice(),
-            .is_private = is_private,
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .items = try items.toOwnedSlice(),
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return t;
     }
 
     /// Parse an impl block
-    pub fn parseImpl(self: *Self) !*Impl {
+    pub fn parseImpl(self: *Self) !*ImplBlock {
         const start_loc = self.currentLocation();
         const generic_params = try self.parseGenericParams();
 
@@ -1018,49 +658,78 @@ pub const Parser = struct {
 
         try self.expect(.lbrace, "'{' after impl target");
 
-        var methods = std.ArrayList(*Function).init(self.allocator);
+        var items = std.ArrayList(*ImplItem).init(self.allocator);
         while (!self.check(.rbrace) and !self.isAtEnd()) {
-            const is_private = self.match(.kw_private);
-            try self.expect(.kw_fn, "'fn' for impl method");
-            const func = try self.parseFunction(is_private);
-            try methods.append(func);
+            const item_start = self.currentLocation();
+            const visibility: Declaration.Visibility = if (self.match(.kw_private)) .private else .public;
+
+            if (self.match(.kw_fn)) {
+                const func = try self.parseFunction();
+                const item = try self.allocator.create(ImplItem);
+                item.* = .{
+                    .kind = .{ .function = func },
+                    .visibility = visibility,
+                    .span = makeSpan(item_start, self.previousLocation()),
+                };
+                try items.append(item);
+            } else if (self.match(.kw_const)) {
+                const const_decl = try self.parseConstDecl();
+                const item = try self.allocator.create(ImplItem);
+                item.* = .{
+                    .kind = .{ .constant = const_decl },
+                    .visibility = visibility,
+                    .span = makeSpan(item_start, self.previousLocation()),
+                };
+                try items.append(item);
+            } else {
+                return self.errorAtCurrent("Expected 'fn' or 'const' in impl block");
+            }
         }
 
         try self.expect(.rbrace, "'}' after impl body");
 
-        const impl = try self.allocator.create(Impl);
+        const impl = try self.allocator.create(ImplBlock);
         impl.* = .{
-            .generic_params = try generic_params.toOwnedSlice(),
+            .generic_params = generic_params,
             .trait_type = trait_type,
             .target_type = target_type,
-            .methods = try methods.toOwnedSlice(),
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .where_clause = null,
+            .items = try items.toOwnedSlice(),
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return impl;
     }
 
     /// Parse an import declaration
-    fn parseImport(self: *Self) !*Import {
+    fn parseImportDecl(self: *Self) !*ImportDecl {
         const start_loc = self.currentLocation();
+        try self.expect(.kw_import, "'import'");
 
-        var path = std.ArrayList([]const u8).init(self.allocator);
+        var segments = std.ArrayList(Identifier).init(self.allocator);
         const first = try self.expectIdentifier("module path");
-        try path.append(first);
+        try segments.append(makeIdentifier(first, self.previousLocation()));
 
         while (self.match(.colon_colon)) {
-            const next = try self.expectIdentifier("module path segment");
-            try path.append(next);
+            if (self.check(.lbrace)) break; // import foo::bar::{...}
+            const seg = try self.expectIdentifier("module path segment");
+            try segments.append(makeIdentifier(seg, self.previousLocation()));
         }
 
-        var items: ?[]const ImportItem = null;
+        const path = Path{
+            .segments = try segments.toOwnedSlice(),
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        var items: ?[]const ImportDecl.ImportItem = null;
         if (self.match(.lbrace)) {
-            var import_items = std.ArrayList(ImportItem).init(self.allocator);
+            var import_items = std.ArrayList(ImportDecl.ImportItem).init(self.allocator);
             while (!self.check(.rbrace) and !self.isAtEnd()) {
                 const item_name = try self.expectIdentifier("import item");
-                var alias: ?[]const u8 = null;
-                // Could add 'as' keyword handling here
+                const item_ident = makeIdentifier(item_name, self.previousLocation());
+                var alias: ?Identifier = null;
+                // Could add 'as' keyword handling here if needed
                 try import_items.append(.{
-                    .name = item_name,
+                    .name = item_ident,
                     .alias = alias,
                 });
                 if (!self.match(.comma)) break;
@@ -1069,13 +738,39 @@ pub const Parser = struct {
             items = try import_items.toOwnedSlice();
         }
 
-        const imp = try self.allocator.create(Import);
+        const imp = try self.allocator.create(ImportDecl);
         imp.* = .{
-            .path = try path.toOwnedSlice(),
+            .path = path,
             .items = items,
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return imp;
+    }
+
+    /// Parse a constant declaration
+    fn parseConstDecl(self: *Self) !*ConstDecl {
+        const start_loc = self.currentLocation();
+        const name = try self.expectIdentifier("constant name");
+        const name_ident = makeIdentifier(name, start_loc);
+
+        var type_ann: ?*TypeExpr = null;
+        if (self.match(.colon)) {
+            type_ann = try self.parseTypeExpr();
+        }
+
+        var value: ?*Expr = null;
+        if (self.match(.eq)) {
+            value = try self.parseExpr();
+        }
+
+        const const_decl = try self.allocator.create(ConstDecl);
+        const_decl.* = .{
+            .name = name_ident,
+            .type_expr = type_ann,
+            .value = value,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+        return const_decl;
     }
 
     // ========================================================================
@@ -1085,25 +780,36 @@ pub const Parser = struct {
     /// Parse a type expression
     pub fn parseTypeExpr(self: *Self) anyerror!*TypeExpr {
         const start_loc = self.currentLocation();
-        var type_expr = try self.allocator.create(TypeExpr);
+        const type_expr = try self.allocator.create(TypeExpr);
 
         // Optional type: ?T
         if (self.match(.question)) {
             const inner = try self.parseTypeExpr();
+            const opt_type = try self.allocator.create(OptionType);
+            opt_type.* = .{
+                .inner_type = inner,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
             type_expr.* = .{
-                .kind = .{ .optional = inner },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .option = opt_type },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return type_expr;
         }
 
         // Reference type: &T or &mut T
         if (self.match(.ampersand)) {
-            const mutable = self.match(.kw_mut);
+            const is_mut = self.match(.kw_mut);
             const inner = try self.parseTypeExpr();
+            const ref_type = try self.allocator.create(ReferenceType);
+            ref_type.* = .{
+                .referenced_type = inner,
+                .is_mut = is_mut,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
             type_expr.* = .{
-                .kind = .{ .reference = .{ .inner = inner, .mutable = mutable } },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .reference = ref_type },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return type_expr;
         }
@@ -1119,35 +825,51 @@ pub const Parser = struct {
             }
             try self.expect(.rparen, "')' after function type parameters");
 
-            var ret_type = try self.allocator.create(TypeExpr);
-            ret_type.* = .{
-                .kind = .{ .name = "void" },
-                .span = .{ .start = start_loc, .end = start_loc },
-            };
+            var ret_type: *TypeExpr = undefined;
             if (self.match(.arrow)) {
                 ret_type = try self.parseTypeExpr();
+            } else {
+                // Default void return
+                ret_type = try self.allocator.create(TypeExpr);
+                const named = try self.allocator.create(NamedType);
+                const void_ident = makeIdentifier("void", start_loc);
+                named.* = .{
+                    .path = .{
+                        .segments = try self.allocator.dupe(Identifier, &[_]Identifier{void_ident}),
+                        .span = makeSpan(start_loc, start_loc),
+                    },
+                    .generic_args = null,
+                    .span = makeSpan(start_loc, start_loc),
+                };
+                ret_type.* = .{
+                    .kind = .{ .named = named },
+                    .span = makeSpan(start_loc, start_loc),
+                };
             }
 
-            var effects = std.ArrayList([]const u8).init(self.allocator);
+            var effects: ?[]const *TypeExpr = null;
             if (self.match(.kw_with)) {
                 try self.expect(.lbracket, "'[' after 'with' in type");
+                var effect_list = std.ArrayList(*TypeExpr).init(self.allocator);
                 while (!self.check(.rbracket) and !self.isAtEnd()) {
-                    const effect = try self.expectIdentifier("effect name");
-                    try effects.append(effect);
+                    const effect = try self.parseTypeExpr();
+                    try effect_list.append(effect);
                     if (!self.match(.comma)) break;
                 }
                 try self.expect(.rbracket, "']' after effects in type");
+                effects = try effect_list.toOwnedSlice();
             }
 
+            const func_type = try self.allocator.create(FunctionType);
+            func_type.* = .{
+                .params = try param_types.toOwnedSlice(),
+                .return_type = ret_type,
+                .effects = effects,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
             type_expr.* = .{
-                .kind = .{
-                    .function = .{
-                        .params = try param_types.toOwnedSlice(),
-                        .ret = ret_type,
-                        .effects = try effects.toOwnedSlice(),
-                    },
-                },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .function = func_type },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return type_expr;
         }
@@ -1159,14 +881,20 @@ pub const Parser = struct {
                 const first = try self.parseTypeExpr();
                 try types.append(first);
                 while (self.match(.comma)) {
-                    const next = try self.parseTypeExpr();
-                    try types.append(next);
+                    const next_type = try self.parseTypeExpr();
+                    try types.append(next_type);
                 }
             }
             try self.expect(.rparen, "')' after tuple type");
+
+            const tuple_type = try self.allocator.create(TupleType);
+            tuple_type.* = .{
+                .elements = try types.toOwnedSlice(),
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
             type_expr.* = .{
-                .kind = .{ .tuple = try types.toOwnedSlice() },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .tuple = tuple_type },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return type_expr;
         }
@@ -1174,31 +902,67 @@ pub const Parser = struct {
         // Array type: [T] or [T; N]
         if (self.match(.lbracket)) {
             const elem_type = try self.parseTypeExpr();
-            var size: ?*Expr = null;
             if (self.match(.semicolon)) {
-                size = try self.parseExpr();
+                // Fixed-size array: [T; N]
+                const size = try self.parseExpr();
+                try self.expect(.rbracket, "']' after array type");
+
+                const arr_type = try self.allocator.create(ArrayType);
+                arr_type.* = .{
+                    .element_type = elem_type,
+                    .size = size,
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+                type_expr.* = .{
+                    .kind = .{ .array = arr_type },
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+            } else {
+                // Slice type: [T]
+                try self.expect(.rbracket, "']' after slice type");
+
+                const slice_type = try self.allocator.create(SliceType);
+                slice_type.* = .{
+                    .element_type = elem_type,
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+                type_expr.* = .{
+                    .kind = .{ .slice = slice_type },
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
             }
-            try self.expect(.rbracket, "']' after array type");
-            type_expr.* = .{
-                .kind = .{ .array = .{ .element = elem_type, .size = size } },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
             return type_expr;
         }
 
         // Inferred type: _
         if (self.match(.underscore)) {
             type_expr.* = .{
-                .kind = .inferred,
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .infer,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return type_expr;
         }
 
         // Named type or generic type
         const name = try self.expectIdentifier("type name");
+        const name_ident = makeIdentifier(name, start_loc);
+
+        var segments = std.ArrayList(Identifier).init(self.allocator);
+        try segments.append(name_ident);
+
+        // Handle paths: Foo::Bar::Baz
+        while (self.match(.colon_colon)) {
+            const seg = try self.expectIdentifier("type path segment");
+            try segments.append(makeIdentifier(seg, self.previousLocation()));
+        }
+
+        const path = Path{
+            .segments = try segments.toOwnedSlice(),
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
 
         // Check for generic arguments
+        var generic_args: ?[]const *TypeExpr = null;
         if (self.match(.lbracket)) {
             var args = std.ArrayList(*TypeExpr).init(self.allocator);
             while (!self.check(.rbracket) and !self.isAtEnd()) {
@@ -1207,21 +971,19 @@ pub const Parser = struct {
                 if (!self.match(.comma)) break;
             }
             try self.expect(.rbracket, "']' after generic arguments");
-            type_expr.* = .{
-                .kind = .{
-                    .generic = .{
-                        .name = name,
-                        .args = try args.toOwnedSlice(),
-                    },
-                },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
-        } else {
-            type_expr.* = .{
-                .kind = .{ .name = name },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
+            generic_args = try args.toOwnedSlice();
         }
+
+        const named = try self.allocator.create(NamedType);
+        named.* = .{
+            .path = path,
+            .generic_args = generic_args,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+        type_expr.* = .{
+            .kind = .{ .named = named },
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
 
         return type_expr;
     }
@@ -1231,7 +993,7 @@ pub const Parser = struct {
     // ========================================================================
 
     /// Parse a statement
-    pub fn parseStatement(self: *Self) anyerror!*Stmt {
+    pub fn parseStatement(self: *Self) anyerror!*Statement {
         const start_loc = self.currentLocation();
 
         if (self.match(.kw_let)) {
@@ -1246,19 +1008,34 @@ pub const Parser = struct {
             else
                 null;
             _ = self.match(.semicolon);
-            const stmt = try self.allocator.create(Stmt);
+
+            const break_stmt = try self.allocator.create(BreakStmt);
+            break_stmt.* = .{
+                .label = null,
+                .value = value,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const stmt = try self.allocator.create(Statement);
             stmt.* = .{
-                .kind = .{ .@"break" = value },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .break_stmt = break_stmt },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return stmt;
         }
         if (self.match(.kw_continue)) {
             _ = self.match(.semicolon);
-            const stmt = try self.allocator.create(Stmt);
+
+            const continue_stmt = try self.allocator.create(ContinueStmt);
+            continue_stmt.* = .{
+                .label = null,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const stmt = try self.allocator.create(Statement);
             stmt.* = .{
-                .kind = .@"continue",
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .continue_stmt = continue_stmt },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return stmt;
         }
@@ -1274,20 +1051,17 @@ pub const Parser = struct {
         if (self.match(.kw_discard)) {
             const expr = try self.parseExpr();
             _ = self.match(.semicolon);
-            const stmt = try self.allocator.create(Stmt);
-            stmt.* = .{
-                .kind = .{ .discard = expr },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+
+            const discard = try self.allocator.create(DiscardStmt);
+            discard.* = .{
+                .value = expr,
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
-            return stmt;
-        }
-        if (self.match(.kw_expect)) {
-            const expr = try self.parseExpr();
-            _ = self.match(.semicolon);
-            const stmt = try self.allocator.create(Stmt);
+
+            const stmt = try self.allocator.create(Statement);
             stmt.* = .{
-                .kind = .{ .expect = expr },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .discard = discard },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return stmt;
         }
@@ -1299,10 +1073,19 @@ pub const Parser = struct {
         if (self.match(.eq)) {
             const value = try self.parseExpr();
             _ = self.match(.semicolon);
-            const stmt = try self.allocator.create(Stmt);
+
+            const assignment = try self.allocator.create(Assignment);
+            assignment.* = .{
+                .target = expr,
+                .op = .assign,
+                .value = value,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const stmt = try self.allocator.create(Statement);
             stmt.* = .{
-                .kind = .{ .assignment = .{ .target = expr, .value = value } },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .assignment = assignment },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return stmt;
         }
@@ -1311,26 +1094,35 @@ pub const Parser = struct {
         if (self.matchCompoundAssignment()) |op| {
             const value = try self.parseExpr();
             _ = self.match(.semicolon);
-            const stmt = try self.allocator.create(Stmt);
+
+            const assignment = try self.allocator.create(Assignment);
+            assignment.* = .{
+                .target = expr,
+                .op = op,
+                .value = value,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const stmt = try self.allocator.create(Statement);
             stmt.* = .{
-                .kind = .{ .compound_assignment = .{ .target = expr, .op = op, .value = value } },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .assignment = assignment },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return stmt;
         }
 
         _ = self.match(.semicolon);
-        const stmt = try self.allocator.create(Stmt);
+        const stmt = try self.allocator.create(Statement);
         stmt.* = .{
-            .kind = .{ .expr = expr },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .expression = expr },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return stmt;
     }
 
     /// Parse let binding
-    pub fn parseLetBinding(self: *Self, start_loc: SourceLocation) !*Stmt {
-        const mutable = self.match(.kw_mut);
+    pub fn parseLetBinding(self: *Self, start_loc: SourceLocation) !*Statement {
+        const is_mut = self.match(.kw_mut);
         const pattern = try self.parsePattern();
 
         var type_ann: ?*TypeExpr = null;
@@ -1345,94 +1137,125 @@ pub const Parser = struct {
 
         _ = self.match(.semicolon);
 
-        const stmt = try self.allocator.create(Stmt);
+        const let_binding = try self.allocator.create(LetBinding);
+        let_binding.* = .{
+            .pattern = pattern,
+            .type_annotation = type_ann,
+            .value = value,
+            .is_mut = is_mut,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        const stmt = try self.allocator.create(Statement);
         stmt.* = .{
-            .kind = .{
-                .let_binding = .{
-                    .pattern = pattern,
-                    .type_annotation = type_ann,
-                    .value = value,
-                    .mutable = mutable,
-                },
-            },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .let_binding = let_binding },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return stmt;
     }
 
     /// Parse return statement
-    pub fn parseReturn(self: *Self, start_loc: SourceLocation) !*Stmt {
+    pub fn parseReturn(self: *Self, start_loc: SourceLocation) !*Statement {
         var value: ?*Expr = null;
         if (!self.check(.rbrace) and !self.check(.semicolon) and !self.isAtEnd()) {
             value = try self.parseExpr();
         }
         _ = self.match(.semicolon);
 
-        const stmt = try self.allocator.create(Stmt);
+        const return_stmt = try self.allocator.create(ReturnStmt);
+        return_stmt.* = .{
+            .value = value,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        const stmt = try self.allocator.create(Statement);
         stmt.* = .{
-            .kind = .{ .@"return" = value },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .return_stmt = return_stmt },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return stmt;
     }
 
     /// Parse while loop
-    pub fn parseWhile(self: *Self, start_loc: SourceLocation) !*Stmt {
+    pub fn parseWhile(self: *Self, start_loc: SourceLocation) !*Statement {
         const condition = try self.parseExpr();
-        const body = try self.parseBlock();
+        const body = try self.parseBlockExpr();
 
-        const stmt = try self.allocator.create(Stmt);
+        const while_loop = try self.allocator.create(WhileLoop);
+        while_loop.* = .{
+            .label = null,
+            .condition = condition,
+            .body = body,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        const stmt = try self.allocator.create(Statement);
         stmt.* = .{
-            .kind = .{ .while_loop = .{ .condition = condition, .body = body } },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .while_loop = while_loop },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return stmt;
     }
 
     /// Parse for loop
-    pub fn parseFor(self: *Self, start_loc: SourceLocation) !*Stmt {
+    pub fn parseFor(self: *Self, start_loc: SourceLocation) !*Statement {
         const pattern = try self.parsePattern();
         try self.expect(.kw_in, "'in' after for loop pattern");
         const iterable = try self.parseExpr();
-        const body = try self.parseBlock();
+        const body = try self.parseBlockExpr();
 
-        const stmt = try self.allocator.create(Stmt);
+        const for_loop = try self.allocator.create(ForLoop);
+        for_loop.* = .{
+            .label = null,
+            .pattern = pattern,
+            .iterator = iterable,
+            .body = body,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        const stmt = try self.allocator.create(Statement);
         stmt.* = .{
-            .kind = .{ .for_loop = .{ .pattern = pattern, .iterable = iterable, .body = body } },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .for_loop = for_loop },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return stmt;
     }
 
     /// Parse infinite loop
-    pub fn parseLoop(self: *Self, start_loc: SourceLocation) !*Stmt {
-        const body = try self.parseBlock();
+    pub fn parseLoop(self: *Self, start_loc: SourceLocation) !*Statement {
+        const body = try self.parseBlockExpr();
 
-        const stmt = try self.allocator.create(Stmt);
+        const loop_stmt = try self.allocator.create(LoopStmt);
+        loop_stmt.* = .{
+            .label = null,
+            .body = body,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        const stmt = try self.allocator.create(Statement);
         stmt.* = .{
-            .kind = .{ .loop = body },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .loop_stmt = loop_stmt },
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return stmt;
     }
 
-    /// Parse a block: { ... }
-    pub fn parseBlock(self: *Self) anyerror!*Block {
+    /// Parse a block expression: { ... }
+    pub fn parseBlockExpr(self: *Self) anyerror!*BlockExpr {
         const start_loc = self.currentLocation();
         try self.expect(.lbrace, "'{'");
 
-        var statements = std.ArrayList(*Stmt).init(self.allocator);
+        var statements = std.ArrayList(*Statement).init(self.allocator);
         var trailing_expr: ?*Expr = null;
 
         while (!self.check(.rbrace) and !self.isAtEnd()) {
-            // Check if this could be a trailing expression (no semicolon needed)
             const stmt = try self.parseStatement();
 
             // If it's an expression statement and we're at the end of the block,
             // it might be the trailing expression
             if (self.check(.rbrace)) {
-                if (stmt.kind == .expr) {
-                    trailing_expr = stmt.kind.expr;
+                if (stmt.kind == .expression) {
+                    trailing_expr = stmt.kind.expression;
                 } else {
                     try statements.append(stmt);
                 }
@@ -1443,11 +1266,11 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}'");
 
-        const block = try self.allocator.create(Block);
+        const block = try self.allocator.create(BlockExpr);
         block.* = .{
             .statements = try statements.toOwnedSlice(),
-            .expr = trailing_expr,
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .result = trailing_expr,
+            .span = makeSpan(start_loc, self.previousLocation()),
         };
         return block;
     }
@@ -1469,24 +1292,77 @@ pub const Parser = struct {
             const op_prec = self.getCurrentPrecedence();
             if (@intFromEnum(op_prec) < @intFromEnum(min_prec)) break;
 
-            const op_token = self.advance();
+            // Handle range operators specially
+            if (self.check(.dot_dot) or self.check(.dot_dot_eq)) {
+                const is_inclusive = self.check(.dot_dot_eq);
+                _ = self.advance();
+                var end_expr: ?*Expr = null;
+
+                // Check if there's an end expression
+                if (!self.check(.rbracket) and !self.check(.rparen) and !self.check(.rbrace) and
+                    !self.check(.comma) and !self.check(.semicolon) and !self.isAtEnd())
+                {
+                    end_expr = try self.parsePrecedence(op_prec.next());
+                }
+
+                const range = try self.allocator.create(RangeExpr);
+                range.* = .{
+                    .start = left,
+                    .end = end_expr,
+                    .inclusive = is_inclusive,
+                    .span = Span.merge(left.span, if (end_expr) |e| e.span else left.span),
+                };
+
+                const new_left = try self.allocator.create(Expr);
+                new_left.* = .{
+                    .kind = .{ .range = range },
+                    .span = range.span,
+                };
+                left = new_left;
+                continue;
+            }
+
+            // Handle pipeline operator
+            if (self.check(.pipe_gt)) {
+                _ = self.advance();
+                const right = try self.parsePrecedence(op_prec.next());
+
+                const pipeline = try self.allocator.create(PipelineExpr);
+                pipeline.* = .{
+                    .left = left,
+                    .right = right,
+                    .span = Span.merge(left.span, right.span),
+                };
+
+                const new_left = try self.allocator.create(Expr);
+                new_left.* = .{
+                    .kind = .{ .pipeline = pipeline },
+                    .span = pipeline.span,
+                };
+                left = new_left;
+                continue;
+            }
+
+            const op_token = self.peek();
             const op = tokenToBinaryOp(op_token.type) orelse break;
+            _ = self.advance();
 
-            // Handle right-associativity for power operator
-            const next_prec = if (op == .power) op_prec else op_prec.next();
-
+            // Handle right-associativity (none in current implementation, but structure supports it)
+            const next_prec = op_prec.next();
             const right = try self.parsePrecedence(next_prec);
+
+            const binary = try self.allocator.create(BinaryExpr);
+            binary.* = .{
+                .left = left,
+                .op = op,
+                .right = right,
+                .span = Span.merge(left.span, right.span),
+            };
 
             const new_left = try self.allocator.create(Expr);
             new_left.* = .{
-                .kind = .{
-                    .binary = .{
-                        .op = op,
-                        .left = left,
-                        .right = right,
-                    },
-                },
-                .span = Span.merge(left.span, right.span),
+                .kind = .{ .binary = binary },
+                .span = binary.span,
             };
             left = new_left;
         }
@@ -1501,28 +1377,52 @@ pub const Parser = struct {
         // Prefix operators
         if (self.match(.minus)) {
             const operand = try self.parseUnary();
+
+            const unary = try self.allocator.create(UnaryExpr);
+            unary.* = .{
+                .op = .neg,
+                .operand = operand,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .unary = .{ .op = .neg, .operand = operand } },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .unary = unary },
+                .span = unary.span,
             };
             return expr;
         }
         if (self.match(.kw_not) or self.match(.bang)) {
             const operand = try self.parseUnary();
+
+            const unary = try self.allocator.create(UnaryExpr);
+            unary.* = .{
+                .op = .not,
+                .operand = operand,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .unary = .{ .op = .not, .operand = operand } },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .unary = unary },
+                .span = unary.span,
             };
             return expr;
         }
         if (self.match(.tilde)) {
             const operand = try self.parseUnary();
+
+            const unary = try self.allocator.create(UnaryExpr);
+            unary.* = .{
+                .op = .bit_not,
+                .operand = operand,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .unary = .{ .op = .bit_not, .operand = operand } },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .unary = unary },
+                .span = unary.span,
             };
             return expr;
         }
@@ -1542,15 +1442,26 @@ pub const Parser = struct {
                 // Index access
                 const index = try self.parseExpr();
                 try self.expect(.rbracket, "']' after index");
+
+                const index_access = try self.allocator.create(IndexAccess);
+                index_access.* = .{
+                    .object = expr,
+                    .index = index,
+                    .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
+                };
+
                 const new_expr = try self.allocator.create(Expr);
                 new_expr.* = .{
-                    .kind = .{ .index = .{ .object = expr, .index = index } },
-                    .span = Span.merge(expr.span, .{ .start = self.previousLocation(), .end = self.previousLocation() }),
+                    .kind = .{ .index_access = index_access },
+                    .span = index_access.span,
                 };
                 expr = new_expr;
             } else if (self.match(.dot)) {
                 // Field access or method call
+                const field_start = self.currentLocation();
                 const field = try self.expectIdentifier("field name");
+                const field_ident = makeIdentifier(field, field_start);
+
                 if (self.match(.lparen)) {
                     // Method call
                     var args = std.ArrayList(*Expr).init(self.allocator);
@@ -1563,42 +1474,67 @@ pub const Parser = struct {
                         }
                     }
                     try self.expect(.rparen, "')' after method arguments");
+
+                    const method_call = try self.allocator.create(MethodCall);
+                    method_call.* = .{
+                        .object = expr,
+                        .method = field_ident,
+                        .generic_args = null,
+                        .args = try args.toOwnedSlice(),
+                        .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
+                    };
+
                     const new_expr = try self.allocator.create(Expr);
                     new_expr.* = .{
-                        .kind = .{
-                            .method_call = .{
-                                .receiver = expr,
-                                .method = field,
-                                .args = try args.toOwnedSlice(),
-                            },
-                        },
-                        .span = Span.merge(expr.span, .{ .start = self.previousLocation(), .end = self.previousLocation() }),
+                        .kind = .{ .method_call = method_call },
+                        .span = method_call.span,
                     };
                     expr = new_expr;
                 } else {
                     // Field access
+                    const field_access = try self.allocator.create(FieldAccess);
+                    field_access.* = .{
+                        .object = expr,
+                        .field = field_ident,
+                        .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
+                    };
+
                     const new_expr = try self.allocator.create(Expr);
                     new_expr.* = .{
-                        .kind = .{ .field_access = .{ .object = expr, .field = field } },
-                        .span = Span.merge(expr.span, .{ .start = self.previousLocation(), .end = self.previousLocation() }),
+                        .kind = .{ .field_access = field_access },
+                        .span = field_access.span,
                     };
                     expr = new_expr;
                 }
             } else if (self.match(.question)) {
-                // Try operator (error propagation)
+                // Error propagation: expr?
+                const error_prop = try self.allocator.create(ErrorPropagateExpr);
+                error_prop.* = .{
+                    .operand = expr,
+                    .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
+                };
+
                 const new_expr = try self.allocator.create(Expr);
                 new_expr.* = .{
-                    .kind = .{ .try_expr = expr },
-                    .span = Span.merge(expr.span, .{ .start = self.previousLocation(), .end = self.previousLocation() }),
+                    .kind = .{ .error_propagate = error_prop },
+                    .span = error_prop.span,
                 };
                 expr = new_expr;
             } else if (self.match(.question_question)) {
-                // Null coalescing
+                // Null coalescing: expr ?? default
                 const default = try self.parsePrecedence(.@"or");
+
+                const coalesce = try self.allocator.create(CoalesceExpr);
+                coalesce.* = .{
+                    .left = expr,
+                    .right = default,
+                    .span = Span.merge(expr.span, default.span),
+                };
+
                 const new_expr = try self.allocator.create(Expr);
                 new_expr.* = .{
-                    .kind = .{ .coalesce = .{ .value = expr, .default = default } },
-                    .span = Span.merge(expr.span, default.span),
+                    .kind = .{ .coalesce = coalesce },
+                    .span = coalesce.span,
                 };
                 expr = new_expr;
             } else {
@@ -1611,28 +1547,37 @@ pub const Parser = struct {
 
     /// Finish parsing a function call
     fn finishCall(self: *Self, callee: *Expr) !*Expr {
-        var args = std.ArrayList(*Expr).init(self.allocator);
+        var args = std.ArrayList(*FunctionCall.CallArg).init(self.allocator);
 
         if (!self.check(.rparen)) {
-            const first = try self.parseExpr();
-            try args.append(first);
-            while (self.match(.comma)) {
-                const arg = try self.parseExpr();
-                try args.append(arg);
+            while (true) {
+                const arg_expr = try self.parseExpr();
+
+                const call_arg = try self.allocator.create(FunctionCall.CallArg);
+                call_arg.* = .{
+                    .name = null,
+                    .value = arg_expr,
+                };
+                try args.append(call_arg);
+
+                if (!self.match(.comma)) break;
             }
         }
 
         try self.expect(.rparen, "')' after arguments");
 
+        const call = try self.allocator.create(FunctionCall);
+        call.* = .{
+            .function = callee,
+            .generic_args = null,
+            .args = try args.toOwnedSlice(),
+            .span = Span.merge(callee.span, makeSpan(self.previousLocation(), self.previousLocation())),
+        };
+
         const expr = try self.allocator.create(Expr);
         expr.* = .{
-            .kind = .{
-                .call = .{
-                    .callee = callee,
-                    .args = try args.toOwnedSlice(),
-                },
-            },
-            .span = Span.merge(callee.span, .{ .start = self.previousLocation(), .end = self.previousLocation() }),
+            .kind = .{ .function_call = call },
+            .span = call.span,
         };
         return expr;
     }
@@ -1644,17 +1589,17 @@ pub const Parser = struct {
         // Integer literal
         if (self.match(.integer)) {
             const lexeme = self.previous().lexeme;
-            // Remove underscores and parse
-            var clean = std.ArrayList(u8).init(self.allocator);
-            defer clean.deinit();
-            for (lexeme) |c| {
-                if (c != '_') try clean.append(c);
-            }
-            const value = std.fmt.parseInt(i128, clean.items, 10) catch 0;
+
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .int = .{ .value = lexeme, .suffix = null } },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .int_literal = value },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .literal = lit },
+                .span = lit.span,
             };
             return expr;
         }
@@ -1662,27 +1607,71 @@ pub const Parser = struct {
         // Float literal
         if (self.match(.float)) {
             const lexeme = self.previous().lexeme;
-            var clean = std.ArrayList(u8).init(self.allocator);
-            defer clean.deinit();
-            for (lexeme) |c| {
-                if (c != '_') try clean.append(c);
-            }
-            const value = std.fmt.parseFloat(f64, clean.items) catch 0.0;
+
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .float = .{ .value = lexeme, .suffix = null } },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .float_literal = value },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .literal = lit },
+                .span = lit.span,
             };
             return expr;
         }
 
         // String literal
-        if (self.match(.string) or self.match(.raw_string) or self.match(.byte_string)) {
+        if (self.match(.string)) {
             const lexeme = self.previous().lexeme;
+
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .string = .{ .value = lexeme, .kind = .regular } },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .string_literal = lexeme },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .literal = lit },
+                .span = lit.span,
+            };
+            return expr;
+        }
+
+        // Raw string
+        if (self.match(.raw_string)) {
+            const lexeme = self.previous().lexeme;
+
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .string = .{ .value = lexeme, .kind = .raw } },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const expr = try self.allocator.create(Expr);
+            expr.* = .{
+                .kind = .{ .literal = lit },
+                .span = lit.span,
+            };
+            return expr;
+        }
+
+        // Byte string
+        if (self.match(.byte_string)) {
+            const lexeme = self.previous().lexeme;
+
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .string = .{ .value = lexeme, .kind = .byte } },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const expr = try self.allocator.create(Expr);
+            expr.* = .{
+                .kind = .{ .literal = lit },
+                .span = lit.span,
             };
             return expr;
         }
@@ -1690,29 +1679,47 @@ pub const Parser = struct {
         // Character literal
         if (self.match(.char_literal)) {
             const lexeme = self.previous().lexeme;
-            const value = if (lexeme.len >= 2) lexeme[1] else 0;
+
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .char = .{ .value = lexeme } },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .char_literal = value },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .literal = lit },
+                .span = lit.span,
             };
             return expr;
         }
 
         // Boolean literals
         if (self.match(.kw_true)) {
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .bool = true },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .bool_literal = true },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .literal = lit },
+                .span = lit.span,
             };
             return expr;
         }
         if (self.match(.kw_false)) {
+            const lit = try self.allocator.create(Literal);
+            lit.* = .{
+                .kind = .{ .bool = false },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .bool_literal = false },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .literal = lit },
+                .span = lit.span,
             };
             return expr;
         }
@@ -1727,58 +1734,27 @@ pub const Parser = struct {
             return self.parseMatch(start_loc);
         }
 
-        // Return expression
-        if (self.match(.kw_return)) {
-            var value: ?*Expr = null;
-            if (!self.check(.rbrace) and !self.check(.semicolon) and !self.isAtEnd()) {
-                value = try self.parseExpr();
-            }
-            const expr = try self.allocator.create(Expr);
-            expr.* = .{
-                .kind = .{ .@"return" = value },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
-            return expr;
-        }
-
-        // Break expression
-        if (self.match(.kw_break)) {
-            var value: ?*Expr = null;
-            if (!self.check(.rbrace) and !self.check(.semicolon) and !self.isAtEnd()) {
-                value = try self.parseExpr();
-            }
-            const expr = try self.allocator.create(Expr);
-            expr.* = .{
-                .kind = .{ .@"break" = value },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
-            return expr;
-        }
-
-        // Continue expression
-        if (self.match(.kw_continue)) {
-            const expr = try self.allocator.create(Expr);
-            expr.* = .{
-                .kind = .@"continue",
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
-            return expr;
-        }
-
         // Comptime expression
         if (self.match(.kw_comptime)) {
             const inner = try self.parseExpr();
+
+            const comptime_expr = try self.allocator.create(ComptimeExpr);
+            comptime_expr.* = .{
+                .expr = inner,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .comptime_expr = inner },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .comptime_expr = comptime_expr },
+                .span = comptime_expr.span,
             };
             return expr;
         }
 
         // Block expression
         if (self.check(.lbrace)) {
-            const block = try self.parseBlock();
+            const block = try self.parseBlockExpr();
             const expr = try self.allocator.create(Expr);
             expr.* = .{
                 .kind = .{ .block = block },
@@ -1792,6 +1768,26 @@ pub const Parser = struct {
             var elements = std.ArrayList(*Expr).init(self.allocator);
             if (!self.check(.rbracket)) {
                 const first = try self.parseExpr();
+
+                // Check for repeat syntax: [value; count]
+                if (self.match(.semicolon)) {
+                    const count = try self.parseExpr();
+                    try self.expect(.rbracket, "']' after array repeat");
+
+                    const arr = try self.allocator.create(ArrayLiteral);
+                    arr.* = .{
+                        .kind = .{ .repeat = .{ .value = first, .count = count } },
+                        .span = makeSpan(start_loc, self.previousLocation()),
+                    };
+
+                    const expr = try self.allocator.create(Expr);
+                    expr.* = .{
+                        .kind = .{ .array_literal = arr },
+                        .span = arr.span,
+                    };
+                    return expr;
+                }
+
                 try elements.append(first);
                 while (self.match(.comma)) {
                     if (self.check(.rbracket)) break; // trailing comma
@@ -1800,10 +1796,17 @@ pub const Parser = struct {
                 }
             }
             try self.expect(.rbracket, "']' after array elements");
+
+            const arr = try self.allocator.create(ArrayLiteral);
+            arr.* = .{
+                .kind = .{ .elements = try elements.toOwnedSlice() },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const expr = try self.allocator.create(Expr);
             expr.* = .{
-                .kind = .{ .array_literal = try elements.toOwnedSlice() },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .array_literal = arr },
+                .span = arr.span,
             };
             return expr;
         }
@@ -1818,10 +1821,17 @@ pub const Parser = struct {
             if (self.check(.rparen)) {
                 // Empty tuple
                 _ = self.advance();
+
+                const tuple = try self.allocator.create(TupleLiteral);
+                tuple.* = .{
+                    .elements = &[_]*Expr{},
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{
-                    .kind = .{ .tuple_literal = &[_]*Expr{} },
-                    .span = .{ .start = start_loc, .end = self.previousLocation() },
+                    .kind = .{ .tuple_literal = tuple },
+                    .span = tuple.span,
                 };
                 return expr;
             }
@@ -1842,10 +1852,17 @@ pub const Parser = struct {
                     }
                 }
                 try self.expect(.rparen, "')' after tuple elements");
+
+                const tuple = try self.allocator.create(TupleLiteral);
+                tuple.* = .{
+                    .elements = try elements.toOwnedSlice(),
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{
-                    .kind = .{ .tuple_literal = try elements.toOwnedSlice() },
-                    .span = .{ .start = start_loc, .end = self.previousLocation() },
+                    .kind = .{ .tuple_literal = tuple },
+                    .span = tuple.span,
                 };
                 return expr;
             }
@@ -1854,26 +1871,54 @@ pub const Parser = struct {
             const expr = try self.allocator.create(Expr);
             expr.* = .{
                 .kind = .{ .grouped = first },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return expr;
         }
 
-        // Identifier or struct literal
+        // Identifier, path, or struct literal
         if (self.match(.identifier)) {
             const name = self.previous().lexeme;
+            const name_ident = makeIdentifier(name, start_loc);
+
+            // Build path if needed
+            var segments = std.ArrayList(Identifier).init(self.allocator);
+            try segments.append(name_ident);
+
+            while (self.match(.colon_colon)) {
+                const seg = try self.expectIdentifier("path segment");
+                try segments.append(makeIdentifier(seg, self.previousLocation()));
+            }
 
             // Check for struct literal: Name { ... }
             if (self.check(.lbrace)) {
-                return self.parseStructLiteral(start_loc, name);
+                const path = Path{
+                    .segments = try segments.toOwnedSlice(),
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+                return self.parseStructLiteral(start_loc, path);
             }
 
-            const expr = try self.allocator.create(Expr);
-            expr.* = .{
-                .kind = .{ .identifier = name },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
-            };
-            return expr;
+            // Just an identifier or path
+            if (segments.items.len == 1) {
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{
+                    .kind = .{ .identifier = name_ident },
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+                return expr;
+            } else {
+                const path = Path{
+                    .segments = try segments.toOwnedSlice(),
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{
+                    .kind = .{ .path = path },
+                    .span = path.span,
+                };
+                return expr;
+            }
         }
 
         return self.errorAtCurrent("Expected expression");
@@ -1882,35 +1927,36 @@ pub const Parser = struct {
     /// Parse if expression
     pub fn parseIf(self: *Self, start_loc: SourceLocation) !*Expr {
         const condition = try self.parseExpr();
-        const then_branch = try self.parseBlock();
+        const then_branch = try self.parseBlockExpr();
 
-        var else_branch: ?*Expr = null;
+        var else_branch: ?IfExpr.ElseBranch = null;
         if (self.match(.kw_else)) {
             if (self.match(.kw_if)) {
                 // else if
-                else_branch = try self.parseIf(self.currentLocation());
+                const else_if_expr = try self.parseIf(self.currentLocation());
+                // Extract the IfExpr from the Expr
+                if (else_if_expr.kind == .if_expr) {
+                    else_branch = .{ .else_if = else_if_expr.kind.if_expr };
+                }
             } else {
                 // else block
-                const else_block = try self.parseBlock();
-                const else_expr = try self.allocator.create(Expr);
-                else_expr.* = .{
-                    .kind = .{ .block = else_block },
-                    .span = else_block.span,
-                };
-                else_branch = else_expr;
+                const else_block = try self.parseBlockExpr();
+                else_branch = .{ .else_block = else_block };
             }
         }
 
+        const if_expr = try self.allocator.create(IfExpr);
+        if_expr.* = .{
+            .condition = condition,
+            .then_branch = then_branch,
+            .else_branch = else_branch,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
         const expr = try self.allocator.create(Expr);
         expr.* = .{
-            .kind = .{
-                .@"if" = .{
-                    .condition = condition,
-                    .then_branch = then_branch,
-                    .else_branch = else_branch,
-                },
-            },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .if_expr = if_expr },
+            .span = if_expr.span,
         };
         return expr;
     }
@@ -1920,8 +1966,9 @@ pub const Parser = struct {
         const scrutinee = try self.parseExpr();
         try self.expect(.lbrace, "'{' after match scrutinee");
 
-        var arms = std.ArrayList(MatchArm).init(self.allocator);
+        var arms = std.ArrayList(*MatchArm).init(self.allocator);
         while (!self.check(.rbrace) and !self.isAtEnd()) {
+            const arm_start = self.currentLocation();
             const pattern = try self.parsePattern();
 
             var guard: ?*Expr = null;
@@ -1930,80 +1977,114 @@ pub const Parser = struct {
             }
 
             try self.expect(.fat_arrow, "'=>' after match pattern");
-            const body = try self.parseExpr();
+            const body_expr = try self.parseExpr();
             _ = self.match(.comma);
 
-            try arms.append(.{
+            const arm = try self.allocator.create(MatchArm);
+            arm.* = .{
                 .pattern = pattern,
                 .guard = guard,
-                .body = body,
-            });
+                .body = .{ .expression = body_expr },
+                .span = makeSpan(arm_start, self.previousLocation()),
+            };
+            try arms.append(arm);
         }
 
         try self.expect(.rbrace, "'}' after match arms");
 
+        const match_expr = try self.allocator.create(MatchExpr);
+        match_expr.* = .{
+            .scrutinee = scrutinee,
+            .arms = try arms.toOwnedSlice(),
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
         const expr = try self.allocator.create(Expr);
         expr.* = .{
-            .kind = .{
-                .match = .{
-                    .scrutinee = scrutinee,
-                    .arms = try arms.toOwnedSlice(),
-                },
-            },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .match_expr = match_expr },
+            .span = match_expr.span,
         };
         return expr;
     }
 
     /// Parse lambda expression
     fn parseLambda(self: *Self, start_loc: SourceLocation) !*Expr {
-        var params = std.ArrayList(LambdaParam).init(self.allocator);
+        var params = std.ArrayList(*LambdaParam).init(self.allocator);
 
         if (!self.check(.pipe)) {
             while (true) {
+                const param_start = self.currentLocation();
                 const param_name = try self.expectIdentifier("parameter name");
+                const param_ident = makeIdentifier(param_name, param_start);
+
                 var type_ann: ?*TypeExpr = null;
                 if (self.match(.colon)) {
                     type_ann = try self.parseTypeExpr();
                 }
-                try params.append(.{
-                    .name = param_name,
-                    .type_annotation = type_ann,
-                });
+
+                const param = try self.allocator.create(LambdaParam);
+                param.* = .{
+                    .name = param_ident,
+                    .type_expr = type_ann,
+                    .span = makeSpan(param_start, self.previousLocation()),
+                };
+                try params.append(param);
+
                 if (!self.match(.comma)) break;
             }
         }
 
         try self.expect(.pipe, "'|' after lambda parameters");
 
-        const body = try self.parseExpr();
+        var return_type: ?*TypeExpr = null;
+        if (self.match(.arrow)) {
+            return_type = try self.parseTypeExpr();
+        }
+
+        var body: LambdaExpr.LambdaBody = undefined;
+        if (self.check(.lbrace)) {
+            body = .{ .block = try self.parseBlockExpr() };
+        } else {
+            body = .{ .expression = try self.parseExpr() };
+        }
+
+        const lambda = try self.allocator.create(LambdaExpr);
+        lambda.* = .{
+            .params = try params.toOwnedSlice(),
+            .return_type = return_type,
+            .body = body,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
 
         const expr = try self.allocator.create(Expr);
         expr.* = .{
-            .kind = .{
-                .lambda = .{
-                    .params = try params.toOwnedSlice(),
-                    .body = body,
-                },
-            },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .lambda = lambda },
+            .span = lambda.span,
         };
         return expr;
     }
 
     /// Parse struct literal
-    fn parseStructLiteral(self: *Self, start_loc: SourceLocation, name: []const u8) !*Expr {
+    fn parseStructLiteral(self: *Self, start_loc: SourceLocation, path: Path) !*Expr {
         try self.expect(.lbrace, "'{' for struct literal");
 
-        var fields = std.ArrayList(FieldInit).init(self.allocator);
+        var fields = std.ArrayList(*StructLiteral.FieldInit).init(self.allocator);
         while (!self.check(.rbrace) and !self.isAtEnd()) {
+            const field_start = self.currentLocation();
             const field_name = try self.expectIdentifier("field name");
+            const field_ident = makeIdentifier(field_name, field_start);
+
             try self.expect(.colon, "':' after field name");
             const field_value = try self.parseExpr();
-            try fields.append(.{
-                .name = field_name,
+
+            const field_init = try self.allocator.create(StructLiteral.FieldInit);
+            field_init.* = .{
+                .name = field_ident,
                 .value = field_value,
-            });
+                .span = makeSpan(field_start, self.previousLocation()),
+            };
+            try fields.append(field_init);
+
             if (!self.match(.comma)) {
                 if (!self.check(.rbrace)) {
                     return self.errorAtCurrent("Expected ',' or '}' after field");
@@ -2013,15 +2094,18 @@ pub const Parser = struct {
 
         try self.expect(.rbrace, "'}' after struct fields");
 
+        const struct_lit = try self.allocator.create(StructLiteral);
+        struct_lit.* = .{
+            .type_path = path,
+            .fields = try fields.toOwnedSlice(),
+            .spread = null,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
         const expr = try self.allocator.create(Expr);
         expr.* = .{
-            .kind = .{
-                .struct_literal = .{
-                    .name = name,
-                    .fields = try fields.toOwnedSlice(),
-                },
-            },
-            .span = .{ .start = start_loc, .end = self.previousLocation() },
+            .kind = .{ .struct_literal = struct_lit },
+            .span = struct_lit.span,
         };
         return expr;
     }
@@ -2039,24 +2123,30 @@ pub const Parser = struct {
             const pattern = try self.allocator.create(Pattern);
             pattern.* = .{
                 .kind = .wildcard,
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
-            return pattern;
+            return self.parsePatternSuffix(pattern);
         }
 
         // Literal patterns
         if (self.match(.integer) or self.match(.float) or self.match(.string) or
             self.match(.kw_true) or self.match(.kw_false))
         {
-            // Rewind and parse as expression
+            // Rewind and parse as literal
             self.current -= 1;
-            const expr = try self.parsePrimary();
+            const lit_expr = try self.parsePrimary();
+
+            const lit = switch (lit_expr.kind) {
+                .literal => |l| l,
+                else => return self.errorAtCurrent("Expected literal pattern"),
+            };
+
             const pattern = try self.allocator.create(Pattern);
             pattern.* = .{
-                .kind = .{ .literal = expr },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .literal = lit },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
-            return pattern;
+            return self.parsePatternSuffix(pattern);
         }
 
         // Tuple pattern: (a, b, c)
@@ -2072,82 +2162,158 @@ pub const Parser = struct {
                 }
             }
             try self.expect(.rparen, "')' after tuple pattern");
+
+            const tuple_pattern = try self.allocator.create(TuplePattern);
+            tuple_pattern.* = .{
+                .elements = try elements.toOwnedSlice(),
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const pattern = try self.allocator.create(Pattern);
             pattern.* = .{
-                .kind = .{ .tuple = try elements.toOwnedSlice() },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .tuple = tuple_pattern },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
-            return pattern;
+            return self.parsePatternSuffix(pattern);
         }
 
-        // Array pattern: [a, b, ..rest]
+        // Slice pattern: [a, b, ..rest]
         if (self.match(.lbracket)) {
             var elements = std.ArrayList(*Pattern).init(self.allocator);
-            var rest: ?[]const u8 = null;
+            var rest: ?SlicePattern.RestPattern = null;
+            var rest_position: usize = 0;
 
             while (!self.check(.rbracket) and !self.isAtEnd()) {
                 if (self.match(.dot_dot)) {
                     // Rest pattern
-                    rest = try self.expectIdentifier("rest binding name");
+                    var binding: ?Identifier = null;
+                    if (self.check(.identifier)) {
+                        const rest_name = try self.expectIdentifier("rest binding name");
+                        binding = makeIdentifier(rest_name, self.previousLocation());
+                    }
+                    rest = .{
+                        .binding = binding,
+                        .position = rest_position,
+                    };
                     break;
                 }
                 const elem = try self.parsePattern();
                 try elements.append(elem);
+                rest_position += 1;
                 if (!self.match(.comma)) break;
             }
-            try self.expect(.rbracket, "']' after array pattern");
+            try self.expect(.rbracket, "']' after slice pattern");
+
+            const slice_pattern = try self.allocator.create(SlicePattern);
+            slice_pattern.* = .{
+                .elements = try elements.toOwnedSlice(),
+                .rest = rest,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
             const pattern = try self.allocator.create(Pattern);
             pattern.* = .{
-                .kind = .{
-                    .array = .{
-                        .elements = try elements.toOwnedSlice(),
-                        .rest = rest,
-                    },
-                },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{ .slice = slice_pattern },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
-            return pattern;
+            return self.parsePatternSuffix(pattern);
         }
 
-        // Identifier or variant pattern
+        // Identifier, variant, or struct pattern
         if (self.match(.identifier)) {
             const name = self.previous().lexeme;
+            const name_ident = makeIdentifier(name, start_loc);
+
+            // Build path if needed
+            var segments = std.ArrayList(Identifier).init(self.allocator);
+            try segments.append(name_ident);
+
+            while (self.match(.colon_colon)) {
+                const seg = try self.expectIdentifier("path segment");
+                try segments.append(makeIdentifier(seg, self.previousLocation()));
+            }
+
+            const path: ?Path = if (segments.items.len > 1) Path{
+                .segments = try segments.toOwnedSlice(),
+                .span = makeSpan(start_loc, self.previousLocation()),
+            } else null;
 
             // Check for variant pattern: Some(x) or None
             if (self.match(.lparen)) {
-                var payload: ?*Pattern = null;
+                var payload: EnumVariantPattern.Payload = .none;
                 if (!self.check(.rparen)) {
-                    payload = try self.parsePattern();
+                    var payload_patterns = std.ArrayList(*Pattern).init(self.allocator);
+                    const first = try self.parsePattern();
+                    try payload_patterns.append(first);
+                    while (self.match(.comma)) {
+                        if (self.check(.rparen)) break;
+                        const p = try self.parsePattern();
+                        try payload_patterns.append(p);
+                    }
+                    payload = .{ .tuple = try payload_patterns.toOwnedSlice() };
                 }
                 try self.expect(.rparen, "')' after variant payload");
+
+                const variant_pattern = try self.allocator.create(EnumVariantPattern);
+                variant_pattern.* = .{
+                    .type_path = path,
+                    .variant = name_ident,
+                    .payload = payload,
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+
                 const pattern = try self.allocator.create(Pattern);
                 pattern.* = .{
-                    .kind = .{ .variant = .{ .name = name, .payload = payload } },
-                    .span = .{ .start = start_loc, .end = self.previousLocation() },
+                    .kind = .{ .enum_variant = variant_pattern },
+                    .span = makeSpan(start_loc, self.previousLocation()),
                 };
                 return self.parsePatternSuffix(pattern);
             }
 
             // Check for struct pattern: Point { x, y }
             if (self.match(.lbrace)) {
-                var fields = std.ArrayList(FieldPattern).init(self.allocator);
+                var fields = std.ArrayList(*FieldPattern).init(self.allocator);
+                var has_rest = false;
+
                 while (!self.check(.rbrace) and !self.isAtEnd()) {
+                    if (self.match(.dot_dot)) {
+                        has_rest = true;
+                        break;
+                    }
+
+                    const field_start = self.currentLocation();
                     const field_name = try self.expectIdentifier("field name");
+                    const field_ident = makeIdentifier(field_name, field_start);
+
                     var field_pattern: ?*Pattern = null;
                     if (self.match(.colon)) {
                         field_pattern = try self.parsePattern();
                     }
-                    try fields.append(.{
-                        .name = field_name,
+
+                    const fp = try self.allocator.create(FieldPattern);
+                    fp.* = .{
+                        .name = field_ident,
                         .pattern = field_pattern,
-                    });
+                        .span = makeSpan(field_start, self.previousLocation()),
+                    };
+                    try fields.append(fp);
+
                     if (!self.match(.comma)) break;
                 }
                 try self.expect(.rbrace, "'}' after struct pattern");
+
+                const struct_pattern = try self.allocator.create(StructPattern);
+                struct_pattern.* = .{
+                    .type_path = path,
+                    .fields = try fields.toOwnedSlice(),
+                    .rest = has_rest,
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+
                 const pattern = try self.allocator.create(Pattern);
                 pattern.* = .{
-                    .kind = .{ .@"struct" = .{ .name = name, .fields = try fields.toOwnedSlice() } },
-                    .span = .{ .start = start_loc, .end = self.previousLocation() },
+                    .kind = .{ .struct_pattern = struct_pattern },
+                    .span = makeSpan(start_loc, self.previousLocation()),
                 };
                 return self.parsePatternSuffix(pattern);
             }
@@ -2155,8 +2321,14 @@ pub const Parser = struct {
             // Simple identifier binding
             const pattern = try self.allocator.create(Pattern);
             pattern.* = .{
-                .kind = .{ .identifier = name },
-                .span = .{ .start = start_loc, .end = self.previousLocation() },
+                .kind = .{
+                    .identifier = .{
+                        .name = name_ident,
+                        .is_mut = false,
+                        .binding = null,
+                    },
+                },
+                .span = makeSpan(start_loc, self.previousLocation()),
             };
             return self.parsePatternSuffix(pattern);
         }
@@ -2179,10 +2351,16 @@ pub const Parser = struct {
             if (!self.match(.pipe)) break;
         }
 
+        const or_pattern = try self.allocator.create(OrPattern);
+        or_pattern.* = .{
+            .patterns = try patterns.toOwnedSlice(),
+            .span = Span.merge(first.span, patterns.items[patterns.items.len - 1].span),
+        };
+
         const pattern = try self.allocator.create(Pattern);
         pattern.* = .{
-            .kind = .{ .@"or" = try patterns.toOwnedSlice() },
-            .span = Span.merge(first.span, patterns.items[patterns.items.len - 1].span),
+            .kind = .{ .or_pattern = or_pattern },
+            .span = or_pattern.span,
         };
         return pattern;
     }
@@ -2205,51 +2383,49 @@ pub const Parser = struct {
             .lt_lt, .gt_gt => .shift,
             .plus, .minus => .term,
             .star, .slash, .percent => .factor,
-            .dot_dot, .dot_dot_eq => .comparison, // Range as comparison precedence
+            .dot_dot, .dot_dot_eq => .comparison,
             else => .none,
         };
     }
 
     /// Convert token type to binary operator
-    fn tokenToBinaryOp(token_type: TokenType) ?BinaryOp {
+    fn tokenToBinaryOp(token_type: TokenType) ?BinaryExpr.BinaryOp {
         return switch (token_type) {
             .plus => .add,
             .minus => .sub,
             .star => .mul,
             .slash => .div,
             .percent => .mod,
-            .caret => .power,
             .eq_eq => .eq,
-            .bang_eq => .neq,
+            .bang_eq => .ne,
             .lt => .lt,
             .gt => .gt,
-            .lt_eq => .lte,
-            .gt_eq => .gte,
+            .lt_eq => .le,
+            .gt_eq => .ge,
             .kw_and => .@"and",
             .kw_or => .@"or",
             .ampersand => .bit_and,
             .pipe => .bit_or,
+            .caret => .bit_xor,
             .lt_lt => .shl,
             .gt_gt => .shr,
-            .pipe_gt => .pipeline,
-            .dot_dot => .range,
-            .dot_dot_eq => .range_inclusive,
+            .kw_in => .in,
             else => null,
         };
     }
 
     /// Match compound assignment operator
-    fn matchCompoundAssignment(self: *Self) ?BinaryOp {
-        if (self.match(.plus_eq)) return .add;
-        if (self.match(.minus_eq)) return .sub;
-        if (self.match(.star_eq)) return .mul;
-        if (self.match(.slash_eq)) return .div;
-        if (self.match(.percent_eq)) return .mod;
-        if (self.match(.ampersand_eq)) return .bit_and;
-        if (self.match(.pipe_eq)) return .bit_or;
-        if (self.match(.caret_eq)) return .power;
-        if (self.match(.lt_lt_eq)) return .shl;
-        if (self.match(.gt_gt_eq)) return .shr;
+    fn matchCompoundAssignment(self: *Self) ?Assignment.AssignOp {
+        if (self.match(.plus_eq)) return .add_assign;
+        if (self.match(.minus_eq)) return .sub_assign;
+        if (self.match(.star_eq)) return .mul_assign;
+        if (self.match(.slash_eq)) return .div_assign;
+        if (self.match(.percent_eq)) return .mod_assign;
+        if (self.match(.ampersand_eq)) return .bit_and_assign;
+        if (self.match(.pipe_eq)) return .bit_or_assign;
+        if (self.match(.caret_eq)) return .bit_xor_assign;
+        if (self.match(.lt_lt_eq)) return .shl_assign;
+        if (self.match(.gt_gt_eq)) return .shr_assign;
         return null;
     }
 
@@ -2395,8 +2571,8 @@ pub const Parser = struct {
 // Convenience Function
 // ============================================================================
 
-/// Parse source code into a Module AST
-pub fn parseSource(source: []const u8, allocator: Allocator) !*Module {
+/// Parse source code into a SourceFile AST
+pub fn parseSource(source: []const u8, allocator: Allocator) !*SourceFile {
     var lex = Lexer.init(source, allocator);
     defer lex.deinit();
 
@@ -2415,22 +2591,13 @@ pub fn parseSource(source: []const u8, allocator: Allocator) !*Module {
 
 const testing = std.testing;
 
-fn testParse(source: []const u8) !*Module {
+fn testParse(source: []const u8) !*SourceFile {
     return parseSource(source, testing.allocator);
 }
 
-fn expectNoErrors(parser: *Parser) !void {
-    if (parser.hasErrors()) {
-        for (parser.getErrors()) |err| {
-            std.debug.print("Parse error: {}\n", .{err});
-        }
-        return error.UnexpectedErrors;
-    }
-}
-
 test "parse empty source" {
-    const module = try testParse("");
-    try testing.expectEqual(@as(usize, 0), module.declarations.len);
+    const source_file = try testParse("");
+    try testing.expectEqual(@as(usize, 0), source_file.declarations.len);
 }
 
 test "parse simple function" {
@@ -2439,14 +2606,14 @@ test "parse simple function" {
         \\    return a + b
         \\}
     ;
-    const module = try testParse(source);
-    try testing.expectEqual(@as(usize, 1), module.declarations.len);
+    const source_file = try testParse(source);
+    try testing.expectEqual(@as(usize, 1), source_file.declarations.len);
 
-    const decl = module.declarations[0];
+    const decl = source_file.declarations[0];
     try testing.expect(decl.kind == .function);
 
     const func = decl.kind.function;
-    try testing.expectEqualStrings("add", func.name);
+    try testing.expectEqualStrings("add", func.name.name);
     try testing.expectEqual(@as(usize, 2), func.params.len);
 }
 
@@ -2456,12 +2623,13 @@ test "parse function with generics" {
         \\    return list.get(0)
         \\}
     ;
-    const module = try testParse(source);
-    try testing.expectEqual(@as(usize, 1), module.declarations.len);
+    const source_file = try testParse(source);
+    try testing.expectEqual(@as(usize, 1), source_file.declarations.len);
 
-    const func = module.declarations[0].kind.function;
-    try testing.expectEqual(@as(usize, 1), func.generic_params.len);
-    try testing.expectEqualStrings("T", func.generic_params[0].name);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expect(func.generic_params != null);
+    try testing.expectEqual(@as(usize, 1), func.generic_params.?.len);
+    try testing.expectEqualStrings("T", func.generic_params.?[0].name.name);
 }
 
 test "parse function with effects" {
@@ -2470,11 +2638,10 @@ test "parse function with effects" {
         \\    return ""
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
-    try testing.expectEqual(@as(usize, 2), func.effects.len);
-    try testing.expectEqualStrings("IO", func.effects[0]);
-    try testing.expectEqualStrings("Error", func.effects[1]);
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expect(func.effects != null);
+    try testing.expectEqual(@as(usize, 2), func.effects.?.len);
 }
 
 test "parse function with contracts" {
@@ -2486,11 +2653,11 @@ test "parse function with contracts" {
         \\    return a / b
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
-    try testing.expectEqual(@as(usize, 2), func.contracts.len);
-    try testing.expect(func.contracts[0].kind == .requires);
-    try testing.expect(func.contracts[1].kind == .ensures);
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expect(func.contracts != null);
+    try testing.expectEqual(@as(usize, 1), func.contracts.?.requires.len);
+    try testing.expectEqual(@as(usize, 1), func.contracts.?.ensures.len);
 }
 
 test "parse struct definition" {
@@ -2500,14 +2667,14 @@ test "parse struct definition" {
         \\    y: int,
         \\}
     ;
-    const module = try testParse(source);
-    try testing.expectEqual(@as(usize, 1), module.declarations.len);
+    const source_file = try testParse(source);
+    try testing.expectEqual(@as(usize, 1), source_file.declarations.len);
 
-    const s = module.declarations[0].kind.@"struct";
-    try testing.expectEqualStrings("Point", s.name);
+    const s = source_file.declarations[0].kind.struct_def;
+    try testing.expectEqualStrings("Point", s.name.name);
     try testing.expectEqual(@as(usize, 2), s.fields.len);
-    try testing.expectEqualStrings("x", s.fields[0].name);
-    try testing.expectEqualStrings("y", s.fields[1].name);
+    try testing.expectEqualStrings("x", s.fields[0].name.name);
+    try testing.expectEqualStrings("y", s.fields[1].name.name);
 }
 
 test "parse generic struct" {
@@ -2517,9 +2684,10 @@ test "parse generic struct" {
         \\    second: B,
         \\}
     ;
-    const module = try testParse(source);
-    const s = module.declarations[0].kind.@"struct";
-    try testing.expectEqual(@as(usize, 2), s.generic_params.len);
+    const source_file = try testParse(source);
+    const s = source_file.declarations[0].kind.struct_def;
+    try testing.expect(s.generic_params != null);
+    try testing.expectEqual(@as(usize, 2), s.generic_params.?.len);
 }
 
 test "parse enum definition" {
@@ -2529,14 +2697,14 @@ test "parse enum definition" {
         \\    None,
         \\}
     ;
-    const module = try testParse(source);
-    try testing.expectEqual(@as(usize, 1), module.declarations.len);
+    const source_file = try testParse(source);
+    try testing.expectEqual(@as(usize, 1), source_file.declarations.len);
 
-    const e = module.declarations[0].kind.@"enum";
-    try testing.expectEqualStrings("Option", e.name);
+    const e = source_file.declarations[0].kind.enum_def;
+    try testing.expectEqualStrings("Option", e.name.name);
     try testing.expectEqual(@as(usize, 2), e.variants.len);
-    try testing.expectEqualStrings("Some", e.variants[0].name);
-    try testing.expectEqualStrings("None", e.variants[1].name);
+    try testing.expectEqualStrings("Some", e.variants[0].name.name);
+    try testing.expectEqualStrings("None", e.variants[1].name.name);
 }
 
 test "parse trait definition" {
@@ -2546,10 +2714,10 @@ test "parse trait definition" {
         \\    fn has_next(self: &Self) -> bool
         \\}
     ;
-    const module = try testParse(source);
-    const t = module.declarations[0].kind.trait;
-    try testing.expectEqualStrings("Iterator", t.name);
-    try testing.expectEqual(@as(usize, 2), t.methods.len);
+    const source_file = try testParse(source);
+    const t = source_file.declarations[0].kind.trait_def;
+    try testing.expectEqualStrings("Iterator", t.name.name);
+    try testing.expectEqual(@as(usize, 2), t.items.len);
 }
 
 test "parse impl block" {
@@ -2560,10 +2728,10 @@ test "parse impl block" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const impl = module.declarations[0].kind.impl;
+    const source_file = try testParse(source);
+    const impl = source_file.declarations[0].kind.impl_block;
     try testing.expect(impl.trait_type != null);
-    try testing.expectEqual(@as(usize, 1), impl.methods.len);
+    try testing.expectEqual(@as(usize, 1), impl.items.len);
 }
 
 test "parse let binding" {
@@ -2573,10 +2741,10 @@ test "parse let binding" {
         \\    let mut y: int = 10
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
-    try testing.expectEqual(@as(usize, 2), func.body.?.statements.len);
+    try testing.expectEqual(@as(usize, 2), func.body.?.block.statements.len);
 }
 
 test "parse if expression" {
@@ -2589,8 +2757,8 @@ test "parse if expression" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2603,8 +2771,8 @@ test "parse match expression" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2614,13 +2782,13 @@ test "parse binary expressions with precedence" {
         \\    1 + 2 * 3
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
-    const body = func.body.?;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    const body = func.body.?.block;
 
     // Should be trailing expression
-    try testing.expect(body.expr != null);
-    const expr = body.expr.?;
+    try testing.expect(body.result != null);
+    const expr = body.result.?;
 
     // Should be: 1 + (2 * 3), so top level is add
     try testing.expect(expr.kind == .binary);
@@ -2638,8 +2806,8 @@ test "parse pipeline expression" {
         \\    data |> parse |> validate
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2651,11 +2819,11 @@ test "parse for loop" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
-    try testing.expect(func.body.?.statements.len > 0);
-    try testing.expect(func.body.?.statements[0].kind == .for_loop);
+    try testing.expect(func.body.?.block.statements.len > 0);
+    try testing.expect(func.body.?.block.statements[0].kind == .for_loop);
 }
 
 test "parse while loop" {
@@ -2666,11 +2834,11 @@ test "parse while loop" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
-    try testing.expect(func.body.?.statements.len > 0);
-    try testing.expect(func.body.?.statements[0].kind == .while_loop);
+    try testing.expect(func.body.?.block.statements.len > 0);
+    try testing.expect(func.body.?.block.statements[0].kind == .while_loop);
 }
 
 test "parse loop" {
@@ -2681,11 +2849,11 @@ test "parse loop" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
-    try testing.expect(func.body.?.statements.len > 0);
-    try testing.expect(func.body.?.statements[0].kind == .loop);
+    try testing.expect(func.body.?.block.statements.len > 0);
+    try testing.expect(func.body.?.block.statements[0].kind == .loop_stmt);
 }
 
 test "parse array literal" {
@@ -2694,8 +2862,8 @@ test "parse array literal" {
         \\    let arr = [1, 2, 3]
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2705,8 +2873,8 @@ test "parse lambda expression" {
         \\    let f = |x, y| x + y
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2716,19 +2884,19 @@ test "parse struct literal" {
         \\    let p = Point { x: 1, y: 2 }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
 test "parse complex nested expression" {
     const source =
         \\fn test() {
-        \\    foo(bar.baz[0]).method(1 + 2, true)?.unwrap() ?? default
+        \\    foo(bar.baz[0]).method(1 + 2, true)? ?? default
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2741,9 +2909,9 @@ test "parse unary expressions" {
         \\    let d = ~bits
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
-    try testing.expectEqual(@as(usize, 4), func.body.?.statements.len);
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expectEqual(@as(usize, 4), func.body.?.block.statements.len);
 }
 
 test "parse pattern matching patterns" {
@@ -2758,8 +2926,8 @@ test "parse pattern matching patterns" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2768,32 +2936,32 @@ test "parse private declarations" {
         \\private fn internal() {}
         \\private struct Hidden {}
     ;
-    const module = try testParse(source);
-    try testing.expectEqual(@as(usize, 2), module.declarations.len);
-    try testing.expect(module.declarations[0].kind.function.is_private);
-    try testing.expect(module.declarations[1].kind.@"struct".is_private);
+    const source_file = try testParse(source);
+    try testing.expectEqual(@as(usize, 2), source_file.declarations.len);
+    try testing.expect(source_file.declarations[0].visibility == .private);
+    try testing.expect(source_file.declarations[1].visibility == .private);
 }
 
 test "parse import statement" {
     const source =
         \\import std::io::{read, write}
     ;
-    const module = try testParse(source);
-    try testing.expectEqual(@as(usize, 1), module.declarations.len);
-    const imp = module.declarations[0].kind.import;
-    try testing.expectEqual(@as(usize, 2), imp.path.len);
-    try testing.expectEqualStrings("std", imp.path[0]);
-    try testing.expectEqualStrings("io", imp.path[1]);
+    const source_file = try testParse(source);
+    try testing.expectEqual(@as(usize, 1), source_file.imports.len);
+    const imp = source_file.imports[0];
+    try testing.expectEqual(@as(usize, 2), imp.path.segments.len);
+    try testing.expectEqualStrings("std", imp.path.segments[0].name);
+    try testing.expectEqualStrings("io", imp.path.segments[1].name);
 }
 
 test "parse const declaration" {
     const source =
         \\const PI: float = 3.14159
     ;
-    const module = try testParse(source);
-    try testing.expectEqual(@as(usize, 1), module.declarations.len);
-    try testing.expect(module.declarations[0].kind == .constant);
-    try testing.expectEqualStrings("PI", module.declarations[0].kind.constant.name);
+    const source_file = try testParse(source);
+    try testing.expectEqual(@as(usize, 1), source_file.declarations.len);
+    try testing.expect(source_file.declarations[0].kind == .constant);
+    try testing.expectEqualStrings("PI", source_file.declarations[0].kind.constant.name.name);
 }
 
 test "parse tuple type and literal" {
@@ -2802,8 +2970,8 @@ test "parse tuple type and literal" {
         \\    (42, "hello", true)
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.return_type != null);
     try testing.expect(func.return_type.?.kind == .tuple);
 }
@@ -2814,8 +2982,8 @@ test "parse method call chain" {
         \\    obj.first().second().third()
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2827,10 +2995,10 @@ test "parse compound assignment" {
         \\    z *= 3
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
-    try testing.expectEqual(@as(usize, 3), func.body.?.statements.len);
-    try testing.expect(func.body.?.statements[0].kind == .compound_assignment);
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expectEqual(@as(usize, 3), func.body.?.block.statements.len);
+    try testing.expect(func.body.?.block.statements[0].kind == .assignment);
 }
 
 test "parse logical operators" {
@@ -2839,11 +3007,11 @@ test "parse logical operators" {
         \\    a and b or c
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
     // 'or' has lower precedence than 'and', so: (a and b) or c
-    const expr = func.body.?.expr.?;
+    const expr = func.body.?.block.result.?;
     try testing.expect(expr.kind == .binary);
     try testing.expect(expr.kind.binary.op == .@"or");
 }
@@ -2854,8 +3022,8 @@ test "parse comparison chain" {
         \\    x == y and y < z
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2871,8 +3039,8 @@ test "parse else if chain" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }
 
@@ -2885,9 +3053,9 @@ test "parse bitwise operators" {
         \\    let d = x >> 2
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
-    try testing.expectEqual(@as(usize, 4), func.body.?.statements.len);
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expectEqual(@as(usize, 4), func.body.?.block.statements.len);
 }
 
 test "parse type expressions" {
@@ -2903,8 +3071,8 @@ test "parse type expressions" {
         \\    h: [int; 10],
         \\) {}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expectEqual(@as(usize, 8), func.params.len);
 }
 
@@ -2914,8 +3082,8 @@ test "parse trait with super traits" {
         \\    fn cmp(self: &Self, other: &Self) -> Ordering
         \\}
     ;
-    const module = try testParse(source);
-    const t = module.declarations[0].kind.trait;
+    const source_file = try testParse(source);
+    const t = source_file.declarations[0].kind.trait_def;
     try testing.expectEqual(@as(usize, 2), t.super_traits.len);
 }
 
@@ -2930,7 +3098,31 @@ test "parse match with guards" {
         \\    }
         \\}
     ;
-    const module = try testParse(source);
-    const func = module.declarations[0].kind.function;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expect(func.body != null);
+}
+
+test "parse range expressions" {
+    const source =
+        \\fn test() {
+        \\    let a = 0..10
+        \\    let b = 0..=10
+        \\}
+    ;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
+    try testing.expect(func.body != null);
+    try testing.expectEqual(@as(usize, 2), func.body.?.block.statements.len);
+}
+
+test "parse array repeat syntax" {
+    const source =
+        \\fn test() {
+        \\    let zeros = [0; 100]
+        \\}
+    ;
+    const source_file = try testParse(source);
+    const func = source_file.declarations[0].kind.function;
     try testing.expect(func.body != null);
 }

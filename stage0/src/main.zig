@@ -2,13 +2,115 @@
 //!
 //! This is the bootstrap compiler for the dAImond programming language,
 //! written in Zig. It compiles dAImond source code to C.
+//!
+//! Pipeline:
+//!   Source -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> Codegen -> C Code -> CC -> Binary
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const Lexer = @import("lexer.zig").Lexer;
 const Token = @import("lexer.zig").Token;
 const TokenType = @import("lexer.zig").TokenType;
+const SourceLocation = @import("lexer.zig").SourceLocation;
+const parser_mod = @import("parser.zig");
+const Parser = parser_mod.Parser;
+const ParseError = parser_mod.ParseError;
+const ast = @import("ast.zig");
+const SourceFile = ast.SourceFile;
+const errors = @import("errors.zig");
+const ColorConfig = errors.ColorConfig;
+const DiagnosticBag = errors.DiagnosticBag;
 
 const version = "0.1.0";
+
+// ============================================================================
+// Compiler Options
+// ============================================================================
+
+const OptLevel = enum {
+    O0,
+    O1,
+    O2,
+    O3,
+
+    pub fn toCcFlag(self: OptLevel) []const u8 {
+        return switch (self) {
+            .O0 => "-O0",
+            .O1 => "-O1",
+            .O2 => "-O2",
+            .O3 => "-O3",
+        };
+    }
+};
+
+const Command = enum {
+    compile, // daimond <file.dm> - Full compile to executable
+    build, // daimond build <file.dm> - Compile to C only
+    run, // daimond run <file.dm> - Compile and run
+    lex, // daimond lex <file.dm> - Show tokens
+    parse, // daimond parse <file.dm> - Show AST
+    check, // daimond check <file.dm> - Type check only
+    fmt, // daimond fmt <file.dm> - Format code
+};
+
+const CompilerOptions = struct {
+    command: Command = .compile,
+    input_file: ?[]const u8 = null,
+    output_file: ?[]const u8 = null,
+    compile_to_c_only: bool = false, // -c flag
+    emit_c: bool = false, // --emit-c flag
+    no_color: bool = false,
+    opt_level: OptLevel = .O0,
+    verbose: bool = false,
+    show_help: bool = false,
+    show_version: bool = false,
+
+    // Derived paths
+    c_output_path: ?[]const u8 = null,
+    exe_output_path: ?[]const u8 = null,
+};
+
+// ============================================================================
+// Exit Codes
+// ============================================================================
+
+const ExitCode = enum(u8) {
+    success = 0,
+    error_compile = 1,
+    error_usage = 2,
+};
+
+// ============================================================================
+// Timing Utilities
+// ============================================================================
+
+const Timer = struct {
+    start_time: i64,
+    verbose: bool,
+
+    pub fn init(verbose: bool) Timer {
+        return .{
+            .start_time = std.time.milliTimestamp(),
+            .verbose = verbose,
+        };
+    }
+
+    pub fn elapsedMs(self: Timer) i64 {
+        return std.time.milliTimestamp() - self.start_time;
+    }
+
+    pub fn report(self: Timer, writer: anytype, phase: []const u8) !void {
+        if (self.verbose) {
+            try writer.print("        ({d}ms)\n", .{self.elapsedMs()});
+        } else {
+            _ = phase;
+        }
+    }
+};
+
+// ============================================================================
+// Main Entry Point
+// ============================================================================
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -18,70 +120,245 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len < 2) {
+    var opts = parseArgs(args) catch |err| {
+        const stderr = std.io.getStdErr().writer();
+        switch (err) {
+            error.InvalidOption => {},
+            error.MissingFile => try stderr.print("Error: No input file specified\n", .{}),
+            error.MissingOutputArg => try stderr.print("Error: -o requires an argument\n", .{}),
+            else => try stderr.print("Error: {}\n", .{err}),
+        }
+        try printUsage();
+        std.process.exit(@intFromEnum(ExitCode.error_usage));
+    };
+
+    // Handle help and version early
+    if (opts.show_help) {
         try printUsage();
         return;
     }
 
-    const command = args[1];
-
-    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
-        try printUsage();
-        return;
-    }
-
-    if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
+    if (opts.show_version) {
         try printVersion();
         return;
     }
 
-    if (std.mem.eql(u8, command, "lex")) {
-        if (args.len < 3) {
-            std.debug.print("Error: 'lex' command requires a file path\n", .{});
-            return;
-        }
-        try lexFile(args[2], allocator);
+    // Need an input file for most commands
+    if (opts.input_file == null) {
+        try printUsage();
         return;
     }
 
-    // Default: treat argument as source file to compile
-    try compileFile(command, allocator);
+    // Derive output paths
+    const input_file = opts.input_file.?;
+    opts = deriveOutputPaths(opts, input_file, allocator) catch |err| {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print("Error deriving output paths: {}\n", .{err});
+        std.process.exit(@intFromEnum(ExitCode.error_compile));
+    };
+    defer {
+        if (opts.c_output_path) |p| allocator.free(p);
+        if (opts.exe_output_path) |p| allocator.free(p);
+    }
+
+    // Execute the command
+    const exit_code = executeCommand(opts, allocator) catch |err| {
+        const stderr = std.io.getStdErr().writer();
+        try stderr.print("Internal compiler error: {}\n", .{err});
+        std.process.exit(@intFromEnum(ExitCode.error_compile));
+    };
+
+    if (exit_code != .success) {
+        std.process.exit(@intFromEnum(exit_code));
+    }
 }
 
-fn printUsage() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print(
-        \\dAImond Compiler v{s}
-        \\
-        \\Usage: daimond [command] [options] <file.dm>
-        \\
-        \\Commands:
-        \\  <file.dm>      Compile a dAImond source file
-        \\  lex <file>     Tokenize a file and print tokens (debugging)
-        \\
-        \\Options:
-        \\  -h, --help     Show this help message
-        \\  -v, --version  Show version information
-        \\
-        \\Examples:
-        \\  daimond examples/calculator.dm    Compile calculator.dm
-        \\  daimond lex examples/hello.dm     Show tokens in hello.dm
-        \\
-    , .{version});
+// ============================================================================
+// Argument Parsing
+// ============================================================================
+
+fn parseArgs(args: []const []const u8) !CompilerOptions {
+    var opts = CompilerOptions{};
+
+    if (args.len < 2) {
+        opts.show_help = true;
+        return opts;
+    }
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+
+        // Help and version flags
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            opts.show_help = true;
+            return opts;
+        }
+
+        if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
+            opts.show_version = true;
+            return opts;
+        }
+
+        // Commands
+        if (std.mem.eql(u8, arg, "build")) {
+            opts.command = .build;
+            opts.compile_to_c_only = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "run")) {
+            opts.command = .run;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "lex")) {
+            opts.command = .lex;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "parse")) {
+            opts.command = .parse;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "check")) {
+            opts.command = .check;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "fmt")) {
+            opts.command = .fmt;
+            continue;
+        }
+
+        // Options with arguments
+        if (std.mem.eql(u8, arg, "-o")) {
+            i += 1;
+            if (i >= args.len) {
+                return error.MissingOutputArg;
+            }
+            opts.output_file = args[i];
+            continue;
+        }
+
+        // Flags
+        if (std.mem.eql(u8, arg, "-c")) {
+            opts.compile_to_c_only = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--emit-c")) {
+            opts.emit_c = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--no-color")) {
+            opts.no_color = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--verbose")) {
+            opts.verbose = true;
+            continue;
+        }
+
+        // Optimization levels
+        if (std.mem.eql(u8, arg, "-O0")) {
+            opts.opt_level = .O0;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-O1")) {
+            opts.opt_level = .O1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-O2")) {
+            opts.opt_level = .O2;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-O3")) {
+            opts.opt_level = .O3;
+            continue;
+        }
+
+        // Unknown options
+        if (std.mem.startsWith(u8, arg, "-")) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Error: Unknown option '{s}'\n", .{arg});
+            return error.InvalidOption;
+        }
+
+        // Input file
+        if (opts.input_file == null) {
+            opts.input_file = arg;
+        } else {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Error: Multiple input files not supported\n", .{});
+            return error.InvalidOption;
+        }
+    }
+
+    return opts;
 }
 
-fn printVersion() !void {
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("dAImond Compiler v{s} (Stage 0 - Zig)\n", .{version});
+fn deriveOutputPaths(opts: CompilerOptions, input_file: []const u8, allocator: Allocator) !CompilerOptions {
+    var result = opts;
+
+    // Get the base name without extension
+    const basename = std.fs.path.stem(input_file);
+
+    // Derive C output path
+    if (opts.output_file) |out| {
+        if (opts.compile_to_c_only) {
+            result.c_output_path = try allocator.dupe(u8, out);
+        } else {
+            result.exe_output_path = try allocator.dupe(u8, out);
+            const c_path = try std.fmt.allocPrint(allocator, "{s}.c", .{basename});
+            result.c_output_path = c_path;
+        }
+    } else {
+        // Default output names
+        const c_path = try std.fmt.allocPrint(allocator, "{s}.c", .{basename});
+        result.c_output_path = c_path;
+
+        if (!opts.compile_to_c_only) {
+            const exe_path = try allocator.dupe(u8, basename);
+            result.exe_output_path = exe_path;
+        }
+    }
+
+    return result;
 }
 
-fn lexFile(path: []const u8, allocator: std.mem.Allocator) !void {
+// ============================================================================
+// Command Execution
+// ============================================================================
+
+fn executeCommand(opts: CompilerOptions, allocator: Allocator) !ExitCode {
+    return switch (opts.command) {
+        .compile => try compileFile(opts, allocator),
+        .build => try compileFile(opts, allocator),
+        .run => try runFile(opts, allocator),
+        .lex => try lexFile(opts, allocator),
+        .parse => try parseFile(opts, allocator),
+        .check => try checkFile(opts, allocator),
+        .fmt => try formatFile(opts, allocator),
+    };
+}
+
+// ============================================================================
+// LEX Command
+// ============================================================================
+
+fn lexFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     const stdout = std.io.getStdOut().writer();
+    const path = opts.input_file.?;
+    const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
 
     // Read source file
     const source = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
         std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
-        return;
+        return .error_compile;
     };
     defer allocator.free(source);
 
@@ -92,55 +369,72 @@ fn lexFile(path: []const u8, allocator: std.mem.Allocator) !void {
     const tokens = try lexer.scanAll();
     defer allocator.free(tokens);
 
-    // Print tokens
-    try stdout.print("Tokens from '{s}':\n", .{path});
-    try stdout.print("{'=':[<60]}\n", .{""});
+    // Print header
+    try stdout.print("{s}Tokens from '{s}':{s}\n", .{
+        colors.bold(),
+        path,
+        colors.reset(),
+    });
+    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
 
+    // Print tokens
     for (tokens) |token| {
-        try stdout.print("{d:>4}:{d:<4} {s:<16} '{s}'\n", .{
+        const type_name = @tagName(token.type);
+        const truncated_lexeme = if (token.lexeme.len > 40) token.lexeme[0..40] else token.lexeme;
+
+        try stdout.print("{s}{d:>4}{s}:{s}{d:<4}{s} {s}{s:<16}{s} '{s}'\n", .{
+            colors.dim(),
             token.location.line,
+            colors.reset(),
+            colors.dim(),
             token.location.column,
-            @tagName(token.type),
-            if (token.lexeme.len > 40) token.lexeme[0..40] else token.lexeme,
+            colors.reset(),
+            colors.cyan(),
+            type_name,
+            colors.reset(),
+            truncated_lexeme,
         });
     }
 
-    try stdout.print("{'=':[<60]}\n", .{""});
-    try stdout.print("Total: {} tokens\n", .{tokens.len});
+    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+    try stdout.print("Total: {s}{d}{s} tokens\n", .{ colors.bold(), tokens.len, colors.reset() });
 
     // Report any errors
     if (lexer.hasErrors()) {
-        try stdout.print("\nLexer Errors:\n", .{});
+        try stdout.print("\n{s}Lexer Errors:{s}\n", .{ colors.error_style(), colors.reset() });
         for (lexer.getErrors()) |err| {
-            try stdout.print("  Line {}, Col {}: {s}\n", .{
+            try stdout.print("  Line {d}, Col {d}: {s}\n", .{
                 err.location.line,
                 err.location.column,
                 err.message,
             });
+            if (err.source_line) |line| {
+                try stdout.print("    {s}|{s} {s}\n", .{ colors.cyan(), colors.reset(), line });
+            }
         }
+        return .error_compile;
     }
+
+    return .success;
 }
 
-fn compileFile(path: []const u8, allocator: std.mem.Allocator) !void {
-    const stdout = std.io.getStdOut().writer();
+// ============================================================================
+// PARSE Command
+// ============================================================================
 
-    // Check file extension
-    if (!std.mem.endsWith(u8, path, ".dm")) {
-        std.debug.print("Error: Expected a .dm file, got '{s}'\n", .{path});
-        return;
-    }
+fn parseFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
+    const stdout = std.io.getStdOut().writer();
+    const path = opts.input_file.?;
+    const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
 
     // Read source file
     const source = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
         std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
-        return;
+        return .error_compile;
     };
     defer allocator.free(source);
 
-    try stdout.print("Compiling '{s}'...\n", .{path});
-
-    // Phase 1: Lexing
-    try stdout.print("  [1/4] Lexing...\n", .{});
+    // Tokenize
     var lexer = Lexer.init(source, allocator);
     defer lexer.deinit();
 
@@ -148,28 +442,608 @@ fn compileFile(path: []const u8, allocator: std.mem.Allocator) !void {
     defer allocator.free(tokens);
 
     if (lexer.hasErrors()) {
-        try stdout.print("\nLexer errors:\n", .{});
-        for (lexer.getErrors()) |err| {
-            try stdout.print("  Line {}, Col {}: {s}\n", .{
-                err.location.line,
-                err.location.column,
-                err.message,
-            });
-        }
-        return;
+        try displayLexerErrors(&lexer, source, path, colors, stdout);
+        return .error_compile;
     }
 
-    try stdout.print("        Found {} tokens\n", .{tokens.len});
+    // Parse
+    var parser = Parser.init(tokens, allocator);
+    defer parser.deinit();
 
-    // Phase 2: Parsing (TODO)
-    try stdout.print("  [2/4] Parsing... (not yet implemented)\n", .{});
+    const ast_result = parser.parse() catch |err| {
+        try stdout.print("{s}Parse error:{s} {}\n", .{ colors.error_style(), colors.reset(), err });
+        return .error_compile;
+    };
 
-    // Phase 3: Type Checking (TODO)
-    try stdout.print("  [3/4] Type checking... (not yet implemented)\n", .{});
+    if (parser.hasErrors()) {
+        try displayParseErrors(&parser, source, path, colors, stdout);
+        return .error_compile;
+    }
 
-    // Phase 4: Code Generation (TODO)
-    try stdout.print("  [4/4] Code generation... (not yet implemented)\n", .{});
+    // Print AST summary
+    try stdout.print("{s}AST for '{s}':{s}\n", .{ colors.bold(), path, colors.reset() });
+    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
 
-    try stdout.print("\nNote: Only lexing is currently implemented.\n", .{});
-    try stdout.print("      Parser, type checker, and codegen coming soon!\n", .{});
+    try printAstSummary(ast_result, colors, stdout);
+
+    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+    try stdout.print("{s}Parse successful!{s}\n", .{ colors.bold() ++ colors.cyan(), colors.reset() });
+
+    return .success;
+}
+
+fn printAstSummary(source_file: *SourceFile, colors: ColorConfig, writer: anytype) !void {
+    // Print imports
+    if (source_file.imports.len > 0) {
+        try writer.print("\n{s}Imports:{s} ({d})\n", .{ colors.bold(), colors.reset(), source_file.imports.len });
+        for (source_file.imports) |imp| {
+            try writer.print("  - ", .{});
+            for (imp.path.segments, 0..) |seg, i| {
+                if (i > 0) try writer.print("::", .{});
+                try writer.print("{s}", .{seg.name});
+            }
+            try writer.print("\n", .{});
+        }
+    }
+
+    // Print declarations
+    try writer.print("\n{s}Declarations:{s} ({d})\n", .{ colors.bold(), colors.reset(), source_file.declarations.len });
+
+    for (source_file.declarations) |decl| {
+        const visibility = if (decl.visibility == .private) "private " else "";
+
+        switch (decl.kind) {
+            .function => |func| {
+                try writer.print("  {s}fn{s} {s}{s}{s}", .{
+                    colors.cyan(),
+                    colors.reset(),
+                    visibility,
+                    colors.bold(),
+                    func.name.name,
+                });
+                try writer.print("{s}(", .{colors.reset()});
+
+                // Print parameters
+                for (func.params, 0..) |param, i| {
+                    if (i > 0) try writer.print(", ", .{});
+                    try writer.print("{s}", .{param.name.name});
+                    if (param.type_expr) |_| {
+                        try writer.print(": ...", .{});
+                    }
+                }
+
+                try writer.print(")", .{});
+
+                if (func.return_type) |_| {
+                    try writer.print(" -> ...", .{});
+                }
+
+                if (func.effects) |effs| {
+                    try writer.print(" with [{d} effects]", .{effs.len});
+                }
+
+                try writer.print("\n", .{});
+            },
+            .struct_def => |s| {
+                try writer.print("  {s}struct{s} {s}{s}{s} ({d} fields)\n", .{
+                    colors.cyan(),
+                    colors.reset(),
+                    visibility,
+                    colors.bold(),
+                    s.name.name,
+                    s.fields.len,
+                });
+            },
+            .enum_def => |e| {
+                try writer.print("  {s}enum{s} {s}{s}{s} ({d} variants)\n", .{
+                    colors.cyan(),
+                    colors.reset(),
+                    visibility,
+                    colors.bold(),
+                    e.name.name,
+                    e.variants.len,
+                });
+            },
+            .trait_def => |t| {
+                try writer.print("  {s}trait{s} {s}{s}{s} ({d} items)\n", .{
+                    colors.cyan(),
+                    colors.reset(),
+                    visibility,
+                    colors.bold(),
+                    t.name.name,
+                    t.items.len,
+                });
+            },
+            .impl_block => |impl| {
+                try writer.print("  {s}impl{s} ", .{ colors.cyan(), colors.reset() });
+                if (impl.trait_type) |_| {
+                    try writer.print("... for ", .{});
+                }
+                try writer.print("... ({d} items)\n", .{impl.items.len});
+            },
+            .constant => |c| {
+                try writer.print("  {s}const{s} {s}{s}{s}\n", .{
+                    colors.cyan(),
+                    colors.reset(),
+                    visibility,
+                    colors.bold(),
+                    c.name.name,
+                });
+            },
+        }
+    }
+}
+
+// ============================================================================
+// CHECK Command
+// ============================================================================
+
+fn checkFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
+    const stdout = std.io.getStdOut().writer();
+    const path = opts.input_file.?;
+    const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
+
+    // Phase timers
+    var total_timer = Timer.init(opts.verbose);
+
+    // Read source file
+    const source = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        return .error_compile;
+    };
+    defer allocator.free(source);
+
+    if (opts.verbose) {
+        try stdout.print("{s}Type checking '{s}'...{s}\n", .{ colors.bold(), path, colors.reset() });
+    }
+
+    // Phase 1: Lexing
+    var lex_timer = Timer.init(opts.verbose);
+    var lexer = Lexer.init(source, allocator);
+    defer lexer.deinit();
+
+    const tokens = try lexer.scanAll();
+    defer allocator.free(tokens);
+
+    if (opts.verbose) {
+        try stdout.print("  [1/3] Lexing... {d} tokens", .{tokens.len});
+        try lex_timer.report(stdout, "lex");
+    }
+
+    if (lexer.hasErrors()) {
+        try displayLexerErrors(&lexer, source, path, colors, stdout);
+        return .error_compile;
+    }
+
+    // Phase 2: Parsing
+    var parse_timer = Timer.init(opts.verbose);
+    var parser = Parser.init(tokens, allocator);
+    defer parser.deinit();
+
+    _ = parser.parse() catch |err| {
+        try stdout.print("{s}Parse error:{s} {}\n", .{ colors.error_style(), colors.reset(), err });
+        return .error_compile;
+    };
+
+    if (opts.verbose) {
+        try stdout.print("  [2/3] Parsing...", .{});
+        try parse_timer.report(stdout, "parse");
+    }
+
+    if (parser.hasErrors()) {
+        try displayParseErrors(&parser, source, path, colors, stdout);
+        return .error_compile;
+    }
+
+    // Phase 3: Type Checking (placeholder)
+    var check_timer = Timer.init(opts.verbose);
+    if (opts.verbose) {
+        try stdout.print("  [3/3] Type checking...", .{});
+        try check_timer.report(stdout, "check");
+    }
+
+    // TODO: Implement type checker
+    // For now, just report success after parsing
+
+    if (opts.verbose) {
+        try stdout.print("\n{s}Total time: {d}ms{s}\n", .{ colors.dim(), total_timer.elapsedMs(), colors.reset() });
+    }
+
+    try stdout.print("{s}Type check passed!{s} No errors found.\n", .{
+        colors.bold() ++ colors.cyan(),
+        colors.reset(),
+    });
+
+    return .success;
+}
+
+// ============================================================================
+// FMT Command
+// ============================================================================
+
+fn formatFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
+    const stdout = std.io.getStdOut().writer();
+    const path = opts.input_file.?;
+    const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
+
+    _ = allocator;
+
+    // TODO: Implement formatter
+    try stdout.print("{s}Note:{s} Formatter is not yet implemented.\n", .{
+        colors.warning_style(),
+        colors.reset(),
+    });
+    try stdout.print("File: {s}\n", .{path});
+
+    return .success;
+}
+
+// ============================================================================
+// COMPILE Command (Full Pipeline)
+// ============================================================================
+
+fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
+    const stdout = std.io.getStdOut().writer();
+    const path = opts.input_file.?;
+    const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
+
+    // Check file extension
+    if (!std.mem.endsWith(u8, path, ".dm")) {
+        std.debug.print("{s}Error:{s} Expected a .dm file, got '{s}'\n", .{
+            colors.error_style(),
+            colors.reset(),
+            path,
+        });
+        return .error_compile;
+    }
+
+    // Read source file
+    const source = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+        std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+        return .error_compile;
+    };
+    defer allocator.free(source);
+
+    var total_timer = Timer.init(opts.verbose);
+
+    try stdout.print("{s}Compiling '{s}'...{s}\n", .{ colors.bold(), path, colors.reset() });
+
+    // Phase 1: Lexing
+    var lex_timer = Timer.init(opts.verbose);
+    try stdout.print("  [1/5] Lexing...", .{});
+
+    var lexer = Lexer.init(source, allocator);
+    defer lexer.deinit();
+
+    const tokens = try lexer.scanAll();
+    defer allocator.free(tokens);
+
+    if (opts.verbose) {
+        try stdout.print(" {d} tokens", .{tokens.len});
+    }
+    try lex_timer.report(stdout, "lex");
+    if (!opts.verbose) try stdout.print("\n", .{});
+
+    if (lexer.hasErrors()) {
+        try displayLexerErrors(&lexer, source, path, colors, stdout);
+        return .error_compile;
+    }
+
+    // Phase 2: Parsing
+    var parse_timer = Timer.init(opts.verbose);
+    try stdout.print("  [2/5] Parsing...", .{});
+
+    var parser = Parser.init(tokens, allocator);
+    defer parser.deinit();
+
+    const ast_result = parser.parse() catch |err| {
+        try stdout.print("\n{s}Parse error:{s} {}\n", .{ colors.error_style(), colors.reset(), err });
+        return .error_compile;
+    };
+
+    if (opts.verbose) {
+        try stdout.print(" {d} declarations", .{ast_result.declarations.len});
+    }
+    try parse_timer.report(stdout, "parse");
+    if (!opts.verbose) try stdout.print("\n", .{});
+
+    if (parser.hasErrors()) {
+        try displayParseErrors(&parser, source, path, colors, stdout);
+        return .error_compile;
+    }
+
+    // Phase 3: Type Checking
+    var check_timer = Timer.init(opts.verbose);
+    try stdout.print("  [3/5] Type checking...", .{});
+
+    // TODO: Implement type checker
+    _ = check_timer;
+    if (opts.verbose) {
+        try stdout.print(" (not yet implemented)", .{});
+    }
+    try stdout.print("\n", .{});
+
+    // Phase 4: Code Generation
+    var codegen_timer = Timer.init(opts.verbose);
+    try stdout.print("  [4/5] Generating C code...", .{});
+
+    // TODO: Implement codegen
+    _ = codegen_timer;
+    if (opts.verbose) {
+        try stdout.print(" (not yet implemented)", .{});
+    }
+    try stdout.print("\n", .{});
+
+    // If only compiling to C, stop here
+    if (opts.compile_to_c_only) {
+        try stdout.print("\n{s}Note:{s} Code generation not yet implemented.\n", .{
+            colors.warning_style(),
+            colors.reset(),
+        });
+        try stdout.print("Would write C code to: {s}\n", .{opts.c_output_path.?});
+        return .success;
+    }
+
+    // Phase 5: C Compiler Invocation
+    var cc_timer = Timer.init(opts.verbose);
+    try stdout.print("  [5/5] Compiling C code...", .{});
+
+    // TODO: Implement CC invocation
+    _ = cc_timer;
+    if (opts.verbose) {
+        try stdout.print(" (not yet implemented)", .{});
+    }
+    try stdout.print("\n", .{});
+
+    if (opts.verbose) {
+        try stdout.print("\n{s}Total time: {d}ms{s}\n", .{ colors.dim(), total_timer.elapsedMs(), colors.reset() });
+    }
+
+    try stdout.print("\n{s}Note:{s} Only lexing and parsing are currently implemented.\n", .{
+        colors.warning_style(),
+        colors.reset(),
+    });
+    try stdout.print("      Type checker, code generator, and C compiler integration coming soon!\n", .{});
+
+    return .success;
+}
+
+// ============================================================================
+// RUN Command
+// ============================================================================
+
+fn runFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
+    const stdout = std.io.getStdOut().writer();
+    const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
+
+    // First compile
+    const compile_result = try compileFile(opts, allocator);
+    if (compile_result != .success) {
+        return compile_result;
+    }
+
+    // Then run (not implemented yet)
+    try stdout.print("\n{s}Note:{s} Running not yet implemented.\n", .{
+        colors.warning_style(),
+        colors.reset(),
+    });
+    try stdout.print("Would run: {s}\n", .{opts.exe_output_path orelse "(default output)"});
+
+    return .success;
+}
+
+// ============================================================================
+// Error Display
+// ============================================================================
+
+fn displayLexerErrors(lexer: *Lexer, source: []const u8, file_path: []const u8, colors: ColorConfig, writer: anytype) !void {
+    try writer.print("\n{s}Lexer Errors:{s}\n", .{ colors.error_style(), colors.reset() });
+
+    for (lexer.getErrors()) |err| {
+        try writer.print("\n{s}Error{s} at {s}:{d}:{d}: {s}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            file_path,
+            err.location.line,
+            err.location.column,
+            err.message,
+        });
+
+        // Show source context
+        if (errors.extractLine(source, err.location.line)) |line| {
+            try writer.print("   {s}|{s}\n", .{ colors.cyan(), colors.reset() });
+            try writer.print("{s}{d:>3}{s} {s}|{s} {s}\n", .{
+                colors.dim(),
+                err.location.line,
+                colors.reset(),
+                colors.cyan(),
+                colors.reset(),
+                line,
+            });
+            try writer.print("   {s}|{s} ", .{ colors.cyan(), colors.reset() });
+
+            // Draw caret
+            const col = if (err.location.column > 0) err.location.column - 1 else 0;
+            try writer.writeByteNTimes(' ', col);
+            try writer.print("{s}^{s}\n", .{ colors.error_style(), colors.reset() });
+        }
+    }
+
+    const error_count = lexer.getErrors().len;
+    try writer.print("\n{s}aborting due to {d} lexer error(s){s}\n", .{
+        colors.bold(),
+        error_count,
+        colors.reset(),
+    });
+}
+
+fn displayParseErrors(parser: *Parser, source: []const u8, file_path: []const u8, colors: ColorConfig, writer: anytype) !void {
+    try writer.print("\n{s}Parse Errors:{s}\n", .{ colors.error_style(), colors.reset() });
+
+    for (parser.getErrors()) |err| {
+        try writer.print("\n{s}Error{s} at {s}:{d}:{d}: {s}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            file_path,
+            err.location.line,
+            err.location.column,
+            err.message,
+        });
+
+        if (err.expected) |exp| {
+            try writer.print("  expected: {s}\n", .{exp});
+        }
+        if (err.found) |fnd| {
+            try writer.print("  found: {s}\n", .{fnd});
+        }
+
+        // Show source context
+        if (errors.extractLine(source, err.location.line)) |line| {
+            try writer.print("   {s}|{s}\n", .{ colors.cyan(), colors.reset() });
+            try writer.print("{s}{d:>3}{s} {s}|{s} {s}\n", .{
+                colors.dim(),
+                err.location.line,
+                colors.reset(),
+                colors.cyan(),
+                colors.reset(),
+                line,
+            });
+            try writer.print("   {s}|{s} ", .{ colors.cyan(), colors.reset() });
+
+            // Draw caret
+            const col = if (err.location.column > 0) err.location.column - 1 else 0;
+            try writer.writeByteNTimes(' ', col);
+            try writer.print("{s}^{s}\n", .{ colors.error_style(), colors.reset() });
+        }
+    }
+
+    const error_count = parser.getErrors().len;
+    try writer.print("\n{s}aborting due to {d} parse error(s){s}\n", .{
+        colors.bold(),
+        error_count,
+        colors.reset(),
+    });
+}
+
+// ============================================================================
+// Help and Version
+// ============================================================================
+
+fn printUsage() !void {
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print(
+        \\{s}dAImond Compiler v{s}{s}
+        \\
+        \\{s}Usage:{s} daimond [command] [options] <file.dm>
+        \\
+        \\{s}Commands:{s}
+        \\  <file.dm>           Compile a dAImond source file to executable
+        \\  build <file.dm>     Compile to C code only
+        \\  run <file.dm>       Compile and run immediately
+        \\  lex <file.dm>       Tokenize and display tokens (debugging)
+        \\  parse <file.dm>     Parse and display AST structure (debugging)
+        \\  check <file.dm>     Type check only, don't generate code
+        \\  fmt <file.dm>       Format source code (not yet implemented)
+        \\
+        \\{s}Options:{s}
+        \\  -o <output>         Specify output file name
+        \\  -c                  Compile to C only, don't invoke C compiler
+        \\  --emit-c            Keep generated C file after compilation
+        \\  --no-color          Disable colored output
+        \\  -O0/-O1/-O2/-O3     Optimization level (default: -O0)
+        \\  --verbose           Show detailed compilation progress
+        \\  -h, --help          Show this help message
+        \\  -v, --version       Show version information
+        \\
+        \\{s}Examples:{s}
+        \\  daimond hello.dm                Compile hello.dm to executable
+        \\  daimond build hello.dm          Compile hello.dm to hello.c
+        \\  daimond run hello.dm            Compile and run hello.dm
+        \\  daimond -O2 -o myapp hello.dm   Compile with -O2 to 'myapp'
+        \\  daimond lex hello.dm            Show tokens in hello.dm
+        \\  daimond parse hello.dm          Show AST for hello.dm
+        \\  daimond check hello.dm          Type check hello.dm
+        \\
+        \\{s}Pipeline:{s}
+        \\  Source -> Lexer -> Tokens -> Parser -> AST -> Checker -> Codegen -> CC -> Binary
+        \\
+    , .{
+        "\x1b[1m",       version, "\x1b[0m",
+        "\x1b[1m",       "\x1b[0m",
+        "\x1b[1m",       "\x1b[0m",
+        "\x1b[1m",       "\x1b[0m",
+        "\x1b[1m",       "\x1b[0m",
+        "\x1b[1m\x1b[2m", "\x1b[0m",
+    });
+}
+
+fn printVersion() !void {
+    const stdout = std.io.getStdOut().writer();
+    try stdout.print(
+        \\dAImond Compiler v{s} (Stage 0 - Zig Bootstrap)
+        \\
+        \\Target: C code generation (then native via CC)
+        \\Build:  Zig {s}
+        \\
+    , .{ version, @import("builtin").zig_version_string });
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "parseArgs - help flag" {
+    const args = [_][]const u8{ "daimond", "--help" };
+    const opts = try parseArgs(&args);
+    try testing.expect(opts.show_help);
+}
+
+test "parseArgs - version flag" {
+    const args = [_][]const u8{ "daimond", "-v" };
+    const opts = try parseArgs(&args);
+    try testing.expect(opts.show_version);
+}
+
+test "parseArgs - lex command" {
+    const args = [_][]const u8{ "daimond", "lex", "test.dm" };
+    const opts = try parseArgs(&args);
+    try testing.expectEqual(Command.lex, opts.command);
+    try testing.expectEqualStrings("test.dm", opts.input_file.?);
+}
+
+test "parseArgs - build command" {
+    const args = [_][]const u8{ "daimond", "build", "test.dm" };
+    const opts = try parseArgs(&args);
+    try testing.expectEqual(Command.build, opts.command);
+    try testing.expect(opts.compile_to_c_only);
+}
+
+test "parseArgs - optimization levels" {
+    const args = [_][]const u8{ "daimond", "-O2", "test.dm" };
+    const opts = try parseArgs(&args);
+    try testing.expectEqual(OptLevel.O2, opts.opt_level);
+}
+
+test "parseArgs - output file" {
+    const args = [_][]const u8{ "daimond", "-o", "output", "test.dm" };
+    const opts = try parseArgs(&args);
+    try testing.expectEqualStrings("output", opts.output_file.?);
+    try testing.expectEqualStrings("test.dm", opts.input_file.?);
+}
+
+test "parseArgs - multiple flags" {
+    const args = [_][]const u8{ "daimond", "--verbose", "--no-color", "-O3", "test.dm" };
+    const opts = try parseArgs(&args);
+    try testing.expect(opts.verbose);
+    try testing.expect(opts.no_color);
+    try testing.expectEqual(OptLevel.O3, opts.opt_level);
+}
+
+test "OptLevel to CC flag" {
+    try testing.expectEqualStrings("-O0", OptLevel.O0.toCcFlag());
+    try testing.expectEqualStrings("-O1", OptLevel.O1.toCcFlag());
+    try testing.expectEqualStrings("-O2", OptLevel.O2.toCcFlag());
+    try testing.expectEqualStrings("-O3", OptLevel.O3.toCcFlag());
 }

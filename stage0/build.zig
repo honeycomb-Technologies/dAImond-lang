@@ -70,10 +70,30 @@ pub fn build(b: *std.Build) void {
 
     const run_parser_tests = b.addRunArtifact(parser_tests);
 
+    // Unit tests for codegen
+    const codegen_tests = b.addTest(.{
+        .root_source_file = b.path("src/codegen.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const run_codegen_tests = b.addRunArtifact(codegen_tests);
+
+    // Unit tests for checker
+    const checker_tests = b.addTest(.{
+        .root_source_file = b.path("src/checker.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const run_checker_tests = b.addRunArtifact(checker_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lexer_tests.step);
     test_step.dependOn(&run_errors_tests.step);
     test_step.dependOn(&run_ast_tests.step);
     test_step.dependOn(&run_types_tests.step);
     test_step.dependOn(&run_parser_tests.step);
+    test_step.dependOn(&run_codegen_tests.step);
+    test_step.dependOn(&run_checker_tests.step);
 }
