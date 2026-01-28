@@ -722,7 +722,9 @@ fn findCCompiler() ?[]const u8 {
 
     for (compilers) |compiler| {
         // Try to run the compiler with --version to check if it exists
-        var child = std.process.Child.init(&.{ compiler, "--version" }, std.heap.page_allocator);
+        var child = std.process.Child.init(.{
+            .argv = &.{ compiler, "--version" },
+        });
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
 
@@ -1009,7 +1011,9 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     }
 
     // Spawn the C compiler process
-    var child = std.process.Child.init(cc_args.items, allocator);
+    var child = std.process.Child.init(.{
+        .argv = cc_args.items,
+    });
     child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
 
@@ -1121,7 +1125,9 @@ fn runFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     defer if (run_path.ptr != exe_path.ptr) allocator.free(run_path);
 
     // Run the executable
-    var child = std.process.Child.init(&.{run_path}, allocator);
+    var child = std.process.Child.init(.{
+        .argv = &.{run_path},
+    });
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
     child.stdin_behavior = .Inherit;
