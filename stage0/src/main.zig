@@ -20,6 +20,10 @@ const SourceFile = ast.SourceFile;
 const errors = @import("errors.zig");
 const ColorConfig = errors.ColorConfig;
 const DiagnosticBag = errors.DiagnosticBag;
+const checker_mod = @import("checker.zig");
+const TypeChecker = checker_mod.TypeChecker;
+const codegen = @import("codegen.zig");
+const CodeGenerator = codegen.CodeGenerator;
 
 const version = "0.1.0";
 
@@ -506,10 +510,9 @@ fn printAstSummary(source_file: *SourceFile, colors: ColorConfig, writer: anytyp
                 // Print parameters
                 for (func.params, 0..) |param, i| {
                     if (i > 0) try writer.print(", ", .{});
-                    try writer.print("{s}", .{param.name.name});
-                    if (param.type_expr) |_| {
-                        try writer.print(": ...", .{});
-                    }
+                    // type_expr is required for function parameters, so always print type marker
+                    _ = param.type_expr; // Acknowledge the required type_expr field
+                    try writer.print("{s}: ...", .{param.name.name});
                 }
 
                 try writer.print(")", .{});
@@ -620,13 +623,13 @@ fn checkFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var parser = Parser.init(tokens, allocator);
     defer parser.deinit();
 
-    _ = parser.parse() catch |err| {
+    const ast_result = parser.parse() catch |err| {
         try stdout.print("{s}Parse error:{s} {}\n", .{ colors.error_style(), colors.reset(), err });
         return .error_compile;
     };
 
     if (opts.verbose) {
-        try stdout.print("  [2/3] Parsing...", .{});
+        try stdout.print("  [2/3] Parsing... {d} declarations", .{ast_result.declarations.len});
         try parse_timer.report(stdout, "parse");
     }
 
@@ -635,15 +638,45 @@ fn checkFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         return .error_compile;
     }
 
-    // Phase 3: Type Checking (placeholder)
+    // Phase 3: Type Checking
     var check_timer = Timer.init(opts.verbose);
     if (opts.verbose) {
         try stdout.print("  [3/3] Type checking...", .{});
+    }
+
+    var type_checker = TypeChecker.init(allocator) catch |err| {
+        try stdout.print("{s}Error initializing type checker:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+    defer type_checker.deinit();
+
+    // Set source for error messages
+    type_checker.setSource(source);
+    type_checker.setSourceFile(path);
+
+    // Run type checking on the AST
+    type_checker.checkSourceFile(ast_result) catch |err| {
+        try stdout.print("{s}Type check error:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
+    if (opts.verbose) {
         try check_timer.report(stdout, "check");
     }
 
-    // TODO: Implement type checker
-    // For now, just report success after parsing
+    // Check for type errors
+    if (type_checker.hasErrors()) {
+        try displayTypeErrors(&type_checker, colors, stdout);
+        return .error_compile;
+    }
 
     if (opts.verbose) {
         try stdout.print("\n{s}Total time: {d}ms{s}\n", .{ colors.dim(), total_timer.elapsedMs(), colors.reset() });
@@ -676,6 +709,85 @@ fn formatFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     try stdout.print("File: {s}\n", .{path});
 
     return .success;
+}
+
+// ============================================================================
+// C Compiler Utilities
+// ============================================================================
+
+/// Find a C compiler available on the system
+fn findCCompiler() ?[]const u8 {
+    // Try common C compilers in order of preference
+    const compilers = [_][]const u8{ "cc", "gcc", "clang" };
+
+    for (compilers) |compiler| {
+        // Try to run the compiler with --version to check if it exists
+        var child = std.process.Child.init(&.{ compiler, "--version" }, std.heap.page_allocator);
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+
+        child.spawn() catch continue;
+        const result = child.wait() catch continue;
+
+        switch (result) {
+            .Exited => |code| {
+                if (code == 0) return compiler;
+            },
+            else => {},
+        }
+    }
+
+    return null;
+}
+
+/// Get the path to the dAImond runtime directory
+fn getRuntimePath(allocator: Allocator) ![]const u8 {
+    // Try to find runtime relative to executable
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const exe_path = std.fs.selfExePath(&buf) catch {
+        // If we can't get exe path, try relative paths
+        return try findRuntimeRelative(allocator);
+    };
+
+    const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+
+    // Check ../runtime (if exe is in zig-out/bin)
+    const runtime_path1 = try std.fs.path.join(allocator, &.{ exe_dir, "..", "..", "runtime" });
+    if (std.fs.cwd().access(runtime_path1, .{})) |_| {
+        return runtime_path1;
+    } else |_| {
+        allocator.free(runtime_path1);
+    }
+
+    // Check ./runtime (if exe is in stage0)
+    const runtime_path2 = try std.fs.path.join(allocator, &.{ exe_dir, "runtime" });
+    if (std.fs.cwd().access(runtime_path2, .{})) |_| {
+        return runtime_path2;
+    } else |_| {
+        allocator.free(runtime_path2);
+    }
+
+    // Fall back to relative path search
+    return try findRuntimeRelative(allocator);
+}
+
+/// Find runtime directory using relative paths from current directory
+fn findRuntimeRelative(allocator: Allocator) ![]const u8 {
+    // Common relative paths to try
+    const paths = [_][]const u8{
+        "runtime",
+        "stage0/runtime",
+        "../runtime",
+        "../stage0/runtime",
+    };
+
+    for (paths) |path| {
+        if (std.fs.cwd().access(path, .{})) |_| {
+            return try allocator.dupe(u8, path);
+        } else |_| {}
+    }
+
+    return error.RuntimeNotFound;
 }
 
 // ============================================================================
@@ -756,31 +868,85 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var check_timer = Timer.init(opts.verbose);
     try stdout.print("  [3/5] Type checking...", .{});
 
-    // TODO: Implement type checker
-    _ = check_timer;
+    var type_checker = TypeChecker.init(allocator) catch |err| {
+        try stdout.print("\n{s}Error initializing type checker:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+    defer type_checker.deinit();
+
+    // Set source for error messages
+    type_checker.setSource(source);
+    type_checker.setSourceFile(path);
+
+    // Run type checking on the AST
+    type_checker.checkSourceFile(ast_result) catch |err| {
+        try stdout.print("\n{s}Type check error:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
     if (opts.verbose) {
-        try stdout.print(" (not yet implemented)", .{});
+        try stdout.print(" ok", .{});
     }
-    try stdout.print("\n", .{});
+    try check_timer.report(stdout, "check");
+    if (!opts.verbose) try stdout.print("\n", .{});
+
+    // Check for type errors
+    if (type_checker.hasErrors()) {
+        try displayTypeErrors(&type_checker, colors, stdout);
+        return .error_compile;
+    }
 
     // Phase 4: Code Generation
     var codegen_timer = Timer.init(opts.verbose);
     try stdout.print("  [4/5] Generating C code...", .{});
 
-    // TODO: Implement codegen
-    _ = codegen_timer;
+    var code_generator = CodeGenerator.init(allocator);
+    defer code_generator.deinit();
+
+    const c_code = code_generator.generate(ast_result) catch |err| {
+        try stdout.print("\n{s}Code generation error:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
+    // Write C code to output file
+    const c_output_path = opts.c_output_path.?;
+    std.fs.cwd().writeFile(.{
+        .sub_path = c_output_path,
+        .data = c_code,
+    }) catch |err| {
+        try stdout.print("\n{s}Error writing C file:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
     if (opts.verbose) {
-        try stdout.print(" (not yet implemented)", .{});
+        try stdout.print(" -> {s}", .{c_output_path});
     }
-    try stdout.print("\n", .{});
+    try codegen_timer.report(stdout, "codegen");
+    if (!opts.verbose) try stdout.print("\n", .{});
 
     // If only compiling to C, stop here
     if (opts.compile_to_c_only) {
-        try stdout.print("\n{s}Note:{s} Code generation not yet implemented.\n", .{
-            colors.warning_style(),
+        try stdout.print("\n{s}Successfully generated C code:{s} {s}\n", .{
+            colors.bold() ++ colors.cyan(),
             colors.reset(),
+            c_output_path,
         });
-        try stdout.print("Would write C code to: {s}\n", .{opts.c_output_path.?});
         return .success;
     }
 
@@ -788,22 +954,134 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var cc_timer = Timer.init(opts.verbose);
     try stdout.print("  [5/5] Compiling C code...", .{});
 
-    // TODO: Implement CC invocation
-    _ = cc_timer;
-    if (opts.verbose) {
-        try stdout.print(" (not yet implemented)", .{});
+    const exe_output_path = opts.exe_output_path.?;
+
+    // Find the runtime path relative to the executable or use a default
+    const runtime_path = getRuntimePath(allocator) catch null;
+    defer if (runtime_path) |rp| allocator.free(rp);
+
+    // Construct compiler arguments
+    var cc_args = std.ArrayList([]const u8).init(allocator);
+    defer cc_args.deinit();
+
+    // Try to find a C compiler (cc, gcc, clang)
+    const cc_name = findCCompiler() orelse {
+        try stdout.print("\n{s}Error:{s} No C compiler found (tried cc, gcc, clang)\n", .{
+            colors.error_style(),
+            colors.reset(),
+        });
+        return .error_compile;
+    };
+
+    try cc_args.append(cc_name);
+    try cc_args.append("-o");
+    try cc_args.append(exe_output_path);
+    try cc_args.append(c_output_path);
+
+    // Add runtime include path and source if available
+    if (runtime_path) |rp| {
+        const include_flag = try std.fmt.allocPrint(allocator, "-I{s}", .{rp});
+        try cc_args.append(include_flag);
+
+        const runtime_c = try std.fmt.allocPrint(allocator, "{s}/daimond_runtime.c", .{rp});
+
+        // Only add runtime.c if it exists
+        if (std.fs.cwd().access(runtime_c, .{})) |_| {
+            try cc_args.append(runtime_c);
+        } else |_| {
+            allocator.free(runtime_c);
+        }
     }
-    try stdout.print("\n", .{});
+
+    // Add optimization level
+    try cc_args.append(opts.opt_level.toCcFlag());
+
+    // Add standard flags
+    try cc_args.append("-std=c11");
+    try cc_args.append("-Wall");
+
+    if (opts.verbose) {
+        try stdout.print("\n        Running: ", .{});
+        for (cc_args.items) |arg| {
+            try stdout.print("{s} ", .{arg});
+        }
+        try stdout.print("\n        ", .{});
+    }
+
+    // Spawn the C compiler process
+    var child = std.process.Child.init(cc_args.items, allocator);
+    child.stderr_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+
+    child.spawn() catch |err| {
+        try stdout.print("\n{s}Error spawning C compiler:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
+    // Wait for completion and get result
+    const result = child.wait() catch |err| {
+        try stdout.print("\n{s}Error waiting for C compiler:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                try stdout.print("\n{s}C compiler failed with exit code {d}{s}\n", .{
+                    colors.error_style(),
+                    code,
+                    colors.reset(),
+                });
+
+                // Try to read and display compiler errors
+                if (child.stderr) |stderr| {
+                    const err_output = stderr.reader().readAllAlloc(allocator, 10 * 1024) catch "";
+                    defer allocator.free(err_output);
+                    if (err_output.len > 0) {
+                        try stdout.print("{s}\n", .{err_output});
+                    }
+                }
+
+                return .error_compile;
+            }
+        },
+        else => {
+            try stdout.print("\n{s}C compiler terminated abnormally{s}\n", .{
+                colors.error_style(),
+                colors.reset(),
+            });
+            return .error_compile;
+        },
+    }
+
+    if (opts.verbose) {
+        try stdout.print("-> {s}", .{exe_output_path});
+    }
+    try cc_timer.report(stdout, "cc");
+    if (!opts.verbose) try stdout.print("\n", .{});
+
+    // Clean up intermediate C file unless --emit-c was specified
+    if (!opts.emit_c) {
+        std.fs.cwd().deleteFile(c_output_path) catch {};
+    }
 
     if (opts.verbose) {
         try stdout.print("\n{s}Total time: {d}ms{s}\n", .{ colors.dim(), total_timer.elapsedMs(), colors.reset() });
     }
 
-    try stdout.print("\n{s}Note:{s} Only lexing and parsing are currently implemented.\n", .{
-        colors.warning_style(),
+    try stdout.print("\n{s}Successfully compiled:{s} {s}\n", .{
+        colors.bold() ++ colors.cyan(),
         colors.reset(),
+        exe_output_path,
     });
-    try stdout.print("      Type checker, code generator, and C compiler integration coming soon!\n", .{});
 
     return .success;
 }
@@ -822,12 +1100,83 @@ fn runFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         return compile_result;
     }
 
-    // Then run (not implemented yet)
-    try stdout.print("\n{s}Note:{s} Running not yet implemented.\n", .{
-        colors.warning_style(),
-        colors.reset(),
-    });
-    try stdout.print("Would run: {s}\n", .{opts.exe_output_path orelse "(default output)"});
+    // Get the executable path
+    const exe_path = opts.exe_output_path orelse {
+        try stdout.print("{s}Error:{s} No executable path available\n", .{
+            colors.error_style(),
+            colors.reset(),
+        });
+        return .error_compile;
+    };
+
+    try stdout.print("{s}Running:{s} {s}\n", .{ colors.bold(), colors.reset(), exe_path });
+    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+
+    // Make the path executable-friendly (prepend ./ if needed)
+    const run_path = if (std.mem.startsWith(u8, exe_path, "/") or std.mem.startsWith(u8, exe_path, "./"))
+        exe_path
+    else blk: {
+        break :blk try std.fmt.allocPrint(allocator, "./{s}", .{exe_path});
+    };
+    defer if (run_path.ptr != exe_path.ptr) allocator.free(run_path);
+
+    // Run the executable
+    var child = std.process.Child.init(&.{run_path}, allocator);
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    child.stdin_behavior = .Inherit;
+
+    child.spawn() catch |err| {
+        try stdout.print("{s}Error running executable:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
+    const result = child.wait() catch |err| {
+        try stdout.print("{s}Error waiting for process:{s} {}\n", .{
+            colors.error_style(),
+            colors.reset(),
+            err,
+        });
+        return .error_compile;
+    };
+
+    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                try stdout.print("{s}Process exited with code {d}{s}\n", .{
+                    colors.warning_style(),
+                    code,
+                    colors.reset(),
+                });
+            } else {
+                try stdout.print("{s}Process exited successfully{s}\n", .{
+                    colors.cyan(),
+                    colors.reset(),
+                });
+            }
+        },
+        .Signal => |sig| {
+            try stdout.print("{s}Process terminated by signal {d}{s}\n", .{
+                colors.error_style(),
+                sig,
+                colors.reset(),
+            });
+            return .error_compile;
+        },
+        else => {
+            try stdout.print("{s}Process terminated abnormally{s}\n", .{
+                colors.error_style(),
+                colors.reset(),
+            });
+            return .error_compile;
+        },
+    }
 
     return .success;
 }
@@ -919,6 +1268,28 @@ fn displayParseErrors(parser: *Parser, source: []const u8, file_path: []const u8
 
     const error_count = parser.getErrors().len;
     try writer.print("\n{s}aborting due to {d} parse error(s){s}\n", .{
+        colors.bold(),
+        error_count,
+        colors.reset(),
+    });
+}
+
+fn displayTypeErrors(type_checker: *TypeChecker, colors: ColorConfig, writer: anytype) !void {
+    try writer.print("\n{s}Type Errors:{s}\n", .{ colors.error_style(), colors.reset() });
+
+    const diagnostics = type_checker.getDiagnostics();
+    for (diagnostics) |diagnostic| {
+        try diagnostic.render(writer, colors);
+    }
+
+    var error_count: usize = 0;
+    for (diagnostics) |d| {
+        if (d.severity == .@"error") {
+            error_count += 1;
+        }
+    }
+
+    try writer.print("\n{s}aborting due to {d} type error(s){s}\n", .{
         colors.bold(),
         error_count,
         colors.reset(),
