@@ -1,0 +1,10 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Generated files
+*.c
+!src/*.c
+
+# Compiled binaries
+main

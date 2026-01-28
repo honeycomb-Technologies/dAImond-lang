@@ -216,13 +216,13 @@ pub const SourceSpan = struct {
     source_file: ?[]const u8 = null,
 
     /// Create a span from a single location with a given length
-    pub fn fromLocation(loc: SourceLocation, length: usize) SourceSpan {
+    pub fn fromLocation(loc: SourceLocation, len: usize) SourceSpan {
         return .{
             .start = loc,
             .end = .{
                 .line = loc.line,
-                .column = loc.column + length,
-                .offset = loc.offset + length,
+                .column = loc.column + len,
+                .offset = loc.offset + len,
             },
         };
     }
@@ -445,7 +445,7 @@ pub const Diagnostic = struct {
             .note => "Note",
         };
 
-        try writer.print("{s}{s}[{s}]{s}: {s}{s}\n", .{
+        try writer.print("{s}{s}[{}]{s}: {s}{s}\n", .{
             severity_style,
             severity_name,
             self.code,

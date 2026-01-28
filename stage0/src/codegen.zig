@@ -262,6 +262,9 @@ pub const CodeGenerator = struct {
     // Current function name (for error messages)
     current_function: ?[]const u8,
 
+    // Whether current function returns void (don't generate return for block result)
+    current_function_is_void: bool,
+
     // Region stack for memory management
     region_stack: std.ArrayList([]const u8),
 
@@ -286,6 +289,7 @@ pub const CodeGenerator = struct {
             .temp_counter = 0,
             .lambda_depth = 0,
             .current_function = null,
+            .current_function_is_void = false,
             .region_stack = std.ArrayList([]const u8).init(allocator),
         };
     }
@@ -381,6 +385,16 @@ pub const CodeGenerator = struct {
         for (self.impl_methods.items) |info| {
             try self.generateFunction(info.method, info.target_type);
         }
+
+        // Generate main entry point that calls dm_main
+        try self.writer.blankLine();
+        try self.writer.writeLine("int main(int argc, char** argv) {");
+        self.writer.indent();
+        try self.writer.writeLine("(void)argc; (void)argv;");
+        try self.writer.writeLine("dm_main();");
+        try self.writer.writeLine("return 0;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
 
         return self.writer.getOutput();
     }
@@ -717,7 +731,7 @@ pub const CodeGenerator = struct {
         }
 
         const ret_type = try self.mapType(func.return_type);
-        return try std.fmt.allocPrint(self.allocator, "{s} (*)({})", .{ ret_type, params_str.items });
+        return try std.fmt.allocPrint(self.allocator, "{s} (*)({s})", .{ ret_type, params_str.items });
     }
 
     /// Map array type to C
@@ -1064,6 +1078,10 @@ pub const CodeGenerator = struct {
         self.current_function = func.name.name;
         defer self.current_function = null;
 
+        const is_void = func.return_type == null;
+        self.current_function_is_void = is_void;
+        defer self.current_function_is_void = false;
+
         const func_name = try self.mangleFunctionName(func.name.name, type_prefix);
         const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
 
@@ -1134,21 +1152,27 @@ pub const CodeGenerator = struct {
     // ========================================================================
 
     /// Generate a block of statements
-    fn generateBlock(self: *Self, block: *BlockExpr) !void {
+    fn generateBlock(self: *Self, block: *BlockExpr) anyerror!void {
         for (block.statements) |stmt| {
             try self.generateStatement(stmt);
         }
 
         // Handle block result expression
         if (block.result) |result| {
-            try self.writer.write("return ");
-            try self.generateExpr(result);
-            try self.writer.writeLine(";");
+            if (self.current_function_is_void) {
+                // For void functions, just execute the expression (don't return it)
+                try self.generateExpr(result);
+                try self.writer.writeLine(";");
+            } else {
+                try self.writer.write("return ");
+                try self.generateExpr(result);
+                try self.writer.writeLine(";");
+            }
         }
     }
 
     /// Generate a statement
-    fn generateStatement(self: *Self, stmt: *Statement) !void {
+    fn generateStatement(self: *Self, stmt: *Statement) anyerror!void {
         switch (stmt.kind) {
             .let_binding => |let| try self.generateLetBinding(let),
             .return_stmt => |ret| try self.generateReturn(ret),
@@ -1174,7 +1198,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate let binding
-    fn generateLetBinding(self: *Self, let: *LetBinding) !void {
+    fn generateLetBinding(self: *Self, let: *LetBinding) anyerror!void {
         // Get type string
         const type_str = if (let.type_annotation) |t|
             try self.mapType(t)
@@ -1246,7 +1270,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate return statement
-    fn generateReturn(self: *Self, ret: *ReturnStmt) !void {
+    fn generateReturn(self: *Self, ret: *ReturnStmt) anyerror!void {
         if (ret.value) |val| {
             try self.writer.write("return ");
             try self.generateExpr(val);
@@ -1257,7 +1281,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate if statement
-    fn generateIfStatement(self: *Self, if_expr: *IfExpr) !void {
+    fn generateIfStatement(self: *Self, if_expr: *IfExpr) anyerror!void {
         try self.writer.write("if (");
         try self.generateExpr(if_expr.condition);
         try self.writer.write(")");
@@ -1284,7 +1308,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate match statement (as switch/if chain)
-    fn generateMatchStatement(self: *Self, match: *MatchExpr) !void {
+    fn generateMatchStatement(self: *Self, match: *MatchExpr) anyerror!void {
         // Generate match expression into temporary
         const temp = try self.freshTemp();
         try self.writer.print("auto {s} = ", .{temp});
@@ -1330,7 +1354,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate pattern condition for match
-    fn generatePatternCondition(self: *Self, pattern: *Pattern, scrutinee: []const u8) !void {
+    fn generatePatternCondition(self: *Self, pattern: *Pattern, scrutinee: []const u8) anyerror!void {
         switch (pattern.kind) {
             .literal => |lit| {
                 try self.writer.print("{s} == ", .{scrutinee});
@@ -1386,7 +1410,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate pattern bindings
-    fn generatePatternBindings(self: *Self, pattern: *Pattern, scrutinee: []const u8) !void {
+    fn generatePatternBindings(self: *Self, pattern: *Pattern, scrutinee: []const u8) anyerror!void {
         switch (pattern.kind) {
             .identifier => |ident| {
                 try self.writer.printLine("auto {s} = {s};", .{ ident.name.name, scrutinee });
@@ -1427,7 +1451,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate for loop
-    fn generateForLoop(self: *Self, for_stmt: *ForLoop) !void {
+    fn generateForLoop(self: *Self, for_stmt: *ForLoop) anyerror!void {
         // For now, assume iterator is a range expression
         const temp = try self.freshTemp();
         try self.writer.print("for (size_t {s} = 0; ; {s}++)", .{ temp, temp });
@@ -1446,7 +1470,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate while loop
-    fn generateWhileLoop(self: *Self, while_stmt: *WhileLoop) !void {
+    fn generateWhileLoop(self: *Self, while_stmt: *WhileLoop) anyerror!void {
         try self.writer.write("while (");
         try self.generateExpr(while_stmt.condition);
         try self.writer.write(")");
@@ -1456,7 +1480,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate infinite loop
-    fn generateLoopStatement(self: *Self, loop: *LoopStmt) !void {
+    fn generateLoopStatement(self: *Self, loop: *LoopStmt) anyerror!void {
         if (loop.label) |label| {
             try self.writer.printLine("{s}:", .{label.name});
         }
@@ -1468,7 +1492,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate break statement
-    fn generateBreak(self: *Self, brk: *BreakStmt) !void {
+    fn generateBreak(self: *Self, brk: *BreakStmt) anyerror!void {
         if (brk.label) |label| {
             try self.writer.printLine("goto {s}_end;", .{label.name});
         } else {
@@ -1477,7 +1501,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate continue statement
-    fn generateContinue(self: *Self, cont: *ContinueStmt) !void {
+    fn generateContinue(self: *Self, cont: *ContinueStmt) anyerror!void {
         if (cont.label) |label| {
             try self.writer.printLine("goto {s};", .{label.name});
         } else {
@@ -1486,7 +1510,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate region block (arena scope)
-    fn generateRegionBlock(self: *Self, region: *RegionBlock) !void {
+    fn generateRegionBlock(self: *Self, region: *RegionBlock) anyerror!void {
         const arena_name = try std.fmt.allocPrint(self.allocator, "_dm_arena_{s}", .{region.name.name});
         try self.region_stack.append(arena_name);
         defer _ = self.region_stack.pop();
@@ -1499,7 +1523,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate assignment statement
-    fn generateAssignment(self: *Self, assign: *Assignment) !void {
+    fn generateAssignment(self: *Self, assign: *Assignment) anyerror!void {
         try self.generateExpr(assign.target);
 
         const op_str: []const u8 = switch (assign.op) {
@@ -1526,7 +1550,7 @@ pub const CodeGenerator = struct {
     // ========================================================================
 
     /// Generate an expression
-    pub fn generateExpr(self: *Self, expr: *Expr) CodeGenError!void {
+    pub fn generateExpr(self: *Self, expr: *Expr) anyerror!void {
         switch (expr.kind) {
             .literal => |lit| try self.generateLiteral(lit),
             .identifier => |ident| try self.writer.write(ident.name),
@@ -1565,7 +1589,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate literal
-    fn generateLiteral(self: *Self, lit: *Literal) !void {
+    fn generateLiteral(self: *Self, lit: *Literal) anyerror!void {
         switch (lit.kind) {
             .int => |int_lit| {
                 try self.writer.write(int_lit.value);
@@ -1614,7 +1638,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate path expression
-    fn generatePath(self: *Self, path: Path) !void {
+    fn generatePath(self: *Self, path: Path) anyerror!void {
         for (path.segments, 0..) |segment, i| {
             if (i > 0) try self.writer.write("_");
             try self.writer.write(segment.name);
@@ -1622,7 +1646,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate binary expression
-    fn generateBinaryExpr(self: *Self, bin: *BinaryExpr) !void {
+    fn generateBinaryExpr(self: *Self, bin: *BinaryExpr) anyerror!void {
         try self.writer.write("(");
         try self.generateExpr(bin.left);
 
@@ -1654,7 +1678,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate unary expression
-    fn generateUnaryExpr(self: *Self, un: *UnaryExpr) !void {
+    fn generateUnaryExpr(self: *Self, un: *UnaryExpr) anyerror!void {
         const op_str: []const u8 = switch (un.op) {
             .neg => "-",
             .not => "!",
@@ -1670,13 +1694,13 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate field access
-    fn generateFieldAccess(self: *Self, field: *FieldAccess) !void {
+    fn generateFieldAccess(self: *Self, field: *FieldAccess) anyerror!void {
         try self.generateExpr(field.object);
         try self.writer.print(".{s}", .{field.field.name});
     }
 
     /// Generate index access
-    fn generateIndexAccess(self: *Self, idx: *IndexAccess) !void {
+    fn generateIndexAccess(self: *Self, idx: *IndexAccess) anyerror!void {
         try self.generateExpr(idx.object);
         try self.writer.write("[");
         try self.generateExpr(idx.index);
@@ -1684,7 +1708,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate method call (converted to function call)
-    fn generateMethodCall(self: *Self, method: *MethodCall) !void {
+    fn generateMethodCall(self: *Self, method: *MethodCall) anyerror!void {
         // Convert obj.method(args) to Type_method(&obj, args)
         // For simplicity, we'll generate obj.method(args) style for now
         // which requires knowing the type
@@ -1702,7 +1726,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate function call
-    fn generateFunctionCall(self: *Self, call: *FunctionCall) !void {
+    fn generateFunctionCall(self: *Self, call: *FunctionCall) anyerror!void {
         // Check for built-in functions
         if (call.function.kind == .identifier) {
             const name = call.function.kind.identifier.name;
@@ -1760,7 +1784,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate struct literal
-    fn generateStructLiteral(self: *Self, lit: *StructLiteral) !void {
+    fn generateStructLiteral(self: *Self, lit: *StructLiteral) anyerror!void {
         if (lit.type_path) |path| {
             const type_name = path.segments[path.segments.len - 1].name;
             const mangled = try self.mangleTypeName(type_name);
@@ -1779,7 +1803,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate enum literal
-    fn generateEnumLiteral(self: *Self, lit: *EnumLiteral) !void {
+    fn generateEnumLiteral(self: *Self, lit: *EnumLiteral) anyerror!void {
         var type_name: []const u8 = "unknown";
         if (lit.type_path) |path| {
             type_name = path.segments[path.segments.len - 1].name;
@@ -1808,7 +1832,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate array literal
-    fn generateArrayLiteral(self: *Self, arr: *ArrayLiteral) !void {
+    fn generateArrayLiteral(self: *Self, arr: *ArrayLiteral) anyerror!void {
         switch (arr.kind) {
             .elements => |elems| {
                 try self.writer.write("{ ");
@@ -1828,7 +1852,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate tuple literal
-    fn generateTupleLiteral(self: *Self, tup: *TupleLiteral) !void {
+    fn generateTupleLiteral(self: *Self, tup: *TupleLiteral) anyerror!void {
         try self.writer.write("{ ");
         for (tup.elements, 0..) |elem, i| {
             if (i > 0) try self.writer.write(", ");
@@ -1839,7 +1863,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate if expression (ternary operator)
-    fn generateIfExpr(self: *Self, if_e: *IfExpr) !void {
+    fn generateIfExpr(self: *Self, if_e: *IfExpr) anyerror!void {
         try self.writer.write("(");
         try self.generateExpr(if_e.condition);
         try self.writer.write(" ? ");
@@ -1874,7 +1898,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate match expression
-    fn generateMatchExpr(self: *Self, match: *MatchExpr) !void {
+    fn generateMatchExpr(self: *Self, match: *MatchExpr) anyerror!void {
         // For match expressions, generate a series of ternary operators
         // This is a simplified approach - complex matches need lambda lifting
         try self.writer.write("(");
@@ -1912,7 +1936,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate block expression
-    fn generateBlockExpr(self: *Self, block: *BlockExpr) !void {
+    fn generateBlockExpr(self: *Self, block: *BlockExpr) anyerror!void {
         // Block expressions in C require statement expressions (GCC extension)
         // or conversion to immediately-invoked lambda
         try self.writer.write("({");
@@ -1925,7 +1949,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate lambda expression
-    fn generateLambdaExpr(self: *Self, lambda: *LambdaExpr) !void {
+    fn generateLambdaExpr(self: *Self, lambda: *LambdaExpr) anyerror!void {
         self.lambda_depth += 1;
         defer self.lambda_depth -= 1;
 
@@ -1941,7 +1965,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate pipeline expression (transformed to nested calls)
-    fn generatePipeline(self: *Self, pipe: *PipelineExpr) !void {
+    fn generatePipeline(self: *Self, pipe: *PipelineExpr) anyerror!void {
         // x |> f transforms to f(x)
         // Check if right side is a function call
         switch (pipe.right.kind) {
@@ -1974,7 +1998,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate error propagation expression
-    fn generateErrorPropagate(self: *Self, err: *ErrorPropagateExpr) !void {
+    fn generateErrorPropagate(self: *Self, err: *ErrorPropagateExpr) anyerror!void {
         // expr? - early return on error
         // This needs a temporary and early return
         const temp = try self.freshTemp();
@@ -1984,7 +2008,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate null coalescing expression
-    fn generateCoalesce(self: *Self, coal: *CoalesceExpr) !void {
+    fn generateCoalesce(self: *Self, coal: *CoalesceExpr) anyerror!void {
         // left ?? right - if left has value use it, else right
         const temp = try self.freshTemp();
         try self.writer.print("({s} {s} = ", .{ "auto", temp });
@@ -1995,7 +2019,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate range expression
-    fn generateRange(self: *Self, range: *RangeExpr) !void {
+    fn generateRange(self: *Self, range: *RangeExpr) anyerror!void {
         // Ranges are typically used with for loops
         // Generate as struct literal
         try self.writer.write("((struct { size_t start; size_t end; bool inclusive; }){ ");
@@ -2014,7 +2038,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate cast expression
-    fn generateCast(self: *Self, cast: *CastExpr) !void {
+    fn generateCast(self: *Self, cast: *CastExpr) anyerror!void {
         const target_type = try self.mapType(cast.target_type);
         try self.writer.print("(({s})(", .{target_type});
         try self.generateExpr(cast.expr);
@@ -2022,7 +2046,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate type check expression
-    fn generateTypeCheck(self: *Self, check: *TypeCheckExpr) !void {
+    fn generateTypeCheck(self: *Self, check: *TypeCheckExpr) anyerror!void {
         // expr is Type - runtime type check
         // For static types, this should be resolved at compile time
         // Generate a placeholder

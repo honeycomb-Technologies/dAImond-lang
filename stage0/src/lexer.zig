@@ -236,6 +236,18 @@ pub const Lexer = struct {
 
         const c = self.advance();
 
+        // Raw strings: r"..." (check before identifiers)
+        if (c == 'r' and self.peek() == '"') {
+            _ = self.advance(); // consume "
+            return self.rawString();
+        }
+
+        // Byte strings: b"..." (check before identifiers)
+        if (c == 'b' and self.peek() == '"') {
+            _ = self.advance(); // consume "
+            return self.byteString();
+        }
+
         // Identifiers and keywords
         if (isAlpha(c)) return self.identifier();
 
@@ -244,18 +256,6 @@ pub const Lexer = struct {
 
         // String literals
         if (c == '"') return self.string();
-
-        // Raw strings: r"..."
-        if (c == 'r' and self.peek() == '"') {
-            _ = self.advance(); // consume "
-            return self.rawString();
-        }
-
-        // Byte strings: b"..."
-        if (c == 'b' and self.peek() == '"') {
-            _ = self.advance(); // consume "
-            return self.byteString();
-        }
 
         // Character literals
         if (c == '\'') return self.charLiteral();
@@ -658,7 +658,7 @@ test "lex basic tokens" {
     const tokens = try lexer.scanAll();
     defer testing.allocator.free(tokens);
 
-    try testing.expectEqual(@as(usize, 6), tokens.len);
+    try testing.expectEqual(@as(usize, 7), tokens.len); // Includes EOF
     try testing.expectEqual(TokenType.kw_fn, tokens[0].type);
     try testing.expectEqual(TokenType.identifier, tokens[1].type);
     try testing.expectEqualStrings("main", tokens[1].lexeme);
@@ -666,6 +666,7 @@ test "lex basic tokens" {
     try testing.expectEqual(TokenType.rparen, tokens[3].type);
     try testing.expectEqual(TokenType.lbrace, tokens[4].type);
     try testing.expectEqual(TokenType.rbrace, tokens[5].type);
+    try testing.expectEqual(TokenType.eof, tokens[6].type);
 }
 
 test "lex all keywords" {
@@ -849,9 +850,10 @@ test "lex raw and byte strings" {
     const tokens = try lexer.scanAll();
     defer testing.allocator.free(tokens);
 
-    try testing.expectEqual(@as(usize, 3), tokens.len);
+    try testing.expectEqual(@as(usize, 3), tokens.len); // raw_string, byte_string, EOF
     try testing.expectEqual(TokenType.raw_string, tokens[0].type);
     try testing.expectEqual(TokenType.byte_string, tokens[1].type);
+    try testing.expectEqual(TokenType.eof, tokens[2].type);
 }
 
 test "lex character literals" {
@@ -913,12 +915,17 @@ test "lex function definition" {
     const tokens = try lexer.scanAll();
     defer testing.allocator.free(tokens);
 
-    // Verify key tokens
+    // Verify key tokens: fn add ( a : int , b : int ) -> int { return a + b }
+    // 0:fn 1:add 2:( 3:a 4:: 5:int 6:, 7:b 8:: 9:int 10:) 11:-> 12:int
     try testing.expectEqual(TokenType.kw_fn, tokens[0].type);
     try testing.expectEqual(TokenType.identifier, tokens[1].type);
     try testing.expectEqualStrings("add", tokens[1].lexeme);
-    try testing.expectEqual(TokenType.colon, tokens[3].type);
-    try testing.expectEqual(TokenType.arrow, tokens[8].type);
+    try testing.expectEqual(TokenType.lparen, tokens[2].type);
+    try testing.expectEqual(TokenType.identifier, tokens[3].type); // a
+    try testing.expectEqual(TokenType.colon, tokens[4].type);
+    try testing.expectEqual(TokenType.identifier, tokens[5].type); // int
+    try testing.expectEqual(TokenType.rparen, tokens[10].type);
+    try testing.expectEqual(TokenType.arrow, tokens[11].type);
 }
 
 test "lex generic syntax" {

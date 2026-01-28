@@ -1,10 +1,6 @@
--- Hello World in dAImond
--- The simplest possible dAImond program
-
+-- Simple hello world program
 module hello
 
-import std.io { print }
-
-fn main() with [Console] {
+fn main() {
     print("Hello, dAImond!")
 }
