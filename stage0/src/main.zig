@@ -128,7 +128,6 @@ pub fn main() !void {
         const stderr = std.io.getStdErr().writer();
         switch (err) {
             error.InvalidOption => {},
-            error.MissingFile => try stderr.print("Error: No input file specified\n", .{}),
             error.MissingOutputArg => try stderr.print("Error: -o requires an argument\n", .{}),
             else => try stderr.print("Error: {}\n", .{err}),
         }
@@ -379,7 +378,7 @@ fn lexFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         path,
         colors.reset(),
     });
-    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+    try stdout.print("{s}============================================================{s}\n", .{ colors.dim(), colors.reset() });
 
     // Print tokens
     for (tokens) |token| {
@@ -400,7 +399,7 @@ fn lexFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         });
     }
 
-    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+    try stdout.print("{s}============================================================{s}\n", .{ colors.dim(), colors.reset() });
     try stdout.print("Total: {s}{d}{s} tokens\n", .{ colors.bold(), tokens.len, colors.reset() });
 
     // Report any errors
@@ -466,12 +465,12 @@ fn parseFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
 
     // Print AST summary
     try stdout.print("{s}AST for '{s}':{s}\n", .{ colors.bold(), path, colors.reset() });
-    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+    try stdout.print("{s}============================================================{s}\n", .{ colors.dim(), colors.reset() });
 
     try printAstSummary(ast_result, colors, stdout);
 
-    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
-    try stdout.print("{s}Parse successful!{s}\n", .{ colors.bold() ++ colors.cyan(), colors.reset() });
+    try stdout.print("{s}============================================================{s}\n", .{ colors.dim(), colors.reset() });
+    try stdout.print("{s}{s}Parse successful!{s}\n", .{ colors.bold(), colors.cyan(), colors.reset() });
 
     return .success;
 }
@@ -682,8 +681,9 @@ fn checkFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         try stdout.print("\n{s}Total time: {d}ms{s}\n", .{ colors.dim(), total_timer.elapsedMs(), colors.reset() });
     }
 
-    try stdout.print("{s}Type check passed!{s} No errors found.\n", .{
-        colors.bold() ++ colors.cyan(),
+    try stdout.print("{s}{s}Type check passed!{s} No errors found.\n", .{
+        colors.bold(),
+        colors.cyan(),
         colors.reset(),
     });
 
@@ -722,9 +722,7 @@ fn findCCompiler() ?[]const u8 {
 
     for (compilers) |compiler| {
         // Try to run the compiler with --version to check if it exists
-        var child = std.process.Child.init(.{
-            .argv = &.{ compiler, "--version" },
-        });
+        var child = std.process.Child.init(&.{ compiler, "--version" }, std.heap.page_allocator);
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
 
@@ -944,8 +942,9 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
 
     // If only compiling to C, stop here
     if (opts.compile_to_c_only) {
-        try stdout.print("\n{s}Successfully generated C code:{s} {s}\n", .{
-            colors.bold() ++ colors.cyan(),
+        try stdout.print("\n{s}{s}Successfully generated C code:{s} {s}\n", .{
+            colors.bold(),
+            colors.cyan(),
             colors.reset(),
             c_output_path,
         });
@@ -1011,9 +1010,7 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     }
 
     // Spawn the C compiler process
-    var child = std.process.Child.init(.{
-        .argv = cc_args.items,
-    });
+    var child = std.process.Child.init(cc_args.items, allocator);
     child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
 
@@ -1081,8 +1078,9 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         try stdout.print("\n{s}Total time: {d}ms{s}\n", .{ colors.dim(), total_timer.elapsedMs(), colors.reset() });
     }
 
-    try stdout.print("\n{s}Successfully compiled:{s} {s}\n", .{
-        colors.bold() ++ colors.cyan(),
+    try stdout.print("\n{s}{s}Successfully compiled:{s} {s}\n", .{
+        colors.bold(),
+        colors.cyan(),
         colors.reset(),
         exe_output_path,
     });
@@ -1114,7 +1112,7 @@ fn runFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     };
 
     try stdout.print("{s}Running:{s} {s}\n", .{ colors.bold(), colors.reset(), exe_path });
-    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+    try stdout.print("{s}============================================================{s}\n", .{ colors.dim(), colors.reset() });
 
     // Make the path executable-friendly (prepend ./ if needed)
     const run_path = if (std.mem.startsWith(u8, exe_path, "/") or std.mem.startsWith(u8, exe_path, "./"))
@@ -1125,9 +1123,7 @@ fn runFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     defer if (run_path.ptr != exe_path.ptr) allocator.free(run_path);
 
     // Run the executable
-    var child = std.process.Child.init(.{
-        .argv = &.{run_path},
-    });
+    var child = std.process.Child.init(&.{run_path}, allocator);
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
     child.stdin_behavior = .Inherit;
@@ -1150,7 +1146,7 @@ fn runFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         return .error_compile;
     };
 
-    try stdout.print("{s}{'=':[<60]}{s}\n", .{ colors.dim(), "", colors.reset() });
+    try stdout.print("{s}============================================================{s}\n", .{ colors.dim(), colors.reset() });
 
     switch (result) {
         .Exited => |code| {

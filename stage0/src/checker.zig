@@ -858,7 +858,7 @@ pub const TypeChecker = struct {
     // ========================================================================
 
     /// Infer the type of an expression
-    pub fn inferExpr(self: *Self, expr: *const ast.Expr) !TypeId {
+    pub fn inferExpr(self: *Self, expr: *const ast.Expr) anyerror!TypeId {
         return switch (expr.kind) {
             .literal => |lit| self.inferLiteral(lit),
             .identifier => |ident| self.inferIdentifier(ident, expr.span),
@@ -888,7 +888,7 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn inferLiteral(self: *Self, lit: *const ast.Literal) !TypeId {
+    fn inferLiteral(self: *Self, lit: *const ast.Literal) anyerror!TypeId {
         return switch (lit.kind) {
             .int => |int_lit| {
                 if (int_lit.suffix) |suffix| {
@@ -913,7 +913,7 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn inferIdentifier(self: *Self, ident: ast.Identifier, span: ast.Span) !TypeId {
+    fn inferIdentifier(self: *Self, ident: ast.Identifier, span: ast.Span) anyerror!TypeId {
         if (self.env.lookup(ident.name)) |symbol| {
             self.env.current.markUsed(ident.name);
             return symbol.type_id;
@@ -923,7 +923,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.error_type);
     }
 
-    fn inferPath(self: *Self, path: ast.Path) !TypeId {
+    fn inferPath(self: *Self, path: ast.Path) anyerror!TypeId {
         // For now, just look up the first segment
         if (path.segments.len > 0) {
             if (self.env.lookup(path.segments[0].name)) |symbol| {
@@ -935,7 +935,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.error_type);
     }
 
-    fn inferBinary(self: *Self, bin: *const ast.BinaryExpr) !TypeId {
+    fn inferBinary(self: *Self, bin: *const ast.BinaryExpr) anyerror!TypeId {
         const left_type = try self.inferExpr(bin.left);
         const right_type = try self.inferExpr(bin.right);
 
@@ -979,7 +979,7 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn inferUnary(self: *Self, un: *const ast.UnaryExpr) !TypeId {
+    fn inferUnary(self: *Self, un: *const ast.UnaryExpr) anyerror!TypeId {
         const operand_type = try self.inferExpr(un.operand);
 
         return switch (un.op) {
@@ -1018,7 +1018,7 @@ pub const TypeChecker = struct {
         };
     }
 
-    fn inferFieldAccess(self: *Self, fa: *const ast.FieldAccess) !TypeId {
+    fn inferFieldAccess(self: *Self, fa: *const ast.FieldAccess) anyerror!TypeId {
         const object_type = try self.inferExpr(fa.object);
         const resolved = self.resolveType(object_type);
         const typ = self.type_ctx.get(resolved) orelse {
@@ -1052,7 +1052,7 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn inferIndexAccess(self: *Self, ia: *const ast.IndexAccess) !TypeId {
+    fn inferIndexAccess(self: *Self, ia: *const ast.IndexAccess) anyerror!TypeId {
         const object_type = try self.inferExpr(ia.object);
         const index_type = try self.inferExpr(ia.index);
         const resolved = self.resolveType(object_type);
@@ -1077,7 +1077,7 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn inferMethodCall(self: *Self, mc: *const ast.MethodCall) !TypeId {
+    fn inferMethodCall(self: *Self, mc: *const ast.MethodCall) anyerror!TypeId {
         const object_type = try self.inferExpr(mc.object);
         _ = object_type;
 
@@ -1091,7 +1091,7 @@ pub const TypeChecker = struct {
         return return_type;
     }
 
-    fn inferFunctionCall(self: *Self, fc: *const ast.FunctionCall) !TypeId {
+    fn inferFunctionCall(self: *Self, fc: *const ast.FunctionCall) anyerror!TypeId {
         const func_type = try self.inferExpr(fc.function);
         const resolved = self.resolveType(func_type);
         const typ = self.type_ctx.get(resolved) orelse {
@@ -1124,7 +1124,7 @@ pub const TypeChecker = struct {
         return fn_type.return_type;
     }
 
-    fn inferStructLiteral(self: *Self, sl: *const ast.StructLiteral) !TypeId {
+    fn inferStructLiteral(self: *Self, sl: *const ast.StructLiteral) anyerror!TypeId {
         if (sl.type_path) |path| {
             if (path.segments.len > 0) {
                 if (self.env.lookup(path.segments[0].name)) |symbol| {
@@ -1174,7 +1174,7 @@ pub const TypeChecker = struct {
         });
     }
 
-    fn inferEnumLiteral(self: *Self, el: *const ast.EnumLiteral) !TypeId {
+    fn inferEnumLiteral(self: *Self, el: *const ast.EnumLiteral) anyerror!TypeId {
         if (el.type_path) |path| {
             if (path.segments.len > 0) {
                 if (self.env.lookup(path.segments[0].name)) |symbol| {
@@ -1187,7 +1187,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.error_type);
     }
 
-    fn inferArrayLiteral(self: *Self, al: *const ast.ArrayLiteral) !TypeId {
+    fn inferArrayLiteral(self: *Self, al: *const ast.ArrayLiteral) anyerror!TypeId {
         switch (al.kind) {
             .elements => |elements| {
                 if (elements.len == 0) {
@@ -1213,7 +1213,7 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn inferTupleLiteral(self: *Self, tl: *const ast.TupleLiteral) !TypeId {
+    fn inferTupleLiteral(self: *Self, tl: *const ast.TupleLiteral) anyerror!TypeId {
         var elem_types = std.ArrayList(TypeId).init(self.allocator);
         defer elem_types.deinit();
 
@@ -1225,7 +1225,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.makeTuple(elem_types.items);
     }
 
-    fn inferIfExpr(self: *Self, ie: *const ast.IfExpr) !TypeId {
+    fn inferIfExpr(self: *Self, ie: *const ast.IfExpr) anyerror!TypeId {
         const cond_type = try self.inferExpr(ie.condition);
         const bool_type = try self.type_ctx.intern(.bool);
         try self.unify(cond_type, bool_type, ie.span);
@@ -1250,7 +1250,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.unit);
     }
 
-    fn inferMatchExpr(self: *Self, me: *const ast.MatchExpr) !TypeId {
+    fn inferMatchExpr(self: *Self, me: *const ast.MatchExpr) anyerror!TypeId {
         const scrutinee_type = try self.inferExpr(me.scrutinee);
 
         if (me.arms.len == 0) {
@@ -1288,7 +1288,7 @@ pub const TypeChecker = struct {
         return arm_type orelse try self.type_ctx.intern(.unit);
     }
 
-    fn inferBlock(self: *Self, blk: *const ast.BlockExpr) !TypeId {
+    fn inferBlock(self: *Self, blk: *const ast.BlockExpr) anyerror!TypeId {
         try self.env.pushScope(.block);
         defer self.env.popScope();
 
@@ -1303,7 +1303,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.unit);
     }
 
-    fn inferLambda(self: *Self, lam: *const ast.LambdaExpr) !TypeId {
+    fn inferLambda(self: *Self, lam: *const ast.LambdaExpr) anyerror!TypeId {
         try self.env.pushScope(.function);
         defer self.env.popScope();
 
@@ -1335,7 +1335,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.makeFunction(param_types.items, return_type, EffectSet.pure);
     }
 
-    fn inferPipeline(self: *Self, pipe: *const ast.PipelineExpr) !TypeId {
+    fn inferPipeline(self: *Self, pipe: *const ast.PipelineExpr) anyerror!TypeId {
         const left_type = try self.inferExpr(pipe.left);
         const right_type = try self.inferExpr(pipe.right);
 
@@ -1358,7 +1358,7 @@ pub const TypeChecker = struct {
         return typ.function.return_type;
     }
 
-    fn inferErrorPropagate(self: *Self, ep: *const ast.ErrorPropagateExpr) !TypeId {
+    fn inferErrorPropagate(self: *Self, ep: *const ast.ErrorPropagateExpr) anyerror!TypeId {
         const operand_type = try self.inferExpr(ep.operand);
         const resolved = self.resolveType(operand_type);
         const typ = self.type_ctx.get(resolved) orelse {
@@ -1376,7 +1376,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.error_type);
     }
 
-    fn inferCoalesce(self: *Self, coal: *const ast.CoalesceExpr) !TypeId {
+    fn inferCoalesce(self: *Self, coal: *const ast.CoalesceExpr) anyerror!TypeId {
         const left_type = try self.inferExpr(coal.left);
         const right_type = try self.inferExpr(coal.right);
 
@@ -1395,7 +1395,7 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.error_type);
     }
 
-    fn inferRange(self: *Self, rng: *const ast.RangeExpr) !TypeId {
+    fn inferRange(self: *Self, rng: *const ast.RangeExpr) anyerror!TypeId {
         var elem_type: TypeId = try self.type_ctx.intern(.{ .int = .i64 });
 
         if (rng.start) |start| {
@@ -1410,12 +1410,12 @@ pub const TypeChecker = struct {
         return elem_type;
     }
 
-    fn inferCast(self: *Self, cast: *const ast.CastExpr) !TypeId {
+    fn inferCast(self: *Self, cast: *const ast.CastExpr) anyerror!TypeId {
         _ = try self.inferExpr(cast.expr);
         return try self.resolveTypeExpr(cast.target_type);
     }
 
-    fn inferTypeCheck(self: *Self, tc: *const ast.TypeCheckExpr) !TypeId {
+    fn inferTypeCheck(self: *Self, tc: *const ast.TypeCheckExpr) anyerror!TypeId {
         _ = try self.inferExpr(tc.expr);
         _ = try self.resolveTypeExpr(tc.checked_type);
         return try self.type_ctx.intern(.bool);
@@ -2221,7 +2221,7 @@ pub const TypeChecker = struct {
         return error.UndefinedType;
     }
 
-    fn instantiateGeneric(self: *Self, base_type: TypeId, args: []const *ast.TypeExpr) !TypeId {
+    fn instantiateGeneric(self: *Self, base_type: TypeId, args: []const *ast.TypeExpr) anyerror!TypeId {
         var type_args = std.ArrayList(TypeId).init(self.allocator);
         defer type_args.deinit();
 
@@ -2232,7 +2232,7 @@ pub const TypeChecker = struct {
         return types.instantiateGeneric(self.type_ctx, base_type, type_args.items) catch base_type;
     }
 
-    fn addEffectFromTypeExpr(self: *Self, te: *const ast.TypeExpr, effects: *EffectSet) !void {
+    fn addEffectFromTypeExpr(_: *Self, te: *const ast.TypeExpr, effects: *EffectSet) !void {
         if (te.kind == .named) {
             const name = te.kind.named.path.segments[0].name;
             if (std.mem.eql(u8, name, "IO")) {

@@ -79,6 +79,7 @@ pub const ReferenceType = ast.ReferenceType;
 pub const TupleType = ast.TupleType;
 pub const OptionType = ast.OptionType;
 pub const ImportDecl = ast.ImportDecl;
+pub const ModuleDecl = ast.ModuleDecl;
 
 // ============================================================================
 // Parser Error Types
@@ -208,6 +209,12 @@ pub const Parser = struct {
 
         const start_loc = self.currentLocation();
 
+        // Handle optional module declaration at the start
+        var module_decl: ?*ModuleDecl = null;
+        if (self.match(.kw_module)) {
+            module_decl = try self.parseModuleDecl();
+        }
+
         while (!self.isAtEnd()) {
             // Handle imports first
             if (self.check(.kw_import)) {
@@ -225,12 +232,40 @@ pub const Parser = struct {
 
         const source_file = try self.allocator.create(SourceFile);
         source_file.* = .{
-            .module_decl = null,
+            .module_decl = module_decl,
             .imports = try imports.toOwnedSlice(),
             .declarations = try declarations.toOwnedSlice(),
             .span = makeSpan(start_loc, self.previousLocation()),
         };
         return source_file;
+    }
+
+    /// Parse a module declaration: `module name.subpath`
+    fn parseModuleDecl(self: *Self) !*ModuleDecl {
+        const start_loc = self.currentLocation();
+
+        // Parse the module path (e.g., "tests.generics" or just "hello")
+        var segments = std.ArrayList(Identifier).init(self.allocator);
+        const first = try self.expectIdentifier("module name");
+        try segments.append(makeIdentifier(first, self.previousLocation()));
+
+        // Handle dotted paths like "tests.generics"
+        while (self.match(.dot)) {
+            const seg = try self.expectIdentifier("module path segment");
+            try segments.append(makeIdentifier(seg, self.previousLocation()));
+        }
+
+        const path = Path{
+            .segments = try segments.toOwnedSlice(),
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        const module_decl = try self.allocator.create(ModuleDecl);
+        module_decl.* = .{
+            .name = path,
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+        return module_decl;
     }
 
     // ========================================================================
@@ -299,7 +334,7 @@ pub const Parser = struct {
 
         // Parameters
         try self.expect(.lparen, "'(' after function name");
-        const params = try self.parseFunctionParams();
+        var params = try self.parseFunctionParams();
         try self.expect(.rparen, "')' after parameters");
 
         // Return type
@@ -726,7 +761,7 @@ pub const Parser = struct {
             while (!self.check(.rbrace) and !self.isAtEnd()) {
                 const item_name = try self.expectIdentifier("import item");
                 const item_ident = makeIdentifier(item_name, self.previousLocation());
-                var alias: ?Identifier = null;
+                const alias: ?Identifier = null;
                 // Could add 'as' keyword handling here if needed
                 try import_items.append(.{
                     .name = item_ident,
@@ -1625,10 +1660,12 @@ pub const Parser = struct {
         // String literal
         if (self.match(.string)) {
             const lexeme = self.previous().lexeme;
+            // Strip surrounding quotes from "..."
+            const value = if (lexeme.len >= 2) lexeme[1 .. lexeme.len - 1] else lexeme;
 
             const lit = try self.allocator.create(Literal);
             lit.* = .{
-                .kind = .{ .string = .{ .value = lexeme, .kind = .regular } },
+                .kind = .{ .string = .{ .value = value, .kind = .regular } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
@@ -1643,10 +1680,12 @@ pub const Parser = struct {
         // Raw string
         if (self.match(.raw_string)) {
             const lexeme = self.previous().lexeme;
+            // Strip r"..." prefix and suffix
+            const value = if (lexeme.len >= 3) lexeme[2 .. lexeme.len - 1] else lexeme;
 
             const lit = try self.allocator.create(Literal);
             lit.* = .{
-                .kind = .{ .string = .{ .value = lexeme, .kind = .raw } },
+                .kind = .{ .string = .{ .value = value, .kind = .raw } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
@@ -1661,10 +1700,12 @@ pub const Parser = struct {
         // Byte string
         if (self.match(.byte_string)) {
             const lexeme = self.previous().lexeme;
+            // Strip b"..." prefix and suffix
+            const value = if (lexeme.len >= 3) lexeme[2 .. lexeme.len - 1] else lexeme;
 
             const lit = try self.allocator.create(Literal);
             lit.* = .{
-                .kind = .{ .string = .{ .value = lexeme, .kind = .byte } },
+                .kind = .{ .string = .{ .value = value, .kind = .byte } },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
 
@@ -2441,6 +2482,10 @@ pub const Parser = struct {
 
     /// Look at previous token
     fn previous(self: *Self) Token {
+        if (self.current == 0) {
+            // Return EOF token at start if we haven't advanced yet
+            return self.tokens[0];
+        }
         return self.tokens[self.current - 1];
     }
 

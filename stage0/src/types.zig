@@ -535,8 +535,8 @@ pub const Type = union(enum) {
     pub fn isCopy(self: Self) bool {
         return switch (self) {
             .int, .float, .bool, .char, .unit => true,
-            .array => |arr| _ = arr, // Would need to check element type
-            .tuple => |tup| _ = tup, // Would need to check element types
+            .array => false, // Would need to check element type
+            .tuple => false, // Would need to check element types
             else => false,
         };
     }
@@ -914,7 +914,7 @@ pub const TypeContext = struct {
 
 /// Simple type equality (tag comparison only)
 fn typeEqlSimple(a: Type, b: Type) bool {
-    const TagType = @typeInfo(Type).@"union".tag_type.?;
+    const TagType = @typeInfo(Type).Union.tag_type.?;
     const tag_a: TagType = a;
     const tag_b: TagType = b;
 
@@ -1598,13 +1598,13 @@ test "type size and alignment" {
     try testing.expectEqual(@as(?usize, 8), i64_type.sizeOf());
     try testing.expectEqual(@as(?usize, 8), i64_type.alignOf());
 
-    const char_type = Type.char;
+    const char_type: Type = .char;
     try testing.expectEqual(@as(?usize, 4), char_type.sizeOf());
 
-    const bool_type = Type.bool;
+    const bool_type: Type = .bool;
     try testing.expectEqual(@as(?usize, 1), bool_type.sizeOf());
 
-    const unit_type = Type.unit;
+    const unit_type: Type = .unit;
     try testing.expectEqual(@as(?usize, 0), unit_type.sizeOf());
 }
 
@@ -1621,7 +1621,7 @@ test "type primitive checks" {
     try testing.expect(!f64_type.isIntegral());
     try testing.expect(f64_type.isFloating());
 
-    const bool_type = Type.bool;
+    const bool_type: Type = .bool;
     try testing.expect(bool_type.isPrimitive());
     try testing.expect(!bool_type.isNumeric());
 }
@@ -1630,10 +1630,10 @@ test "type copy semantics" {
     const i32_type = Type{ .int = .i32 };
     try testing.expect(i32_type.isCopy());
 
-    const bool_type = Type.bool;
+    const bool_type: Type = .bool;
     try testing.expect(bool_type.isCopy());
 
-    const str_type = Type.str;
+    const str_type: Type = .str;
     try testing.expect(!str_type.isCopy());
 }
 
