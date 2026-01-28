@@ -1364,7 +1364,8 @@ pub const CodeGenerator = struct {
     fn generateMatchStatement(self: *Self, match: *MatchExpr) anyerror!void {
         // Generate match expression into temporary
         const temp = try self.freshTemp();
-        try self.writer.print("auto {s} = ", .{temp});
+        const scrutinee_type = self.inferCTypeFromExpr(match.scrutinee);
+        try self.writer.print("{s} {s} = ", .{ scrutinee_type, temp });
         try self.generateExpr(match.scrutinee);
         try self.writer.writeLine(";");
 
@@ -1463,10 +1464,13 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate pattern bindings
+    /// Note: Without full type information, we use void* for pattern-bound variables.
+    /// A more sophisticated implementation would track types through pattern matching.
     fn generatePatternBindings(self: *Self, pattern: *Pattern, scrutinee: []const u8) anyerror!void {
         switch (pattern.kind) {
             .identifier => |ident| {
-                try self.writer.printLine("auto {s} = {s};", .{ ident.name.name, scrutinee });
+                // Bind identifier to the scrutinee value (use void* as generic type)
+                try self.writer.printLine("void* {s} = (void*){s};", .{ ident.name.name, scrutinee });
             },
             .enum_variant => |variant| {
                 switch (variant.payload) {
@@ -1474,7 +1478,7 @@ pub const CodeGenerator = struct {
                     .tuple => |patterns| {
                         for (patterns, 0..) |pat, i| {
                             if (pat.kind == .identifier) {
-                                try self.writer.printLine("auto {s} = {s}.data.{s}._{d};", .{
+                                try self.writer.printLine("void* {s} = {s}.data.{s}._{d};", .{
                                     pat.kind.identifier.name.name,
                                     scrutinee,
                                     variant.variant.name,
@@ -1487,7 +1491,7 @@ pub const CodeGenerator = struct {
                         for (fields) |field| {
                             if (field.pattern) |pat| {
                                 if (pat.kind == .identifier) {
-                                    try self.writer.printLine("auto {s} = {s}.data.{s}.{s};", .{
+                                    try self.writer.printLine("void* {s} = {s}.data.{s}.{s};", .{
                                         pat.kind.identifier.name.name,
                                         scrutinee,
                                         variant.variant.name,
@@ -1505,21 +1509,65 @@ pub const CodeGenerator = struct {
 
     /// Generate for loop
     fn generateForLoop(self: *Self, for_stmt: *ForLoop) anyerror!void {
-        // For now, assume iterator is a range expression
-        const temp = try self.freshTemp();
-        try self.writer.print("for (size_t {s} = 0; ; {s}++)", .{ temp, temp });
-        try self.writer.beginBlock();
+        // Check if iterator is a range expression
+        if (for_stmt.iterator.kind == .range) {
+            const range = for_stmt.iterator.kind.range;
+            const temp = try self.freshTemp();
 
-        // Bind pattern variable
-        switch (for_stmt.pattern.kind) {
-            .identifier => |ident| {
-                try self.writer.printLine("auto {s} = {s};", .{ ident.name.name, temp });
-            },
-            else => {},
+            // Generate range-based for loop
+            try self.writer.print("for (int64_t {s} = ", .{temp});
+            if (range.start) |start| {
+                try self.generateExpr(start);
+            } else {
+                try self.writer.write("0");
+            }
+            try self.writer.print("; {s} ", .{temp});
+            if (range.inclusive) {
+                try self.writer.write("<=");
+            } else {
+                try self.writer.write("<");
+            }
+            try self.writer.write(" ");
+            if (range.end) |end| {
+                try self.generateExpr(end);
+            } else {
+                try self.writer.write("INT64_MAX");
+            }
+            try self.writer.print("; {s}++)", .{temp});
+            try self.writer.beginBlock();
+
+            // Bind pattern variable
+            switch (for_stmt.pattern.kind) {
+                .identifier => |ident| {
+                    try self.writer.printLine("int64_t {s} = {s};", .{ ident.name.name, temp });
+                },
+                else => {},
+            }
+
+            try self.generateBlock(for_stmt.body);
+            try self.writer.endBlock();
+        } else {
+            // Generic iterator - generate while loop style
+            const iter_temp = try self.freshTemp();
+            const item_temp = try self.freshTemp();
+
+            try self.writer.print("{{ void* {s} = ", .{iter_temp});
+            try self.generateExpr(for_stmt.iterator);
+            try self.writer.writeLine(";");
+            try self.writer.printLine("while (1) {{ void* {s} = dm_iter_next({s}); if ({s} == NULL) break;", .{ item_temp, iter_temp, item_temp });
+
+            // Bind pattern variable
+            switch (for_stmt.pattern.kind) {
+                .identifier => |ident| {
+                    try self.writer.printLine("void* {s} = {s};", .{ ident.name.name, item_temp });
+                },
+                else => {},
+            }
+
+            try self.generateBlock(for_stmt.body);
+            try self.writer.writeLine("}}");
+            try self.writer.writeLine("}");
         }
-
-        try self.generateBlock(for_stmt.body);
-        try self.writer.endBlock();
     }
 
     /// Generate while loop
@@ -1956,24 +2004,36 @@ pub const CodeGenerator = struct {
 
     /// Generate match expression
     fn generateMatchExpr(self: *Self, match: *MatchExpr) anyerror!void {
-        // For match expressions, generate a series of ternary operators
-        // This is a simplified approach - complex matches need lambda lifting
-        try self.writer.write("(");
+        // Use GCC statement expression to evaluate scrutinee once and match
+        try self.writer.write("({ ");
 
+        // Generate scrutinee into a temp variable
+        const temp = try self.freshTemp();
+        const scrutinee_type = self.inferCTypeFromExpr(match.scrutinee);
+        try self.writer.print("{s} {s} = ", .{ scrutinee_type, temp });
+        try self.generateExpr(match.scrutinee);
+        try self.writer.write("; ");
+
+        // Generate nested ternary operators for each arm
         for (match.arms, 0..) |arm, i| {
             if (i > 0) {
                 try self.writer.write(" : ");
             }
 
-            // Generate condition check
-            const temp = "_dm_match_val";
-            _ = temp; // Would need to lift this
-
+            // Generate pattern condition
             try self.writer.write("(");
-            // Simplified condition
-            try self.writer.write("1 /* match arm */");
+            try self.generatePatternCondition(arm.pattern, temp);
+
+            // Add guard condition if present
+            if (arm.guard) |guard| {
+                try self.writer.write(" && (");
+                try self.generateExpr(guard);
+                try self.writer.write(")");
+            }
+
             try self.writer.write(") ? (");
 
+            // Generate arm body
             switch (arm.body) {
                 .expression => |expr| try self.generateExpr(expr),
                 .block => |block| {
@@ -1988,8 +2048,8 @@ pub const CodeGenerator = struct {
             try self.writer.write(")");
         }
 
-        // Default case
-        try self.writer.write(" : 0)");
+        // Default case (unreachable if patterns are exhaustive)
+        try self.writer.write(" : 0; })");
     }
 
     /// Generate block expression
@@ -2006,19 +2066,32 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate lambda expression
+    /// Note: Full lambda support requires closure conversion which is complex.
+    /// For Stage 0, we implement simple non-capturing lambdas using GCC statement expressions.
     fn generateLambdaExpr(self: *Self, lambda: *LambdaExpr) anyerror!void {
         self.lambda_depth += 1;
         defer self.lambda_depth -= 1;
 
-        // Generate as function pointer or use GCC nested functions
-        // For simplicity, we'll generate a comment placeholder
-        try self.writer.write("/* lambda: */NULL");
-
-        // In a full implementation, we would:
-        // 1. Lift the lambda to a top-level function
-        // 2. Create a closure struct for captured variables
-        // 3. Return a function pointer with the closure
-        _ = lambda;
+        // For simple expression lambdas, we can inline them directly
+        // For complex cases, we need proper closure conversion (Stage 1+)
+        switch (lambda.body) {
+            .expression => |expr| {
+                // Generate as inline expression (works for simple uses)
+                try self.writer.write("(");
+                try self.generateExpr(expr);
+                try self.writer.write(")");
+            },
+            .block => |block| {
+                // For block bodies, use GCC statement expression
+                try self.writer.write("({");
+                try self.generateBlock(block);
+                if (block.result) |result| {
+                    try self.generateExpr(result);
+                    try self.writer.write(";");
+                }
+                try self.writer.write("})");
+            },
+        }
     }
 
     /// Generate pipeline expression (transformed to nested calls)
@@ -2057,22 +2130,24 @@ pub const CodeGenerator = struct {
     /// Generate error propagation expression
     fn generateErrorPropagate(self: *Self, err: *ErrorPropagateExpr) anyerror!void {
         // expr? - early return on error
-        // This needs a temporary and early return
+        // This needs a temporary and early return using GCC statement expression
         const temp = try self.freshTemp();
-        try self.writer.print("({s} {s} = ", .{ "auto", temp });
+        const operand_type = self.inferCTypeFromExpr(err.operand);
+        try self.writer.print("({{ {s} {s} = ", .{ operand_type, temp });
         try self.generateExpr(err.operand);
-        try self.writer.print("; {s}.is_ok ? {s}.value.ok_value : (return {s}))", .{ temp, temp, temp });
+        try self.writer.print("; if (!{s}.is_ok) return {s}; {s}.value.ok_value; }})", .{ temp, temp, temp });
     }
 
     /// Generate null coalescing expression
     fn generateCoalesce(self: *Self, coal: *CoalesceExpr) anyerror!void {
         // left ?? right - if left has value use it, else right
         const temp = try self.freshTemp();
-        try self.writer.print("({s} {s} = ", .{ "auto", temp });
+        const left_type = self.inferCTypeFromExpr(coal.left);
+        try self.writer.print("({{ {s} {s} = ", .{ left_type, temp });
         try self.generateExpr(coal.left);
         try self.writer.print("; {s}.has_value ? {s}.value : ", .{ temp, temp });
         try self.generateExpr(coal.right);
-        try self.writer.write(")");
+        try self.writer.write("; })");
     }
 
     /// Generate range expression
