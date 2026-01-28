@@ -533,6 +533,7 @@ pub const TypeChecker = struct {
         try self.env.defineGlobal(Symbol.init("float", .type_def, float_id));
         try self.env.defineGlobal(Symbol.init("bool", .type_def, bool_id));
         try self.env.defineGlobal(Symbol.init("str", .type_def, str_id));
+        try self.env.defineGlobal(Symbol.init("string", .type_def, str_id)); // alias for str
         try self.env.defineGlobal(Symbol.init("byte", .type_def, try self.type_ctx.intern(.{ .int = .u8 })));
         try self.env.defineGlobal(Symbol.init("char", .type_def, try self.type_ctx.intern(.char)));
 

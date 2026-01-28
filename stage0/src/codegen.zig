@@ -846,6 +846,46 @@ pub const CodeGenerator = struct {
         return try std.fmt.allocPrint(self.stringAllocator(), "dm_{s}", .{name});
     }
 
+    /// Infer C type from an expression (for let bindings without type annotations)
+    fn inferCTypeFromExpr(self: *Self, expr: *Expr) []const u8 {
+        _ = self;
+        return switch (expr.kind) {
+            .literal => |lit| switch (lit.kind) {
+                .int => |int_lit| if (int_lit.suffix) |suffix| blk: {
+                    // Map suffix to C type
+                    if (std.mem.eql(u8, suffix, "i8")) break :blk "int8_t";
+                    if (std.mem.eql(u8, suffix, "i16")) break :blk "int16_t";
+                    if (std.mem.eql(u8, suffix, "i32")) break :blk "int32_t";
+                    if (std.mem.eql(u8, suffix, "i64")) break :blk "int64_t";
+                    if (std.mem.eql(u8, suffix, "u8")) break :blk "uint8_t";
+                    if (std.mem.eql(u8, suffix, "u16")) break :blk "uint16_t";
+                    if (std.mem.eql(u8, suffix, "u32")) break :blk "uint32_t";
+                    if (std.mem.eql(u8, suffix, "u64")) break :blk "uint64_t";
+                    break :blk "int64_t";
+                } else "int64_t",
+                .float => |float_lit| if (float_lit.suffix) |suffix| blk: {
+                    if (std.mem.eql(u8, suffix, "f32")) break :blk "float";
+                    break :blk "double";
+                } else "double",
+                .string => "dm_string",
+                .char => "char",
+                .bool => "bool",
+                .null_lit => "void*",
+            },
+            .binary => "int64_t", // Most binary ops produce integers
+            .unary => "int64_t",
+            .function_call => "void*", // Unknown return type, use void*
+            .struct_literal => "void*", // Would need type resolution
+            .array_literal => "void*",
+            .tuple_literal => "void*",
+            .if_expr => "void*",
+            .match_expr => "void*",
+            .block => "void*",
+            .lambda => "void*",
+            else => "void*", // Fallback for unknown expressions
+        };
+    }
+
     // ========================================================================
     // STRUCT GENERATION
     // ========================================================================
@@ -1208,11 +1248,13 @@ pub const CodeGenerator = struct {
 
     /// Generate let binding
     fn generateLetBinding(self: *Self, let: *LetBinding) anyerror!void {
-        // Get type string
+        // Get type string - infer from expression if no annotation
         const type_str = if (let.type_annotation) |t|
             try self.mapType(t)
+        else if (let.value) |val|
+            self.inferCTypeFromExpr(val)
         else
-            "auto"; // C23 auto, or use void* as fallback
+            "void*"; // No value and no type annotation - use void*
 
         // Handle pattern
         switch (let.pattern.kind) {
@@ -1235,7 +1277,8 @@ pub const CodeGenerator = struct {
                     for (tuple_pat.elements, 0..) |elem, i| {
                         if (elem.kind == .identifier) {
                             const elem_ident = elem.kind.identifier;
-                            try self.writer.print("auto {s} = {s}._{d};", .{ elem_ident.name.name, temp, i });
+                            // Use void* for tuple element type (proper type inference would require full type system)
+                            try self.writer.print("void* {s} = {s}._{d};", .{ elem_ident.name.name, temp, i });
                             try self.writer.newline();
                         }
                     }
@@ -1253,11 +1296,12 @@ pub const CodeGenerator = struct {
                         if (field.pattern) |pat| {
                             if (pat.kind == .identifier) {
                                 const pat_ident = pat.kind.identifier;
-                                try self.writer.print("auto {s} = {s}.{s};", .{ pat_ident.name.name, temp, field.name.name });
+                                // Use void* for struct field type (proper type inference would require full type system)
+                                try self.writer.print("void* {s} = {s}.{s};", .{ pat_ident.name.name, temp, field.name.name });
                                 try self.writer.newline();
                             }
                         } else {
-                            try self.writer.print("auto {s} = {s}.{s};", .{ field.name.name, temp, field.name.name });
+                            try self.writer.print("void* {s} = {s}.{s};", .{ field.name.name, temp, field.name.name });
                             try self.writer.newline();
                         }
                     }
@@ -1742,9 +1786,13 @@ pub const CodeGenerator = struct {
             if (try self.generateBuiltinCall(name, call)) {
                 return;
             }
+            // User-defined function - mangle the name
+            const mangled = try self.mangleFunctionName(name, null);
+            try self.writer.write(mangled);
+        } else {
+            // Complex function expression (e.g., method calls, closures)
+            try self.generateExpr(call.function);
         }
-
-        try self.generateExpr(call.function);
         try self.writer.write("(");
 
         for (call.args, 0..) |arg, i| {

@@ -96,4 +96,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parser_tests.step);
     test_step.dependOn(&run_codegen_tests.step);
     test_step.dependOn(&run_checker_tests.step);
+
+    // Integration test runner executable
+    const integration_exe = b.addExecutable(.{
+        .name = "integration_tests",
+        .root_source_file = b.path("tests/runner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Integration tests depend on the compiler being built first
+    const run_integration = b.addRunArtifact(integration_exe);
+    run_integration.step.dependOn(b.getInstallStep());
+
+    const integration_step = b.step("test-integration", "Run integration tests");
+    integration_step.dependOn(&run_integration.step);
 }
