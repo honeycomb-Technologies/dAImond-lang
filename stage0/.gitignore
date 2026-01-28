@@ -8,3 +8,5 @@ zig-out/
 
 # Compiled binaries
 main
+hello
+/tmp/
