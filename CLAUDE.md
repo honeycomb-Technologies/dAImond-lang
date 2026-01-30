@@ -214,9 +214,18 @@ The runtime targets **C11** for portability.
 - Package management
 - Module system refinements
 
+## Documentation Maintenance
+
+**Always keep documentation in sync with code changes.** When making changes to the codebase, update the relevant documentation as part of the same commit or PR:
+
+- **README.md**: Update the "Current Status" checklist when features are completed or new milestones are added. Update "Project Structure" if files or directories are added/removed. Update code examples if syntax changes.
+- **CLAUDE.md**: Update the "Repository Structure" tree when files are added/removed. Update "Current Status" sections when features move between implemented and not-yet-implemented. Update "Build Commands", "CLI Options Reference", or "Code Conventions" if those change. Add new entries under "Common Development Tasks" for recurring workflows.
+- **Inline docs**: Update module-level `//!` comments and `///` doc comments in Zig source when public APIs change.
+
+Documentation that contradicts the code is worse than no documentation. When in doubt, check the source code -- it is always the ground truth.
+
 ## Important Notes
 
-- The README's "Current Status" checklist is outdated - it shows parser/checker/codegen as TODO, but they are implemented. The source code is the ground truth.
 - The `.gitignore` in `stage0/` excludes `*.c` files (generated output) but includes `!src/*.c` to allow runtime C source files.
 - Zig version is pinned to 0.13.0 via `.mise.toml`. Do not upgrade without testing compatibility.
 - The largest source files are `codegen.zig` and `parser.zig` (each ~119KB). Changes to these require careful testing.
