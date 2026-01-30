@@ -28,40 +28,62 @@ zig build
 # Compile a dAImond file
 ./zig-out/bin/daimond examples/hello.dm
 
+# Compile and run in one step
+./zig-out/bin/daimond run examples/hello.dm
+
 # View tokens (for debugging)
 ./zig-out/bin/daimond lex examples/hello.dm
+
+# View AST (for debugging)
+./zig-out/bin/daimond parse examples/hello.dm
+
+# Type check only
+./zig-out/bin/daimond check examples/hello.dm
 ```
 
 ### Running Tests
 
 ```bash
 cd stage0
+
+# Unit tests (all compiler modules)
 zig build test
+
+# Integration tests (compiles and runs .dm test programs)
+zig build test-integration
 ```
 
 ## Project Structure
 
 ```
 dAImond-lang/
-├── stage0/              # Stage 0 compiler (written in Zig)
+├── stage0/                    # Stage 0 compiler (written in Zig)
+│   ├── build.zig              # Zig build configuration
+│   ├── .mise.toml             # Tool version pinning (Zig 0.13.0)
 │   ├── src/
-│   │   ├── main.zig     # Entry point
-│   │   ├── lexer.zig    # Lexical analyzer
-│   │   ├── parser.zig   # Parser (TODO)
-│   │   ├── checker.zig  # Type checker (TODO)
-│   │   └── codegen.zig  # C code generator (TODO)
-│   ├── tests/
-│   └── build.zig
-├── stage1/              # Stage 1 compiler (written in dAImond, TODO)
-├── stdlib/              # Standard library (TODO)
-├── examples/            # Example programs
-│   ├── hello.dm         # Hello World
-│   └── calculator.dm    # Scientific calculator
-├── tests/               # Test programs
-│   ├── arithmetic.dm
-│   ├── structs.dm
-│   └── generics.dm
-└── docs/                # Documentation
+│   │   ├── main.zig           # CLI entry point and pipeline orchestration
+│   │   ├── lexer.zig          # Lexical analyzer
+│   │   ├── parser.zig         # Recursive descent + Pratt parser
+│   │   ├── ast.zig            # AST node type definitions
+│   │   ├── types.zig          # Type system, inference, effects
+│   │   ├── checker.zig        # Type checker, symbol tables, unification
+│   │   ├── codegen.zig        # C11 code generator
+│   │   └── errors.zig         # Diagnostic reporting, colored output
+│   ├── runtime/               # C runtime library
+│   │   ├── daimond_runtime.h  # Runtime API (strings, arenas, option/result, I/O)
+│   │   ├── daimond_runtime.c  # Runtime implementation
+│   │   └── test_runtime.c     # Runtime unit tests
+│   └── tests/
+│       └── runner.zig         # Integration test harness
+├── examples/                  # Example programs
+│   ├── hello.dm               # Hello World
+│   ├── arithmetic.dm          # Basic math operations
+│   ├── fibonacci.dm           # Recursive functions
+│   └── calculator.dm          # Scientific calculator
+└── tests/                     # Integration test programs
+    ├── arithmetic.dm          # Arithmetic validation
+    ├── structs.dm             # Struct/enum/pattern matching
+    └── generics.dm            # Generics and traits
 ```
 
 ## Language Overview
@@ -189,14 +211,27 @@ Stage 0 (Zig) → Stage 1 (dAImond) → Stage 2 (Self-compiled) → Stage 3 (LLV
 
 ## Current Status
 
+### Stage 0 Compiler (Complete)
 - [x] Project structure
-- [x] Lexer implementation
-- [x] Lexer tests
-- [ ] Parser
-- [ ] Type checker
-- [ ] C code generator
-- [ ] Standard library
-- [ ] Self-hosting
+- [x] Lexer with comprehensive token support
+- [x] Recursive descent + Pratt parser
+- [x] AST definitions for all language constructs
+- [x] Type system with Hindley-Milner inference and unification
+- [x] Type checker with symbol tables and scope management
+- [x] C11 code generator
+- [x] Error diagnostics with colored output
+- [x] C runtime library (strings, arenas, option/result, I/O)
+- [x] CLI with multiple commands (compile, run, lex, parse, check)
+- [x] Unit tests for all compiler modules
+- [x] Integration test harness
+
+### Upcoming
+- [ ] Code formatter (`fmt` command)
+- [ ] Standard library (`stdlib/`)
+- [ ] Stage 1 compiler (dAImond self-hosting)
+- [ ] LLVM backend
+- [ ] Package management
+- [ ] Module system refinements
 
 ## Design Principles
 
@@ -208,7 +243,7 @@ Stage 0 (Zig) → Stage 1 (dAImond) → Stage 2 (Self-compiled) → Stage 3 (LLV
 
 ## Contributing
 
-This project is in early development. See the implementation roadmap in `docs/spec.md`.
+This project is in early development. See `CLAUDE.md` for detailed development guidance.
 
 ## License
 
