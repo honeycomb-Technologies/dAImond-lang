@@ -522,6 +522,17 @@ pub const Lexer = struct {
                         return;
                     }
                 },
+                '/' => {
+                    // Check for C-style comment: //
+                    if (self.peekNext() == '/') {
+                        // Skip comment until end of line
+                        while (self.peek() != '\n' and !self.isAtEnd()) {
+                            _ = self.advance();
+                        }
+                    } else {
+                        return;
+                    }
+                },
                 else => return,
             }
         }

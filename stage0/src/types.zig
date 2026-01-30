@@ -661,6 +661,8 @@ pub const Type = union(enum) {
 /// Type environment for managing types during compilation
 pub const TypeContext = struct {
     allocator: Allocator,
+    /// Arena for type internal data (param arrays, element arrays, etc.)
+    arena: std.heap.ArenaAllocator,
     /// Interned types storage
     types: std.ArrayList(Type),
     /// Name to type ID mapping
@@ -678,6 +680,7 @@ pub const TypeContext = struct {
     pub fn init(allocator: Allocator) Self {
         var ctx = Self{
             .allocator = allocator,
+            .arena = std.heap.ArenaAllocator.init(allocator),
             .types = std.ArrayList(Type).init(allocator),
             .type_names = std.StringHashMap(TypeId).init(allocator),
             .next_type_var = 0,
@@ -691,12 +694,18 @@ pub const TypeContext = struct {
         return ctx;
     }
 
-    /// Clean up resources
+    /// Clean up resources - arena frees all type internal data
     pub fn deinit(self: *Self) void {
+        self.arena.deinit();
         self.types.deinit();
         self.type_names.deinit();
         self.trait_impls.deinit();
         self.substitutions.deinit();
+    }
+
+    /// Get arena allocator for type internal data
+    fn typeAllocator(self: *Self) Allocator {
+        return self.arena.allocator();
     }
 
     /// Register built-in primitive types
@@ -804,8 +813,8 @@ pub const TypeContext = struct {
 
     /// Create a tuple type
     pub fn makeTuple(self: *Self, elements: []const TypeId) !TypeId {
-        // Need to copy the slice
-        const copied = try self.allocator.dupe(TypeId, elements);
+        // Need to copy the slice using arena
+        const copied = try self.typeAllocator().dupe(TypeId, elements);
         return try self.intern(.{ .tuple = .{ .element_types = copied } });
     }
 
@@ -825,7 +834,7 @@ pub const TypeContext = struct {
         return_type: TypeId,
         effects: EffectSet,
     ) !TypeId {
-        const copied_params = try self.allocator.dupe(TypeId, params);
+        const copied_params = try self.typeAllocator().dupe(TypeId, params);
         return try self.intern(.{
             .function = .{
                 .param_types = copied_params,
@@ -856,7 +865,7 @@ pub const TypeContext = struct {
             .array => |a| try self.makeArray(try self.substitute(a.element_type, subs), a.size),
             .slice => |s| try self.makeSlice(try self.substitute(s.element_type, subs), s.is_mutable),
             .tuple => |t| {
-                var new_elements = try self.allocator.alloc(TypeId, t.element_types.len);
+                var new_elements = try self.typeAllocator().alloc(TypeId, t.element_types.len);
                 for (t.element_types, 0..) |elem, i| {
                     new_elements[i] = try self.substitute(elem, subs);
                 }
@@ -868,7 +877,7 @@ pub const TypeContext = struct {
                 if (r.region) |reg| try self.substitute(reg, subs) else null,
             ),
             .function => |f| {
-                var new_params = try self.allocator.alloc(TypeId, f.param_types.len);
+                var new_params = try self.typeAllocator().alloc(TypeId, f.param_types.len);
                 for (f.param_types, 0..) |param, i| {
                     new_params[i] = try self.substitute(param, subs);
                 }
@@ -895,7 +904,7 @@ pub const TypeContext = struct {
 
     /// Find implementations of a trait for a type
     pub fn findTraitImpls(self: *Self, trait_id: TypeId, type_id: TypeId) []const TraitImpl {
-        var results = std.ArrayList(TraitImpl).init(self.allocator);
+        var results = std.ArrayList(TraitImpl).init(self.typeAllocator());
         defer results.deinit();
 
         for (self.trait_impls.items) |impl| {
@@ -1090,7 +1099,7 @@ pub fn instantiateGeneric(
     const generic = ctx.get(generic_id) orelse return error.InvalidType;
 
     // Build substitution map from type parameters to arguments
-    var subs = std.AutoHashMap(TypeId, TypeId).init(ctx.allocator);
+    var subs = std.AutoHashMap(TypeId, TypeId).init(ctx.typeAllocator());
     defer subs.deinit();
 
     switch (generic) {
@@ -1125,7 +1134,7 @@ pub fn instantiateGeneric(
     return try ctx.intern(.{
         .generic_instance = .{
             .base_type = generic_id,
-            .type_args = try ctx.allocator.dupe(TypeId, type_args),
+            .type_args = try ctx.typeAllocator().dupe(TypeId, type_args),
         },
     });
 }

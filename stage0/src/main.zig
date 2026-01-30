@@ -816,6 +816,11 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     };
     defer allocator.free(source);
 
+    // Create arena for compilation data (AST, types, codegen)
+    var compile_arena = std.heap.ArenaAllocator.init(allocator);
+    defer compile_arena.deinit();
+    const compile_allocator = compile_arena.allocator();
+
     var total_timer = Timer.init(opts.verbose);
 
     try stdout.print("{s}Compiling '{s}'...{s}\n", .{ colors.bold(), path, colors.reset() });
@@ -845,7 +850,7 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var parse_timer = Timer.init(opts.verbose);
     try stdout.print("  [2/5] Parsing...", .{});
 
-    var parser = Parser.init(tokens, allocator);
+    var parser = Parser.init(tokens, compile_allocator);
     defer parser.deinit();
 
     const ast_result = parser.parse() catch |err| {
@@ -868,7 +873,7 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var check_timer = Timer.init(opts.verbose);
     try stdout.print("  [3/5] Type checking...", .{});
 
-    var type_checker = TypeChecker.init(allocator) catch |err| {
+    var type_checker = TypeChecker.init(compile_allocator) catch |err| {
         try stdout.print("\n{s}Error initializing type checker:{s} {}\n", .{
             colors.error_style(),
             colors.reset(),
@@ -908,8 +913,13 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var codegen_timer = Timer.init(opts.verbose);
     try stdout.print("  [4/5] Generating C code...", .{});
 
-    var code_generator = CodeGenerator.init(allocator);
+    var code_generator = CodeGenerator.init(compile_allocator);
     defer code_generator.deinit();
+
+    // Wire type context from type checker to code generator
+    if (type_checker.getTypeContext()) |ctx| {
+        code_generator.setTypeContext(ctx);
+    }
 
     const c_code = code_generator.generate(ast_result) catch |err| {
         try stdout.print("\n{s}Code generation error:{s} {}\n", .{
@@ -965,6 +975,13 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var cc_args = std.ArrayList([]const u8).init(allocator);
     defer cc_args.deinit();
 
+    // Track allocated strings that need to be freed after compilation
+    var temp_strings = std.ArrayList([]const u8).init(allocator);
+    defer {
+        for (temp_strings.items) |s| allocator.free(s);
+        temp_strings.deinit();
+    }
+
     // Try to find a C compiler (cc, gcc, clang)
     const cc_name = findCCompiler() orelse {
         try stdout.print("\n{s}Error:{s} No C compiler found (tried cc, gcc, clang)\n", .{
@@ -983,12 +1000,14 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     if (runtime_path) |rp| {
         const include_flag = try std.fmt.allocPrint(allocator, "-I{s}", .{rp});
         try cc_args.append(include_flag);
+        try temp_strings.append(include_flag);
 
         const runtime_c = try std.fmt.allocPrint(allocator, "{s}/daimond_runtime.c", .{rp});
 
         // Only add runtime.c if it exists
         if (std.fs.cwd().access(runtime_c, .{})) |_| {
             try cc_args.append(runtime_c);
+            try temp_strings.append(runtime_c);
         } else |_| {
             allocator.free(runtime_c);
         }
@@ -1000,6 +1019,8 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     // Add standard flags
     try cc_args.append("-std=c11");
     try cc_args.append("-Wall");
+    try cc_args.append("-Wextra");
+    try cc_args.append("-pedantic");
 
     if (opts.verbose) {
         try stdout.print("\n        Running: ", .{});
