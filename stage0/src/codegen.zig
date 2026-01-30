@@ -250,10 +250,17 @@ pub const CodeGenerator = struct {
     // Track generated types for forward declarations
     generated_structs: std.StringHashMap(void),
     generated_enums: std.StringHashMap(void),
+    simple_enums: std.StringHashMap(void),
     forward_declarations: std.ArrayList([]const u8),
 
     // Track impl methods for later generation
     impl_methods: std.ArrayList(ImplMethodInfo),
+
+    // Track variable types for type inference during codegen
+    variable_types: std.StringHashMap([]const u8),
+
+    // Track function return types for type inference during codegen
+    function_return_types: std.StringHashMap([]const u8),
 
     // Unique ID counter for temporary variables
     temp_counter: usize,
@@ -287,8 +294,11 @@ pub const CodeGenerator = struct {
             .type_context = null,
             .generated_structs = std.StringHashMap(void).init(allocator),
             .generated_enums = std.StringHashMap(void).init(allocator),
+            .simple_enums = std.StringHashMap(void).init(allocator),
             .forward_declarations = std.ArrayList([]const u8).init(allocator),
             .impl_methods = std.ArrayList(ImplMethodInfo).init(allocator),
+            .variable_types = std.StringHashMap([]const u8).init(allocator),
+            .function_return_types = std.StringHashMap([]const u8).init(allocator),
             .temp_counter = 0,
             .lambda_depth = 0,
             .current_function = null,
@@ -303,8 +313,11 @@ pub const CodeGenerator = struct {
         self.writer.deinit();
         self.generated_structs.deinit();
         self.generated_enums.deinit();
+        self.simple_enums.deinit();
         self.forward_declarations.deinit();
         self.impl_methods.deinit();
+        self.variable_types.deinit();
+        self.function_return_types.deinit();
         self.region_stack.deinit();
     }
 
@@ -591,6 +604,51 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
+        // String concatenation
+        try self.writer.writeLine("static inline dm_string dm_string_concat(dm_string a, dm_string b) {");
+        self.writer.indent();
+        try self.writer.writeLine("size_t new_len = a.len + b.len;");
+        try self.writer.writeLine("char* buf = (char*)malloc(new_len + 1);");
+        try self.writer.writeLine("memcpy(buf, a.data, a.len);");
+        try self.writer.writeLine("memcpy(buf + a.len, b.data, b.len);");
+        try self.writer.writeLine("buf[new_len] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = buf, .len = new_len, .capacity = new_len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Int to string conversion
+        try self.writer.writeLine("static inline dm_string dm_int_to_string(int64_t n) {");
+        self.writer.indent();
+        try self.writer.writeLine("char buf[32];");
+        try self.writer.writeLine("int len = snprintf(buf, sizeof(buf), \"%lld\", (long long)n);");
+        try self.writer.writeLine("char* result = (char*)malloc(len + 1);");
+        try self.writer.writeLine("memcpy(result, buf, len + 1);");
+        try self.writer.writeLine("return (dm_string){ .data = result, .len = (size_t)len, .capacity = (size_t)len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Bool to string conversion
+        try self.writer.writeLine("static inline dm_string dm_bool_to_string(bool b) {");
+        self.writer.indent();
+        try self.writer.writeLine("return b ? dm_string_from_cstr(\"true\") : dm_string_from_cstr(\"false\");");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Float to string conversion
+        try self.writer.writeLine("static inline dm_string dm_float_to_string(double f) {");
+        self.writer.indent();
+        try self.writer.writeLine("char buf[64];");
+        try self.writer.writeLine("int len = snprintf(buf, sizeof(buf), \"%g\", f);");
+        try self.writer.writeLine("char* result = (char*)malloc(len + 1);");
+        try self.writer.writeLine("memcpy(result, buf, len + 1);");
+        try self.writer.writeLine("return (dm_string){ .data = result, .len = (size_t)len, .capacity = (size_t)len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
         try self.writer.writeLineComment("End of Runtime");
         try self.writer.blankLine();
     }
@@ -607,8 +665,11 @@ pub const CodeGenerator = struct {
                 try self.forward_declarations.append(name);
             },
             .enum_def => |e| {
-                const name = try self.mangleTypeName(e.name.name);
-                try self.forward_declarations.append(name);
+                // Simple enums don't need struct forward declarations
+                if (!isSimpleEnum(e)) {
+                    const name = try self.mangleTypeName(e.name.name);
+                    try self.forward_declarations.append(name);
+                }
             },
             else => {},
         }
@@ -620,7 +681,6 @@ pub const CodeGenerator = struct {
 
         try self.writer.writeLineComment("Forward Declarations");
         for (self.forward_declarations.items) |name| {
-            try self.writer.printLine("struct {s};", .{name});
             try self.writer.printLine("typedef struct {s} {s};", .{ name, name });
         }
         try self.writer.blankLine();
@@ -672,10 +732,9 @@ pub const CodeGenerator = struct {
             return "int8_t";
         } else if (std.mem.eql(u8, type_name, "u8") or std.mem.eql(u8, type_name, "byte")) {
             return "uint8_t";
-        } else if (std.mem.eql(u8, type_name, "i128")) {
-            return "__int128";
-        } else if (std.mem.eql(u8, type_name, "u128")) {
-            return "unsigned __int128";
+        } else if (std.mem.eql(u8, type_name, "i128") or std.mem.eql(u8, type_name, "u128")) {
+            // 128-bit integers not supported in C11 standard; use int64_t as fallback
+            return "int64_t";
         } else if (std.mem.eql(u8, type_name, "float") or std.mem.eql(u8, type_name, "f64")) {
             return "double";
         } else if (std.mem.eql(u8, type_name, "f32")) {
@@ -689,6 +748,11 @@ pub const CodeGenerator = struct {
         } else if (std.mem.eql(u8, type_name, "void") or std.mem.eql(u8, type_name, "unit")) {
             return "void";
         } else if (std.mem.eql(u8, type_name, "Option")) {
+            // Check if user defined their own Option type
+            const mangled = try self.mangleTypeName(type_name);
+            if (self.generated_enums.contains(mangled) or self.generated_structs.contains(mangled)) {
+                return mangled;
+            }
             // Generic Option
             if (named.generic_args) |args| {
                 if (args.len > 0) {
@@ -697,6 +761,11 @@ pub const CodeGenerator = struct {
             }
             return "dm_option_void";
         } else if (std.mem.eql(u8, type_name, "Result")) {
+            // Check if user defined their own Result type
+            const mangled = try self.mangleTypeName(type_name);
+            if (self.generated_enums.contains(mangled) or self.generated_structs.contains(mangled)) {
+                return mangled;
+            }
             // Generic Result
             if (named.generic_args) |args| {
                 if (args.len >= 2) {
@@ -707,6 +776,11 @@ pub const CodeGenerator = struct {
             }
             return "dm_result_void";
         } else if (std.mem.eql(u8, type_name, "List") or std.mem.eql(u8, type_name, "Vec")) {
+            // Check if user defined their own List/Vec type
+            const mangled = try self.mangleTypeName(type_name);
+            if (self.generated_enums.contains(mangled) or self.generated_structs.contains(mangled)) {
+                return mangled;
+            }
             // Generic List
             if (named.generic_args) |args| {
                 if (args.len > 0) {
@@ -848,7 +922,6 @@ pub const CodeGenerator = struct {
 
     /// Infer C type from an expression (for let bindings without type annotations)
     fn inferCTypeFromExpr(self: *Self, expr: *Expr) []const u8 {
-        _ = self;
         return switch (expr.kind) {
             .literal => |lit| switch (lit.kind) {
                 .int => |int_lit| if (int_lit.suffix) |suffix| blk: {
@@ -872,18 +945,138 @@ pub const CodeGenerator = struct {
                 .bool => "bool",
                 .null_lit => "void*",
             },
-            .binary => "int64_t", // Most binary ops produce integers
-            .unary => "int64_t",
-            .function_call => "void*", // Unknown return type, use void*
-            .struct_literal => "void*", // Would need type resolution
+            .binary => |bin| blk: {
+                // Comparison and logical ops produce bool
+                break :blk switch (bin.op) {
+                    .eq, .ne, .lt, .le, .gt, .ge, .@"and", .@"or", .in => "bool",
+                    .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .shl, .shr => inner: {
+                        // Check if either operand is a float or string
+                        const left_type = self.inferCTypeFromExpr(bin.left);
+                        if (std.mem.eql(u8, left_type, "double") or std.mem.eql(u8, left_type, "float")) break :inner left_type;
+                        if (std.mem.eql(u8, left_type, "dm_string")) break :inner "dm_string";
+                        const right_type = self.inferCTypeFromExpr(bin.right);
+                        if (std.mem.eql(u8, right_type, "double") or std.mem.eql(u8, right_type, "float")) break :inner right_type;
+                        if (std.mem.eql(u8, right_type, "dm_string")) break :inner "dm_string";
+                        break :inner "int64_t";
+                    },
+                };
+            },
+            .unary => |un| blk: {
+                break :blk switch (un.op) {
+                    .not => "bool",
+                    .neg, .bit_not => self.inferCTypeFromExpr(un.operand),
+                    .deref, .ref => "void*",
+                };
+            },
+            .function_call => |call| blk: {
+                // Try to look up the function's return type from declarations
+                if (call.function.kind == .identifier) {
+                    const name = call.function.kind.identifier.name;
+                    // Check known built-in return types
+                    if (std.mem.eql(u8, name, "len")) break :blk "int64_t";
+                    if (std.mem.eql(u8, name, "to_string") or
+                        std.mem.eql(u8, name, "int_to_string") or
+                        std.mem.eql(u8, name, "bool_to_string") or
+                        std.mem.eql(u8, name, "float_to_string")) break :blk "dm_string";
+                    // Look up in function declarations tracked during generation
+                    if (self.lookupFunctionReturnType(name)) |ret_type| break :blk ret_type;
+                }
+                // Check if calling an enum variant constructor: Type::Variant(args)
+                if (call.function.kind == .path) {
+                    const path = call.function.kind.path;
+                    if (path.segments.len >= 2) {
+                        break :blk self.mangleTypeName(path.segments[0].name) catch "int64_t";
+                    }
+                }
+                break :blk "int64_t"; // Default to int64_t rather than void*
+            },
+            .struct_literal => |lit| blk: {
+                if (lit.type_path) |path| {
+                    if (path.segments.len > 0) {
+                        const type_name = path.segments[path.segments.len - 1].name;
+                        break :blk self.mangleTypeName(type_name) catch "void*";
+                    }
+                }
+                break :blk "void*";
+            },
+            .enum_literal => |lit| blk: {
+                if (lit.type_path) |path| {
+                    if (path.segments.len > 0) {
+                        const type_name = path.segments[path.segments.len - 1].name;
+                        break :blk self.mangleTypeName(type_name) catch "void*";
+                    }
+                }
+                break :blk "void*";
+            },
+            .if_expr => |if_e| blk: {
+                // Infer from the then branch result
+                if (if_e.then_branch.result) |result| {
+                    break :blk self.inferCTypeFromExpr(result);
+                }
+                break :blk "void*";
+            },
+            .match_expr => |match| blk: {
+                // Infer from the first arm body
+                if (match.arms.len > 0) {
+                    switch (match.arms[0].body) {
+                        .expression => |arm_expr| break :blk self.inferCTypeFromExpr(arm_expr),
+                        .block => |block| {
+                            if (block.result) |result| break :blk self.inferCTypeFromExpr(result);
+                        },
+                    }
+                }
+                break :blk "void*";
+            },
+            .block => |block| blk: {
+                if (block.result) |result| {
+                    break :blk self.inferCTypeFromExpr(result);
+                }
+                break :blk "void*";
+            },
+            .identifier => |ident| blk: {
+                // Look up in known variable types
+                if (self.lookupVariableType(ident.name)) |var_type| break :blk var_type;
+                break :blk "int64_t"; // Default to int64_t for identifiers
+            },
+            .field_access => "int64_t", // Need type info for proper inference
+            .cast => |cast| blk: {
+                break :blk self.mapType(cast.target_type) catch "void*";
+            },
+            .grouped => |inner| self.inferCTypeFromExpr(inner),
+            .path => |path| blk: {
+                // Multi-segment path like Color::Red -> type is the first segment (the enum name)
+                if (path.segments.len >= 2) {
+                    break :blk self.mangleTypeName(path.segments[0].name) catch "int64_t";
+                }
+                break :blk "int64_t";
+            },
             .array_literal => "void*",
             .tuple_literal => "void*",
-            .if_expr => "void*",
-            .match_expr => "void*",
-            .block => "void*",
             .lambda => "void*",
-            else => "void*", // Fallback for unknown expressions
+            .type_check => "bool",
+            .range => "void*",
+            else => "int64_t", // Default to int64_t rather than void*
         };
+    }
+
+    /// Look up the return type of a known function (from declarations already processed)
+    fn lookupFunctionReturnType(self: *Self, name: []const u8) ?[]const u8 {
+        return self.function_return_types.get(name);
+    }
+
+    /// Look up the type of a known variable
+    fn lookupVariableType(self: *Self, name: []const u8) ?[]const u8 {
+        return self.variable_types.get(name);
+    }
+
+    /// Track a variable's C type
+    fn trackVariableType(self: *Self, name: []const u8, c_type: []const u8) void {
+        self.variable_types.put(name, c_type) catch {};
+    }
+
+    /// Track a function's return C type
+    fn trackFunctionReturnType(self: *Self, name: []const u8, c_type: []const u8) void {
+        self.function_return_types.put(name, c_type) catch {};
     }
 
     // ========================================================================
@@ -898,22 +1091,33 @@ pub const CodeGenerator = struct {
         if (self.generated_structs.contains(name)) return;
         try self.generated_structs.put(name, {});
 
-        try self.writer.printLine("struct {s}", .{name});
-        try self.writer.openBrace();
+        try self.writer.printLine("typedef struct {s} {{", .{name});
+        self.writer.indent();
 
         for (s.fields) |field| {
             const field_type = try self.mapType(field.type_expr);
             try self.writer.printLine("{s} {s};", .{ field_type, field.name.name });
         }
 
-        try self.writer.closeBrace();
-        try self.writer.printLine("typedef struct {s} {s};", .{ name, name });
+        self.writer.dedent();
+        try self.writer.printLine("}} {s};", .{name});
         try self.writer.blankLine();
     }
 
     // ========================================================================
     // ENUM GENERATION (Tagged Unions)
     // ========================================================================
+
+    /// Check if an enum has only unit variants (no payloads)
+    fn isSimpleEnum(e: *EnumDecl) bool {
+        for (e.variants) |variant| {
+            switch (variant.payload) {
+                .none => {},
+                .tuple, .struct_fields => return false,
+            }
+        }
+        return true;
+    }
 
     /// Generate C enum/tagged union
     fn generateEnum(self: *Self, e: *EnumDecl) !void {
@@ -922,7 +1126,26 @@ pub const CodeGenerator = struct {
         if (self.generated_enums.contains(name)) return;
         try self.generated_enums.put(name, {});
 
-        // Generate tag enum
+        // Simple enum optimization: all-unit-variant enums become plain C enums
+        if (isSimpleEnum(e)) {
+            try self.simple_enums.put(name, {});
+
+            try self.writer.printLine("typedef enum {s} {{", .{name});
+            self.writer.indent();
+            for (e.variants, 0..) |variant, i| {
+                try self.writer.print("{s}_{s}", .{ name, variant.name.name });
+                if (i < e.variants.len - 1) {
+                    try self.writer.write(",");
+                }
+                try self.writer.newline();
+            }
+            self.writer.dedent();
+            try self.writer.printLine("}} {s};", .{name});
+            try self.writer.blankLine();
+            return;
+        }
+
+        // Generate tag enum for complex enums
         try self.writer.printLine("typedef enum {s}_tag {{", .{name});
         self.writer.indent();
         for (e.variants, 0..) |variant, i| {
@@ -943,13 +1166,14 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("union {");
         self.writer.indent();
 
+        var has_payload_variant = false;
         for (e.variants) |variant| {
             switch (variant.payload) {
                 .none => {
-                    // Unit variant - no payload
-                    try self.writer.printLine("char {s}; // unit variant placeholder", .{variant.name.name});
+                    // Unit variant in a mixed enum - no union field needed
                 },
                 .tuple => |tuple_types| {
+                    has_payload_variant = true;
                     if (tuple_types.len == 1) {
                         const payload_type = try self.mapType(tuple_types[0]);
                         try self.writer.printLine("{s} {s};", .{ payload_type, variant.name.name });
@@ -964,6 +1188,7 @@ pub const CodeGenerator = struct {
                     }
                 },
                 .struct_fields => |fields| {
+                    has_payload_variant = true;
                     // Struct variant
                     try self.writer.print("struct {{ ", .{});
                     for (fields) |field| {
@@ -973,6 +1198,11 @@ pub const CodeGenerator = struct {
                     try self.writer.printLine("}} {s};", .{variant.name.name});
                 },
             }
+        }
+
+        // If no payload variants exist in a mixed enum, add a placeholder
+        if (!has_payload_variant) {
+            try self.writer.writeLine("char _placeholder;");
         }
 
         self.writer.dedent();
@@ -1092,30 +1322,42 @@ pub const CodeGenerator = struct {
     // FUNCTION GENERATION
     // ========================================================================
 
+    /// Check if a method has a self parameter (first param named "self")
+    fn methodHasSelf(func: *FunctionDecl) bool {
+        if (func.params.len > 0) {
+            return std.mem.eql(u8, func.params[0].name.name, "self");
+        }
+        return false;
+    }
+
     /// Generate function prototype
     fn generateFunctionPrototype(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8) !void {
         const func_name = try self.mangleFunctionName(func.name.name, type_prefix);
         const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+        const has_self = type_prefix != null and methodHasSelf(func);
 
         try self.writer.print("{s} {s}(", .{ ret_type, func_name });
 
-        // If this is a method, add self parameter
-        if (type_prefix) |prefix| {
-            const mangled_type = try self.mangleTypeName(prefix);
+        // If this is a method with self, add typed self pointer parameter
+        if (has_self) {
+            const mangled_type = try self.mangleTypeName(type_prefix.?);
             try self.writer.print("{s}* self", .{mangled_type});
-            if (func.params.len > 0) {
+            if (func.params.len > 1) {
                 try self.writer.write(", ");
             }
         }
 
-        // Generate parameter list
-        for (func.params, 0..) |param, i| {
-            if (i > 0) try self.writer.write(", ");
+        // Generate parameter list (skip self param if present)
+        const start_idx: usize = if (has_self) 1 else 0;
+        var first = true;
+        for (func.params[start_idx..]) |param| {
+            if (!first) try self.writer.write(", ");
+            first = false;
             const param_type = try self.mapType(param.type_expr);
             try self.writer.print("{s} {s}", .{ param_type, param.name.name });
         }
 
-        if (type_prefix == null and func.params.len == 0) {
+        if (!has_self and type_prefix == null and func.params.len == 0) {
             try self.writer.write("void");
         }
 
@@ -1131,28 +1373,39 @@ pub const CodeGenerator = struct {
         self.current_function_is_void = is_void;
         defer self.current_function_is_void = false;
 
+        const has_self = type_prefix != null and methodHasSelf(func);
         const func_name = try self.mangleFunctionName(func.name.name, type_prefix);
         const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
 
+        // Track function return type - also track with type prefix for method calls
+        self.trackFunctionReturnType(func.name.name, ret_type);
+        if (type_prefix) |prefix| {
+            const full_name = try std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ prefix, func.name.name });
+            self.trackFunctionReturnType(full_name, ret_type);
+        }
+
         try self.writer.print("{s} {s}(", .{ ret_type, func_name });
 
-        // If this is a method, add self parameter
-        if (type_prefix) |prefix| {
-            const mangled_type = try self.mangleTypeName(prefix);
+        // If this is a method with self, add typed self pointer parameter
+        if (has_self) {
+            const mangled_type = try self.mangleTypeName(type_prefix.?);
             try self.writer.print("{s}* self", .{mangled_type});
-            if (func.params.len > 0) {
+            if (func.params.len > 1) {
                 try self.writer.write(", ");
             }
         }
 
-        // Generate parameter list
-        for (func.params, 0..) |param, i| {
-            if (i > 0) try self.writer.write(", ");
+        // Generate parameter list (skip self param if present)
+        const start_idx: usize = if (has_self) 1 else 0;
+        var first = true;
+        for (func.params[start_idx..]) |param| {
+            if (!first) try self.writer.write(", ");
+            first = false;
             const param_type = try self.mapType(param.type_expr);
             try self.writer.print("{s} {s}", .{ param_type, param.name.name });
         }
 
-        if (type_prefix == null and func.params.len == 0) {
+        if (!has_self and type_prefix == null and func.params.len == 0) {
             try self.writer.write("void");
         }
 
@@ -1160,6 +1413,12 @@ pub const CodeGenerator = struct {
 
         // Generate body
         if (func.body) |body| {
+            // Track parameter types for use in body (skip self)
+            for (func.params[start_idx..]) |param| {
+                const param_type = try self.mapType(param.type_expr);
+                self.trackVariableType(param.name.name, param_type);
+            }
+
             switch (body) {
                 .block => |block| {
                     try self.writer.beginBlock();
@@ -1210,8 +1469,15 @@ pub const CodeGenerator = struct {
         if (block.result) |result| {
             if (self.current_function_is_void) {
                 // For void functions, just execute the expression (don't return it)
-                try self.generateExpr(result);
-                try self.writer.writeLine(";");
+                // Use statement form for if/match to avoid ternary expressions
+                if (result.kind == .match_expr) {
+                    try self.generateMatchStatement(result.kind.match_expr);
+                } else if (result.kind == .if_expr) {
+                    try self.generateIfStatement(result.kind.if_expr);
+                } else {
+                    try self.generateExpr(result);
+                    try self.writer.writeLine(";");
+                }
             } else {
                 try self.writer.write("return ");
                 try self.generateExpr(result);
@@ -1234,8 +1500,15 @@ pub const CodeGenerator = struct {
             .continue_stmt => |cont| try self.generateContinue(cont),
             .region_block => |region| try self.generateRegionBlock(region),
             .expression => |expr| {
-                try self.generateExpr(expr);
-                try self.writer.writeLine(";");
+                // If the expression is an if or match, generate as statement form
+                if (expr.kind == .if_expr) {
+                    try self.generateIfStatement(expr.kind.if_expr);
+                } else if (expr.kind == .match_expr) {
+                    try self.generateMatchStatement(expr.kind.match_expr);
+                } else {
+                    try self.generateExpr(expr);
+                    try self.writer.writeLine(";");
+                }
             },
             .assignment => |assign| try self.generateAssignment(assign),
             .discard => |discard| {
@@ -1259,6 +1532,8 @@ pub const CodeGenerator = struct {
         // Handle pattern
         switch (let.pattern.kind) {
             .identifier => |ident| {
+                // Track this variable's type for later inference
+                self.trackVariableType(ident.name.name, type_str);
                 try self.writer.print("{s} {s}", .{ type_str, ident.name.name });
                 if (let.value) |val| {
                     try self.writer.write(" = ");
@@ -1369,6 +1644,25 @@ pub const CodeGenerator = struct {
         try self.generateExpr(match.scrutinee);
         try self.writer.writeLine(";");
 
+        // Wrap match in a block scope for pattern bindings
+        try self.writer.openBrace();
+
+        // Pre-emit identifier pattern bindings for arms with guards
+        // This ensures the bound variable is available in the guard condition
+        var emitted_bindings = std.StringHashMap(void).init(self.allocator);
+        defer emitted_bindings.deinit();
+
+        for (match.arms) |arm| {
+            if (arm.pattern.kind == .identifier and arm.guard != null) {
+                const ident = arm.pattern.kind.identifier;
+                if (!emitted_bindings.contains(ident.name.name)) {
+                    try self.writer.printLine("{s} {s} = {s};", .{ scrutinee_type, ident.name.name, temp });
+                    self.trackVariableType(ident.name.name, scrutinee_type);
+                    try emitted_bindings.put(ident.name.name, {});
+                }
+            }
+        }
+
         // Generate if-else chain for pattern matching
         for (match.arms, 0..) |arm, i| {
             if (i == 0) {
@@ -1389,14 +1683,21 @@ pub const CodeGenerator = struct {
             try self.writer.write(")");
             try self.writer.beginBlock();
 
-            // Generate pattern bindings
-            try self.generatePatternBindings(arm.pattern, temp);
+            // Generate pattern bindings (skip identifier patterns that were pre-emitted)
+            if (!(arm.pattern.kind == .identifier and arm.guard != null)) {
+                try self.generatePatternBindings(arm.pattern, temp, scrutinee_type);
+            }
 
             // Generate arm body
             switch (arm.body) {
                 .expression => |expr| {
-                    try self.generateExpr(expr);
-                    try self.writer.writeLine(";");
+                    // If the arm body is a block expression, generate it as a block (not a GCC statement expr)
+                    if (expr.kind == .block) {
+                        try self.generateBlock(expr.kind.block);
+                    } else {
+                        try self.generateExpr(expr);
+                        try self.writer.writeLine(";");
+                    }
                 },
                 .block => |block| try self.generateBlock(block),
             }
@@ -1405,14 +1706,22 @@ pub const CodeGenerator = struct {
         }
 
         try self.writer.newline();
+        try self.writer.closeBrace();
     }
 
     /// Generate pattern condition for match
     fn generatePatternCondition(self: *Self, pattern: *Pattern, scrutinee: []const u8) anyerror!void {
         switch (pattern.kind) {
             .literal => |lit| {
-                try self.writer.print("{s} == ", .{scrutinee});
-                try self.generateLiteral(lit);
+                // For string literals, use dm_string_eq
+                if (lit.kind == .string) {
+                    try self.writer.print("dm_string_eq({s}, dm_string_from_cstr(", .{scrutinee});
+                    try self.generateLiteral(lit);
+                    try self.writer.write("))");
+                } else {
+                    try self.writer.print("{s} == ", .{scrutinee});
+                    try self.generateLiteral(lit);
+                }
             },
             .identifier => {
                 // Identifier pattern always matches
@@ -1422,12 +1731,17 @@ pub const CodeGenerator = struct {
                 try self.writer.write("true");
             },
             .enum_variant => |variant| {
-                // Check tag
+                // Check tag/value for enum variant
                 const variant_name = variant.variant.name;
                 if (variant.type_path) |path| {
                     const type_name = path.segments[path.segments.len - 1].name;
                     const mangled = try self.mangleTypeName(type_name);
-                    try self.writer.print("{s}.tag == {s}_tag_{s}", .{ scrutinee, mangled, variant_name });
+                    // Check if this is a simple enum (plain C enum vs tagged union)
+                    if (self.simple_enums.contains(mangled)) {
+                        try self.writer.print("{s} == {s}_{s}", .{ scrutinee, mangled, variant_name });
+                    } else {
+                        try self.writer.print("{s}.tag == {s}_tag_{s}", .{ scrutinee, mangled, variant_name });
+                    }
                 } else {
                     try self.writer.print("{s}.tag == {s}", .{ scrutinee, variant_name });
                 }
@@ -1464,26 +1778,36 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate pattern bindings
-    /// Note: Without full type information, we use void* for pattern-bound variables.
-    /// A more sophisticated implementation would track types through pattern matching.
-    fn generatePatternBindings(self: *Self, pattern: *Pattern, scrutinee: []const u8) anyerror!void {
+    fn generatePatternBindings(self: *Self, pattern: *Pattern, scrutinee: []const u8, scrutinee_type: []const u8) anyerror!void {
         switch (pattern.kind) {
             .identifier => |ident| {
-                // Bind identifier to the scrutinee value (use void* as generic type)
-                try self.writer.printLine("void* {s} = (void*){s};", .{ ident.name.name, scrutinee });
+                // Bind identifier to the scrutinee value with proper type
+                try self.writer.printLine("{s} {s} = {s};", .{ scrutinee_type, ident.name.name, scrutinee });
+                self.trackVariableType(ident.name.name, scrutinee_type);
             },
             .enum_variant => |variant| {
                 switch (variant.payload) {
                     .none => {},
                     .tuple => |patterns| {
-                        for (patterns, 0..) |pat, i| {
-                            if (pat.kind == .identifier) {
-                                try self.writer.printLine("void* {s} = {s}.data.{s}._{d};", .{
-                                    pat.kind.identifier.name.name,
-                                    scrutinee,
-                                    variant.variant.name,
-                                    i,
-                                });
+                        if (patterns.len == 1 and patterns[0].kind == .identifier) {
+                            // Single payload: access union field directly
+                            try self.writer.printLine("int64_t {s} = {s}.data.{s};", .{
+                                patterns[0].kind.identifier.name.name,
+                                scrutinee,
+                                variant.variant.name,
+                            });
+                            self.trackVariableType(patterns[0].kind.identifier.name.name, "int64_t");
+                        } else {
+                            for (patterns, 0..) |pat, i| {
+                                if (pat.kind == .identifier) {
+                                    try self.writer.printLine("int64_t {s} = {s}.data.{s}._{d};", .{
+                                        pat.kind.identifier.name.name,
+                                        scrutinee,
+                                        variant.variant.name,
+                                        i,
+                                    });
+                                    self.trackVariableType(pat.kind.identifier.name.name, "int64_t");
+                                }
                             }
                         }
                     },
@@ -1491,16 +1815,51 @@ pub const CodeGenerator = struct {
                         for (fields) |field| {
                             if (field.pattern) |pat| {
                                 if (pat.kind == .identifier) {
-                                    try self.writer.printLine("void* {s} = {s}.data.{s}.{s};", .{
+                                    try self.writer.printLine("int64_t {s} = {s}.data.{s}.{s};", .{
                                         pat.kind.identifier.name.name,
                                         scrutinee,
                                         variant.variant.name,
                                         field.name.name,
                                     });
+                                    self.trackVariableType(pat.kind.identifier.name.name, "int64_t");
                                 }
                             }
                         }
                     },
+                }
+            },
+            .tuple => |tuple_pat| {
+                for (tuple_pat.elements, 0..) |elem, i| {
+                    if (elem.kind == .identifier) {
+                        try self.writer.printLine("int64_t {s} = {s}._{d};", .{
+                            elem.kind.identifier.name.name,
+                            scrutinee,
+                            i,
+                        });
+                        self.trackVariableType(elem.kind.identifier.name.name, "int64_t");
+                    }
+                }
+            },
+            .struct_pattern => |struct_pat| {
+                for (struct_pat.fields) |field| {
+                    if (field.pattern) |pat| {
+                        if (pat.kind == .identifier) {
+                            try self.writer.printLine("int64_t {s} = {s}.{s};", .{
+                                pat.kind.identifier.name.name,
+                                scrutinee,
+                                field.name.name,
+                            });
+                            self.trackVariableType(pat.kind.identifier.name.name, "int64_t");
+                        }
+                    } else {
+                        // Shorthand: `{ x }` binds field value to `x`
+                        try self.writer.printLine("int64_t {s} = {s}.{s};", .{
+                            field.name.name,
+                            scrutinee,
+                            field.name.name,
+                        });
+                        self.trackVariableType(field.name.name, "int64_t");
+                    }
                 }
             },
             else => {},
@@ -1590,6 +1949,9 @@ pub const CodeGenerator = struct {
         try self.generateBlock(loop.body);
         self.writer.dedent();
         try self.writer.writeLine("}");
+        if (loop.label) |label| {
+            try self.writer.printLine("{s}_end:;", .{label.name});
+        }
     }
 
     /// Generate break statement
@@ -1655,7 +2017,7 @@ pub const CodeGenerator = struct {
         switch (expr.kind) {
             .literal => |lit| try self.generateLiteral(lit),
             .identifier => |ident| try self.writer.write(ident.name),
-            .path => |path| try self.generatePath(path),
+            .path => |path| try self.generatePathExpr(path),
             .binary => |bin| try self.generateBinaryExpr(bin),
             .unary => |un| try self.generateUnaryExpr(un),
             .field_access => |field| try self.generateFieldAccess(field),
@@ -1740,14 +2102,66 @@ pub const CodeGenerator = struct {
 
     /// Generate path expression
     fn generatePath(self: *Self, path: Path) anyerror!void {
-        for (path.segments, 0..) |segment, i| {
-            if (i > 0) try self.writer.write("_");
-            try self.writer.write(segment.name);
+        if (path.segments.len >= 2) {
+            // Multi-segment path like Color::Red -> dm_Color_Red
+            // First segment is a type name that needs mangling
+            const mangled = try self.mangleTypeName(path.segments[0].name);
+            try self.writer.write(mangled);
+            for (path.segments[1..]) |segment| {
+                try self.writer.write("_");
+                try self.writer.write(segment.name);
+            }
+        } else {
+            for (path.segments, 0..) |segment, i| {
+                if (i > 0) try self.writer.write("_");
+                try self.writer.write(segment.name);
+            }
+        }
+    }
+
+    /// Generate a path expression, adding () for complex enum unit variants
+    fn generatePathExpr(self: *Self, path: Path) anyerror!void {
+        try self.generatePath(path);
+        // For complex enum unit variants accessed as standalone expressions (not function calls),
+        // we need to call the constructor function
+        if (path.segments.len >= 2) {
+            const mangled = try self.mangleTypeName(path.segments[0].name);
+            if (!self.simple_enums.contains(mangled) and self.generated_enums.contains(mangled)) {
+                try self.writer.write("()");
+            }
         }
     }
 
     /// Generate binary expression
     fn generateBinaryExpr(self: *Self, bin: *BinaryExpr) anyerror!void {
+        // Special handling for 'in' operator
+        if (bin.op == .in) {
+            try self.generateInExpr(bin);
+            return;
+        }
+
+        // Special handling for string equality
+        const left_type = self.inferCTypeFromExpr(bin.left);
+        if (std.mem.eql(u8, left_type, "dm_string") and (bin.op == .eq or bin.op == .ne)) {
+            if (bin.op == .ne) try self.writer.write("!");
+            try self.writer.write("dm_string_eq(");
+            try self.generateExpr(bin.left);
+            try self.writer.write(", ");
+            try self.generateExpr(bin.right);
+            try self.writer.write(")");
+            return;
+        }
+
+        // Special handling for string concatenation
+        if (std.mem.eql(u8, left_type, "dm_string") and bin.op == .add) {
+            try self.writer.write("dm_string_concat(");
+            try self.generateExpr(bin.left);
+            try self.writer.write(", ");
+            try self.generateExpr(bin.right);
+            try self.writer.write(")");
+            return;
+        }
+
         try self.writer.write("(");
         try self.generateExpr(bin.left);
 
@@ -1770,12 +2184,47 @@ pub const CodeGenerator = struct {
             .bit_xor => " ^ ",
             .shl => " << ",
             .shr => " >> ",
-            .in => " /* in */ ", // Custom handling needed
+            .in => unreachable, // Handled above
         };
 
         try self.writer.write(op_str);
         try self.generateExpr(bin.right);
         try self.writer.write(")");
+    }
+
+    /// Generate 'in' operator expression
+    fn generateInExpr(self: *Self, bin: *BinaryExpr) anyerror!void {
+        // If RHS is a range expression, generate range check
+        if (bin.right.kind == .range) {
+            const range = bin.right.kind.range;
+            try self.writer.write("(");
+            // left >= start
+            if (range.start) |start| {
+                try self.generateExpr(bin.left);
+                try self.writer.write(" >= ");
+                try self.generateExpr(start);
+            } else {
+                try self.writer.write("true");
+            }
+            try self.writer.write(" && ");
+            // left < end (or <= for inclusive)
+            if (range.end) |end| {
+                try self.generateExpr(bin.left);
+                if (range.inclusive) {
+                    try self.writer.write(" <= ");
+                } else {
+                    try self.writer.write(" < ");
+                }
+                try self.generateExpr(end);
+            } else {
+                try self.writer.write("true");
+            }
+            try self.writer.write(")");
+        } else {
+            // For non-range RHS, generate false as fallback
+            // (full collection membership would need runtime support)
+            try self.writer.write("false /* 'in' requires range RHS */");
+        }
     }
 
     /// Generate unary expression
@@ -1796,8 +2245,18 @@ pub const CodeGenerator = struct {
 
     /// Generate field access
     fn generateFieldAccess(self: *Self, field: *FieldAccess) anyerror!void {
+        // Check if the object is 'self' (a pointer in methods) - use -> instead of .
+        const is_pointer = if (field.object.kind == .identifier)
+            std.mem.eql(u8, field.object.kind.identifier.name, "self")
+        else
+            false;
+
         try self.generateExpr(field.object);
-        try self.writer.print(".{s}", .{field.field.name});
+        if (is_pointer) {
+            try self.writer.print("->{s}", .{field.field.name});
+        } else {
+            try self.writer.print(".{s}", .{field.field.name});
+        }
     }
 
     /// Generate index access
@@ -1810,10 +2269,17 @@ pub const CodeGenerator = struct {
 
     /// Generate method call (converted to function call)
     fn generateMethodCall(self: *Self, method: *MethodCall) anyerror!void {
-        // Convert obj.method(args) to Type_method(&obj, args)
-        // For simplicity, we'll generate obj.method(args) style for now
-        // which requires knowing the type
-        try self.writer.print("dm_{s}(", .{method.method.name});
+        // Convert obj.method(args) to dm_Type_method(&obj, args)
+        // Infer the type name from the object expression
+        const obj_type = self.inferCTypeFromExpr(method.object);
+
+        // Strip "dm_" prefix if present to get the raw type name for method lookup
+        const type_name = if (std.mem.startsWith(u8, obj_type, "dm_"))
+            obj_type[3..]
+        else
+            obj_type;
+
+        try self.writer.print("dm_{s}_{s}(", .{ type_name, method.method.name });
         try self.writer.write("&(");
         try self.generateExpr(method.object);
         try self.writer.write(")");
@@ -1837,6 +2303,10 @@ pub const CodeGenerator = struct {
             // User-defined function - mangle the name
             const mangled = try self.mangleFunctionName(name, null);
             try self.writer.write(mangled);
+        } else if (call.function.kind == .path) {
+            // Path as function target - use generatePath (not generatePathExpr)
+            // to avoid adding () for enum constructors that take arguments
+            try self.generatePath(call.function.kind.path);
         } else {
             // Complex function expression (e.g., method calls, closures)
             try self.generateExpr(call.function);
@@ -1854,23 +2324,29 @@ pub const CodeGenerator = struct {
     /// Generate built-in function calls
     fn generateBuiltinCall(self: *Self, name: []const u8, call: *FunctionCall) !bool {
         if (std.mem.eql(u8, name, "print")) {
-            try self.writer.write("printf(\"%s\", (");
             if (call.args.len > 0) {
-                try self.generateExpr(call.args[0].value);
+                try self.generatePrintCall(call.args[0].value, false);
             }
-            try self.writer.write(").data)");
             return true;
         } else if (std.mem.eql(u8, name, "println")) {
-            try self.writer.write("dm_println_str(");
             if (call.args.len > 0) {
-                try self.generateExpr(call.args[0].value);
+                try self.generatePrintCall(call.args[0].value, true);
+            } else {
+                try self.writer.write("putchar('\\n')");
             }
-            try self.writer.write(")");
             return true;
         } else if (std.mem.eql(u8, name, "panic")) {
             try self.writer.write("dm_panic(");
             if (call.args.len > 0) {
-                try self.generateExpr(call.args[0].value);
+                // panic takes a string argument - extract C string
+                const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                if (std.mem.eql(u8, arg_type, "dm_string")) {
+                    try self.writer.write("(");
+                    try self.generateExpr(call.args[0].value);
+                    try self.writer.write(").data");
+                } else {
+                    try self.generateExpr(call.args[0].value);
+                }
             } else {
                 try self.writer.write("\"panic\"");
             }
@@ -1883,9 +2359,99 @@ pub const CodeGenerator = struct {
             }
             try self.writer.write(", \"assertion failed\")");
             return true;
+        } else if (std.mem.eql(u8, name, "len")) {
+            // len(x) -> get length of string or array
+            if (call.args.len > 0) {
+                try self.writer.write("((int64_t)(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(").len)");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "int_to_string")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_int_to_string(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "bool_to_string")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_bool_to_string(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "float_to_string")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_float_to_string(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
         }
 
         return false;
+    }
+
+    /// Generate print/println with type-based dispatch
+    fn generatePrintCall(self: *Self, arg: *Expr, newline: bool) !void {
+        const arg_type = self.inferCTypeFromExpr(arg);
+        const nl_str = if (newline) "\\n" else "";
+
+        if (std.mem.eql(u8, arg_type, "dm_string")) {
+            if (newline) {
+                try self.writer.write("dm_println_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            } else {
+                try self.writer.write("dm_print_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            }
+        } else if (std.mem.eql(u8, arg_type, "int64_t") or
+            std.mem.eql(u8, arg_type, "int32_t") or
+            std.mem.eql(u8, arg_type, "int16_t") or
+            std.mem.eql(u8, arg_type, "int8_t"))
+        {
+            try self.writer.print("printf(\"%lld{s}\", (long long)(", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write("))");
+        } else if (std.mem.eql(u8, arg_type, "uint64_t") or
+            std.mem.eql(u8, arg_type, "uint32_t") or
+            std.mem.eql(u8, arg_type, "uint16_t") or
+            std.mem.eql(u8, arg_type, "uint8_t"))
+        {
+            try self.writer.print("printf(\"%llu{s}\", (unsigned long long)(", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write("))");
+        } else if (std.mem.eql(u8, arg_type, "double")) {
+            try self.writer.print("printf(\"%g{s}\", (double)(", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write("))");
+        } else if (std.mem.eql(u8, arg_type, "float")) {
+            try self.writer.print("printf(\"%g{s}\", (double)(", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write("))");
+        } else if (std.mem.eql(u8, arg_type, "bool")) {
+            try self.writer.print("printf(\"%s{s}\", (", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write(") ? \"true\" : \"false\")");
+        } else if (std.mem.eql(u8, arg_type, "char")) {
+            try self.writer.print("printf(\"%c{s}\", (char)(", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write("))");
+        } else {
+            // Fallback: assume string
+            if (newline) {
+                try self.writer.write("dm_println_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            } else {
+                try self.writer.write("dm_print_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            }
+        }
     }
 
     /// Generate struct literal
@@ -1914,6 +2480,12 @@ pub const CodeGenerator = struct {
             type_name = path.segments[path.segments.len - 1].name;
         }
         const mangled = try self.mangleTypeName(type_name);
+
+        // Simple enum: emit constant directly
+        if (self.simple_enums.contains(mangled)) {
+            try self.writer.print("{s}_{s}", .{ mangled, lit.variant.name });
+            return;
+        }
 
         try self.writer.print("{s}_{s}(", .{ mangled, lit.variant.name });
 
@@ -2002,19 +2574,11 @@ pub const CodeGenerator = struct {
         try self.writer.write(")");
     }
 
-    /// Generate match expression
+    /// Generate match expression (as a value)
+    /// Generates nested ternary operators - one per arm
     fn generateMatchExpr(self: *Self, match: *MatchExpr) anyerror!void {
-        // Use GCC statement expression to evaluate scrutinee once and match
-        try self.writer.write("({ ");
-
-        // Generate scrutinee into a temp variable
-        const temp = try self.freshTemp();
-        const scrutinee_type = self.inferCTypeFromExpr(match.scrutinee);
-        try self.writer.print("{s} {s} = ", .{ scrutinee_type, temp });
-        try self.generateExpr(match.scrutinee);
-        try self.writer.write("; ");
-
-        // Generate nested ternary operators for each arm
+        // For match-as-expression, generate nested ternary chain
+        // Note: this doesn't support pattern bindings in the arms - use match statement for that
         for (match.arms, 0..) |arm, i| {
             if (i > 0) {
                 try self.writer.write(" : ");
@@ -2022,7 +2586,7 @@ pub const CodeGenerator = struct {
 
             // Generate pattern condition
             try self.writer.write("(");
-            try self.generatePatternCondition(arm.pattern, temp);
+            try self.generatePatternCondition(arm.pattern, "_dm_unreachable");
 
             // Add guard condition if present
             if (arm.guard) |guard| {
@@ -2049,20 +2613,29 @@ pub const CodeGenerator = struct {
         }
 
         // Default case (unreachable if patterns are exhaustive)
-        try self.writer.write(" : 0; })");
+        try self.writer.write(" : 0");
     }
 
     /// Generate block expression
     fn generateBlockExpr(self: *Self, block: *BlockExpr) anyerror!void {
-        // Block expressions in C require statement expressions (GCC extension)
-        // or conversion to immediately-invoked lambda
-        try self.writer.write("({");
-        try self.generateBlock(block);
-        if (block.result) |result| {
-            try self.generateExpr(result);
-            try self.writer.write(";");
+        // Block expressions as values are not directly expressible in C11.
+        // For simple cases (single result expression), emit the result directly.
+        // For complex cases with statements, emit the statements before and result inline.
+        if (block.statements.len == 0) {
+            if (block.result) |result| {
+                try self.generateExpr(result);
+            } else {
+                try self.writer.write("0");
+            }
+        } else {
+            // Emit block statements before the expression context
+            try self.generateBlock(block);
+            if (block.result) |result| {
+                try self.generateExpr(result);
+            } else {
+                try self.writer.write("0");
+            }
         }
-        try self.writer.write("})");
     }
 
     /// Generate lambda expression
@@ -2082,14 +2655,13 @@ pub const CodeGenerator = struct {
                 try self.writer.write(")");
             },
             .block => |block| {
-                // For block bodies, use GCC statement expression
-                try self.writer.write("({");
+                // For block bodies, emit statements then result expression
+                try self.writer.write("(");
                 try self.generateBlock(block);
                 if (block.result) |result| {
                     try self.generateExpr(result);
-                    try self.writer.write(";");
                 }
-                try self.writer.write("})");
+                try self.writer.write(")");
             },
         }
     }
@@ -2130,24 +2702,23 @@ pub const CodeGenerator = struct {
     /// Generate error propagation expression
     fn generateErrorPropagate(self: *Self, err: *ErrorPropagateExpr) anyerror!void {
         // expr? - early return on error
-        // This needs a temporary and early return using GCC statement expression
-        const temp = try self.freshTemp();
-        const operand_type = self.inferCTypeFromExpr(err.operand);
-        try self.writer.print("({{ {s} {s} = ", .{ operand_type, temp });
+        // In C11, we emit the operand and access .value.ok_value
+        // The early-return check must be emitted as a preceding statement by the caller
         try self.generateExpr(err.operand);
-        try self.writer.print("; if (!{s}.is_ok) return {s}; {s}.value.ok_value; }})", .{ temp, temp, temp });
+        try self.writer.write(".value.ok_value");
     }
 
     /// Generate null coalescing expression
     fn generateCoalesce(self: *Self, coal: *CoalesceExpr) anyerror!void {
         // left ?? right - if left has value use it, else right
-        const temp = try self.freshTemp();
-        const left_type = self.inferCTypeFromExpr(coal.left);
-        try self.writer.print("({{ {s} {s} = ", .{ left_type, temp });
+        // Use C11 ternary: (left).has_value ? (left).value : (right)
+        try self.writer.write("(");
         try self.generateExpr(coal.left);
-        try self.writer.print("; {s}.has_value ? {s}.value : ", .{ temp, temp });
+        try self.writer.write(").has_value ? (");
+        try self.generateExpr(coal.left);
+        try self.writer.write(").value : (");
         try self.generateExpr(coal.right);
-        try self.writer.write("; })");
+        try self.writer.write(")");
     }
 
     /// Generate range expression
@@ -2179,12 +2750,14 @@ pub const CodeGenerator = struct {
 
     /// Generate type check expression
     fn generateTypeCheck(self: *Self, check: *TypeCheckExpr) anyerror!void {
-        // expr is Type - runtime type check
-        // For static types, this should be resolved at compile time
-        // Generate a placeholder
-        try self.writer.write("(");
-        try self.generateExpr(check.expr);
-        try self.writer.write(", true /* is type check */)");
+        // For enum variant checks: expr is Variant -> check tag
+        // For static type checks: resolve at compile time to true
+        const target_type = self.mapType(check.checked_type) catch "void*";
+
+        // Check if the target type looks like an enum variant (contains _tag_)
+        // For now, for static types, just emit true since dAImond is statically typed
+        _ = target_type;
+        try self.writer.write("true");
     }
 };
 

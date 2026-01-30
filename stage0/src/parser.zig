@@ -1218,7 +1218,8 @@ pub const Parser = struct {
 
     /// Parse while loop
     pub fn parseWhile(self: *Self, start_loc: SourceLocation) !*Statement {
-        const condition = try self.parseExpr();
+        // Use parseExprNoStruct to avoid `while a > b { ... }` being parsed as struct literal
+        const condition = try self.parseExprNoStruct();
         const body = try self.parseBlockExpr();
 
         const while_loop = try self.astAllocator().create(WhileLoop);
@@ -1353,7 +1354,7 @@ pub const Parser = struct {
                 if (!self.check(.rbracket) and !self.check(.rparen) and !self.check(.rbrace) and
                     !self.check(.comma) and !self.check(.semicolon) and !self.isAtEnd())
                 {
-                    end_expr = try self.parsePrecedence(op_prec.next());
+                    end_expr = try self.parsePrecedenceImpl(op_prec.next(), allow_struct_lit);
                 }
 
                 const range = try self.astAllocator().create(RangeExpr);
@@ -1376,7 +1377,7 @@ pub const Parser = struct {
             // Handle pipeline operator
             if (self.check(.pipe_gt)) {
                 _ = self.advance();
-                const right = try self.parsePrecedence(op_prec.next());
+                const right = try self.parsePrecedenceImpl(op_prec.next(), allow_struct_lit);
 
                 const pipeline = try self.astAllocator().create(PipelineExpr);
                 pipeline.* = .{
@@ -1400,7 +1401,7 @@ pub const Parser = struct {
 
             // Handle right-associativity (none in current implementation, but structure supports it)
             const next_prec = op_prec.next();
-            const right = try self.parsePrecedence(next_prec);
+            const right = try self.parsePrecedenceImpl(next_prec, allow_struct_lit);
 
             const binary = try self.astAllocator().create(BinaryExpr);
             binary.* = .{
@@ -1999,7 +2000,8 @@ pub const Parser = struct {
 
     /// Parse if expression
     pub fn parseIf(self: *Self, start_loc: SourceLocation) !*Expr {
-        const condition = try self.parseExpr();
+        // Use parseExprNoStruct to avoid `if a > b { ... }` being parsed as `if a > (b { ... })`
+        const condition = try self.parseExprNoStruct();
         const then_branch = try self.parseBlockExpr();
 
         var else_branch: ?IfExpr.ElseBranch = null;
@@ -2307,12 +2309,14 @@ pub const Parser = struct {
                 try segments.append(makeIdentifier(seg, self.previousLocation()));
             }
 
-            const path: ?Path = if (segments.items.len > 1) Path{
-                .segments = try segments.toOwnedSlice(),
+            // Save all segments before toOwnedSlice moves them
+            const all_segments = try self.astAllocator().dupe(Identifier, segments.items);
+            const path: ?Path = if (all_segments.len > 1) Path{
+                .segments = all_segments,
                 .span = makeSpan(start_loc, self.previousLocation()),
             } else null;
 
-            // Check for variant pattern: Some(x) or None
+            // Check for variant pattern: Some(x) or Shape::Circle(r)
             if (self.match(.lparen)) {
                 var payload: EnumVariantPattern.Payload = .none;
                 if (!self.check(.rparen)) {
@@ -2328,10 +2332,22 @@ pub const Parser = struct {
                 }
                 try self.expect(.rparen, "')' after variant payload");
 
+                // For multi-segment paths, the last segment is the variant name
+                // and the preceding segments form the type path
+                var variant_name = name_ident;
+                var type_path_val = path;
+                if (all_segments.len > 1) {
+                    variant_name = all_segments[all_segments.len - 1];
+                    type_path_val = Path{
+                        .segments = all_segments[0 .. all_segments.len - 1],
+                        .span = makeSpan(start_loc, self.previousLocation()),
+                    };
+                }
+
                 const variant_pattern = try self.astAllocator().create(EnumVariantPattern);
                 variant_pattern.* = .{
-                    .type_path = path,
-                    .variant = name_ident,
+                    .type_path = type_path_val,
+                    .variant = variant_name,
                     .payload = payload,
                     .span = makeSpan(start_loc, self.previousLocation()),
                 };
@@ -2387,6 +2403,30 @@ pub const Parser = struct {
                 const pattern = try self.astAllocator().create(Pattern);
                 pattern.* = .{
                     .kind = .{ .struct_pattern = struct_pattern },
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+                return self.parsePatternSuffix(pattern);
+            }
+
+            // Multi-segment path without payload is a unit enum variant pattern
+            if (path != null) {
+                const last_seg = all_segments[all_segments.len - 1];
+                const type_path = Path{
+                    .segments = all_segments[0 .. all_segments.len - 1],
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+
+                const variant_pattern = try self.astAllocator().create(EnumVariantPattern);
+                variant_pattern.* = .{
+                    .type_path = type_path,
+                    .variant = last_seg,
+                    .payload = .none,
+                    .span = makeSpan(start_loc, self.previousLocation()),
+                };
+
+                const pattern = try self.astAllocator().create(Pattern);
+                pattern.* = .{
+                    .kind = .{ .enum_variant = variant_pattern },
                     .span = makeSpan(start_loc, self.previousLocation()),
                 };
                 return self.parsePatternSuffix(pattern);

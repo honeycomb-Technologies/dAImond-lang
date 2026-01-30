@@ -1027,7 +1027,16 @@ pub const TypeChecker = struct {
             return try self.type_ctx.intern(.error_type);
         };
 
-        switch (typ) {
+        // Auto-dereference through references for field access
+        const derefed_typ = if (typ == .ref) blk: {
+            const pointee = self.resolveType(typ.ref.pointee);
+            break :blk self.type_ctx.get(pointee) orelse {
+                try self.reportError(.undefined_field, "cannot access field on unknown type", fa.span);
+                return try self.type_ctx.intern(.error_type);
+            };
+        } else typ;
+
+        switch (derefed_typ) {
             .@"struct" => |s| {
                 if (s.getField(fa.field.name)) |field| {
                     return field.type_id;
@@ -1082,17 +1091,55 @@ pub const TypeChecker = struct {
         const object_type = try self.inferExpr(mc.object);
         _ = object_type;
 
+        // Infer argument types
+        for (mc.args) |arg| {
+            _ = try self.inferExpr(arg);
+        }
+
         // For now, create fresh return type
         // Full implementation would look up method on type
         const return_type = try self.freshTypeVar();
-
-        // Track effects from method call
-        self.current_effects.addBuiltin(.memory);
 
         return return_type;
     }
 
     fn inferFunctionCall(self: *Self, fc: *const ast.FunctionCall) anyerror!TypeId {
+        // Special handling for built-in functions that accept any type
+        if (fc.function.kind == .identifier) {
+            const name = fc.function.kind.identifier.name;
+            if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
+                std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "panic") or
+                std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "int_to_string") or
+                std.mem.eql(u8, name, "bool_to_string") or std.mem.eql(u8, name, "float_to_string"))
+            {
+                // Infer argument types but don't constrain them
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.type_ctx.intern(.unit);
+            }
+        }
+
+        // Special handling for enum variant constructors: Option::Some(42)
+        if (fc.function.kind == .path) {
+            const path = fc.function.kind.path;
+            if (path.segments.len >= 2) {
+                if (self.env.lookup(path.segments[0].name)) |symbol| {
+                    const resolved_type = self.type_ctx.get(symbol.type_id);
+                    if (resolved_type) |rt| {
+                        if (rt == .@"enum") {
+                            // This is an enum variant constructor call
+                            // Infer argument types but don't constrain them
+                            for (fc.args) |arg| {
+                                _ = try self.inferExpr(arg.value);
+                            }
+                            return symbol.type_id;
+                        }
+                    }
+                }
+            }
+        }
+
         const func_type = try self.inferExpr(fc.function);
         const resolved = self.resolveType(func_type);
         const typ = self.type_ctx.get(resolved) orelse {
@@ -1263,7 +1310,12 @@ pub const TypeChecker = struct {
         var arm_type: ?TypeId = null;
 
         for (me.arms) |arm| {
+            // Each arm gets its own scope for pattern bindings
+            try self.env.pushScope(.block);
+
             try self.checkPattern(arm.pattern, scrutinee_type);
+            // Register pattern bindings in scope for guard and body
+            try self.bindPattern(arm.pattern, scrutinee_type, false);
 
             if (arm.guard) |guard| {
                 const guard_type = try self.inferExpr(guard);
@@ -1275,6 +1327,8 @@ pub const TypeChecker = struct {
                 .expression => |expr| try self.inferExpr(expr),
                 .block => |blk| try self.inferBlock(blk),
             };
+
+            self.env.popScope();
 
             if (arm_type) |at| {
                 try self.unify(at, body_type, arm.span);
@@ -1714,11 +1768,23 @@ pub const TypeChecker = struct {
                 }
             },
             .enum_variant => |ev| {
+                // Look up payload types from the enum definition
+                const resolved_enum = self.resolveType(typ);
+                const enum_typ = self.type_ctx.get(resolved_enum);
+                const variant_info = if (enum_typ != null and enum_typ.? == .@"enum")
+                    enum_typ.?.@"enum".getVariant(ev.variant.name)
+                else
+                    null;
+
                 switch (ev.payload) {
                     .none => {},
                     .tuple => |patterns| {
-                        for (patterns) |p| {
-                            try self.bindPattern(p, try self.freshTypeVar(), is_mut);
+                        for (patterns, 0..) |p, idx| {
+                            const payload_type = if (variant_info != null and idx < variant_info.?.payload_types.len)
+                                variant_info.?.payload_types[idx]
+                            else
+                                try self.freshTypeVar();
+                            try self.bindPattern(p, payload_type, is_mut);
                         }
                     },
                     .struct_fields => |fields| {
@@ -1753,17 +1819,28 @@ pub const TypeChecker = struct {
 
         switch (typ) {
             .@"enum" => |e| {
-                var covered = std.StringHashMap(void).init(self.allocator);
-                defer covered.deinit();
-
+                // Check for wildcard/identifier patterns that cover all variants
+                var has_catchall = false;
                 for (arms) |arm| {
-                    try self.collectCoveredVariants(arm.pattern, &covered);
+                    if (arm.pattern.kind == .wildcard or arm.pattern.kind == .identifier) {
+                        has_catchall = true;
+                        break;
+                    }
                 }
 
-                for (e.variants) |variant| {
-                    if (!covered.contains(variant.name)) {
-                        try self.reportError(.missing_match_arm, "non-exhaustive pattern: missing variant", span);
-                        return;
+                if (!has_catchall) {
+                    var covered = std.StringHashMap(void).init(self.allocator);
+                    defer covered.deinit();
+
+                    for (arms) |arm| {
+                        try self.collectCoveredVariants(arm.pattern, &covered);
+                    }
+
+                    for (e.variants) |variant| {
+                        if (!covered.contains(variant.name)) {
+                            try self.reportError(.missing_match_arm, "non-exhaustive pattern: missing variant", span);
+                            return;
+                        }
                     }
                 }
             },
@@ -1830,9 +1907,10 @@ pub const TypeChecker = struct {
     pub fn checkDeclaration(self: *Self, decl: *const ast.Declaration) !void {
         switch (decl.kind) {
             .function => |func| try self.checkFunction(func, decl.visibility == .public),
-            .struct_def => |sd| try self.checkStruct(sd, decl.visibility == .public),
-            .enum_def => |ed| try self.checkEnum(ed, decl.visibility == .public),
-            .trait_def => |td| try self.checkTrait(td, decl.visibility == .public),
+            // Structs, enums, and traits are already checked in the first pass
+            .struct_def => {},
+            .enum_def => {},
+            .trait_def => {},
             .impl_block => |ib| try self.checkImpl(ib),
             .constant => |cd| try self.checkConst(cd, decl.visibility == .public),
         }
@@ -1845,26 +1923,14 @@ pub const TypeChecker = struct {
             return;
         }
 
-        // Build function type
+        // Build function type from signature (before checking body)
         var param_types = std.ArrayList(TypeId).init(self.allocator);
         defer param_types.deinit();
 
-        try self.env.pushScope(.function);
-        defer self.env.popScope();
-
-        // Register generic parameters
-        if (func.generic_params) |gps| {
-            for (gps) |gp| {
-                const type_var = try self.namedTypeVar(gp.name.name);
-                try self.env.define(Symbol.init(gp.name.name, .type_param, type_var));
-            }
-        }
-
-        // Process parameters
+        // We need to resolve param types in the current scope first
         for (func.params) |param| {
             const param_type = try self.resolveTypeExpr(param.type_expr);
             try param_types.append(param_type);
-            try self.env.define(Symbol.init(param.name.name, .variable, param_type).withMutable(param.is_mut));
         }
 
         // Process return type
@@ -1873,8 +1939,6 @@ pub const TypeChecker = struct {
         else
             try self.type_ctx.intern(.unit);
 
-        self.env.current.return_type = return_type;
-
         // Process effects
         var effects = EffectSet.pure;
         if (func.effects) |effs| {
@@ -1882,6 +1946,33 @@ pub const TypeChecker = struct {
                 try self.addEffectFromTypeExpr(eff, &effects);
             }
         }
+
+        // Register function in current scope BEFORE checking body (enables recursion)
+        const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
+        try self.env.define(Symbol.init(func.name.name, .function, fn_type)
+            .withPublic(is_public)
+            .withEffects(effects)
+            .withLocation(func.span));
+
+        // Now push a function scope for the body
+        try self.env.pushScope(.function);
+        defer self.env.popScope();
+
+        // Register generic parameters in function scope
+        if (func.generic_params) |gps| {
+            for (gps) |gp| {
+                const type_var = try self.namedTypeVar(gp.name.name);
+                try self.env.define(Symbol.init(gp.name.name, .type_param, type_var));
+            }
+        }
+
+        // Define parameters in function scope
+        for (func.params) |param| {
+            const param_type = try self.resolveTypeExpr(param.type_expr);
+            try self.env.define(Symbol.init(param.name.name, .variable, param_type).withMutable(param.is_mut));
+        }
+
+        self.env.current.return_type = return_type;
         self.env.current.allowed_effects = effects;
 
         // Check contracts
@@ -1895,11 +1986,21 @@ pub const TypeChecker = struct {
 
         // Check body
         if (func.body) |body| {
-            const body_type = switch (body) {
-                .block => |blk| try self.inferBlock(blk),
-                .expression => |expr| try self.inferExpr(expr),
-            };
-            try self.unify(body_type, return_type, func.span);
+            switch (body) {
+                .block => |blk| {
+                    const body_type = try self.inferBlock(blk);
+                    // Only unify body type with return type if the block has a
+                    // result expression (tail expression). Blocks with explicit
+                    // return statements already check return types in checkReturn.
+                    if (blk.result != null) {
+                        try self.unify(body_type, return_type, func.span);
+                    }
+                },
+                .expression => |expr| {
+                    const body_type = try self.inferExpr(expr);
+                    try self.unify(body_type, return_type, func.span);
+                },
+            }
 
             // Check ensures contracts
             if (func.contracts) |contracts| {
@@ -1910,15 +2011,6 @@ pub const TypeChecker = struct {
                 }
             }
         }
-
-        // Register function in outer scope
-        self.env.popScope();
-        const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
-        try self.env.define(Symbol.init(func.name.name, .function, fn_type)
-            .withPublic(is_public)
-            .withEffects(effects)
-            .withLocation(func.span));
-        try self.env.pushScope(.function);
     }
 
     fn checkStruct(self: *Self, sd: *const ast.StructDecl, is_public: bool) !void {
@@ -1928,10 +2020,8 @@ pub const TypeChecker = struct {
         }
 
         var fields = std.ArrayList(types.StructField).init(self.allocator);
-        defer fields.deinit();
 
         var type_params = std.ArrayList([]const u8).init(self.allocator);
-        defer type_params.deinit();
 
         // Register generic parameters
         if (sd.generic_params) |gps| {
@@ -1952,11 +2042,15 @@ pub const TypeChecker = struct {
             });
         }
 
+        // Use toOwnedSlice to produce a stable slice that outlives the ArrayList
+        const owned_fields = try fields.toOwnedSlice();
+        const owned_type_params = try type_params.toOwnedSlice();
+
         const struct_type = try self.type_ctx.intern(.{
             .@"struct" = .{
                 .name = sd.name.name,
-                .fields = fields.items,
-                .type_params = type_params.items,
+                .fields = owned_fields,
+                .type_params = owned_type_params,
                 .is_packed = false,
                 .size = null,
                 .alignment = null,
@@ -1975,10 +2069,8 @@ pub const TypeChecker = struct {
         }
 
         var variants = std.ArrayList(types.EnumVariant).init(self.allocator);
-        defer variants.deinit();
 
         var type_params = std.ArrayList([]const u8).init(self.allocator);
-        defer type_params.deinit();
 
         if (ed.generic_params) |gps| {
             for (gps) |gp| {
@@ -1988,7 +2080,6 @@ pub const TypeChecker = struct {
 
         for (ed.variants) |variant| {
             var payload_types = std.ArrayList(TypeId).init(self.allocator);
-            defer payload_types.deinit();
 
             switch (variant.payload) {
                 .none => {},
@@ -2006,18 +2097,24 @@ pub const TypeChecker = struct {
                 },
             }
 
+            // Use toOwnedSlice so the payload_types slice outlives the ArrayList
+            const owned_payload = try payload_types.toOwnedSlice();
+
             try variants.append(.{
                 .name = variant.name.name,
-                .payload_types = payload_types.items,
+                .payload_types = owned_payload,
                 .tag_value = null,
             });
         }
 
+        const owned_variants = try variants.toOwnedSlice();
+        const owned_type_params = try type_params.toOwnedSlice();
+
         const enum_type = try self.type_ctx.intern(.{
             .@"enum" = .{
                 .name = ed.name.name,
-                .variants = variants.items,
-                .type_params = type_params.items,
+                .variants = owned_variants,
+                .type_params = owned_type_params,
                 .tag_type = .u32,
             },
         });
@@ -2270,6 +2367,9 @@ pub const TypeChecker = struct {
             .array => |arr| arr.element_type,
             .slice => |s| s.element_type,
             .str => try self.type_ctx.intern(.char),
+            // Ranges return the element type directly (e.g., i64 for 0..5),
+            // so iterating over a range of int/float yields that same type.
+            .int, .float => resolved,
             else => {
                 try self.reportError(.type_mismatch, "expected iterable type", span);
                 return try self.freshTypeVar();
@@ -2352,6 +2452,11 @@ pub const TypeChecker = struct {
     /// Get all diagnostics
     pub fn getDiagnostics(self: *Self) []const Diagnostic {
         return self.diagnostics.items();
+    }
+
+    /// Get the type context for use by codegen
+    pub fn getTypeContext(self: *Self) ?*TypeContext {
+        return self.type_ctx;
     }
 
     /// Get the inferred type of an expression (after solving constraints)

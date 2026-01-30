@@ -916,6 +916,11 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     var code_generator = CodeGenerator.init(compile_allocator);
     defer code_generator.deinit();
 
+    // Wire type context from type checker to code generator
+    if (type_checker.getTypeContext()) |ctx| {
+        code_generator.setTypeContext(ctx);
+    }
+
     const c_code = code_generator.generate(ast_result) catch |err| {
         try stdout.print("\n{s}Code generation error:{s} {}\n", .{
             colors.error_style(),
@@ -1014,6 +1019,8 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     // Add standard flags
     try cc_args.append("-std=c11");
     try cc_args.append("-Wall");
+    try cc_args.append("-Wextra");
+    try cc_args.append("-pedantic");
 
     if (opts.verbose) {
         try stdout.print("\n        Running: ", .{});
