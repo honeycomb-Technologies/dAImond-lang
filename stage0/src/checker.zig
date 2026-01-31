@@ -537,6 +537,12 @@ pub const TypeChecker = struct {
         try self.env.defineGlobal(Symbol.init("byte", .type_def, try self.type_ctx.intern(.{ .int = .u8 })));
         try self.env.defineGlobal(Symbol.init("char", .type_def, try self.type_ctx.intern(.char)));
 
+        // Register generic container types (List, Vec)
+        // These are mapped to monomorphized C types by codegen
+        try self.env.defineGlobal(Symbol.init("List", .type_def, try self.freshTypeVar()));
+        try self.env.defineGlobal(Symbol.init("Vec", .type_def, try self.freshTypeVar()));
+        try self.env.defineGlobal(Symbol.init("String", .type_def, str_id));
+
         // Register built-in functions
         // print function with IO effect
         var print_effects = EffectSet.init(self.allocator);
@@ -1023,16 +1029,15 @@ pub const TypeChecker = struct {
         const object_type = try self.inferExpr(fa.object);
         const resolved = self.resolveType(object_type);
         const typ = self.type_ctx.get(resolved) orelse {
-            try self.reportError(.undefined_field, "cannot access field on unknown type", fa.span);
-            return try self.type_ctx.intern(.error_type);
+            // Unknown type - allow field access (codegen will handle it)
+            return try self.freshTypeVar();
         };
 
         // Auto-dereference through references for field access
         const derefed_typ = if (typ == .ref) blk: {
             const pointee = self.resolveType(typ.ref.pointee);
             break :blk self.type_ctx.get(pointee) orelse {
-                try self.reportError(.undefined_field, "cannot access field on unknown type", fa.span);
-                return try self.type_ctx.intern(.error_type);
+                return try self.freshTypeVar();
             };
         } else typ;
 
@@ -1055,6 +1060,10 @@ pub const TypeChecker = struct {
                 }
                 return t.element_types[index];
             },
+            .type_var => {
+                // Type variable (e.g., from generic container elements) - allow field access
+                return try self.freshTypeVar();
+            },
             else => {
                 try self.reportError(.expected_struct_type, "field access requires struct type", fa.span);
                 return try self.type_ctx.intern(.error_type);
@@ -1067,8 +1076,8 @@ pub const TypeChecker = struct {
         const index_type = try self.inferExpr(ia.index);
         const resolved = self.resolveType(object_type);
         const typ = self.type_ctx.get(resolved) orelse {
-            try self.reportError(.expected_array_type, "cannot index unknown type", ia.span);
-            return try self.type_ctx.intern(.error_type);
+            // Unknown type (e.g., List[T]) - allow indexing, return fresh type var
+            return try self.freshTypeVar();
         };
 
         // Check index is integer
@@ -1080,6 +1089,10 @@ pub const TypeChecker = struct {
             .array => |arr| return arr.element_type,
             .slice => |s| return s.element_type,
             .str => return try self.type_ctx.intern(.char),
+            .type_var => {
+                // Type variable (e.g., from List[T]) - allow indexing
+                return try self.freshTypeVar();
+            },
             else => {
                 try self.reportError(.expected_array_type, "indexing requires array or slice type", ia.span);
                 return try self.type_ctx.intern(.error_type);
@@ -1107,16 +1120,56 @@ pub const TypeChecker = struct {
         // Special handling for built-in functions that accept any type
         if (fc.function.kind == .identifier) {
             const name = fc.function.kind.identifier.name;
+            // Builtins returning void/unit
             if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
                 std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "panic") or
-                std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "int_to_string") or
-                std.mem.eql(u8, name, "bool_to_string") or std.mem.eql(u8, name, "float_to_string"))
+                std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln") or
+                std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "file_write"))
             {
-                // Infer argument types but don't constrain them
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
                 }
                 return try self.type_ctx.intern(.unit);
+            }
+            // Builtins returning int
+            if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "parse_int") or
+                std.mem.eql(u8, name, "string_find") or std.mem.eql(u8, name, "args_len") or
+                std.mem.eql(u8, name, "system"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.type_ctx.intern(.{ .int = .i64 });
+            }
+            // Builtins returning string
+            if (std.mem.eql(u8, name, "int_to_string") or std.mem.eql(u8, name, "bool_to_string") or
+                std.mem.eql(u8, name, "float_to_string") or std.mem.eql(u8, name, "substr") or
+                std.mem.eql(u8, name, "char_to_string") or std.mem.eql(u8, name, "file_read") or
+                std.mem.eql(u8, name, "args_get"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.type_ctx.intern(.str);
+            }
+            // Builtins returning bool
+            if (std.mem.eql(u8, name, "is_alpha") or std.mem.eql(u8, name, "is_digit") or
+                std.mem.eql(u8, name, "is_alnum") or std.mem.eql(u8, name, "is_whitespace") or
+                std.mem.eql(u8, name, "string_contains") or std.mem.eql(u8, name, "starts_with") or
+                std.mem.eql(u8, name, "ends_with"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.type_ctx.intern(.bool);
+            }
+            // List_new returns a fresh type var (its type is inferred from usage context)
+            if (std.mem.eql(u8, name, "List_new"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.freshTypeVar();
             }
         }
 
@@ -2370,6 +2423,8 @@ pub const TypeChecker = struct {
             // Ranges return the element type directly (e.g., i64 for 0..5),
             // so iterating over a range of int/float yields that same type.
             .int, .float => resolved,
+            // Type variables (e.g., from List[T]) - allow iteration
+            .type_var => try self.freshTypeVar(),
             else => {
                 try self.reportError(.type_mismatch, "expected iterable type", span);
                 return try self.freshTypeVar();

@@ -1038,6 +1038,10 @@ pub fn commonType(ctx: *TypeContext, a_id: TypeId, b_id: TypeId) ?TypeId {
     const a_tag = std.meta.activeTag(a);
     const b_tag = std.meta.activeTag(b);
 
+    // Type variables are compatible with any concrete type
+    if (a_tag == .type_var) return b_id;
+    if (b_tag == .type_var) return a_id;
+
     // Both integers - find wider type
     if (a_tag == .int and b_tag == .int) {
         const a_int = a.int;
