@@ -262,6 +262,11 @@ pub const CodeGenerator = struct {
     // Track function return types for type inference during codegen
     function_return_types: std.StringHashMap([]const u8),
 
+    // Track generated list types: maps list type name -> element C type
+    generated_list_types: std.StringHashMap([]const u8),
+    // Deferred buffer for list type definitions
+    list_type_writer: CWriter,
+
     // Unique ID counter for temporary variables
     temp_counter: usize,
 
@@ -299,6 +304,8 @@ pub const CodeGenerator = struct {
             .impl_methods = std.ArrayList(ImplMethodInfo).init(allocator),
             .variable_types = std.StringHashMap([]const u8).init(allocator),
             .function_return_types = std.StringHashMap([]const u8).init(allocator),
+            .generated_list_types = std.StringHashMap([]const u8).init(allocator),
+            .list_type_writer = CWriter.init(allocator),
             .temp_counter = 0,
             .lambda_depth = 0,
             .current_function = null,
@@ -318,6 +325,8 @@ pub const CodeGenerator = struct {
         self.impl_methods.deinit();
         self.variable_types.deinit();
         self.function_return_types.deinit();
+        self.generated_list_types.deinit();
+        self.list_type_writer.deinit();
         self.region_stack.deinit();
     }
 
@@ -369,6 +378,21 @@ pub const CodeGenerator = struct {
             }
         }
 
+        // Pre-scan all declarations to discover List[T] types used in function parameters,
+        // return types, struct fields, let bindings, and function bodies. This triggers
+        // monomorphized list type generation so the definitions are available before
+        // function prototypes.
+        for (source.declarations) |decl| {
+            try self.scanForListTypes(decl);
+        }
+
+        // Insert generated list type definitions
+        if (self.list_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized List Types");
+            try self.writer.write(self.list_type_writer.getOutput());
+        }
+
         try self.writer.blankLine();
 
         // Generate function prototypes
@@ -412,7 +436,8 @@ pub const CodeGenerator = struct {
         try self.writer.blankLine();
         try self.writer.writeLine("int main(int argc, char** argv) {");
         self.writer.indent();
-        try self.writer.writeLine("(void)argc; (void)argv;");
+        try self.writer.writeLine("dm_argc = argc;");
+        try self.writer.writeLine("dm_argv = argv;");
         try self.writer.writeLine("dm_main();");
         try self.writer.writeLine("return 0;");
         self.writer.dedent();
@@ -645,6 +670,194 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("char* result = (char*)malloc(len + 1);");
         try self.writer.writeLine("memcpy(result, buf, len + 1);");
         try self.writer.writeLine("return (dm_string){ .data = result, .len = (size_t)len, .capacity = (size_t)len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // String substring
+        try self.writer.writeLine("static inline dm_string dm_string_substr(dm_string s, int64_t start, int64_t length) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (start < 0 || (size_t)start >= s.len) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("size_t actual_len = (size_t)length;");
+        try self.writer.writeLine("if ((size_t)start + actual_len > s.len) actual_len = s.len - (size_t)start;");
+        try self.writer.writeLine("char* buf = (char*)malloc(actual_len + 1);");
+        try self.writer.writeLine("memcpy(buf, s.data + start, actual_len);");
+        try self.writer.writeLine("buf[actual_len] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = buf, .len = actual_len, .capacity = actual_len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // String comparison (lexicographic)
+        try self.writer.writeLine("static inline int64_t dm_string_cmp(dm_string a, dm_string b) {");
+        self.writer.indent();
+        try self.writer.writeLine("size_t min_len = a.len < b.len ? a.len : b.len;");
+        try self.writer.writeLine("int c = memcmp(a.data, b.data, min_len);");
+        try self.writer.writeLine("if (c != 0) return (int64_t)c;");
+        try self.writer.writeLine("if (a.len < b.len) return -1;");
+        try self.writer.writeLine("if (a.len > b.len) return 1;");
+        try self.writer.writeLine("return 0;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Character classification functions
+        try self.writer.writeLine("static inline bool dm_is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }");
+        try self.writer.writeLine("static inline bool dm_is_digit(char c) { return c >= '0' && c <= '9'; }");
+        try self.writer.writeLine("static inline bool dm_is_alnum(char c) { return dm_is_alpha(c) || dm_is_digit(c); }");
+        try self.writer.writeLine("static inline bool dm_is_whitespace(char c) { return c == ' ' || c == '\\t' || c == '\\n' || c == '\\r'; }");
+        try self.writer.blankLine();
+
+        // Char to string conversion
+        try self.writer.writeLine("static inline dm_string dm_char_to_string(char c) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* buf = (char*)malloc(2);");
+        try self.writer.writeLine("buf[0] = c;");
+        try self.writer.writeLine("buf[1] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = buf, .len = 1, .capacity = 1 };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // String contains
+        try self.writer.writeLine("static inline bool dm_string_contains(dm_string haystack, dm_string needle) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (needle.len == 0) return true;");
+        try self.writer.writeLine("if (needle.len > haystack.len) return false;");
+        try self.writer.writeLine("for (size_t i = 0; i <= haystack.len - needle.len; i++) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (memcmp(haystack.data + i, needle.data, needle.len) == 0) return true;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.writeLine("return false;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // String find (index of)
+        try self.writer.writeLine("static inline int64_t dm_string_find(dm_string haystack, dm_string needle) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (needle.len == 0) return 0;");
+        try self.writer.writeLine("if (needle.len > haystack.len) return -1;");
+        try self.writer.writeLine("for (size_t i = 0; i <= haystack.len - needle.len; i++) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (memcmp(haystack.data + i, needle.data, needle.len) == 0) return (int64_t)i;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.writeLine("return -1;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // String starts_with / ends_with
+        try self.writer.writeLine("static inline bool dm_string_starts_with(dm_string s, dm_string prefix) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (prefix.len > s.len) return false;");
+        try self.writer.writeLine("return memcmp(s.data, prefix.data, prefix.len) == 0;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline bool dm_string_ends_with(dm_string s, dm_string suffix) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (suffix.len > s.len) return false;");
+        try self.writer.writeLine("return memcmp(s.data + s.len - suffix.len, suffix.data, suffix.len) == 0;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Parse int
+        try self.writer.writeLine("static inline int64_t dm_parse_int(dm_string s) {");
+        self.writer.indent();
+        try self.writer.writeLine("char buf[32];");
+        try self.writer.writeLine("size_t copy_len = s.len < 31 ? s.len : 31;");
+        try self.writer.writeLine("memcpy(buf, s.data, copy_len);");
+        try self.writer.writeLine("buf[copy_len] = '\\0';");
+        try self.writer.writeLine("return (int64_t)atoll(buf);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Stderr print functions
+        try self.writer.writeLine("static inline void dm_eprint_str(dm_string s) {");
+        self.writer.indent();
+        try self.writer.writeLine("fwrite(s.data, 1, s.len, stderr);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline void dm_eprintln_str(dm_string s) {");
+        self.writer.indent();
+        try self.writer.writeLine("fwrite(s.data, 1, s.len, stderr);");
+        try self.writer.writeLine("fputc('\\n', stderr);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Exit function
+        try self.writer.writeLine("static inline void dm_exit(int64_t code) { exit((int)code); }");
+        try self.writer.blankLine();
+
+        // Process execution
+        try self.writer.writeLine("static inline int64_t dm_system(dm_string command) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cmd = (char*)malloc(command.len + 1);");
+        try self.writer.writeLine("memcpy(cmd, command.data, command.len);");
+        try self.writer.writeLine("cmd[command.len] = '\\0';");
+        try self.writer.writeLine("int result = system(cmd);");
+        try self.writer.writeLine("free(cmd);");
+        try self.writer.writeLine("return (int64_t)result;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Argc/argv globals and helpers
+        try self.writer.writeLine("static int dm_argc = 0;");
+        try self.writer.writeLine("static char** dm_argv = NULL;");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline dm_string dm_args_get(int64_t index) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (index < 0 || index >= (int64_t)dm_argc) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("return dm_string_from_cstr(dm_argv[index]);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm_args_len(void) { return (int64_t)dm_argc; }");
+        try self.writer.blankLine();
+
+        // File I/O
+        try self.writer.writeLine("static inline dm_string dm_file_read(dm_string path) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cpath = (char*)malloc(path.len + 1);");
+        try self.writer.writeLine("memcpy(cpath, path.data, path.len);");
+        try self.writer.writeLine("cpath[path.len] = '\\0';");
+        try self.writer.writeLine("FILE* f = fopen(cpath, \"rb\");");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("if (!f) dm_panic(\"file_read: cannot open file\");");
+        try self.writer.writeLine("fseek(f, 0, SEEK_END);");
+        try self.writer.writeLine("long file_size = ftell(f);");
+        try self.writer.writeLine("fseek(f, 0, SEEK_SET);");
+        try self.writer.writeLine("char* buf = (char*)malloc((size_t)file_size + 1);");
+        try self.writer.writeLine("size_t read_size = fread(buf, 1, (size_t)file_size, f);");
+        try self.writer.writeLine("fclose(f);");
+        try self.writer.writeLine("buf[read_size] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = buf, .len = read_size, .capacity = (size_t)file_size };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline void dm_file_write(dm_string path, dm_string content) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cpath = (char*)malloc(path.len + 1);");
+        try self.writer.writeLine("memcpy(cpath, path.data, path.len);");
+        try self.writer.writeLine("cpath[path.len] = '\\0';");
+        try self.writer.writeLine("FILE* f = fopen(cpath, \"wb\");");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("if (!f) dm_panic(\"file_write: cannot open file\");");
+        try self.writer.writeLine("fwrite(content.data, 1, content.len, f);");
+        try self.writer.writeLine("fclose(f);");
         self.writer.dedent();
         try self.writer.writeLine("}");
         try self.writer.blankLine();
@@ -885,11 +1098,78 @@ pub const CodeGenerator = struct {
         return try std.fmt.allocPrint(self.stringAllocator(), "dm_result_{s}", .{safe_ok});
     }
 
-    /// Generate List type name
+    /// Generate List type name and emit monomorphized struct + helpers if not already done
     fn generateListType(self: *Self, elem: *TypeExpr) CodeGenError![]const u8 {
         const elem_name = try self.mapType(elem);
         const safe_name = try self.sanitizeTypeName(elem_name);
-        return try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_name});
+        const list_type_name = try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_name});
+
+        if (!self.generated_list_types.contains(list_type_name)) {
+            try self.generated_list_types.put(list_type_name, elem_name);
+            try self.emitListTypeDefinition(list_type_name, elem_name);
+        }
+
+        return list_type_name;
+    }
+
+    /// Emit a monomorphized list type struct and helper functions
+    fn emitListTypeDefinition(self: *Self, list_type_name: []const u8, elem_type: []const u8) !void {
+        var w = &self.list_type_writer;
+
+        // Struct definition
+        try w.printLine("typedef struct {s} {{", .{list_type_name});
+        w.indent();
+        try w.printLine("{s}* data;", .{elem_type});
+        try w.writeLine("size_t len;");
+        try w.writeLine("size_t capacity;");
+        w.dedent();
+        try w.printLine("}} {s};", .{list_type_name});
+        try w.blankLine();
+
+        // _new constructor
+        try w.printLine("static inline {s} {s}_new(void) {{", .{ list_type_name, list_type_name });
+        w.indent();
+        try w.printLine("return ({s}){{ .data = NULL, .len = 0, .capacity = 0 }};", .{list_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _push
+        try w.printLine("static inline void {s}_push({s}* list, {s} value) {{", .{ list_type_name, list_type_name, elem_type });
+        w.indent();
+        try w.writeLine("if (list->len >= list->capacity) {");
+        w.indent();
+        try w.writeLine("size_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;");
+        try w.printLine("{s}* new_data = ({s}*)realloc(list->data, new_cap * sizeof({s}));", .{ elem_type, elem_type, elem_type });
+        try w.writeLine("if (!new_data) dm_panic(\"list push: out of memory\");");
+        try w.writeLine("list->data = new_data;");
+        try w.writeLine("list->capacity = new_cap;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("list->data[list->len] = value;");
+        try w.writeLine("list->len++;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _get
+        try w.printLine("static inline {s} {s}_get({s}* list, int64_t index) {{", .{ elem_type, list_type_name, list_type_name });
+        w.indent();
+        try w.writeLine("if (index < 0 || (size_t)index >= list->len) dm_panic(\"list index out of bounds\");");
+        try w.writeLine("return list->data[index];");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _pop
+        try w.printLine("static inline {s} {s}_pop({s}* list) {{", .{ elem_type, list_type_name, list_type_name });
+        w.indent();
+        try w.writeLine("if (list->len == 0) dm_panic(\"list pop: empty list\");");
+        try w.writeLine("list->len--;");
+        try w.writeLine("return list->data[list->len];");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
     }
 
     /// Sanitize type name for use in identifier
@@ -905,6 +1185,120 @@ pub const CodeGenerator = struct {
             }
         }
         return result.toOwnedSlice();
+    }
+
+    /// Scan a declaration for List[T] usage, triggering monomorphized type generation
+    fn scanForListTypes(self: *Self, decl: *Declaration) !void {
+        switch (decl.kind) {
+            .function => |f| {
+                // Scan parameter types
+                for (f.params) |param| {
+                    try self.scanTypeExprForLists(param.type_expr);
+                }
+                // Scan return type
+                if (f.return_type) |rt| {
+                    try self.scanTypeExprForLists(rt);
+                }
+                // Scan function body for let bindings with List types
+                if (f.body) |body| {
+                    switch (body) {
+                        .block => |block| try self.scanBlockForListTypes(block),
+                        .expression => {},
+                    }
+                }
+            },
+            .struct_def => |s| {
+                for (s.fields) |field| {
+                    try self.scanTypeExprForLists(field.type_expr);
+                }
+            },
+            .impl_block => |impl| {
+                for (impl.items) |item| {
+                    switch (item.kind) {
+                        .function => |f| {
+                            for (f.params) |param| {
+                                try self.scanTypeExprForLists(param.type_expr);
+                            }
+                            if (f.return_type) |rt| {
+                                try self.scanTypeExprForLists(rt);
+                            }
+                            if (f.body) |body| {
+                                switch (body) {
+                                    .block => |block| try self.scanBlockForListTypes(block),
+                                    .expression => {},
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Scan a block for let bindings with List type annotations
+    fn scanBlockForListTypes(self: *Self, block: *BlockExpr) !void {
+        for (block.statements) |stmt| {
+            switch (stmt.kind) {
+                .let_binding => |let_bind| {
+                    if (let_bind.type_annotation) |ta| {
+                        try self.scanTypeExprForLists(ta);
+                    }
+                },
+                .if_stmt => |if_expr| {
+                    try self.scanBlockForListTypes(if_expr.then_branch);
+                    if (if_expr.else_branch) |else_br| {
+                        switch (else_br) {
+                            .else_block => |eb| try self.scanBlockForListTypes(eb),
+                            .else_if => |ei| {
+                                try self.scanBlockForListTypes(ei.then_branch);
+                            },
+                        }
+                    }
+                },
+                .for_loop => |for_stmt| try self.scanBlockForListTypes(for_stmt.body),
+                .while_loop => |while_stmt| try self.scanBlockForListTypes(while_stmt.body),
+                .loop_stmt => |loop| try self.scanBlockForListTypes(loop.body),
+                else => {},
+            }
+        }
+    }
+
+    /// Scan a type expression for List<T> and trigger monomorphization
+    fn scanTypeExprForLists(self: *Self, type_expr: *TypeExpr) !void {
+        switch (type_expr.kind) {
+            .named => |named| {
+                if (named.path.segments.len > 0) {
+                    const type_name = named.path.segments[named.path.segments.len - 1].name;
+                    if (std.mem.eql(u8, type_name, "List") or std.mem.eql(u8, type_name, "Vec")) {
+                        if (named.generic_args) |args| {
+                            if (args.len > 0) {
+                                _ = try self.generateListType(args[0]);
+                            }
+                        }
+                    }
+                }
+                // Recursively scan generic args
+                if (named.generic_args) |args| {
+                    for (args) |arg| {
+                        try self.scanTypeExprForLists(arg);
+                    }
+                }
+            },
+            .array => |arr| try self.scanTypeExprForLists(arr.element_type),
+            .slice => |s| try self.scanTypeExprForLists(s.element_type),
+            .pointer => |p| try self.scanTypeExprForLists(p.pointee_type),
+            .reference => |r| try self.scanTypeExprForLists(r.referenced_type),
+            .option => |o| try self.scanTypeExprForLists(o.inner_type),
+            .function => |f| {
+                for (f.params) |param| {
+                    try self.scanTypeExprForLists(param);
+                }
+                try self.scanTypeExprForLists(f.return_type);
+            },
+            else => {},
+        }
     }
 
     /// Mangle a type name
@@ -973,11 +1367,27 @@ pub const CodeGenerator = struct {
                 if (call.function.kind == .identifier) {
                     const name = call.function.kind.identifier.name;
                     // Check known built-in return types
-                    if (std.mem.eql(u8, name, "len")) break :blk "int64_t";
+                    if (std.mem.eql(u8, name, "len") or
+                        std.mem.eql(u8, name, "parse_int") or
+                        std.mem.eql(u8, name, "string_find") or
+                        std.mem.eql(u8, name, "args_len") or
+                        std.mem.eql(u8, name, "system")) break :blk "int64_t";
                     if (std.mem.eql(u8, name, "to_string") or
                         std.mem.eql(u8, name, "int_to_string") or
                         std.mem.eql(u8, name, "bool_to_string") or
-                        std.mem.eql(u8, name, "float_to_string")) break :blk "dm_string";
+                        std.mem.eql(u8, name, "float_to_string") or
+                        std.mem.eql(u8, name, "substr") or
+                        std.mem.eql(u8, name, "char_to_string") or
+                        std.mem.eql(u8, name, "file_read") or
+                        std.mem.eql(u8, name, "args_get")) break :blk "dm_string";
+                    if (std.mem.eql(u8, name, "is_alpha") or
+                        std.mem.eql(u8, name, "is_digit") or
+                        std.mem.eql(u8, name, "is_alnum") or
+                        std.mem.eql(u8, name, "is_whitespace") or
+                        std.mem.eql(u8, name, "string_contains") or
+                        std.mem.eql(u8, name, "starts_with") or
+                        std.mem.eql(u8, name, "ends_with")) break :blk "bool";
+                    if (std.mem.eql(u8, name, "char")) break :blk "char";
                     // Look up in function declarations tracked during generation
                     if (self.lookupFunctionReturnType(name)) |ret_type| break :blk ret_type;
                 }
@@ -1037,6 +1447,26 @@ pub const CodeGenerator = struct {
                 // Look up in known variable types
                 if (self.lookupVariableType(ident.name)) |var_type| break :blk var_type;
                 break :blk "int64_t"; // Default to int64_t for identifiers
+            },
+            .index_access => |idx| blk: {
+                const obj_type = self.inferCTypeFromExpr(idx.object);
+                if (std.mem.eql(u8, obj_type, "dm_string")) break :blk "char";
+                if (std.mem.startsWith(u8, obj_type, "dm_list_")) {
+                    // Strip "dm_list_" prefix to get element type
+                    break :blk obj_type["dm_list_".len..];
+                }
+                break :blk "int64_t";
+            },
+            .method_call => |mc| blk: {
+                // Try to infer method return type from the method name
+                const obj_type = self.inferCTypeFromExpr(mc.object);
+                const type_name = if (std.mem.startsWith(u8, obj_type, "dm_"))
+                    obj_type[3..]
+                else
+                    obj_type;
+                const full_name = std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ type_name, mc.method.name }) catch break :blk "int64_t";
+                if (self.lookupFunctionReturnType(full_name)) |ret_type| break :blk ret_type;
+                break :blk "int64_t";
             },
             .field_access => "int64_t", // Need type info for proper inference
             .cast => |cast| blk: {
@@ -1906,26 +2336,57 @@ pub const CodeGenerator = struct {
             try self.generateBlock(for_stmt.body);
             try self.writer.endBlock();
         } else {
-            // Generic iterator - generate while loop style
+            // Check if iterating over a string or list
+            const iter_type = self.inferCTypeFromExpr(for_stmt.iterator);
             const iter_temp = try self.freshTemp();
-            const item_temp = try self.freshTemp();
+            const idx_temp = try self.freshTemp();
 
-            try self.writer.print("{{ void* {s} = ", .{iter_temp});
-            try self.generateExpr(for_stmt.iterator);
-            try self.writer.writeLine(";");
-            try self.writer.printLine("while (1) {{ void* {s} = dm_iter_next({s}); if ({s} == NULL) break;", .{ item_temp, iter_temp, item_temp });
+            if (std.mem.eql(u8, iter_type, "dm_string")) {
+                // String iteration: for c in "abc" { ... }
+                try self.writer.print("{s} {s} = ", .{ iter_type, iter_temp });
+                try self.generateExpr(for_stmt.iterator);
+                try self.writer.writeLine(";");
+                try self.writer.print("for (size_t {s} = 0; {s} < {s}.len; {s}++)", .{ idx_temp, idx_temp, iter_temp, idx_temp });
+                try self.writer.beginBlock();
 
-            // Bind pattern variable
-            switch (for_stmt.pattern.kind) {
-                .identifier => |ident| {
-                    try self.writer.printLine("void* {s} = {s};", .{ ident.name.name, item_temp });
-                },
-                else => {},
+                // Bind pattern variable as char
+                switch (for_stmt.pattern.kind) {
+                    .identifier => |ident| {
+                        try self.writer.printLine("char {s} = {s}.data[{s}];", .{ ident.name.name, iter_temp, idx_temp });
+                        self.trackVariableType(ident.name.name, "char");
+                    },
+                    else => {},
+                }
+
+                try self.generateBlock(for_stmt.body);
+                try self.writer.endBlock();
+            } else if (std.mem.startsWith(u8, iter_type, "dm_list_")) {
+                // List iteration: for x in items { ... }
+                const elem_type = iter_type["dm_list_".len..];
+                try self.writer.print("{s} {s} = ", .{ iter_type, iter_temp });
+                try self.generateExpr(for_stmt.iterator);
+                try self.writer.writeLine(";");
+                try self.writer.print("for (size_t {s} = 0; {s} < {s}.len; {s}++)", .{ idx_temp, idx_temp, iter_temp, idx_temp });
+                try self.writer.beginBlock();
+
+                // Bind pattern variable with element type
+                switch (for_stmt.pattern.kind) {
+                    .identifier => |ident| {
+                        try self.writer.printLine("{s} {s} = {s}.data[{s}];", .{ elem_type, ident.name.name, iter_temp, idx_temp });
+                        self.trackVariableType(ident.name.name, elem_type);
+                    },
+                    else => {},
+                }
+
+                try self.generateBlock(for_stmt.body);
+                try self.writer.endBlock();
+            } else {
+                // Fallback: generic iterator (unsupported, emit placeholder)
+                try self.writer.writeLineComment("unsupported iterator type");
+                try self.writer.write("/* for-each on ");
+                try self.writer.write(iter_type);
+                try self.writer.writeLine(" not supported */");
             }
-
-            try self.generateBlock(for_stmt.body);
-            try self.writer.writeLine("}}");
-            try self.writer.writeLine("}");
         }
     }
 
@@ -2162,6 +2623,27 @@ pub const CodeGenerator = struct {
             return;
         }
 
+        // Special handling for string ordering (<, <=, >, >=)
+        if (std.mem.eql(u8, left_type, "dm_string") and
+            (bin.op == .lt or bin.op == .le or bin.op == .gt or bin.op == .ge))
+        {
+            const cmp_op: []const u8 = switch (bin.op) {
+                .lt => " < ",
+                .le => " <= ",
+                .gt => " > ",
+                .ge => " >= ",
+                else => unreachable,
+            };
+            try self.writer.write("(dm_string_cmp(");
+            try self.generateExpr(bin.left);
+            try self.writer.write(", ");
+            try self.generateExpr(bin.right);
+            try self.writer.write(")");
+            try self.writer.write(cmp_op);
+            try self.writer.write("0)");
+            return;
+        }
+
         try self.writer.write("(");
         try self.generateExpr(bin.left);
 
@@ -2261,10 +2743,27 @@ pub const CodeGenerator = struct {
 
     /// Generate index access
     fn generateIndexAccess(self: *Self, idx: *IndexAccess) anyerror!void {
-        try self.generateExpr(idx.object);
-        try self.writer.write("[");
-        try self.generateExpr(idx.index);
-        try self.writer.write("]");
+        const obj_type = self.inferCTypeFromExpr(idx.object);
+        if (std.mem.eql(u8, obj_type, "dm_string")) {
+            // dm_string is a struct: s[i] -> ((char)(s).data[i])
+            try self.writer.write("((char)(");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").data[");
+            try self.generateExpr(idx.index);
+            try self.writer.write("])");
+        } else if (std.mem.startsWith(u8, obj_type, "dm_list_")) {
+            // dm_list_X is a struct: list[i] -> (list).data[i]
+            try self.writer.write("(");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").data[");
+            try self.generateExpr(idx.index);
+            try self.writer.write("]");
+        } else {
+            try self.generateExpr(idx.object);
+            try self.writer.write("[");
+            try self.generateExpr(idx.index);
+            try self.writer.write("]");
+        }
     }
 
     /// Generate method call (converted to function call)
@@ -2388,6 +2887,153 @@ pub const CodeGenerator = struct {
                 try self.writer.write(")");
             }
             return true;
+        } else if (std.mem.eql(u8, name, "substr")) {
+            // substr(s, start, length)
+            if (call.args.len >= 3) {
+                try self.writer.write("dm_string_substr(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[2].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "char_to_string")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_char_to_string(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "is_alpha")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_is_alpha(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "is_digit")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_is_digit(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "is_alnum")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_is_alnum(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "is_whitespace")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_is_whitespace(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "string_contains")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_string_contains(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "string_find")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_string_find(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "starts_with")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_string_starts_with(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "ends_with")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_string_ends_with(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "parse_int")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_parse_int(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "file_read")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_file_read(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "file_write")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_file_write(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "eprint")) {
+            if (call.args.len > 0) {
+                try self.generateEprintCall(call.args[0].value, false);
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "eprintln")) {
+            if (call.args.len > 0) {
+                try self.generateEprintCall(call.args[0].value, true);
+            } else {
+                try self.writer.write("fputc('\\n', stderr)");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "exit")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_exit(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "args_get")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_args_get(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "args_len")) {
+            try self.writer.write("dm_args_len()");
+            return true;
+        } else if (std.mem.eql(u8, name, "system")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_system(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "List_new")) {
+            // List_new() -> zero-initialized list struct
+            // Type will be inferred from the let binding's type annotation
+            try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
+            return true;
         }
 
         return false;
@@ -2448,6 +3094,48 @@ pub const CodeGenerator = struct {
                 try self.writer.write(")");
             } else {
                 try self.writer.write("dm_print_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            }
+        }
+    }
+
+    /// Generate eprint/eprintln with type-based dispatch (stderr variant of print)
+    fn generateEprintCall(self: *Self, arg: *Expr, newline: bool) !void {
+        const arg_type = self.inferCTypeFromExpr(arg);
+
+        if (std.mem.eql(u8, arg_type, "dm_string")) {
+            if (newline) {
+                try self.writer.write("dm_eprintln_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            } else {
+                try self.writer.write("dm_eprint_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            }
+        } else if (std.mem.eql(u8, arg_type, "int64_t") or
+            std.mem.eql(u8, arg_type, "int32_t") or
+            std.mem.eql(u8, arg_type, "int16_t") or
+            std.mem.eql(u8, arg_type, "int8_t"))
+        {
+            const nl_str = if (newline) "\\n" else "";
+            try self.writer.print("fprintf(stderr, \"%lld{s}\", (long long)(", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write("))");
+        } else if (std.mem.eql(u8, arg_type, "bool")) {
+            const nl_str = if (newline) "\\n" else "";
+            try self.writer.print("fprintf(stderr, \"%s{s}\", (", .{nl_str});
+            try self.generateExpr(arg);
+            try self.writer.write(") ? \"true\" : \"false\")");
+        } else {
+            // Fallback: assume string
+            if (newline) {
+                try self.writer.write("dm_eprintln_str(");
+                try self.generateExpr(arg);
+                try self.writer.write(")");
+            } else {
+                try self.writer.write("dm_eprint_str(");
                 try self.generateExpr(arg);
                 try self.writer.write(")");
             }

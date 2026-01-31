@@ -1242,7 +1242,8 @@ pub const Parser = struct {
     pub fn parseFor(self: *Self, start_loc: SourceLocation) !*Statement {
         const pattern = try self.parsePattern();
         try self.expect(.kw_in, "'in' after for loop pattern");
-        const iterable = try self.parseExpr();
+        // Use parseExprNoStruct to avoid `for x in items { ... }` parsing `items { ... }` as struct literal
+        const iterable = try self.parseExprNoStruct();
         const body = try self.parseBlockExpr();
 
         const for_loop = try self.astAllocator().create(ForLoop);

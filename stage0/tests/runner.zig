@@ -1268,6 +1268,319 @@ pub const enum_match_tests = [_]TestCase{
     },
 };
 
+// Phase A: String Operations
+pub const string_ops_tests = [_]TestCase{
+    .{
+        .name = "string_indexing",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hello"
+            \\    let c = s[1]
+            \\    println(char_to_string(c))
+            \\}
+        ,
+        .expected_output = "e\n",
+    },
+    .{
+        .name = "string_substr",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hello world"
+            \\    let sub = substr(s, 6, 5)
+            \\    println(sub)
+            \\}
+        ,
+        .expected_output = "world\n",
+    },
+    .{
+        .name = "string_compare",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println("abc" < "abd")
+            \\    println("xyz" > "abc")
+            \\    println("abc" <= "abc")
+            \\    println("abc" >= "abd")
+            \\}
+        ,
+        .expected_output = "true\ntrue\ntrue\nfalse\n",
+    },
+    .{
+        .name = "char_classify",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "a5 Z"
+            \\    println(is_alpha(s[0]))
+            \\    println(is_digit(s[1]))
+            \\    println(is_whitespace(s[2]))
+            \\    println(is_alnum(s[3]))
+            \\}
+        ,
+        .expected_output = "true\ntrue\ntrue\ntrue\n",
+    },
+    .{
+        .name = "char_to_string_test",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hello"
+            \\    let c = char_to_string(s[0])
+            \\    println(c)
+            \\}
+        ,
+        .expected_output = "h\n",
+    },
+    .{
+        .name = "string_iteration",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    for c in "abc" {
+            \\        print(char_to_string(c))
+            \\    }
+            \\    println("")
+            \\}
+        ,
+        .expected_output = "abc\n",
+    },
+};
+
+// Phase B: Dynamic Lists
+pub const list_tests = [_]TestCase{
+    .{
+        .name = "list_create_push_get",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut items: List[int] = List_new()
+            \\    items.push(10)
+            \\    items.push(20)
+            \\    items.push(30)
+            \\    println(items[0])
+            \\    println(items[1])
+            \\    println(items[2])
+            \\}
+        ,
+        .expected_output = "10\n20\n30\n",
+    },
+    .{
+        .name = "list_len",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut items: List[int] = List_new()
+            \\    println(len(items))
+            \\    items.push(1)
+            \\    items.push(2)
+            \\    items.push(3)
+            \\    println(len(items))
+            \\}
+        ,
+        .expected_output = "0\n3\n",
+    },
+    .{
+        .name = "list_iteration",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut items: List[int] = List_new()
+            \\    items.push(1)
+            \\    items.push(2)
+            \\    items.push(3)
+            \\    let mut sum: int = 0
+            \\    for x in items {
+            \\        sum = sum + x
+            \\    }
+            \\    println(sum)
+            \\}
+        ,
+        .expected_output = "6\n",
+    },
+    .{
+        .name = "list_of_strings",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut words: List[String] = List_new()
+            \\    words.push("hello")
+            \\    words.push(" ")
+            \\    words.push("world")
+            \\    print(words[0])
+            \\    print(words[1])
+            \\    println(words[2])
+            \\}
+        ,
+        .expected_output = "hello world\n",
+    },
+    .{
+        .name = "list_of_structs",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut points: List[Point] = List_new()
+            \\    points.push(Point { x: 1, y: 2 })
+            \\    points.push(Point { x: 3, y: 4 })
+            \\    let p = points[0]
+            \\    println(p.x)
+            \\    println(p.y)
+            \\    let q = points[1]
+            \\    println(q.x)
+            \\    println(q.y)
+            \\}
+        ,
+        .expected_output = "1\n2\n3\n4\n",
+    },
+};
+
+// Phase C: File I/O, Stderr, Exit, Args
+pub const io_tests = [_]TestCase{
+    .{
+        .name = "file_read_write",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    file_write("/tmp/daimond_test_io.txt", "hello from daimond")
+            \\    let content = file_read("/tmp/daimond_test_io.txt")
+            \\    println(content)
+            \\}
+        ,
+        .expected_output = "hello from daimond\n",
+    },
+    .{
+        .name = "exit_code",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    exit(42)
+            \\}
+        ,
+        .expected_output = "",
+        .expected_exit_code = 42,
+    },
+    .{
+        .name = "args_len_test",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let n = args_len()
+            \\    if n > 0 {
+            \\        println("has args")
+            \\    }
+            \\}
+        ,
+        .expected_output = "has args\n",
+    },
+    .{
+        .name = "eprint_test",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    eprintln("error msg")
+            \\    println("ok")
+            \\}
+        ,
+        .expected_output = "ok\n",
+    },
+};
+
+// Phase D: Process Execution
+pub const process_tests = [_]TestCase{
+    .{
+        .name = "system_call",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let result = system("true")
+            \\    println(result)
+            \\}
+        ,
+        .expected_output = "0\n",
+    },
+};
+
+// Phase E: Remaining Utilities
+pub const utility_tests = [_]TestCase{
+    .{
+        .name = "string_find_test",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let pos = string_find("hello world", "world")
+            \\    println(pos)
+            \\    let notfound = string_find("hello", "xyz")
+            \\    println(notfound)
+            \\}
+        ,
+        .expected_output = "6\n-1\n",
+    },
+    .{
+        .name = "starts_ends_with",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(starts_with("hello", "hel"))
+            \\    println(starts_with("hello", "xyz"))
+            \\    println(ends_with("hello", "llo"))
+            \\    println(ends_with("hello", "xyz"))
+            \\}
+        ,
+        .expected_output = "true\nfalse\ntrue\nfalse\n",
+    },
+    .{
+        .name = "parse_int_test",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let n = parse_int("42")
+            \\    println(n)
+            \\    let m = parse_int("-7")
+            \\    println(m)
+            \\}
+        ,
+        .expected_output = "42\n-7\n",
+    },
+    .{
+        .name = "string_contains_test",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(string_contains("hello world", "world"))
+            \\    println(string_contains("hello world", "xyz"))
+            \\    println(string_contains("abc", "bc"))
+            \\}
+        ,
+        .expected_output = "true\nfalse\ntrue\n",
+    },
+};
+
 // Tests for features not yet implemented (will fail until implemented)
 pub const future_tests = [_]TestCase{
     // These tests document what we want to support
@@ -1303,6 +1616,11 @@ pub fn main() !void {
         .{ .name = "Impl Methods", .tests = &impl_tests },
         .{ .name = "Strings", .tests = &string_tests },
         .{ .name = "Enum Match", .tests = &enum_match_tests },
+        .{ .name = "String Ops", .tests = &string_ops_tests },
+        .{ .name = "Lists", .tests = &list_tests },
+        .{ .name = "File I/O", .tests = &io_tests },
+        .{ .name = "Process", .tests = &process_tests },
+        .{ .name = "Utilities", .tests = &utility_tests },
         .{ .name = "Compile Errors", .tests = &compile_error_tests },
     };
 
