@@ -2431,6 +2431,11 @@ pub const CodeGenerator = struct {
 
     /// Generate for loop
     fn generateForLoop(self: *Self, for_stmt: *ForLoop) anyerror!void {
+        // Loop bodies should not treat result expressions as return values
+        const saved_void = self.current_function_is_void;
+        self.current_function_is_void = true;
+        defer self.current_function_is_void = saved_void;
+
         // Check if iterator is a range expression
         if (for_stmt.iterator.kind == .range) {
             const range = for_stmt.iterator.kind.range;
@@ -2529,7 +2534,11 @@ pub const CodeGenerator = struct {
         try self.generateExpr(while_stmt.condition);
         try self.writer.write(")");
         try self.writer.beginBlock();
+        // Loop bodies should not treat result expressions as return values
+        const saved = self.current_function_is_void;
+        self.current_function_is_void = true;
         try self.generateBlock(while_stmt.body);
+        self.current_function_is_void = saved;
         try self.writer.endBlock();
     }
 
@@ -2540,7 +2549,11 @@ pub const CodeGenerator = struct {
         }
         try self.writer.writeLine("while (true) {");
         self.writer.indent();
+        // Loop bodies should not treat result expressions as return values
+        const saved = self.current_function_is_void;
+        self.current_function_is_void = true;
         try self.generateBlock(loop.body);
+        self.current_function_is_void = saved;
         self.writer.dedent();
         try self.writer.writeLine("}");
         if (loop.label) |label| {
