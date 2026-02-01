@@ -1969,18 +1969,47 @@ pub const TypeChecker = struct {
         }
     }
 
-    fn checkFunction(self: *Self, func: *const ast.FunctionDecl, is_public: bool) !void {
-        // Check for duplicate definition
+    /// Pre-register a function's type signature without checking its body.
+    /// This enables forward function references across the module.
+    fn registerFunctionSignature(self: *Self, func: *const ast.FunctionDecl, is_public: bool) !void {
+        // Skip if already registered (e.g. duplicate function name - error reported later)
         if (self.env.lookupLocal(func.name.name)) |_| {
-            try self.reportError(.duplicate_definition, "duplicate function definition", func.span);
             return;
         }
 
-        // Build function type from signature (before checking body)
+        // Build function type from signature
         var param_types = std.ArrayList(TypeId).init(self.allocator);
         defer param_types.deinit();
 
-        // We need to resolve param types in the current scope first
+        for (func.params) |param| {
+            const param_type = try self.resolveTypeExpr(param.type_expr);
+            try param_types.append(param_type);
+        }
+
+        const return_type = if (func.return_type) |rt|
+            try self.resolveTypeExpr(rt)
+        else
+            try self.type_ctx.intern(.unit);
+
+        var effects = EffectSet.pure;
+        if (func.effects) |effs| {
+            for (effs) |eff| {
+                try self.addEffectFromTypeExpr(eff, &effects);
+            }
+        }
+
+        const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
+        try self.env.define(Symbol.init(func.name.name, .function, fn_type)
+            .withPublic(is_public)
+            .withEffects(effects)
+            .withLocation(func.span));
+    }
+
+    fn checkFunction(self: *Self, func: *const ast.FunctionDecl, is_public: bool) !void {
+        // Build function type from signature
+        var param_types = std.ArrayList(TypeId).init(self.allocator);
+        defer param_types.deinit();
+
         for (func.params) |param| {
             const param_type = try self.resolveTypeExpr(param.type_expr);
             try param_types.append(param_type);
@@ -2000,12 +2029,21 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Register function in current scope BEFORE checking body (enables recursion)
-        const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
-        try self.env.define(Symbol.init(func.name.name, .function, fn_type)
-            .withPublic(is_public)
-            .withEffects(effects)
-            .withLocation(func.span));
+        // Register function if not already pre-registered from pass 1.5
+        if (self.env.lookupLocal(func.name.name)) |existing| {
+            if (existing.kind != .function) {
+                try self.reportError(.duplicate_definition, "duplicate function definition", func.span);
+                return;
+            }
+            // Already pre-registered, proceed to check body
+        } else {
+            // Not pre-registered (e.g. impl method), register now
+            const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
+            try self.env.define(Symbol.init(func.name.name, .function, fn_type)
+                .withPublic(is_public)
+                .withEffects(effects)
+                .withLocation(func.span));
+        }
 
         // Now push a function scope for the body
         try self.env.pushScope(.function);
@@ -2236,6 +2274,14 @@ pub const TypeChecker = struct {
 
         // Register Self
         try self.env.define(Symbol.init("Self", .type_param, target_type));
+
+        // Pre-register all method signatures (enables forward references within impl)
+        for (ib.items) |item| {
+            switch (item.kind) {
+                .function => |func| try self.registerFunctionSignature(func, item.visibility == .public),
+                else => {},
+            }
+        }
 
         // Check all items
         for (ib.items) |item| {
@@ -2480,6 +2526,14 @@ pub const TypeChecker = struct {
                 .struct_def => |sd| try self.checkStruct(sd, decl.visibility == .public),
                 .enum_def => |ed| try self.checkEnum(ed, decl.visibility == .public),
                 .trait_def => |td| try self.checkTrait(td, decl.visibility == .public),
+                else => {},
+            }
+        }
+
+        // Pass 1.5: register all top-level function signatures (enables forward references)
+        for (source_file.declarations) |decl| {
+            switch (decl.kind) {
+                .function => |func| try self.registerFunctionSignature(func, decl.visibility == .public),
                 else => {},
             }
         }

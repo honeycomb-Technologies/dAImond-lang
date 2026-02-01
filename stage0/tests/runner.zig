@@ -1751,6 +1751,70 @@ pub const mut_param_tests = [_]TestCase{
     },
 };
 
+// Tests for forward function references
+pub const forward_ref_tests = [_]TestCase{
+    .{
+        .name = "forward_ref_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(bar())
+            \\}
+            \\
+            \\fn bar() -> int {
+            \\    return 42
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "forward_ref_chain",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(a())
+            \\}
+            \\
+            \\fn a() -> int {
+            \\    return b() + 1
+            \\}
+            \\
+            \\fn b() -> int {
+            \\    return 10
+            \\}
+        ,
+        .expected_output = "11\n",
+    },
+    .{
+        .name = "forward_ref_mutual",
+        .source =
+            \\module test
+            \\
+            \\fn is_even(n: int) -> bool {
+            \\    if n == 0 {
+            \\        return true
+            \\    }
+            \\    return is_odd(n - 1)
+            \\}
+            \\
+            \\fn is_odd(n: int) -> bool {
+            \\    if n == 0 {
+            \\        return false
+            \\    }
+            \\    return is_even(n - 1)
+            \\}
+            \\
+            \\fn main() {
+            \\    println(is_even(4))
+            \\    println(is_odd(3))
+            \\}
+        ,
+        .expected_output = "true\ntrue\n",
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -1787,6 +1851,7 @@ pub fn main() !void {
         .{ .name = "Process", .tests = &process_tests },
         .{ .name = "Utilities", .tests = &utility_tests },
         .{ .name = "Mut Params", .tests = &mut_param_tests },
+        .{ .name = "Forward Refs", .tests = &forward_ref_tests },
         .{ .name = "Compile Errors", .tests = &compile_error_tests },
     };
 
