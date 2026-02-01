@@ -201,6 +201,44 @@ pub const Parser = struct {
         return self.allocator;
     }
 
+    /// Process escape sequences in a string literal value.
+    /// Converts \n, \t, \r, \\, \", \', \0 to their actual byte values.
+    /// Returns a newly allocated string with escapes resolved, or the original
+    /// slice if no escapes are present (to avoid unnecessary allocation).
+    fn processStringEscapes(self: *Self, raw: []const u8) ![]const u8 {
+        // Quick check: if no backslashes, return as-is
+        if (std.mem.indexOfScalar(u8, raw, '\\') == null) {
+            return raw;
+        }
+
+        var buf = std.ArrayList(u8).init(self.allocator);
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == '\\' and i + 1 < raw.len) {
+                const next = raw[i + 1];
+                switch (next) {
+                    'n' => try buf.append('\n'),
+                    't' => try buf.append('\t'),
+                    'r' => try buf.append('\r'),
+                    '\\' => try buf.append('\\'),
+                    '"' => try buf.append('"'),
+                    '\'' => try buf.append('\''),
+                    '0' => try buf.append(0),
+                    else => {
+                        // Unknown escape - preserve as-is
+                        try buf.append('\\');
+                        try buf.append(next);
+                    },
+                }
+                i += 2;
+            } else {
+                try buf.append(raw[i]);
+                i += 1;
+            }
+        }
+        return buf.toOwnedSlice();
+    }
+
     // ========================================================================
     // Entry Point
     // ========================================================================
@@ -227,11 +265,25 @@ pub const Parser = struct {
                     try imports.append(imp);
                 } else |_| {
                     self.synchronize();
+                    // Guarantee forward progress to avoid infinite loops
+                    if (!self.isAtEnd() and !self.check(.kw_fn) and !self.check(.kw_struct) and
+                        !self.check(.kw_enum) and !self.check(.kw_trait) and !self.check(.kw_impl) and
+                        !self.check(.kw_import) and !self.check(.kw_const))
+                    {
+                        _ = self.advance();
+                    }
                 }
             } else if (self.parseDeclaration()) |decl| {
                 try declarations.append(decl);
             } else |_| {
                 self.synchronize();
+                // Guarantee forward progress to avoid infinite loops
+                if (!self.isAtEnd() and !self.check(.kw_fn) and !self.check(.kw_struct) and
+                    !self.check(.kw_enum) and !self.check(.kw_trait) and !self.check(.kw_impl) and
+                    !self.check(.kw_import) and !self.check(.kw_const))
+                {
+                    _ = self.advance();
+                }
             }
         }
 
@@ -1694,7 +1746,9 @@ pub const Parser = struct {
         if (self.match(.string)) {
             const lexeme = self.previous().lexeme;
             // Strip surrounding quotes from "..."
-            const value = if (lexeme.len >= 2) lexeme[1 .. lexeme.len - 1] else lexeme;
+            const raw_value = if (lexeme.len >= 2) lexeme[1 .. lexeme.len - 1] else lexeme;
+            // Process escape sequences (\n, \t, \\, \", etc.)
+            const value = try self.processStringEscapes(raw_value);
 
             const lit = try self.astAllocator().create(Literal);
             lit.* = .{
@@ -2648,10 +2702,10 @@ pub const Parser = struct {
         self.panic_mode = false;
 
         while (!self.isAtEnd()) {
-            // Stop at statement boundaries
-            if (self.previous().type == .semicolon or self.previous().type == .rbrace) return;
+            // Stop after closing braces (end of block)
+            if (self.previous().type == .rbrace) return;
 
-            // Stop at declaration keywords
+            // Stop at declaration-starting keywords only
             switch (self.peek().type) {
                 .kw_fn,
                 .kw_struct,
@@ -2659,14 +2713,7 @@ pub const Parser = struct {
                 .kw_trait,
                 .kw_impl,
                 .kw_import,
-                .kw_let,
                 .kw_const,
-                .kw_if,
-                .kw_while,
-                .kw_for,
-                .kw_loop,
-                .kw_return,
-                .kw_match,
                 => return,
                 else => {},
             }
@@ -2687,23 +2734,6 @@ pub const Parser = struct {
 };
 
 // ============================================================================
-// Convenience Function
-// ============================================================================
-
-/// Parse source code into a SourceFile AST
-pub fn parseSource(source: []const u8, allocator: Allocator) !*SourceFile {
-    var lex = Lexer.init(source, allocator);
-    defer lex.deinit();
-
-    const tokens = try lex.scanAll();
-    defer allocator.free(tokens);
-
-    var parser = Parser.init(tokens, allocator);
-    defer parser.deinit();
-
-    return parser.parse();
-}
-
 // ============================================================================
 // TESTS
 // ============================================================================

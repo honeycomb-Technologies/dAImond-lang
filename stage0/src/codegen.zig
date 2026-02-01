@@ -24,15 +24,10 @@ const Path = ast.Path;
 const SourceFile = ast.SourceFile;
 const Declaration = ast.Declaration;
 const FunctionDecl = ast.FunctionDecl;
-const FunctionParam = ast.FunctionParam;
-const GenericParam = ast.GenericParam;
 const StructDecl = ast.StructDecl;
-const StructField = ast.StructField;
 const EnumDecl = ast.EnumDecl;
 const EnumVariant = ast.EnumVariant;
-const TraitDecl = ast.TraitDecl;
 const ImplBlock = ast.ImplBlock;
-const ImplItem = ast.ImplItem;
 const ConstDecl = ast.ConstDecl;
 const Statement = ast.Statement;
 const LetBinding = ast.LetBinding;
@@ -44,7 +39,6 @@ const LoopStmt = ast.LoopStmt;
 const BreakStmt = ast.BreakStmt;
 const ContinueStmt = ast.ContinueStmt;
 const RegionBlock = ast.RegionBlock;
-const DiscardStmt = ast.DiscardStmt;
 const Expr = ast.Expr;
 const Literal = ast.Literal;
 const BinaryExpr = ast.BinaryExpr;
@@ -59,7 +53,6 @@ const ArrayLiteral = ast.ArrayLiteral;
 const TupleLiteral = ast.TupleLiteral;
 const IfExpr = ast.IfExpr;
 const MatchExpr = ast.MatchExpr;
-const MatchArm = ast.MatchArm;
 const BlockExpr = ast.BlockExpr;
 const LambdaExpr = ast.LambdaExpr;
 const PipelineExpr = ast.PipelineExpr;
@@ -68,7 +61,6 @@ const CoalesceExpr = ast.CoalesceExpr;
 const RangeExpr = ast.RangeExpr;
 const CastExpr = ast.CastExpr;
 const TypeCheckExpr = ast.TypeCheckExpr;
-const ComptimeExpr = ast.ComptimeExpr;
 const Pattern = ast.Pattern;
 const TypeExpr = ast.TypeExpr;
 const NamedType = ast.NamedType;
@@ -262,6 +254,9 @@ pub const CodeGenerator = struct {
     // Track function return types for type inference during codegen
     function_return_types: std.StringHashMap([]const u8),
 
+    // Track struct field types: maps "StructName.field" -> C type
+    struct_field_types: std.StringHashMap([]const u8),
+
     // Track generated list types: maps list type name -> element C type
     generated_list_types: std.StringHashMap([]const u8),
     // Deferred buffer for list type definitions
@@ -278,6 +273,12 @@ pub const CodeGenerator = struct {
 
     // Whether current function returns void (don't generate return for block result)
     current_function_is_void: bool,
+
+    // Track which parameters in the current function are mut (pass-by-reference)
+    current_mut_params: std.StringHashMap(void),
+
+    // Track which function parameters are mut: function name → array of is_mut flags
+    function_mut_info: std.StringHashMap([]const bool),
 
     // Region stack for memory management
     region_stack: std.ArrayList([]const u8),
@@ -304,12 +305,15 @@ pub const CodeGenerator = struct {
             .impl_methods = std.ArrayList(ImplMethodInfo).init(allocator),
             .variable_types = std.StringHashMap([]const u8).init(allocator),
             .function_return_types = std.StringHashMap([]const u8).init(allocator),
+            .struct_field_types = std.StringHashMap([]const u8).init(allocator),
             .generated_list_types = std.StringHashMap([]const u8).init(allocator),
             .list_type_writer = CWriter.init(allocator),
             .temp_counter = 0,
             .lambda_depth = 0,
             .current_function = null,
             .current_function_is_void = false,
+            .current_mut_params = std.StringHashMap(void).init(allocator),
+            .function_mut_info = std.StringHashMap([]const bool).init(allocator),
             .region_stack = std.ArrayList([]const u8).init(allocator),
         };
     }
@@ -325,8 +329,11 @@ pub const CodeGenerator = struct {
         self.impl_methods.deinit();
         self.variable_types.deinit();
         self.function_return_types.deinit();
+        self.struct_field_types.deinit();
         self.generated_list_types.deinit();
         self.list_type_writer.deinit();
+        self.current_mut_params.deinit();
+        self.function_mut_info.deinit();
         self.region_stack.deinit();
     }
 
@@ -345,6 +352,34 @@ pub const CodeGenerator = struct {
         const name = try std.fmt.allocPrint(self.stringAllocator(), "_dm_tmp_{d}", .{self.temp_counter});
         self.temp_counter += 1;
         return name;
+    }
+
+    /// Write a string value as a C string literal, escaping special characters.
+    /// The input is the actual byte content (escapes already resolved by parser).
+    /// This re-escapes for C: newline → \n, tab → \t, etc.
+    fn writeCStringLiteral(self: *Self, value: []const u8) !void {
+        try self.writer.write("\"");
+        for (value) |c| {
+            switch (c) {
+                '\n' => try self.writer.write("\\n"),
+                '\t' => try self.writer.write("\\t"),
+                '\r' => try self.writer.write("\\r"),
+                '\\' => try self.writer.write("\\\\"),
+                '"' => try self.writer.write("\\\""),
+                0 => try self.writer.write("\\0"),
+                else => {
+                    if (c >= 0x20 and c < 0x7F) {
+                        try self.writer.buffer.append(c);
+                    } else {
+                        // Non-printable: emit hex escape
+                        var hex_buf: [4]u8 = undefined;
+                        const hex = std.fmt.bufPrint(&hex_buf, "\\x{x:0>2}", .{c}) catch unreachable;
+                        try self.writer.write(hex);
+                    }
+                },
+            }
+        }
+        try self.writer.write("\"");
     }
 
     /// Get the generated C code
@@ -394,6 +429,51 @@ pub const CodeGenerator = struct {
         }
 
         try self.writer.blankLine();
+
+        // Pre-scan all function declarations to record mutable parameter info
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .function => |f| try self.collectFunctionMutInfo(f, null),
+                .impl_block => |impl| {
+                    // impl methods will be collected later, but we need mut info now
+                    const target_name = try self.extractTypeName(impl.target_type);
+                    for (impl.items) |item| {
+                        switch (item.kind) {
+                            .function => |func| {
+                                try self.collectFunctionMutInfo(func, target_name);
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Pre-scan all function return types for inference during codegen
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .function => |f| {
+                    const ret_type = if (f.return_type) |rt| try self.mapType(rt) else "void";
+                    self.trackFunctionReturnType(f.name.name, ret_type);
+                },
+                .impl_block => |impl| {
+                    const target_name = try self.extractTypeName(impl.target_type);
+                    for (impl.items) |item| {
+                        switch (item.kind) {
+                            .function => |func| {
+                                const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+                                self.trackFunctionReturnType(func.name.name, ret_type);
+                                const full_name = try std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ target_name, func.name.name });
+                                self.trackFunctionReturnType(full_name, ret_type);
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
 
         // Generate function prototypes
         for (source.declarations) |decl| {
@@ -1468,7 +1548,12 @@ pub const CodeGenerator = struct {
                 if (self.lookupFunctionReturnType(full_name)) |ret_type| break :blk ret_type;
                 break :blk "int64_t";
             },
-            .field_access => "int64_t", // Need type info for proper inference
+            .field_access => |fa| blk: {
+                const obj_type = self.inferCTypeFromExpr(fa.object);
+                const key = std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ obj_type, fa.field.name }) catch break :blk "int64_t";
+                if (self.struct_field_types.get(key)) |field_type| break :blk field_type;
+                break :blk "int64_t";
+            },
             .cast => |cast| blk: {
                 break :blk self.mapType(cast.target_type) catch "void*";
             },
@@ -1527,6 +1612,9 @@ pub const CodeGenerator = struct {
         for (s.fields) |field| {
             const field_type = try self.mapType(field.type_expr);
             try self.writer.printLine("{s} {s};", .{ field_type, field.name.name });
+            // Track field types for inference: "dm_StructName.fieldName" -> C type
+            const key = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ name, field.name.name });
+            try self.struct_field_types.put(key, field_type);
         }
 
         self.writer.dedent();
@@ -1752,6 +1840,32 @@ pub const CodeGenerator = struct {
     // FUNCTION GENERATION
     // ========================================================================
 
+    /// Collect mutable parameter info for a function declaration.
+    /// Records which parameters are mut so call sites can pass by reference.
+    fn collectFunctionMutInfo(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8) !void {
+        var has_any_mut = false;
+        const has_self = type_prefix != null and methodHasSelf(func);
+        const start_idx: usize = if (has_self) 1 else 0;
+
+        for (func.params[start_idx..]) |param| {
+            if (param.is_mut) {
+                has_any_mut = true;
+                break;
+            }
+        }
+
+        if (!has_any_mut) return;
+
+        // Build array of mut flags (excluding self)
+        const mut_flags = try self.stringAllocator().alloc(bool, func.params[start_idx..].len);
+        for (func.params[start_idx..], 0..) |param, i| {
+            mut_flags[i] = param.is_mut;
+        }
+
+        const func_name = try self.mangleFunctionName(func.name.name, type_prefix);
+        try self.function_mut_info.put(func_name, mut_flags);
+    }
+
     /// Check if a method has a self parameter (first param named "self")
     fn methodHasSelf(func: *FunctionDecl) bool {
         if (func.params.len > 0) {
@@ -1784,7 +1898,11 @@ pub const CodeGenerator = struct {
             if (!first) try self.writer.write(", ");
             first = false;
             const param_type = try self.mapType(param.type_expr);
-            try self.writer.print("{s} {s}", .{ param_type, param.name.name });
+            if (param.is_mut) {
+                try self.writer.print("{s}* {s}", .{ param_type, param.name.name });
+            } else {
+                try self.writer.print("{s} {s}", .{ param_type, param.name.name });
+            }
         }
 
         if (!has_self and type_prefix == null and func.params.len == 0) {
@@ -1825,6 +1943,10 @@ pub const CodeGenerator = struct {
             }
         }
 
+        // Clear and populate mut params for this function
+        self.current_mut_params.clearRetainingCapacity();
+        defer self.current_mut_params.clearRetainingCapacity();
+
         // Generate parameter list (skip self param if present)
         const start_idx: usize = if (has_self) 1 else 0;
         var first = true;
@@ -1832,7 +1954,12 @@ pub const CodeGenerator = struct {
             if (!first) try self.writer.write(", ");
             first = false;
             const param_type = try self.mapType(param.type_expr);
-            try self.writer.print("{s} {s}", .{ param_type, param.name.name });
+            if (param.is_mut) {
+                try self.writer.print("{s}* {s}", .{ param_type, param.name.name });
+                try self.current_mut_params.put(param.name.name, {});
+            } else {
+                try self.writer.print("{s} {s}", .{ param_type, param.name.name });
+            }
         }
 
         if (!has_self and type_prefix == null and func.params.len == 0) {
@@ -1843,6 +1970,12 @@ pub const CodeGenerator = struct {
 
         // Generate body
         if (func.body) |body| {
+            // Track self type for method bodies
+            if (has_self) {
+                const mangled_type = try self.mangleTypeName(type_prefix.?);
+                self.trackVariableType("self", mangled_type);
+            }
+
             // Track parameter types for use in body (skip self)
             for (func.params[start_idx..]) |param| {
                 const param_type = try self.mapType(param.type_expr);
@@ -2477,7 +2610,13 @@ pub const CodeGenerator = struct {
     pub fn generateExpr(self: *Self, expr: *Expr) anyerror!void {
         switch (expr.kind) {
             .literal => |lit| try self.generateLiteral(lit),
-            .identifier => |ident| try self.writer.write(ident.name),
+            .identifier => |ident| {
+                if (self.current_mut_params.contains(ident.name)) {
+                    try self.writer.print("(*{s})", .{ident.name});
+                } else {
+                    try self.writer.write(ident.name);
+                }
+            },
             .path => |path| try self.generatePathExpr(path),
             .binary => |bin| try self.generateBinaryExpr(bin),
             .unary => |un| try self.generateUnaryExpr(un),
@@ -2539,13 +2678,17 @@ pub const CodeGenerator = struct {
             .string => |str_lit| {
                 switch (str_lit.kind) {
                     .regular => {
-                        try self.writer.print("dm_string_from_cstr(\"{s}\")", .{str_lit.value});
+                        try self.writer.write("dm_string_from_cstr(");
+                        try self.writeCStringLiteral(str_lit.value);
+                        try self.writer.write(")");
                     },
                     .raw => {
-                        try self.writer.print("dm_string_from_cstr(\"{s}\")", .{str_lit.value});
+                        try self.writer.write("dm_string_from_cstr(");
+                        try self.writeCStringLiteral(str_lit.value);
+                        try self.writer.write(")");
                     },
                     .byte => {
-                        try self.writer.print("\"{s}\"", .{str_lit.value});
+                        try self.writeCStringLiteral(str_lit.value);
                     },
                 }
             },
@@ -2727,16 +2870,17 @@ pub const CodeGenerator = struct {
 
     /// Generate field access
     fn generateFieldAccess(self: *Self, field: *FieldAccess) anyerror!void {
-        // Check if the object is 'self' (a pointer in methods) - use -> instead of .
-        const is_pointer = if (field.object.kind == .identifier)
-            std.mem.eql(u8, field.object.kind.identifier.name, "self")
-        else
-            false;
+        // Check if the object is a pointer (self or mut param) - use -> instead of .
+        const is_pointer = if (field.object.kind == .identifier) blk: {
+            const name = field.object.kind.identifier.name;
+            break :blk std.mem.eql(u8, name, "self") or self.current_mut_params.contains(name);
+        } else false;
 
-        try self.generateExpr(field.object);
         if (is_pointer) {
-            try self.writer.print("->{s}", .{field.field.name});
+            // Write the name directly (not dereferenced) and use ->
+            try self.writer.print("{s}->{s}", .{ field.object.kind.identifier.name, field.field.name });
         } else {
+            try self.generateExpr(field.object);
             try self.writer.print(".{s}", .{field.field.name});
         }
     }
@@ -2794,14 +2938,15 @@ pub const CodeGenerator = struct {
     /// Generate function call
     fn generateFunctionCall(self: *Self, call: *FunctionCall) anyerror!void {
         // Check for built-in functions
+        var mangled_name: ?[]const u8 = null;
         if (call.function.kind == .identifier) {
             const name = call.function.kind.identifier.name;
             if (try self.generateBuiltinCall(name, call)) {
                 return;
             }
             // User-defined function - mangle the name
-            const mangled = try self.mangleFunctionName(name, null);
-            try self.writer.write(mangled);
+            mangled_name = try self.mangleFunctionName(name, null);
+            try self.writer.write(mangled_name.?);
         } else if (call.function.kind == .path) {
             // Path as function target - use generatePath (not generatePathExpr)
             // to avoid adding () for enum constructors that take arguments
@@ -2812,9 +2957,20 @@ pub const CodeGenerator = struct {
         }
         try self.writer.write("(");
 
+        // Look up mut param info for this function
+        const mut_flags: ?[]const bool = if (mangled_name) |mn| self.function_mut_info.get(mn) else null;
+
         for (call.args, 0..) |arg, i| {
             if (i > 0) try self.writer.write(", ");
-            try self.generateExpr(arg.value);
+            const is_mut_param = if (mut_flags) |flags| (i < flags.len and flags[i]) else false;
+            if (is_mut_param) {
+                // Pass by reference for mut params
+                try self.writer.write("&(");
+                try self.generateExpr(arg.value);
+                try self.writer.write(")");
+            } else {
+                try self.generateExpr(arg.value);
+            }
         }
 
         try self.writer.write(")");

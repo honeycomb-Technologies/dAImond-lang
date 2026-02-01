@@ -469,6 +469,24 @@ pub const compile_error_tests = [_]TestCase{
         .expected_output = "",
         .expect_compile_error = true,
     },
+    .{
+        .name = "missing_param_type",
+        .source =
+        \\module test
+        \\struct Foo { x: int, }
+        \\impl Foo {
+        \\    fn bar(self) -> int {
+        \\        return self.x
+        \\    }
+        \\}
+        \\fn main() {
+        \\    let f = Foo { x: 1 }
+        \\    println(f.bar())
+        \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
 };
 
 // Tests for arithmetic and comparison operations
@@ -765,6 +783,26 @@ pub const struct_tests = [_]TestCase{
         \\}
         ,
         .expected_output = "5\n",
+    },
+    .{
+        .name = "struct_mixed_field_types",
+        .source =
+        \\module test
+        \\
+        \\struct Token {
+        \\    kind: int,
+        \\    value: string,
+        \\    line: int,
+        \\}
+        \\
+        \\fn main() {
+        \\    let t = Token { kind: 1, value: "hello", line: 5 }
+        \\    println(t.kind)
+        \\    println(t.value)
+        \\    println(t.line)
+        \\}
+        ,
+        .expected_output = "1\nhello\n5\n",
     },
 };
 
@@ -1352,6 +1390,54 @@ pub const string_ops_tests = [_]TestCase{
         ,
         .expected_output = "abc\n",
     },
+    .{
+        .name = "string_escape_newline",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hello\nworld"
+            \\    print(s)
+            \\}
+        ,
+        .expected_output = "hello\nworld",
+    },
+    .{
+        .name = "string_escape_tab",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "a\tb"
+            \\    println(s)
+            \\}
+        ,
+        .expected_output = "a\tb\n",
+    },
+    .{
+        .name = "string_escape_backslash",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "back\\slash"
+            \\    println(s)
+            \\}
+        ,
+        .expected_output = "back\\slash\n",
+    },
+    .{
+        .name = "string_escape_quote",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "say \"hi\""
+            \\    println(s)
+            \\}
+        ,
+        .expected_output = "say \"hi\"\n",
+    },
 };
 
 // Phase B: Dynamic Lists
@@ -1581,9 +1667,88 @@ pub const utility_tests = [_]TestCase{
     },
 };
 
-// Tests for features not yet implemented (will fail until implemented)
-pub const future_tests = [_]TestCase{
-    // These tests document what we want to support
+// Mutable parameter tests
+pub const mut_param_tests = [_]TestCase{
+    .{
+        .name = "mut_param_struct",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\fn move_right(mut p: Point, dx: int) {
+            \\    p.x = p.x + dx
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut pt = Point { x: 10, y: 20 }
+            \\    move_right(pt, 5)
+            \\    println(pt.x)
+            \\    println(pt.y)
+            \\}
+        ,
+        .expected_output = "15\n20\n",
+    },
+    .{
+        .name = "mut_param_int",
+        .source =
+            \\module test
+            \\
+            \\fn increment(mut n: int) {
+            \\    n = n + 1
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut x = 10
+            \\    increment(x)
+            \\    println(x)
+            \\}
+        ,
+        .expected_output = "11\n",
+    },
+    .{
+        .name = "mut_param_list",
+        .source =
+            \\module test
+            \\
+            \\fn add_items(mut items: List[int]) {
+            \\    items.push(10)
+            \\    items.push(20)
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut list: List[int] = List_new()
+            \\    add_items(list)
+            \\    println(list[0])
+            \\    println(list[1])
+            \\}
+        ,
+        .expected_output = "10\n20\n",
+    },
+    .{
+        .name = "mut_param_multiple",
+        .source =
+            \\module test
+            \\
+            \\fn swap(mut a: int, mut b: int) {
+            \\    let tmp = a
+            \\    a = b
+            \\    b = tmp
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut x = 1
+            \\    let mut y = 2
+            \\    swap(x, y)
+            \\    println(x)
+            \\    println(y)
+            \\}
+        ,
+        .expected_output = "2\n1\n",
+    },
 };
 
 // Main entry point for running tests
@@ -1621,6 +1786,7 @@ pub fn main() !void {
         .{ .name = "File I/O", .tests = &io_tests },
         .{ .name = "Process", .tests = &process_tests },
         .{ .name = "Utilities", .tests = &utility_tests },
+        .{ .name = "Mut Params", .tests = &mut_param_tests },
         .{ .name = "Compile Errors", .tests = &compile_error_tests },
     };
 
