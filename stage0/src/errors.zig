@@ -227,11 +227,6 @@ pub const SourceSpan = struct {
         };
     }
 
-    /// Create a span covering two locations
-    pub fn spanning(start: SourceLocation, end: SourceLocation) SourceSpan {
-        return .{ .start = start, .end = end };
-    }
-
     /// Get the length of the span in bytes
     pub fn length(self: SourceSpan) usize {
         return self.end.offset - self.start.offset;
@@ -648,26 +643,6 @@ pub const DiagnosticBuilder = struct {
         return self;
     }
 
-    pub fn addLabel(self: *Self, label: Label) !void {
-        try self.labels.append(label);
-    }
-
-    pub fn addPrimaryLabel(self: *Self, span: SourceSpan, message: []const u8) !void {
-        try self.labels.append(.{
-            .span = span,
-            .message = message,
-            .style = .primary,
-        });
-    }
-
-    pub fn addSecondaryLabel(self: *Self, span: SourceSpan, message: []const u8) !void {
-        try self.labels.append(.{
-            .span = span,
-            .message = message,
-            .style = .secondary,
-        });
-    }
-
     pub fn addNote(self: *Self, note: []const u8) !void {
         try self.notes.append(note);
     }
@@ -755,11 +730,6 @@ pub const DiagnosticBag = struct {
         return self.error_count > 0;
     }
 
-    /// Check if there are any warnings
-    pub fn hasWarnings(self: Self) bool {
-        return self.warning_count > 0;
-    }
-
     /// Get all diagnostics
     pub fn items(self: Self) []const Diagnostic {
         return self.diagnostics.items;
@@ -794,12 +764,6 @@ pub const DiagnosticBag = struct {
         }
     }
 
-    /// Clear all diagnostics
-    pub fn clear(self: *Self) void {
-        self.diagnostics.clearRetainingCapacity();
-        self.error_count = 0;
-        self.warning_count = 0;
-    }
 };
 
 // ============================================================================
@@ -838,91 +802,6 @@ pub const Errors = struct {
         return null;
     }
 
-    // ---- Syntax Errors ----
-
-    /// Create an "unexpected token" error
-    pub fn unexpectedToken(
-        self: Self,
-        expected: []const u8,
-        found: TokenType,
-        found_lexeme: []const u8,
-        location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const found_name = @tagName(found);
-        const msg = std.fmt.bufPrint(&buf, "expected {s}, found `{s}` ({s})", .{
-            expected,
-            found_lexeme,
-            found_name,
-        }) catch "unexpected token";
-
-        const span = SourceSpan.fromLocation(location, found_lexeme.len);
-
-        return .{
-            .code = .unexpected_token,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = span,
-                .message = "unexpected token here",
-                .style = .primary,
-            }},
-        };
-    }
-
-    /// Create an "unexpected EOF" error
-    pub fn unexpectedEof(self: Self, expected: []const u8, location: SourceLocation) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "unexpected end of file, expected {s}", .{expected}) catch "unexpected EOF";
-
-        return .{
-            .code = .unexpected_eof,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-        };
-    }
-
-    // ---- Type Errors ----
-
-    /// Create a "type mismatch" error
-    pub fn typeMismatch(
-        self: Self,
-        expected: []const u8,
-        found: []const u8,
-        location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "type mismatch: expected `{s}`, found `{s}`", .{
-            expected,
-            found,
-        }) catch "type mismatch";
-
-        return .{
-            .code = .type_mismatch,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = SourceSpan.fromLocation(location, 1),
-                .message = blk: {
-                    var label_buf: [128]u8 = undefined;
-                    break :blk std.fmt.bufPrint(&label_buf, "found `{s}`", .{found}) catch "found value";
-                },
-                .style = .primary,
-            }},
-        };
-    }
-
-    // ---- Name Resolution Errors ----
-
     /// Create an "undefined variable" error
     pub fn undefinedVariable(self: Self, name: []const u8, location: SourceLocation) Diagnostic {
         var buf: [256]u8 = undefined;
@@ -943,238 +822,6 @@ pub const Errors = struct {
             .notes = &[_][]const u8{
                 "variables must be declared with `let` or `const` before use",
             },
-        };
-    }
-
-    /// Create an "undefined type" error
-    pub fn undefinedType(self: Self, name: []const u8, location: SourceLocation) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "undefined type `{s}`", .{name}) catch "undefined type";
-
-        return .{
-            .code = .undefined_type,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = SourceSpan.fromLocation(location, name.len),
-                .message = "type not found",
-                .style = .primary,
-            }},
-        };
-    }
-
-    /// Create a "duplicate definition" error
-    pub fn duplicateDefinition(
-        self: Self,
-        name: []const u8,
-        original_loc: SourceLocation,
-        duplicate_loc: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "duplicate definition of `{s}`", .{name}) catch "duplicate definition";
-
-        return .{
-            .code = .duplicate_definition,
-            .severity = .@"error",
-            .message = msg,
-            .location = duplicate_loc,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(duplicate_loc),
-            .labels = &[_]Label{
-                .{
-                    .span = SourceSpan.fromLocation(duplicate_loc, name.len),
-                    .message = "duplicate definition here",
-                    .style = .primary,
-                },
-                .{
-                    .span = SourceSpan.fromLocation(original_loc, name.len),
-                    .message = "first defined here",
-                    .style = .secondary,
-                },
-            },
-        };
-    }
-
-    /// Create a "missing field" error
-    pub fn missingField(
-        self: Self,
-        struct_name: []const u8,
-        field: []const u8,
-        location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "struct `{s}` has no field `{s}`", .{
-            struct_name,
-            field,
-        }) catch "missing field";
-
-        return .{
-            .code = .undefined_field,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = SourceSpan.fromLocation(location, field.len),
-                .message = "unknown field",
-                .style = .primary,
-            }},
-        };
-    }
-
-    /// Create a "wrong argument count" error
-    pub fn wrongArgumentCount(
-        self: Self,
-        func_name: []const u8,
-        expected: usize,
-        found: usize,
-        location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "function `{s}` expects {d} argument(s), found {d}", .{
-            func_name,
-            expected,
-            found,
-        }) catch "wrong argument count";
-
-        return .{
-            .code = .type_parameter_count_mismatch,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = SourceSpan.fromLocation(location, 1),
-                .message = blk: {
-                    var label_buf: [64]u8 = undefined;
-                    break :blk std.fmt.bufPrint(&label_buf, "expected {d}, found {d}", .{ expected, found }) catch "wrong count";
-                },
-                .style = .primary,
-            }},
-        };
-    }
-
-    // ---- Borrow/Region Errors ----
-
-    /// Create a "use after move" error
-    pub fn useAfterMove(
-        self: Self,
-        name: []const u8,
-        move_location: SourceLocation,
-        use_location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "use of moved value `{s}`", .{name}) catch "use after move";
-
-        return .{
-            .code = .use_after_move,
-            .severity = .@"error",
-            .message = msg,
-            .location = use_location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(use_location),
-            .labels = &[_]Label{
-                .{
-                    .span = SourceSpan.fromLocation(use_location, name.len),
-                    .message = "value used here after move",
-                    .style = .primary,
-                },
-                .{
-                    .span = SourceSpan.fromLocation(move_location, name.len),
-                    .message = "value moved here",
-                    .style = .secondary,
-                },
-            },
-            .notes = &[_][]const u8{
-                "consider cloning the value if you need to use it after the move",
-            },
-        };
-    }
-
-    /// Create a "cannot borrow as mutable" error
-    pub fn cannotBorrowMutable(
-        self: Self,
-        name: []const u8,
-        location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "cannot borrow `{s}` as mutable", .{name}) catch "cannot borrow as mutable";
-
-        return .{
-            .code = .cannot_borrow_as_mutable,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = SourceSpan.fromLocation(location, name.len),
-                .message = "cannot borrow as mutable",
-                .style = .primary,
-            }},
-            .notes = &[_][]const u8{
-                "consider declaring the variable with `let mut` instead of `let`",
-            },
-        };
-    }
-
-    // ---- Effect Errors ----
-
-    /// Create an "unhandled effect" error
-    pub fn unhandledEffect(
-        self: Self,
-        effect_name: []const u8,
-        location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "unhandled effect `{s}`", .{effect_name}) catch "unhandled effect";
-
-        return .{
-            .code = .unhandled_effect,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = SourceSpan.fromLocation(location, effect_name.len),
-                .message = "effect not handled",
-                .style = .primary,
-            }},
-            .notes = &[_][]const u8{
-                "add a handler using `with` or declare the effect in the function signature",
-            },
-        };
-    }
-
-    // ---- Contract Errors ----
-
-    /// Create a "precondition violated" error
-    pub fn preconditionViolated(
-        self: Self,
-        condition: []const u8,
-        location: SourceLocation,
-    ) Diagnostic {
-        var buf: [256]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "precondition violated: {s}", .{condition}) catch "precondition violated";
-
-        return .{
-            .code = .precondition_violated,
-            .severity = .@"error",
-            .message = msg,
-            .location = location,
-            .source_file = self.source_file,
-            .source_line = self.getSourceLine(location),
-            .labels = &[_]Label{.{
-                .span = SourceSpan.fromLocation(location, 1),
-                .message = "precondition not satisfied here",
-                .style = .primary,
-            }},
         };
     }
 };
