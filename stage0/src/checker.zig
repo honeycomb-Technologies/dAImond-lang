@@ -537,10 +537,13 @@ pub const TypeChecker = struct {
         try self.env.defineGlobal(Symbol.init("byte", .type_def, try self.type_ctx.intern(.{ .int = .u8 })));
         try self.env.defineGlobal(Symbol.init("char", .type_def, try self.type_ctx.intern(.char)));
 
-        // Register generic container types (List, Vec)
+        // Register generic container types (List, Vec, Box, Map)
         // These are mapped to monomorphized C types by codegen
         try self.env.defineGlobal(Symbol.init("List", .type_def, try self.freshTypeVar()));
         try self.env.defineGlobal(Symbol.init("Vec", .type_def, try self.freshTypeVar()));
+        try self.env.defineGlobal(Symbol.init("Box", .type_def, try self.freshTypeVar()));
+        try self.env.defineGlobal(Symbol.init("Map", .type_def, try self.freshTypeVar()));
+        try self.env.defineGlobal(Symbol.init("HashMap", .type_def, try self.freshTypeVar()));
         try self.env.defineGlobal(Symbol.init("String", .type_def, str_id));
 
         // Register built-in functions
@@ -752,6 +755,8 @@ pub const TypeChecker = struct {
     }
 
     /// Check if a type variable occurs in a type (for occurs check)
+    /// Box types are excluded from the occurs check because Box provides heap indirection
+    /// that makes recursive types representable (finite size on the stack).
     fn occursIn(self: *Self, var_id: u32, type_id: TypeId) bool {
         const resolved = self.resolveType(type_id);
         const typ = self.type_ctx.get(resolved) orelse return false;
@@ -760,7 +765,8 @@ pub const TypeChecker = struct {
             .type_var => |tv| tv.id == var_id,
             .option => |inner| self.occursIn(var_id, inner),
             .result => |res| self.occursIn(var_id, res.ok_type) or self.occursIn(var_id, res.err_type),
-            .box => |inner| self.occursIn(var_id, inner),
+            // Box provides heap indirection - don't check through it for recursive types
+            .box => false,
             .array => |arr| self.occursIn(var_id, arr.element_type),
             .slice => |s| self.occursIn(var_id, s.element_type),
             .tuple => |tup| {
@@ -802,7 +808,12 @@ pub const TypeChecker = struct {
         const resolved_super = self.resolveType(super);
 
         if (!types.isCompatible(self.type_ctx, resolved_sub, resolved_super)) {
-            try self.reportTypeMismatch(resolved_sub, resolved_super, location);
+            // For Box and other compound types, try structural unification which
+            // resolves type_vars inside compound types (e.g., Box(type_var) vs Box(struct))
+            self.unify(resolved_sub, resolved_super, location) catch {
+                // Unification failed - the types are genuinely incompatible
+                // (reportTypeMismatch was already called by unify)
+            };
         }
     }
 
@@ -1033,10 +1044,15 @@ pub const TypeChecker = struct {
             return try self.freshTypeVar();
         };
 
-        // Auto-dereference through references for field access
+        // Auto-dereference through references and Box types for field access
         const derefed_typ = if (typ == .ref) blk: {
             const pointee = self.resolveType(typ.ref.pointee);
             break :blk self.type_ctx.get(pointee) orelse {
+                return try self.freshTypeVar();
+            };
+        } else if (typ == .box) blk: {
+            const inner = self.resolveType(typ.box);
+            break :blk self.type_ctx.get(inner) orelse {
                 return try self.freshTypeVar();
             };
         } else typ;
@@ -1166,6 +1182,41 @@ pub const TypeChecker = struct {
             // List_new returns a fresh type var (its type is inferred from usage context)
             if (std.mem.eql(u8, name, "List_new"))
             {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.freshTypeVar();
+            }
+            // Box_new(value) returns Box[T] where T is inferred from the argument
+            if (std.mem.eql(u8, name, "Box_new"))
+            {
+                if (fc.args.len > 0) {
+                    const inner_type = try self.inferExpr(fc.args[0].value);
+                    return try self.type_ctx.makeBox(inner_type);
+                }
+                return try self.freshTypeVar();
+            }
+            // Box_null() returns a fresh type var (type inferred from context)
+            if (std.mem.eql(u8, name, "Box_null"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.freshTypeVar();
+            }
+            // Map_new() returns a fresh type var (type inferred from let binding)
+            if (std.mem.eql(u8, name, "Map_new"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.freshTypeVar();
+            }
+
+            // Generic function calls: identity[int](42)
+            // If the call has explicit generic args, infer argument types and
+            // return a fresh type variable (codegen handles monomorphization)
+            if (fc.generic_args != null and fc.generic_args.?.len > 0) {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
                 }
@@ -1700,6 +1751,13 @@ pub const TypeChecker = struct {
     // ========================================================================
 
     fn checkPattern(self: *Self, pattern: *const ast.Pattern, expected_type: TypeId) !void {
+        // Auto-deref Box types: match on the inner type
+        const resolved_expected = self.resolveType(expected_type);
+        if (self.type_ctx.get(resolved_expected)) |t| {
+            if (t == .box) {
+                return self.checkPattern(pattern, t.box);
+            }
+        }
         switch (pattern.kind) {
             .literal => |lit| {
                 const lit_type = try self.inferLiteral(lit);
@@ -1790,6 +1848,16 @@ pub const TypeChecker = struct {
     }
 
     fn bindPattern(self: *Self, pattern: *const ast.Pattern, typ: TypeId, is_mut: bool) !void {
+        // Auto-deref Box types for enum variant/struct/tuple patterns (match destructuring)
+        // but NOT for simple identifier bindings (let a: Box[T] should keep the Box type)
+        if (pattern.kind != .identifier and pattern.kind != .wildcard) {
+            const resolved_box = self.resolveType(typ);
+            if (self.type_ctx.get(resolved_box)) |bt| {
+                if (bt == .box) {
+                    return self.bindPattern(pattern, bt.box, is_mut);
+                }
+            }
+        }
         switch (pattern.kind) {
             .identifier => |ident| {
                 try self.env.define(Symbol.init(ident.name.name, .variable, typ).withMutable(is_mut or ident.is_mut));
@@ -1869,6 +1937,12 @@ pub const TypeChecker = struct {
     fn checkExhaustiveness(self: *Self, scrutinee_type: TypeId, arms: []const *ast.MatchArm, span: ast.Span) !void {
         const resolved = self.resolveType(scrutinee_type);
         const typ = self.type_ctx.get(resolved) orelse return;
+
+        // Auto-deref Box types for exhaustiveness checking
+        if (typ == .box) {
+            const inner_resolved = self.resolveType(typ.box);
+            return self.checkExhaustiveness(inner_resolved, arms, span);
+        }
 
         switch (typ) {
             .@"enum" => |e| {
@@ -1977,6 +2051,15 @@ pub const TypeChecker = struct {
             return;
         }
 
+        // For generic functions, register generic type params in a temporary scope
+        const has_generics = func.generic_params != null and func.generic_params.?.len > 0;
+        if (has_generics) {
+            try self.env.pushScope(.function);
+            for (func.generic_params.?) |gp| {
+                try self.env.define(Symbol.init(gp.name.name, .type_param, try self.freshTypeVar()));
+            }
+        }
+
         // Build function type from signature
         var param_types = std.ArrayList(TypeId).init(self.allocator);
         defer param_types.deinit();
@@ -1998,6 +2081,10 @@ pub const TypeChecker = struct {
             }
         }
 
+        if (has_generics) {
+            self.env.popScope();
+        }
+
         const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
         try self.env.define(Symbol.init(func.name.name, .function, fn_type)
             .withPublic(is_public)
@@ -2006,6 +2093,15 @@ pub const TypeChecker = struct {
     }
 
     fn checkFunction(self: *Self, func: *const ast.FunctionDecl, is_public: bool) !void {
+        // For generic functions, register generic type params in a temporary scope for type resolution
+        const has_generics = func.generic_params != null and func.generic_params.?.len > 0;
+        if (has_generics) {
+            try self.env.pushScope(.function);
+            for (func.generic_params.?) |gp| {
+                try self.env.define(Symbol.init(gp.name.name, .type_param, try self.freshTypeVar()));
+            }
+        }
+
         // Build function type from signature
         var param_types = std.ArrayList(TypeId).init(self.allocator);
         defer param_types.deinit();
@@ -2027,6 +2123,10 @@ pub const TypeChecker = struct {
             for (effs) |eff| {
                 try self.addEffectFromTypeExpr(eff, &effects);
             }
+        }
+
+        if (has_generics) {
+            self.env.popScope();
         }
 
         // Register function if not already pre-registered from pass 1.5
@@ -2105,9 +2205,16 @@ pub const TypeChecker = struct {
     }
 
     fn checkStruct(self: *Self, sd: *const ast.StructDecl, is_public: bool) !void {
-        if (self.env.lookupLocal(sd.name.name)) |_| {
-            try self.reportError(.duplicate_definition, "duplicate struct definition", sd.span);
-            return;
+        // Save placeholder type_id for unification after defining the real type
+        var placeholder_type_id: ?TypeId = null;
+        if (self.env.lookupLocal(sd.name.name)) |existing| {
+            // Allow overwriting forward-declared placeholder (type_var from Pass 0)
+            const existing_type = self.type_ctx.get(existing.type_id);
+            if (existing_type == null or existing_type.? != .type_var) {
+                try self.reportError(.duplicate_definition, "duplicate struct definition", sd.span);
+                return;
+            }
+            placeholder_type_id = existing.type_id;
         }
 
         var fields = std.ArrayList(types.StructField).init(self.allocator);
@@ -2148,15 +2255,26 @@ pub const TypeChecker = struct {
             },
         });
 
+        // Unify placeholder type_var with the real struct type so forward references resolve
+        if (placeholder_type_id) |ph| {
+            self.unify(ph, struct_type, sd.span) catch {};
+        }
+
         try self.env.define(Symbol.init(sd.name.name, .type_def, struct_type)
             .withPublic(is_public)
             .withLocation(sd.span));
     }
 
     fn checkEnum(self: *Self, ed: *const ast.EnumDecl, is_public: bool) !void {
-        if (self.env.lookupLocal(ed.name.name)) |_| {
-            try self.reportError(.duplicate_definition, "duplicate enum definition", ed.span);
-            return;
+        var placeholder_type_id: ?TypeId = null;
+        if (self.env.lookupLocal(ed.name.name)) |existing| {
+            // Allow overwriting forward-declared placeholder (type_var from Pass 0)
+            const existing_type = self.type_ctx.get(existing.type_id);
+            if (existing_type == null or existing_type.? != .type_var) {
+                try self.reportError(.duplicate_definition, "duplicate enum definition", ed.span);
+                return;
+            }
+            placeholder_type_id = existing.type_id;
         }
 
         var variants = std.ArrayList(types.EnumVariant).init(self.allocator);
@@ -2209,6 +2327,11 @@ pub const TypeChecker = struct {
                 .tag_type = .u32,
             },
         });
+
+        // Unify placeholder type_var with the real enum type so forward references resolve
+        if (placeholder_type_id) |ph| {
+            self.unify(ph, enum_type, ed.span) catch {};
+        }
 
         try self.env.define(Symbol.init(ed.name.name, .type_def, enum_type)
             .withPublic(is_public)
@@ -2332,6 +2455,16 @@ pub const TypeChecker = struct {
         return switch (te.kind) {
             .named => |named| {
                 const name = named.path.segments[0].name;
+                // Special handling for Box[T] -> creates a proper .box type
+                if (std.mem.eql(u8, name, "Box")) {
+                    if (named.generic_args) |args| {
+                        if (args.len > 0) {
+                            const inner = try self.resolveTypeExpr(args[0]);
+                            return try self.type_ctx.makeBox(inner);
+                        }
+                    }
+                    return try self.freshTypeVar();
+                }
                 if (self.env.lookup(name)) |symbol| {
                     if (named.generic_args) |args| {
                         return try self.instantiateGeneric(symbol.type_id, args);
@@ -2518,6 +2651,25 @@ pub const TypeChecker = struct {
         // Process imports
         for (source_file.imports) |import_decl| {
             try self.processImport(import_decl);
+        }
+
+        // Pass 0: pre-register type names so recursive types (e.g., enum Foo { Bar(Box[Foo]) }) work
+        for (source_file.declarations) |decl| {
+            switch (decl.kind) {
+                .struct_def => |sd| {
+                    if (self.env.lookupLocal(sd.name.name) == null) {
+                        try self.env.define(Symbol.init(sd.name.name, .type_def, try self.freshTypeVar())
+                            .withLocation(sd.span));
+                    }
+                },
+                .enum_def => |ed| {
+                    if (self.env.lookupLocal(ed.name.name) == null) {
+                        try self.env.define(Symbol.init(ed.name.name, .type_def, try self.freshTypeVar())
+                            .withLocation(ed.span));
+                    }
+                },
+                else => {},
+            }
         }
 
         // First pass: register all type definitions

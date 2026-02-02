@@ -1554,7 +1554,84 @@ pub const Parser = struct {
                 // Function call
                 expr = try self.finishCall(expr);
             } else if (self.match(.lbracket)) {
-                // Index access
+                // Could be index access or generic function call: f[T](args)
+                // Try to detect generic args: if the expression is an identifier and
+                // the content looks like type names followed by ']' then '(',
+                // treat as generic function call.
+                const bracket_pos = self.current;
+                const is_ident_callee = (expr.kind == .identifier);
+
+                // Try parsing as generic args if callee is identifier
+                if (is_ident_callee) {
+                    // Save parser state for backtracking
+                    const saved_pos = self.current;
+                    const saved_error_count = self.errors.items.len;
+                    const saved_panic_mode = self.panic_mode;
+                    var generic_args = std.ArrayList(*TypeExpr).init(self.astAllocator());
+                    var looks_generic = true;
+
+                    // Try parsing comma-separated type expressions
+                    while (!self.check(.rbracket) and !self.isAtEnd()) {
+                        const type_arg = self.parseTypeExpr() catch {
+                            looks_generic = false;
+                            break;
+                        };
+                        try generic_args.append(type_arg);
+                        if (!self.match(.comma)) break;
+                    }
+
+                    // Check if we got ']' followed by '('
+                    if (looks_generic and self.match(.rbracket) and self.check(.lparen)) {
+                        // This is a generic function call: identity[int](42)
+                        _ = self.advance(); // consume '('
+                        const generic_args_slice = try generic_args.toOwnedSlice();
+
+                        var args = std.ArrayList(*FunctionCall.CallArg).init(self.astAllocator());
+                        if (!self.check(.rparen)) {
+                            const first_arg = try self.parseExpr();
+                            const call_arg = try self.astAllocator().create(FunctionCall.CallArg);
+                            call_arg.* = .{
+                                .name = null,
+                                .value = first_arg,
+                            };
+                            try args.append(call_arg);
+                            while (self.match(.comma)) {
+                                const arg = try self.parseExpr();
+                                const ca = try self.astAllocator().create(FunctionCall.CallArg);
+                                ca.* = .{
+                                    .name = null,
+                                    .value = arg,
+                                };
+                                try args.append(ca);
+                            }
+                        }
+                        try self.expect(.rparen, "')' after generic function arguments");
+
+                        const call = try self.astAllocator().create(FunctionCall);
+                        call.* = .{
+                            .function = expr,
+                            .generic_args = generic_args_slice,
+                            .args = try args.toOwnedSlice(),
+                            .span = Span.merge(expr.span, makeSpan(self.previousLocation(), self.previousLocation())),
+                        };
+
+                        const new_expr = try self.astAllocator().create(Expr);
+                        new_expr.* = .{
+                            .kind = .{ .function_call = call },
+                            .span = call.span,
+                        };
+                        expr = new_expr;
+                        continue;
+                    }
+
+                    // Not a generic call, rewind and restore parser state
+                    self.current = saved_pos;
+                    self.errors.shrinkRetainingCapacity(saved_error_count);
+                    self.panic_mode = saved_panic_mode;
+                }
+                _ = bracket_pos;
+
+                // Regular index access
                 const index = try self.parseExpr();
                 try self.expect(.rbracket, "']' after index");
 

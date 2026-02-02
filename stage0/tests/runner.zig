@@ -6,12 +6,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+pub const TestFile = struct {
+    path: []const u8, // relative path, e.g., "utils.dm"
+    source: []const u8,
+};
+
 pub const TestCase = struct {
     name: []const u8,
     source: []const u8,
     expected_output: []const u8,
     expected_exit_code: u8 = 0,
     expect_compile_error: bool = false,
+    extra_files: ?[]const TestFile = null,
 };
 
 pub const TestResult = struct {
@@ -42,6 +48,23 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
         const file = try std.fs.cwd().createFile(source_path, .{});
         defer file.close();
         try file.writeAll(case.source);
+    }
+
+    // Write extra files (for import tests)
+    if (case.extra_files) |extra_files| {
+        for (extra_files) |ef| {
+            const extra_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tmp_dir, ef.path });
+            defer allocator.free(extra_path);
+
+            // Create subdirectories if needed
+            if (std.fs.path.dirname(extra_path)) |dir| {
+                std.fs.cwd().makePath(dir) catch {};
+            }
+
+            const file = try std.fs.cwd().createFile(extra_path, .{});
+            defer file.close();
+            try file.writeAll(ef.source);
+        }
     }
 
     // Compile the test
@@ -1815,6 +1838,424 @@ pub const forward_ref_tests = [_]TestCase{
     },
 };
 
+// Tests for Box[T] heap-allocated pointer types
+pub const box_tests = [_]TestCase{
+    .{
+        .name = "box_struct_access",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let b: Box[Point] = Box_new(Point { x: 10, y: 20 })
+            \\    println(b.x)
+            \\    println(b.y)
+            \\}
+        ,
+        .expected_output = "10\n20\n",
+    },
+    .{
+        .name = "box_null_check",
+        .source =
+            \\module test
+            \\
+            \\struct Node {
+            \\    value: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let b: Box[Node] = Box_null()
+            \\    if b == Box_null() {
+            \\        println("null")
+            \\    }
+            \\    let c: Box[Node] = Box_new(Node { value: 42 })
+            \\    if c != Box_null() {
+            \\        println("not null")
+            \\    }
+            \\}
+        ,
+        .expected_output = "null\nnot null\n",
+    },
+    .{
+        .name = "box_recursive_list",
+        .source =
+            \\module test
+            \\
+            \\struct ConsData {
+            \\    value: int,
+            \\    next: Box[ConsData],
+            \\}
+            \\
+            \\fn sum_list(node: Box[ConsData]) -> int {
+            \\    if node == Box_null() {
+            \\        return 0
+            \\    }
+            \\    return node.value + sum_list(node.next)
+            \\}
+            \\
+            \\fn main() {
+            \\    let c: Box[ConsData] = Box_new(ConsData { value: 3, next: Box_null() })
+            \\    let b: Box[ConsData] = Box_new(ConsData { value: 2, next: c })
+            \\    let a: Box[ConsData] = Box_new(ConsData { value: 1, next: b })
+            \\    println(sum_list(a))
+            \\}
+        ,
+        .expected_output = "6\n",
+    },
+    .{
+        .name = "box_recursive_tree",
+        .source =
+            \\module test
+            \\
+            \\struct TreeNode {
+            \\    value: int,
+            \\    left: Box[TreeNode],
+            \\    right: Box[TreeNode],
+            \\}
+            \\
+            \\fn tree_sum(node: Box[TreeNode]) -> int {
+            \\    if node == Box_null() {
+            \\        return 0
+            \\    }
+            \\    let v = node.value
+            \\    let l = tree_sum(node.left)
+            \\    let r = tree_sum(node.right)
+            \\    return v + l + r
+            \\}
+            \\
+            \\fn main() {
+            \\    let leaf1: Box[TreeNode] = Box_new(TreeNode { value: 1, left: Box_null(), right: Box_null() })
+            \\    let leaf2: Box[TreeNode] = Box_new(TreeNode { value: 3, left: Box_null(), right: Box_null() })
+            \\    let root: Box[TreeNode] = Box_new(TreeNode { value: 2, left: leaf1, right: leaf2 })
+            \\    println(tree_sum(root))
+            \\}
+        ,
+        .expected_output = "6\n",
+    },
+    .{
+        .name = "box_nested_access",
+        .source =
+            \\module test
+            \\
+            \\struct Inner {
+            \\    value: int,
+            \\}
+            \\
+            \\struct Outer {
+            \\    inner: Box[Inner],
+            \\}
+            \\
+            \\fn main() {
+            \\    let i: Box[Inner] = Box_new(Inner { value: 99 })
+            \\    let o = Outer { inner: i }
+            \\    println(o.inner.value)
+            \\}
+        ,
+        .expected_output = "99\n",
+    },
+};
+
+// Tests for Map[K,V] hash map types
+pub const map_tests = [_]TestCase{
+    .{
+        .name = "map_create_insert_get",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("x", 10)
+            \\    m.insert("y", 20)
+            \\    println(m.get("x"))
+            \\    println(m.get("y"))
+            \\}
+        ,
+        .expected_output = "10\n20\n",
+    },
+    .{
+        .name = "map_contains",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("hello", 42)
+            \\    println(m.contains("hello"))
+            \\    println(m.contains("world"))
+            \\}
+        ,
+        .expected_output = "true\nfalse\n",
+    },
+    .{
+        .name = "map_remove",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("a", 1)
+            \\    println(m.contains("a"))
+            \\    m.remove("a")
+            \\    println(m.contains("a"))
+            \\}
+        ,
+        .expected_output = "true\nfalse\n",
+    },
+    .{
+        .name = "map_update_value",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("key", 1)
+            \\    m.insert("key", 2)
+            \\    println(m.get("key"))
+            \\    println(m.len())
+            \\}
+        ,
+        .expected_output = "2\n1\n",
+    },
+    .{
+        .name = "map_int_keys",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[int, string] = Map_new()
+            \\    m.insert(1, "one")
+            \\    m.insert(2, "two")
+            \\    println(m.get(1))
+            \\    println(m.get(2))
+            \\}
+        ,
+        .expected_output = "one\ntwo\n",
+    },
+    .{
+        .name = "map_len",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    println(m.len())
+            \\    m.insert("a", 1)
+            \\    m.insert("b", 2)
+            \\    m.insert("c", 3)
+            \\    println(m.len())
+            \\    m.remove("b")
+            \\    println(m.len())
+            \\}
+        ,
+        .expected_output = "0\n3\n2\n",
+    },
+    .{
+        .name = "map_remove_then_insert",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("key", 1)
+            \\    m.remove("key")
+            \\    m.insert("key", 2)
+            \\    println(m.get("key"))
+            \\    println(m.len())
+            \\}
+        ,
+        .expected_output = "2\n1\n",
+    },
+};
+
+// Tests for generic function monomorphization
+pub const generic_function_tests = [_]TestCase{
+    .{
+        .name = "generic_identity_int",
+        .source =
+            \\module test
+            \\
+            \\fn identity[T](x: T) -> T {
+            \\    return x
+            \\}
+            \\
+            \\fn main() {
+            \\    println(identity[int](42))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "generic_identity_string",
+        .source =
+            \\module test
+            \\
+            \\fn identity[T](x: T) -> T {
+            \\    return x
+            \\}
+            \\
+            \\fn main() {
+            \\    println(identity[string]("hello"))
+            \\}
+        ,
+        .expected_output = "hello\n",
+    },
+    .{
+        .name = "generic_multiple_instantiations",
+        .source =
+            \\module test
+            \\
+            \\fn identity[T](x: T) -> T {
+            \\    return x
+            \\}
+            \\
+            \\fn main() {
+            \\    println(identity[int](42))
+            \\    println(identity[string]("hi"))
+            \\    println(identity[bool](true))
+            \\}
+        ,
+        .expected_output = "42\nhi\ntrue\n",
+    },
+    .{
+        .name = "generic_two_params",
+        .source =
+            \\module test
+            \\
+            \\fn first[A, B](a: A, b: B) -> A {
+            \\    return a
+            \\}
+            \\
+            \\fn main() {
+            \\    println(first[int, string](42, "hello"))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+};
+
+pub const import_tests = [_]TestCase{
+    .{
+        .name = "import_basic",
+        .source =
+            \\module main
+            \\
+            \\import utils
+            \\
+            \\fn main() {
+            \\    println(add(10, 32))
+            \\}
+        ,
+        .expected_output = "42\n",
+        .extra_files = &[_]TestFile{
+            .{
+                .path = "utils.dm",
+                .source =
+                    \\module utils
+                    \\
+                    \\fn add(a: int, b: int) -> int {
+                    \\    return a + b
+                    \\}
+                ,
+            },
+        },
+    },
+    .{
+        .name = "import_selective",
+        .source =
+            \\module main
+            \\
+            \\import utils { add }
+            \\
+            \\fn main() {
+            \\    println(add(10, 32))
+            \\}
+        ,
+        .expected_output = "42\n",
+        .extra_files = &[_]TestFile{
+            .{
+                .path = "utils.dm",
+                .source =
+                    \\module utils
+                    \\
+                    \\fn add(a: int, b: int) -> int {
+                    \\    return a + b
+                    \\}
+                    \\
+                    \\fn sub(a: int, b: int) -> int {
+                    \\    return a - b
+                    \\}
+                ,
+            },
+        },
+    },
+    .{
+        .name = "import_nested_path",
+        .source =
+            \\module main
+            \\
+            \\import foo::bar
+            \\
+            \\fn main() {
+            \\    println(greet())
+            \\}
+        ,
+        .expected_output = "hello from bar\n",
+        .extra_files = &[_]TestFile{
+            .{
+                .path = "foo/bar.dm",
+                .source =
+                    \\module bar
+                    \\
+                    \\fn greet() -> string {
+                    \\    return "hello from bar"
+                    \\}
+                ,
+            },
+        },
+    },
+    .{
+        .name = "import_multiple",
+        .source =
+            \\module main
+            \\
+            \\import math
+            \\import strings
+            \\
+            \\fn main() {
+            \\    println(double(21))
+            \\    println(exclaim("hello"))
+            \\}
+        ,
+        .expected_output = "42\nhello!\n",
+        .extra_files = &[_]TestFile{
+            .{
+                .path = "math.dm",
+                .source =
+                    \\module math
+                    \\
+                    \\fn double(x: int) -> int {
+                    \\    return x * 2
+                    \\}
+                ,
+            },
+            .{
+                .path = "strings.dm",
+                .source =
+                    \\module strings
+                    \\
+                    \\fn exclaim(s: string) -> string {
+                    \\    return s + "!"
+                    \\}
+                ,
+            },
+        },
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -1852,6 +2293,10 @@ pub fn main() !void {
         .{ .name = "Utilities", .tests = &utility_tests },
         .{ .name = "Mut Params", .tests = &mut_param_tests },
         .{ .name = "Forward Refs", .tests = &forward_ref_tests },
+        .{ .name = "Box Types", .tests = &box_tests },
+        .{ .name = "Map Types", .tests = &map_tests },
+        .{ .name = "Generic Functions", .tests = &generic_function_tests },
+        .{ .name = "Imports", .tests = &import_tests },
         .{ .name = "Compile Errors", .tests = &compile_error_tests },
     };
 

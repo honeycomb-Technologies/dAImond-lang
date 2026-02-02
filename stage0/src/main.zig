@@ -791,6 +791,213 @@ fn findRuntimeRelative(allocator: Allocator) ![]const u8 {
 }
 
 // ============================================================================
+// Module Loader (Multi-file Import Support)
+// ============================================================================
+
+const ModuleLoader = struct {
+    allocator: Allocator,
+    loaded_files: std.StringHashMap(LoadedFile),
+    in_progress: std.StringHashMap(void),
+    all_declarations: std.ArrayList(*ast.Declaration),
+    verbose: bool,
+
+    const LoadedFile = struct {
+        source: []const u8,
+        source_file: *SourceFile,
+    };
+
+    pub fn init(allocator: Allocator, verbose: bool) ModuleLoader {
+        return .{
+            .allocator = allocator,
+            .loaded_files = std.StringHashMap(LoadedFile).init(allocator),
+            .in_progress = std.StringHashMap(void).init(allocator),
+            .all_declarations = std.ArrayList(*ast.Declaration).init(allocator),
+            .verbose = verbose,
+        };
+    }
+
+    pub fn deinit(self: *ModuleLoader) void {
+        // Free sources we loaded (not the entry file, which is managed externally)
+        var iter = self.loaded_files.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.source);
+        }
+        self.loaded_files.deinit();
+        self.in_progress.deinit();
+        self.all_declarations.deinit();
+    }
+
+    /// Resolve an import path to a file system path.
+    /// `import foo` -> `<dir>/foo.dm`
+    /// `import foo::bar` -> `<dir>/foo/bar.dm`
+    fn resolveImportPath(self: *ModuleLoader, import_decl: *const ast.ImportDecl, importing_dir: []const u8) ![]const u8 {
+        const segments = import_decl.path.segments;
+        if (segments.len == 0) return error.EmptyImportPath;
+
+        // Build path: join segments with '/' and append '.dm'
+        var path_parts = std.ArrayList([]const u8).init(self.allocator);
+        defer path_parts.deinit();
+
+        try path_parts.append(importing_dir);
+        for (segments) |seg| {
+            try path_parts.append(seg.name);
+        }
+
+        // Join all parts with path separator
+        const joined = try std.fs.path.join(self.allocator, path_parts.items);
+        defer self.allocator.free(joined);
+
+        // Append .dm extension
+        const full_path = try std.fmt.allocPrint(self.allocator, "{s}.dm", .{joined});
+        return full_path;
+    }
+
+    /// Load and parse a single file. Returns the parsed SourceFile.
+    fn loadFile(self: *ModuleLoader, file_path: []const u8) !LoadedFile {
+        // Check cache first
+        if (self.loaded_files.get(file_path)) |loaded| {
+            return loaded;
+        }
+
+        // Read the file
+        const source = std.fs.cwd().readFileAlloc(self.allocator, file_path, 10 * 1024 * 1024) catch |err| {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Error reading imported file '{s}': {}\n", .{ file_path, err });
+            return error.ImportFileNotFound;
+        };
+
+        // Lex
+        var lexer = Lexer.init(source, self.allocator);
+        defer lexer.deinit();
+        const tokens = try lexer.scanAll();
+        defer self.allocator.free(tokens);
+
+        if (lexer.hasErrors()) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Lexer errors in imported file '{s}'\n", .{file_path});
+            return error.ImportLexError;
+        }
+
+        // Parse
+        var parser = Parser.init(tokens, self.allocator);
+        defer parser.deinit();
+        const ast_result = parser.parse() catch |err| {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Parse error in imported file '{s}': {}\n", .{ file_path, err });
+            return error.ImportParseError;
+        };
+
+        if (parser.hasErrors()) {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Parse errors in imported file '{s}'\n", .{file_path});
+            return error.ImportParseError;
+        }
+
+        const loaded = LoadedFile{ .source = source, .source_file = ast_result };
+
+        // Cache by path
+        const cached_path = try self.allocator.dupe(u8, file_path);
+        try self.loaded_files.put(cached_path, loaded);
+
+        return loaded;
+    }
+
+    /// Recursively process imports from a source file.
+    /// Adds imported declarations to all_declarations.
+    fn processImports(self: *ModuleLoader, source_file: *SourceFile, file_dir: []const u8) !void {
+        for (source_file.imports) |import_decl| {
+            const resolved_path = try self.resolveImportPath(import_decl, file_dir);
+            defer self.allocator.free(resolved_path);
+
+            // Check for circular imports
+            if (self.in_progress.contains(resolved_path)) {
+                const stderr = std.io.getStdErr().writer();
+                try stderr.print("Error: Circular import detected: '{s}'\n", .{resolved_path});
+                return error.CircularImport;
+            }
+
+            // Check if already loaded (skip)
+            if (self.loaded_files.contains(resolved_path)) continue;
+
+            // Mark as in-progress
+            const progress_key = try self.allocator.dupe(u8, resolved_path);
+            try self.in_progress.put(progress_key, {});
+
+            if (self.verbose) {
+                const stdout = std.io.getStdOut().writer();
+                try stdout.print("        Loading import: {s}\n", .{resolved_path});
+            }
+
+            // Load and parse the imported file
+            const loaded = try self.loadFile(resolved_path);
+
+            // Get directory of imported file for nested imports
+            const import_dir = std.fs.path.dirname(resolved_path) orelse ".";
+
+            // Recursively process imports from the loaded file
+            try self.processImports(loaded.source_file, import_dir);
+
+            // Add declarations from imported file, filtered by import items
+            try self.addDeclarations(loaded.source_file, import_decl);
+
+            // Remove from in-progress
+            _ = self.in_progress.remove(resolved_path);
+        }
+    }
+
+    /// Add declarations from an imported source file, respecting selective imports.
+    fn addDeclarations(self: *ModuleLoader, source_file: *SourceFile, import_decl: *const ast.ImportDecl) !void {
+        if (import_decl.items) |items| {
+            // Selective import: only add named declarations
+            for (source_file.declarations) |decl| {
+                const decl_name = getDeclName(decl) orelse continue;
+                for (items) |item| {
+                    if (std.mem.eql(u8, decl_name, item.name.name)) {
+                        try self.all_declarations.append(decl);
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Import all declarations
+            for (source_file.declarations) |decl| {
+                try self.all_declarations.append(decl);
+            }
+        }
+    }
+
+    /// Get the name of a declaration for filtering
+    fn getDeclName(decl: *ast.Declaration) ?[]const u8 {
+        return switch (decl.kind) {
+            .function => |f| f.name.name,
+            .struct_def => |s| s.name.name,
+            .enum_def => |e| e.name.name,
+            .trait_def => |t| t.name.name,
+            .constant => |c| c.name.name,
+            .impl_block => null, // impl blocks are always included
+        };
+    }
+
+    /// Build a merged SourceFile with all imported + entry declarations.
+    fn getMergedSourceFile(self: *ModuleLoader, entry_file: *SourceFile) !*SourceFile {
+        // Add entry file declarations after imports
+        for (entry_file.declarations) |decl| {
+            try self.all_declarations.append(decl);
+        }
+
+        // Create merged source file
+        const merged = try self.allocator.create(SourceFile);
+        merged.* = .{
+            .module_decl = entry_file.module_decl,
+            .imports = &[_]*ast.ImportDecl{}, // imports are resolved
+            .declarations = try self.all_declarations.toOwnedSlice(),
+            .span = entry_file.span,
+        };
+        return merged;
+    }
+};
+
+// ============================================================================
 // COMPILE Command (Full Pipeline)
 // ============================================================================
 
@@ -869,6 +1076,26 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         return .error_compile;
     }
 
+    // Phase 2.5: Module Loading (resolve imports)
+    var final_ast = ast_result;
+    var module_loader: ?ModuleLoader = null;
+    defer if (module_loader) |*ml| ml.deinit();
+
+    if (ast_result.imports.len > 0) {
+        const input_dir = std.fs.path.dirname(path) orelse ".";
+        var loader = ModuleLoader.init(compile_allocator, opts.verbose);
+        try loader.processImports(ast_result, input_dir);
+        final_ast = try loader.getMergedSourceFile(ast_result);
+        module_loader = loader;
+
+        if (opts.verbose) {
+            try stdout.print("        Resolved {d} import(s), {d} total declarations\n", .{
+                ast_result.imports.len,
+                final_ast.declarations.len,
+            });
+        }
+    }
+
     // Phase 3: Type Checking
     var check_timer = Timer.init(opts.verbose);
     try stdout.print("  [3/5] Type checking...", .{});
@@ -887,8 +1114,8 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     type_checker.setSource(source);
     type_checker.setSourceFile(path);
 
-    // Run type checking on the AST
-    type_checker.checkSourceFile(ast_result) catch |err| {
+    // Run type checking on the merged AST
+    type_checker.checkSourceFile(final_ast) catch |err| {
         try stdout.print("\n{s}Type check error:{s} {}\n", .{
             colors.error_style(),
             colors.reset(),
@@ -921,7 +1148,7 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         code_generator.setTypeContext(ctx);
     }
 
-    const c_code = code_generator.generate(ast_result) catch |err| {
+    const c_code = code_generator.generate(final_ast) catch |err| {
         try stdout.print("\n{s}Code generation error:{s} {}\n", .{
             colors.error_style(),
             colors.reset(),

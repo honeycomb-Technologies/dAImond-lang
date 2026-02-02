@@ -262,6 +262,26 @@ pub const CodeGenerator = struct {
     // Deferred buffer for list type definitions
     list_type_writer: CWriter,
 
+    // Track generated box types: maps box helper name -> element C type
+    generated_box_types: std.StringHashMap([]const u8),
+    // Deferred buffer for box helper definitions
+    box_type_writer: CWriter,
+
+    // Track generated map types: maps map type name -> MapTypeInfo
+    generated_map_types: std.StringHashMap(MapTypeInfo),
+    // Deferred buffer for map type definitions
+    map_type_writer: CWriter,
+
+    // Track enum variant payload types: maps "dm_EnumName.VariantName" -> C type
+    enum_variant_types: std.StringHashMap([]const u8),
+
+    // Generic function monomorphization support
+    generic_functions: std.StringHashMap(*FunctionDecl),
+    pending_monomorphizations: std.StringHashMap(MonoRequest),
+    generated_monomorphizations: std.StringHashMap(void),
+    active_type_substitutions: ?std.StringHashMap([]const u8),
+    mono_emit_queue: std.ArrayList(MonoQueueItem),
+
     // Unique ID counter for temporary variables
     temp_counter: usize,
 
@@ -291,6 +311,23 @@ pub const CodeGenerator = struct {
         trait_name: ?[]const u8,
     };
 
+    const MapTypeInfo = struct {
+        key_type: []const u8,
+        value_type: []const u8,
+    };
+
+    const MonoRequest = struct {
+        func: *FunctionDecl,
+        type_prefix: ?[]const u8,
+        concrete_types: []const []const u8,
+        generic_param_names: []const []const u8,
+    };
+
+    const MonoQueueItem = struct {
+        name: []const u8,
+        req: MonoRequest,
+    };
+
     /// Initialize a new code generator
     pub fn init(allocator: Allocator) Self {
         return .{
@@ -308,6 +345,16 @@ pub const CodeGenerator = struct {
             .struct_field_types = std.StringHashMap([]const u8).init(allocator),
             .generated_list_types = std.StringHashMap([]const u8).init(allocator),
             .list_type_writer = CWriter.init(allocator),
+            .generated_box_types = std.StringHashMap([]const u8).init(allocator),
+            .box_type_writer = CWriter.init(allocator),
+            .generated_map_types = std.StringHashMap(MapTypeInfo).init(allocator),
+            .map_type_writer = CWriter.init(allocator),
+            .enum_variant_types = std.StringHashMap([]const u8).init(allocator),
+            .generic_functions = std.StringHashMap(*FunctionDecl).init(allocator),
+            .pending_monomorphizations = std.StringHashMap(MonoRequest).init(allocator),
+            .generated_monomorphizations = std.StringHashMap(void).init(allocator),
+            .active_type_substitutions = null,
+            .mono_emit_queue = std.ArrayList(MonoQueueItem).init(allocator),
             .temp_counter = 0,
             .lambda_depth = 0,
             .current_function = null,
@@ -332,6 +379,16 @@ pub const CodeGenerator = struct {
         self.struct_field_types.deinit();
         self.generated_list_types.deinit();
         self.list_type_writer.deinit();
+        self.generated_box_types.deinit();
+        self.box_type_writer.deinit();
+        self.generated_map_types.deinit();
+        self.map_type_writer.deinit();
+        self.enum_variant_types.deinit();
+        self.generic_functions.deinit();
+        self.pending_monomorphizations.deinit();
+        self.generated_monomorphizations.deinit();
+        self.mono_emit_queue.deinit();
+        if (self.active_type_substitutions) |*subs| subs.deinit();
         self.current_mut_params.deinit();
         self.function_mut_info.deinit();
         self.region_stack.deinit();
@@ -428,6 +485,20 @@ pub const CodeGenerator = struct {
             try self.writer.write(self.list_type_writer.getOutput());
         }
 
+        // Insert generated box helper definitions
+        if (self.box_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Box Helpers");
+            try self.writer.write(self.box_type_writer.getOutput());
+        }
+
+        // Insert generated map type definitions
+        if (self.map_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Map Types");
+            try self.writer.write(self.map_type_writer.getOutput());
+        }
+
         try self.writer.blankLine();
 
         // Pre-scan all function declarations to record mutable parameter info
@@ -454,6 +525,9 @@ pub const CodeGenerator = struct {
         for (source.declarations) |decl| {
             switch (decl.kind) {
                 .function => |f| {
+                    // Skip generic functions - their return types depend on type parameters
+                    // and are tracked per-monomorphization in emitMonomorphizedPrototypes
+                    if (f.generic_params != null and f.generic_params.?.len > 0) continue;
                     const ret_type = if (f.return_type) |rt| try self.mapType(rt) else "void";
                     self.trackFunctionReturnType(f.name.name, ret_type);
                 },
@@ -489,6 +563,27 @@ pub const CodeGenerator = struct {
             try self.generateFunctionPrototype(info.method, info.target_type);
         }
 
+        // Pre-scan all function bodies to discover generic function calls
+        // and queue monomorphizations. This must happen after generic functions
+        // are registered (during prototype generation) but before implementations.
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .function => |f| try self.scanForGenericCalls(f),
+                .impl_block => |impl| {
+                    for (impl.items) |item| {
+                        switch (item.kind) {
+                            .function => |f| try self.scanForGenericCalls(f),
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Emit monomorphized function prototypes (forward declarations)
+        try self.emitMonomorphizedPrototypes();
+
         try self.writer.blankLine();
 
         // Generate constants
@@ -511,6 +606,9 @@ pub const CodeGenerator = struct {
         for (self.impl_methods.items) |info| {
             try self.generateFunction(info.method, info.target_type);
         }
+
+        // Generate monomorphized function implementations
+        try self.emitMonomorphizedImplementations();
 
         // Generate main entry point that calls dm_main
         try self.writer.blankLine();
@@ -1090,6 +1188,19 @@ pub const CodeGenerator = struct {
                 }
             }
             return "void*";
+        } else if (std.mem.eql(u8, type_name, "Map") or std.mem.eql(u8, type_name, "HashMap")) {
+            const mangled = try self.mangleTypeName(type_name);
+            if (self.generated_enums.contains(mangled) or self.generated_structs.contains(mangled))
+                return mangled;
+            if (named.generic_args) |args| {
+                if (args.len >= 2) return self.generateMapType(args[0], args[1]);
+            }
+            return "dm_map_void";
+        }
+
+        // Check active type substitutions for generic monomorphization
+        if (self.active_type_substitutions) |subs| {
+            if (subs.get(type_name)) |concrete| return concrete;
         }
 
         // User-defined type - apply mangling
@@ -1252,6 +1363,315 @@ pub const CodeGenerator = struct {
         try w.blankLine();
     }
 
+    /// Generate Box helper name and emit monomorphized allocation helper if not already done
+    fn generateBoxType(self: *Self, elem: *TypeExpr) CodeGenError![]const u8 {
+        const elem_name = try self.mapType(elem);
+        const safe_name = try self.sanitizeTypeName(elem_name);
+        const box_helper_name = try std.fmt.allocPrint(self.stringAllocator(), "dm_box_{s}", .{safe_name});
+
+        if (!self.generated_box_types.contains(box_helper_name)) {
+            try self.generated_box_types.put(box_helper_name, elem_name);
+            try self.emitBoxTypeDefinition(box_helper_name, elem_name);
+        }
+
+        return box_helper_name;
+    }
+
+    /// Emit a monomorphized box allocation helper function
+    fn emitBoxTypeDefinition(self: *Self, box_helper_name: []const u8, elem_type: []const u8) !void {
+        var w = &self.box_type_writer;
+
+        // Box allocation helper: T* dm_box_T(T value)
+        try w.printLine("static inline {s}* {s}({s} value) {{", .{ elem_type, box_helper_name, elem_type });
+        w.indent();
+        try w.printLine("{s}* p = ({s}*)malloc(sizeof({s}));", .{ elem_type, elem_type, elem_type });
+        try w.writeLine("if (!p) dm_panic(\"box: out of memory\");");
+        try w.writeLine("*p = value;");
+        try w.writeLine("return p;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+    }
+
+    /// Generate Map type name and emit monomorphized struct + helpers if not already done
+    fn generateMapType(self: *Self, key_expr: *TypeExpr, val_expr: *TypeExpr) CodeGenError![]const u8 {
+        const key_name = try self.mapType(key_expr);
+        const val_name = try self.mapType(val_expr);
+        const safe_key = try self.sanitizeTypeName(key_name);
+        const safe_val = try self.sanitizeTypeName(val_name);
+        const map_type_name = try std.fmt.allocPrint(self.stringAllocator(), "dm_map_{s}_{s}", .{ safe_key, safe_val });
+
+        if (!self.generated_map_types.contains(map_type_name)) {
+            // Pre-generate List types for keys() and values()
+            _ = try self.generateListTypeByName(key_name);
+            _ = try self.generateListTypeByName(val_name);
+            try self.generated_map_types.put(map_type_name, .{ .key_type = key_name, .value_type = val_name });
+            try self.emitMapTypeDefinition(map_type_name, key_name, val_name);
+        }
+
+        return map_type_name;
+    }
+
+    /// Generate a List type from a C type name string (for map keys/values helpers)
+    fn generateListTypeByName(self: *Self, elem_name: []const u8) ![]const u8 {
+        const safe_name = try self.sanitizeTypeName(elem_name);
+        const list_type_name = try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_name});
+
+        if (!self.generated_list_types.contains(list_type_name)) {
+            try self.generated_list_types.put(list_type_name, elem_name);
+            try self.emitListTypeDefinition(list_type_name, elem_name);
+        }
+
+        return list_type_name;
+    }
+
+    /// Emit a monomorphized map type struct and helper functions
+    fn emitMapTypeDefinition(self: *Self, map_type_name: []const u8, key_type: []const u8, val_type: []const u8) !void {
+        var w = &self.map_type_writer;
+        const safe_key = try self.sanitizeTypeName(key_type);
+        const safe_val = try self.sanitizeTypeName(val_type);
+        const key_list_type = try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_key});
+        const val_list_type = try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_val});
+        const is_string_key = std.mem.eql(u8, key_type, "dm_string");
+
+        // Entry struct
+        try w.printLine("typedef struct {s}_entry {{", .{map_type_name});
+        w.indent();
+        try w.printLine("{s} key;", .{key_type});
+        try w.printLine("{s} value;", .{val_type});
+        try w.writeLine("int state;  /* 0=empty, 1=occupied, 2=tombstone */");
+        w.dedent();
+        try w.printLine("}} {s}_entry;", .{map_type_name});
+        try w.blankLine();
+
+        // Map struct
+        try w.printLine("typedef struct {s} {{", .{map_type_name});
+        w.indent();
+        try w.printLine("{s}_entry* entries;", .{map_type_name});
+        try w.writeLine("size_t len;");
+        try w.writeLine("size_t capacity;");
+        w.dedent();
+        try w.printLine("}} {s};", .{map_type_name});
+        try w.blankLine();
+
+        // Hash function
+        try w.printLine("static inline size_t {s}_hash({s} key) {{", .{ map_type_name, key_type });
+        w.indent();
+        if (is_string_key) {
+            // FNV-1a for string keys
+            try w.writeLine("size_t h = 14695981039346656037ULL;");
+            try w.writeLine("for (size_t i = 0; i < key.len; i++) {");
+            w.indent();
+            try w.writeLine("h ^= (unsigned char)key.data[i];");
+            try w.writeLine("h *= 1099511628211ULL;");
+            w.dedent();
+            try w.writeLine("}");
+            try w.writeLine("return h;");
+        } else {
+            // splitmix64 for integer keys
+            try w.writeLine("uint64_t x = (uint64_t)key;");
+            try w.writeLine("x ^= x >> 30;");
+            try w.writeLine("x *= 0xbf58476d1ce4e5b9ULL;");
+            try w.writeLine("x ^= x >> 27;");
+            try w.writeLine("x *= 0x94d049bb133111ebULL;");
+            try w.writeLine("x ^= x >> 31;");
+            try w.writeLine("return (size_t)x;");
+        }
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // Key equality function
+        try w.printLine("static inline bool {s}_key_eq({s} a, {s} b) {{", .{ map_type_name, key_type, key_type });
+        w.indent();
+        if (is_string_key) {
+            try w.writeLine("return dm_string_eq(a, b);");
+        } else {
+            try w.writeLine("return a == b;");
+        }
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _new constructor
+        try w.printLine("static inline {s} {s}_new(void) {{", .{ map_type_name, map_type_name });
+        w.indent();
+        try w.printLine("return ({s}){{ .entries = NULL, .len = 0, .capacity = 0 }};", .{map_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _find_slot (linear probing, tombstone-aware)
+        try w.printLine("static inline size_t {s}_find_slot({s}* map, {s} key) {{", .{ map_type_name, map_type_name, key_type });
+        w.indent();
+        try w.printLine("size_t idx = {s}_hash(key) & (map->capacity - 1);", .{map_type_name});
+        try w.writeLine("size_t first_tombstone = (size_t)-1;");
+        try w.writeLine("for (size_t i = 0; i < map->capacity; i++) {");
+        w.indent();
+        try w.writeLine("if (map->entries[idx].state == 0) {");
+        w.indent();
+        try w.writeLine("return (first_tombstone != (size_t)-1) ? first_tombstone : idx;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.printLine("if (map->entries[idx].state == 1 && {s}_key_eq(map->entries[idx].key, key)) {{", .{map_type_name});
+        w.indent();
+        try w.writeLine("return idx;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("if (map->entries[idx].state == 2 && first_tombstone == (size_t)-1) {");
+        w.indent();
+        try w.writeLine("first_tombstone = idx;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("idx = (idx + 1) & (map->capacity - 1);");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("return (first_tombstone != (size_t)-1) ? first_tombstone : idx;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _resize
+        try w.printLine("static inline void {s}_resize({s}* map) {{", .{ map_type_name, map_type_name });
+        w.indent();
+        try w.writeLine("size_t new_cap = map->capacity == 0 ? 16 : map->capacity * 2;");
+        try w.printLine("{s}_entry* new_entries = ({s}_entry*)calloc(new_cap, sizeof({s}_entry));", .{ map_type_name, map_type_name, map_type_name });
+        try w.writeLine("if (!new_entries) dm_panic(\"map resize: out of memory\");");
+        try w.printLine("{s} new_map = {{ .entries = new_entries, .len = 0, .capacity = new_cap }};", .{map_type_name});
+        try w.writeLine("for (size_t i = 0; i < map->capacity; i++) {");
+        w.indent();
+        try w.writeLine("if (map->entries[i].state == 1) {");
+        w.indent();
+        try w.printLine("size_t slot = {s}_find_slot(&new_map, map->entries[i].key);", .{map_type_name});
+        try w.writeLine("new_map.entries[slot].key = map->entries[i].key;");
+        try w.writeLine("new_map.entries[slot].value = map->entries[i].value;");
+        try w.writeLine("new_map.entries[slot].state = 1;");
+        try w.writeLine("new_map.len++;");
+        w.dedent();
+        try w.writeLine("}");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("free(map->entries);");
+        try w.writeLine("map->entries = new_entries;");
+        try w.writeLine("map->capacity = new_cap;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _insert
+        try w.printLine("static inline void {s}_insert({s}* map, {s} key, {s} value) {{", .{ map_type_name, map_type_name, key_type, val_type });
+        w.indent();
+        try w.writeLine("if (map->capacity == 0 || (map->len + 1) * 4 > map->capacity * 3) {");
+        w.indent();
+        try w.printLine("{s}_resize(map);", .{map_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.printLine("size_t slot = {s}_find_slot(map, key);", .{map_type_name});
+        try w.writeLine("if (map->entries[slot].state != 1) {");
+        w.indent();
+        try w.writeLine("map->len++;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("map->entries[slot].key = key;");
+        try w.writeLine("map->entries[slot].value = value;");
+        try w.writeLine("map->entries[slot].state = 1;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _get
+        try w.printLine("static inline {s} {s}_get({s}* map, {s} key) {{", .{ val_type, map_type_name, map_type_name, key_type });
+        w.indent();
+        try w.writeLine("if (map->capacity == 0) dm_panic(\"map get: key not found\");");
+        try w.printLine("size_t slot = {s}_find_slot(map, key);", .{map_type_name});
+        try w.writeLine("if (map->entries[slot].state != 1) dm_panic(\"map get: key not found\");");
+        try w.writeLine("return map->entries[slot].value;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _contains
+        try w.printLine("static inline bool {s}_contains({s}* map, {s} key) {{", .{ map_type_name, map_type_name, key_type });
+        w.indent();
+        try w.writeLine("if (map->capacity == 0) return false;");
+        try w.printLine("size_t slot = {s}_find_slot(map, key);", .{map_type_name});
+        try w.writeLine("return map->entries[slot].state == 1;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _remove
+        try w.printLine("static inline bool {s}_remove({s}* map, {s} key) {{", .{ map_type_name, map_type_name, key_type });
+        w.indent();
+        try w.writeLine("if (map->capacity == 0) return false;");
+        try w.printLine("size_t slot = {s}_find_slot(map, key);", .{map_type_name});
+        try w.writeLine("if (map->entries[slot].state != 1) return false;");
+        try w.writeLine("map->entries[slot].state = 2;");
+        try w.writeLine("map->len--;");
+        try w.writeLine("return true;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _len
+        try w.printLine("static inline int64_t {s}_len({s}* map) {{", .{ map_type_name, map_type_name });
+        w.indent();
+        try w.writeLine("return (int64_t)map->len;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _keys
+        try w.printLine("static inline {s} {s}_keys({s}* map) {{", .{ key_list_type, map_type_name, map_type_name });
+        w.indent();
+        try w.printLine("{s} result = {s}_new();", .{ key_list_type, key_list_type });
+        try w.writeLine("for (size_t i = 0; i < map->capacity; i++) {");
+        w.indent();
+        try w.printLine("if (map->entries[i].state == 1) {s}_push(&result, map->entries[i].key);", .{key_list_type});
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("return result;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _values
+        try w.printLine("static inline {s} {s}_values({s}* map) {{", .{ val_list_type, map_type_name, map_type_name });
+        w.indent();
+        try w.printLine("{s} result = {s}_new();", .{ val_list_type, val_list_type });
+        try w.writeLine("for (size_t i = 0; i < map->capacity; i++) {");
+        w.indent();
+        try w.printLine("if (map->entries[i].state == 1) {s}_push(&result, map->entries[i].value);", .{val_list_type});
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("return result;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // Track method return types for inference.
+        // The method lookup in inferCTypeFromExpr uses "{type_name}_{method}" where
+        // type_name has the "dm_" prefix stripped, so for "dm_map_X_Y" it becomes "map_X_Y".
+        const stripped_name = if (std.mem.startsWith(u8, map_type_name, "dm_"))
+            map_type_name[3..]
+        else
+            map_type_name;
+        const insert_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_insert", .{stripped_name});
+        const get_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_get", .{stripped_name});
+        const contains_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_contains", .{stripped_name});
+        const remove_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_remove", .{stripped_name});
+        const len_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_len", .{stripped_name});
+        const keys_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_keys", .{stripped_name});
+        const values_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_values", .{stripped_name});
+        self.trackFunctionReturnType(insert_key, "void");
+        self.trackFunctionReturnType(get_key, val_type);
+        self.trackFunctionReturnType(contains_key, "bool");
+        self.trackFunctionReturnType(remove_key, "bool");
+        self.trackFunctionReturnType(len_key, "int64_t");
+        self.trackFunctionReturnType(keys_key, key_list_type);
+        self.trackFunctionReturnType(values_key, val_list_type);
+    }
+
     /// Sanitize type name for use in identifier
     fn sanitizeTypeName(self: *Self, name: []const u8) ![]const u8 {
         var result = std.ArrayList(u8).init(self.stringAllocator());
@@ -1358,6 +1778,20 @@ pub const CodeGenerator = struct {
                             }
                         }
                     }
+                    if (std.mem.eql(u8, type_name, "Box")) {
+                        if (named.generic_args) |args| {
+                            if (args.len > 0) {
+                                _ = try self.generateBoxType(args[0]);
+                            }
+                        }
+                    }
+                    if (std.mem.eql(u8, type_name, "Map") or std.mem.eql(u8, type_name, "HashMap")) {
+                        if (named.generic_args) |args| {
+                            if (args.len >= 2) {
+                                _ = try self.generateMapType(args[0], args[1]);
+                            }
+                        }
+                    }
                 }
                 // Recursively scan generic args
                 if (named.generic_args) |args| {
@@ -1376,6 +1810,153 @@ pub const CodeGenerator = struct {
                     try self.scanTypeExprForLists(param);
                 }
                 try self.scanTypeExprForLists(f.return_type);
+            },
+            else => {},
+        }
+    }
+
+    /// Pre-scan a function declaration for generic function calls.
+    /// This discovers monomorphization needs before code emission so that
+    /// forward declarations can be emitted.
+    fn scanForGenericCalls(self: *Self, func: *FunctionDecl) anyerror!void {
+        // Skip generic functions themselves - they aren't compiled directly
+        if (func.generic_params != null and func.generic_params.?.len > 0) return;
+
+        if (func.body) |body| {
+            switch (body) {
+                .block => |block| try self.scanBlockForGenericCalls(block),
+                .expression => |expr| try self.scanExprForGenericCalls(expr),
+            }
+        }
+    }
+
+    /// Scan a block for generic function calls
+    fn scanBlockForGenericCalls(self: *Self, block: *BlockExpr) anyerror!void {
+        for (block.statements) |stmt| {
+            try self.scanStmtForGenericCalls(stmt);
+        }
+        if (block.result) |result| {
+            try self.scanExprForGenericCalls(result);
+        }
+    }
+
+    /// Scan a statement for generic function calls
+    fn scanStmtForGenericCalls(self: *Self, stmt: *Statement) anyerror!void {
+        switch (stmt.kind) {
+            .expression => |expr| try self.scanExprForGenericCalls(expr),
+            .let_binding => |lb| {
+                if (lb.value) |val| try self.scanExprForGenericCalls(val);
+            },
+            .return_stmt => |ret| {
+                if (ret.value) |val| try self.scanExprForGenericCalls(val);
+            },
+            .if_stmt => |if_expr| {
+                try self.scanExprForGenericCalls(if_expr.condition);
+                try self.scanBlockForGenericCalls(if_expr.then_branch);
+                if (if_expr.else_branch) |else_br| {
+                    switch (else_br) {
+                        .else_block => |eb| try self.scanBlockForGenericCalls(eb),
+                        .else_if => |ei| {
+                            try self.scanExprForGenericCalls(ei.condition);
+                            try self.scanBlockForGenericCalls(ei.then_branch);
+                        },
+                    }
+                }
+            },
+            .for_loop => |for_stmt| {
+                try self.scanExprForGenericCalls(for_stmt.iterator);
+                try self.scanBlockForGenericCalls(for_stmt.body);
+            },
+            .while_loop => |while_stmt| {
+                try self.scanExprForGenericCalls(while_stmt.condition);
+                try self.scanBlockForGenericCalls(while_stmt.body);
+            },
+            .loop_stmt => |loop| try self.scanBlockForGenericCalls(loop.body),
+            .assignment => |asgn| {
+                try self.scanExprForGenericCalls(asgn.target);
+                try self.scanExprForGenericCalls(asgn.value);
+            },
+            .match_stmt => |match_expr| {
+                try self.scanExprForGenericCalls(match_expr.scrutinee);
+                for (match_expr.arms) |arm| {
+                    if (arm.guard) |guard| try self.scanExprForGenericCalls(guard);
+                    switch (arm.body) {
+                        .expression => |e| try self.scanExprForGenericCalls(e),
+                        .block => |b| try self.scanBlockForGenericCalls(b),
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Scan an expression for generic function calls
+    fn scanExprForGenericCalls(self: *Self, expr: *Expr) anyerror!void {
+        switch (expr.kind) {
+            .function_call => |call| {
+                // Check if this calls a generic function
+                if (call.function.kind == .identifier) {
+                    const name = call.function.kind.identifier.name;
+                    if (self.generic_functions.get(name)) |generic_func| {
+                        const concrete_types = try self.resolveGenericArgs(call, generic_func);
+                        try self.requestMonomorphization(generic_func, null, concrete_types, generic_func.generic_params.?);
+                    }
+                }
+                // Scan arguments recursively
+                for (call.args) |arg| {
+                    try self.scanExprForGenericCalls(arg.value);
+                }
+            },
+            .method_call => |mc| {
+                try self.scanExprForGenericCalls(mc.object);
+                for (mc.args) |arg| {
+                    try self.scanExprForGenericCalls(arg);
+                }
+            },
+            .binary => |bin| {
+                try self.scanExprForGenericCalls(bin.left);
+                try self.scanExprForGenericCalls(bin.right);
+            },
+            .unary => |un| try self.scanExprForGenericCalls(un.operand),
+            .grouped => |inner| try self.scanExprForGenericCalls(inner),
+            .if_expr => |if_expr| {
+                try self.scanExprForGenericCalls(if_expr.condition);
+                try self.scanBlockForGenericCalls(if_expr.then_branch);
+                if (if_expr.else_branch) |else_br| {
+                    switch (else_br) {
+                        .else_block => |eb| try self.scanBlockForGenericCalls(eb),
+                        .else_if => |ei| {
+                            try self.scanExprForGenericCalls(ei.condition);
+                            try self.scanBlockForGenericCalls(ei.then_branch);
+                        },
+                    }
+                }
+            },
+            .block => |block| try self.scanBlockForGenericCalls(block),
+            .field_access => |fa| try self.scanExprForGenericCalls(fa.object),
+            .index_access => |ia| {
+                try self.scanExprForGenericCalls(ia.object);
+                try self.scanExprForGenericCalls(ia.index);
+            },
+            .match_expr => |match_expr| {
+                try self.scanExprForGenericCalls(match_expr.scrutinee);
+                for (match_expr.arms) |arm| {
+                    if (arm.guard) |guard| try self.scanExprForGenericCalls(guard);
+                    switch (arm.body) {
+                        .expression => |e| try self.scanExprForGenericCalls(e),
+                        .block => |b| try self.scanBlockForGenericCalls(b),
+                    }
+                }
+            },
+            .pipeline => |pipe| {
+                try self.scanExprForGenericCalls(pipe.left);
+                try self.scanExprForGenericCalls(pipe.right);
+            },
+            .lambda => |lam| {
+                switch (lam.body) {
+                    .block => |block| try self.scanBlockForGenericCalls(block),
+                    .expression => |e| try self.scanExprForGenericCalls(e),
+                }
             },
             else => {},
         }
@@ -1446,6 +2027,18 @@ pub const CodeGenerator = struct {
                 // Try to look up the function's return type from declarations
                 if (call.function.kind == .identifier) {
                     const name = call.function.kind.identifier.name;
+                    // Box_new(value) returns pointer to arg type
+                    if (std.mem.eql(u8, name, "Box_new")) {
+                        if (call.args.len > 0) {
+                            const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                            break :blk std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{arg_type}) catch "void*";
+                        }
+                        break :blk "void*";
+                    }
+                    // Box_null() returns void* (type inferred from context)
+                    if (std.mem.eql(u8, name, "Box_null")) break :blk "void*";
+                    // Map_new() type inferred from let binding context
+                    if (std.mem.eql(u8, name, "Map_new")) break :blk "void*";
                     // Check known built-in return types
                     if (std.mem.eql(u8, name, "len") or
                         std.mem.eql(u8, name, "parse_int") or
@@ -1470,6 +2063,12 @@ pub const CodeGenerator = struct {
                     if (std.mem.eql(u8, name, "char")) break :blk "char";
                     // Look up in function declarations tracked during generation
                     if (self.lookupFunctionReturnType(name)) |ret_type| break :blk ret_type;
+                    // Check if this is a generic function call - look up monomorphized name
+                    if (self.generic_functions.get(name)) |generic_func| {
+                        const concrete_types = self.resolveGenericArgs(call, generic_func) catch break :blk "int64_t";
+                        const mono_name = self.getMonomorphizedName(name, null, concrete_types) catch break :blk "int64_t";
+                        if (self.lookupFunctionReturnType(mono_name)) |ret_type| break :blk ret_type;
+                    }
                 }
                 // Check if calling an enum variant constructor: Type::Variant(args)
                 if (call.function.kind == .path) {
@@ -1539,7 +2138,9 @@ pub const CodeGenerator = struct {
             },
             .method_call => |mc| blk: {
                 // Try to infer method return type from the method name
-                const obj_type = self.inferCTypeFromExpr(mc.object);
+                var obj_type = self.inferCTypeFromExpr(mc.object);
+                // Strip pointer for Box types
+                if (std.mem.endsWith(u8, obj_type, "*")) obj_type = obj_type[0 .. obj_type.len - 1];
                 const type_name = if (std.mem.startsWith(u8, obj_type, "dm_"))
                     obj_type[3..]
                 else
@@ -1549,7 +2150,11 @@ pub const CodeGenerator = struct {
                 break :blk "int64_t";
             },
             .field_access => |fa| blk: {
-                const obj_type = self.inferCTypeFromExpr(fa.object);
+                var obj_type = self.inferCTypeFromExpr(fa.object);
+                // Strip pointer for Box types: dm_Node* -> dm_Node
+                if (std.mem.endsWith(u8, obj_type, "*")) {
+                    obj_type = obj_type[0 .. obj_type.len - 1];
+                }
                 const key = std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ obj_type, fa.field.name }) catch break :blk "int64_t";
                 if (self.struct_field_types.get(key)) |field_type| break :blk field_type;
                 break :blk "int64_t";
@@ -1695,12 +2300,18 @@ pub const CodeGenerator = struct {
                     if (tuple_types.len == 1) {
                         const payload_type = try self.mapType(tuple_types[0]);
                         try self.writer.printLine("{s} {s};", .{ payload_type, variant.name.name });
+                        // Track variant payload type: "dm_Enum.Variant" -> C type
+                        const vkey = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ name, variant.name.name });
+                        try self.enum_variant_types.put(vkey, payload_type);
                     } else {
                         // Multiple tuple elements - create anonymous struct
                         try self.writer.print("struct {{ ", .{});
                         for (tuple_types, 0..) |t, i| {
                             const payload_type = try self.mapType(t);
                             try self.writer.print("{s} _{d}; ", .{ payload_type, i });
+                            // Track individual tuple element types: "dm_Enum.Variant._0" -> C type
+                            const vkey = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}._{d}", .{ name, variant.name.name, i });
+                            try self.enum_variant_types.put(vkey, payload_type);
                         }
                         try self.writer.printLine("}} {s};", .{variant.name.name});
                     }
@@ -1712,6 +2323,9 @@ pub const CodeGenerator = struct {
                     for (fields) |field| {
                         const field_type = try self.mapType(field.type_expr);
                         try self.writer.print("{s} {s}; ", .{ field_type, field.name.name });
+                        // Track struct field types: "dm_Enum.Variant.field" -> C type
+                        const vkey = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}.{s}", .{ name, variant.name.name, field.name.name });
+                        try self.enum_variant_types.put(vkey, field_type);
                     }
                     try self.writer.printLine("}} {s};", .{variant.name.name});
                 },
@@ -1876,7 +2490,18 @@ pub const CodeGenerator = struct {
 
     /// Generate function prototype
     fn generateFunctionPrototype(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8) !void {
-        const func_name = try self.mangleFunctionName(func.name.name, type_prefix);
+        // Skip generic functions - they are generated on demand at call sites
+        if (func.generic_params != null and func.generic_params.?.len > 0) {
+            try self.generic_functions.put(func.name.name, func);
+            return;
+        }
+
+        try self.emitFunctionPrototype(func, type_prefix, null);
+    }
+
+    /// Emit a function prototype with optional name override (for monomorphized functions)
+    fn emitFunctionPrototype(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8, name_override: ?[]const u8) !void {
+        const func_name = name_override orelse try self.mangleFunctionName(func.name.name, type_prefix);
         const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
         const has_self = type_prefix != null and methodHasSelf(func);
 
@@ -1914,6 +2539,17 @@ pub const CodeGenerator = struct {
 
     /// Generate full function definition
     fn generateFunction(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8) !void {
+        // Skip generic functions - they are generated on demand at call sites
+        if (func.generic_params != null and func.generic_params.?.len > 0) {
+            // Already stored in generateFunctionPrototype
+            return;
+        }
+
+        try self.emitFunctionDefinition(func, type_prefix, null);
+    }
+
+    /// Emit a full function definition with optional name override (for monomorphized functions)
+    fn emitFunctionDefinition(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8, name_override: ?[]const u8) !void {
         self.current_function = func.name.name;
         defer self.current_function = null;
 
@@ -1922,11 +2558,14 @@ pub const CodeGenerator = struct {
         defer self.current_function_is_void = false;
 
         const has_self = type_prefix != null and methodHasSelf(func);
-        const func_name = try self.mangleFunctionName(func.name.name, type_prefix);
+        const func_name = name_override orelse try self.mangleFunctionName(func.name.name, type_prefix);
         const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
 
         // Track function return type - also track with type prefix for method calls
         self.trackFunctionReturnType(func.name.name, ret_type);
+        if (name_override) |mono_name| {
+            self.trackFunctionReturnType(mono_name, ret_type);
+        }
         if (type_prefix) |prefix| {
             const full_name = try std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ prefix, func.name.name });
             self.trackFunctionReturnType(full_name, ret_type);
@@ -2001,6 +2640,182 @@ pub const CodeGenerator = struct {
         }
 
         try self.writer.blankLine();
+    }
+
+    // ========================================================================
+    // GENERIC FUNCTION MONOMORPHIZATION
+    // ========================================================================
+
+    /// Resolve concrete C types for a generic function call
+    fn resolveGenericArgs(self: *Self, call: *FunctionCall, func: *FunctionDecl) ![]const []const u8 {
+        const generic_params = func.generic_params orelse return &[_][]const u8{};
+        const alloc = self.stringAllocator();
+        var concrete = try std.ArrayList([]const u8).initCapacity(alloc, generic_params.len);
+
+        if (call.generic_args) |explicit_args| {
+            // Explicit type arguments: identity[int](42)
+            for (explicit_args) |arg| {
+                try concrete.append(try self.mapType(arg));
+            }
+        } else {
+            // Infer from call arguments: for each generic param, find matching function param
+            for (generic_params) |gp| {
+                var found = false;
+                for (func.params, 0..) |param, i| {
+                    if (self.typeExprUsesGenericParam(param.type_expr, gp.name.name)) {
+                        if (i < call.args.len) {
+                            try concrete.append(self.inferCTypeFromExpr(call.args[i].value));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    try concrete.append("int64_t"); // fallback
+                }
+            }
+        }
+
+        return concrete.toOwnedSlice();
+    }
+
+    /// Check if a type expression references a generic parameter name
+    fn typeExprUsesGenericParam(self: *Self, type_expr: *TypeExpr, param_name: []const u8) bool {
+        _ = self;
+        return switch (type_expr.kind) {
+            .named => |named| blk: {
+                if (named.path.segments.len == 1 and
+                    std.mem.eql(u8, named.path.segments[0].name, param_name))
+                    break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    /// Generate a monomorphized function name: dm_identity_int64_t
+    fn getMonomorphizedName(self: *Self, name: []const u8, type_prefix: ?[]const u8, concrete_types: []const []const u8) ![]const u8 {
+        var buf = std.ArrayList(u8).init(self.stringAllocator());
+        try buf.appendSlice("dm_");
+        if (type_prefix) |prefix| {
+            try buf.appendSlice(prefix);
+            try buf.append('_');
+        }
+        try buf.appendSlice(name);
+        for (concrete_types) |ct| {
+            try buf.append('_');
+            const safe = try self.sanitizeTypeName(ct);
+            try buf.appendSlice(safe);
+        }
+        return buf.toOwnedSlice();
+    }
+
+    /// Queue a monomorphization request (if not already generated/pending)
+    fn requestMonomorphization(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8, concrete_types: []const []const u8, generic_params: []const *ast.GenericParam) !void {
+        const mono_name = try self.getMonomorphizedName(func.name.name, type_prefix, concrete_types);
+        if (self.generated_monomorphizations.contains(mono_name)) return;
+        if (self.pending_monomorphizations.contains(mono_name)) return;
+
+        // Collect generic param names
+        var param_names = try std.ArrayList([]const u8).initCapacity(self.stringAllocator(), generic_params.len);
+        for (generic_params) |gp| {
+            try param_names.append(gp.name.name);
+        }
+
+        try self.pending_monomorphizations.put(mono_name, .{
+            .func = func,
+            .type_prefix = type_prefix,
+            .concrete_types = concrete_types,
+            .generic_param_names = try param_names.toOwnedSlice(),
+        });
+    }
+
+    /// Emit forward declarations (prototypes) for all pending monomorphized functions
+    fn emitMonomorphizedPrototypes(self: *Self) !void {
+        while (self.pending_monomorphizations.count() > 0) {
+            var iter = self.pending_monomorphizations.iterator();
+            var new_items = std.ArrayList(MonoQueueItem).init(self.allocator);
+            defer new_items.deinit();
+
+            while (iter.next()) |entry| {
+                try new_items.append(.{ .name = entry.key_ptr.*, .req = entry.value_ptr.* });
+            }
+            self.pending_monomorphizations.clearRetainingCapacity();
+
+            for (new_items.items) |item| {
+                try self.generated_monomorphizations.put(item.name, {});
+
+                // Set up type substitutions for correct type mapping in prototype
+                var subs = std.StringHashMap([]const u8).init(self.allocator);
+                for (item.req.generic_param_names, 0..) |param_name, j| {
+                    if (j < item.req.concrete_types.len) {
+                        try subs.put(param_name, item.req.concrete_types[j]);
+                    }
+                }
+                const saved_subs = self.active_type_substitutions;
+                self.active_type_substitutions = subs;
+                try self.emitFunctionPrototype(item.req.func, item.req.type_prefix, item.name);
+
+                // Track monomorphized function return type for inferCTypeFromExpr
+                const ret_type = if (item.req.func.return_type) |rt| try self.mapType(rt) else "void";
+                self.trackFunctionReturnType(item.name, ret_type);
+
+                self.active_type_substitutions = saved_subs;
+                subs.deinit();
+
+                // Track for later implementation emission
+                try self.mono_emit_queue.append(item);
+            }
+        }
+    }
+
+    /// Emit implementations for all queued monomorphized functions
+    fn emitMonomorphizedImplementations(self: *Self) !void {
+        // Emit implementations for all queued items
+        var i: usize = 0;
+        while (i < self.mono_emit_queue.items.len) : (i += 1) {
+            const item = self.mono_emit_queue.items[i];
+            try self.emitMonomorphizedFunction(item.name, item.req);
+        }
+
+        // Handle any new monomorphizations discovered during implementation emission
+        while (self.pending_monomorphizations.count() > 0) {
+            var new_items = std.ArrayList(MonoQueueItem).init(self.allocator);
+            defer new_items.deinit();
+
+            var iter = self.pending_monomorphizations.iterator();
+            while (iter.next()) |entry| {
+                try new_items.append(.{ .name = entry.key_ptr.*, .req = entry.value_ptr.* });
+            }
+            self.pending_monomorphizations.clearRetainingCapacity();
+
+            for (new_items.items) |item| {
+                try self.generated_monomorphizations.put(item.name, {});
+                try self.emitMonomorphizedFunction(item.name, item.req);
+            }
+        }
+    }
+
+    /// Emit a single monomorphized function implementation
+    fn emitMonomorphizedFunction(self: *Self, mono_name: []const u8, req: MonoRequest) !void {
+        // Set up type substitutions
+        var subs = std.StringHashMap([]const u8).init(self.allocator);
+        for (req.generic_param_names, 0..) |param_name, i| {
+            if (i < req.concrete_types.len) {
+                try subs.put(param_name, req.concrete_types[i]);
+            }
+        }
+
+        // Save and set active type substitutions
+        const saved_subs = self.active_type_substitutions;
+        self.active_type_substitutions = subs;
+        defer {
+            self.active_type_substitutions = saved_subs;
+            subs.deinit();
+        }
+
+        // Emit only the definition (prototype was already emitted)
+        try self.emitFunctionDefinition(req.func, req.type_prefix, mono_name);
     }
 
     /// Generate constant definition
@@ -2202,9 +3017,18 @@ pub const CodeGenerator = struct {
     fn generateMatchStatement(self: *Self, match: *MatchExpr) anyerror!void {
         // Generate match expression into temporary
         const temp = try self.freshTemp();
-        const scrutinee_type = self.inferCTypeFromExpr(match.scrutinee);
+        const raw_type = self.inferCTypeFromExpr(match.scrutinee);
+        const is_box = std.mem.endsWith(u8, raw_type, "*");
+        const scrutinee_type = if (is_box) raw_type[0 .. raw_type.len - 1] else raw_type;
         try self.writer.print("{s} {s} = ", .{ scrutinee_type, temp });
-        try self.generateExpr(match.scrutinee);
+        if (is_box) {
+            // Dereference Box pointer for match
+            try self.writer.write("*(");
+            try self.generateExpr(match.scrutinee);
+            try self.writer.write(")");
+        } else {
+            try self.generateExpr(match.scrutinee);
+        }
         try self.writer.writeLine(";");
 
         // Wrap match in a block scope for pattern bindings
@@ -2353,23 +3177,30 @@ pub const CodeGenerator = struct {
                     .none => {},
                     .tuple => |patterns| {
                         if (patterns.len == 1 and patterns[0].kind == .identifier) {
-                            // Single payload: access union field directly
-                            try self.writer.printLine("int64_t {s} = {s}.data.{s};", .{
+                            // Single payload: look up actual variant payload type
+                            const vkey = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ scrutinee_type, variant.variant.name });
+                            const payload_type = self.enum_variant_types.get(vkey) orelse "int64_t";
+                            try self.writer.printLine("{s} {s} = {s}.data.{s};", .{
+                                payload_type,
                                 patterns[0].kind.identifier.name.name,
                                 scrutinee,
                                 variant.variant.name,
                             });
-                            self.trackVariableType(patterns[0].kind.identifier.name.name, "int64_t");
+                            self.trackVariableType(patterns[0].kind.identifier.name.name, payload_type);
                         } else {
                             for (patterns, 0..) |pat, i| {
                                 if (pat.kind == .identifier) {
-                                    try self.writer.printLine("int64_t {s} = {s}.data.{s}._{d};", .{
+                                    // Look up individual tuple element type
+                                    const vkey = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}._{d}", .{ scrutinee_type, variant.variant.name, i });
+                                    const elem_type = self.enum_variant_types.get(vkey) orelse "int64_t";
+                                    try self.writer.printLine("{s} {s} = {s}.data.{s}._{d};", .{
+                                        elem_type,
                                         pat.kind.identifier.name.name,
                                         scrutinee,
                                         variant.variant.name,
                                         i,
                                     });
-                                    self.trackVariableType(pat.kind.identifier.name.name, "int64_t");
+                                    self.trackVariableType(pat.kind.identifier.name.name, elem_type);
                                 }
                             }
                         }
@@ -2378,13 +3209,17 @@ pub const CodeGenerator = struct {
                         for (fields) |field| {
                             if (field.pattern) |pat| {
                                 if (pat.kind == .identifier) {
-                                    try self.writer.printLine("int64_t {s} = {s}.data.{s}.{s};", .{
+                                    // Look up struct field type in variant
+                                    const vkey = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}.{s}", .{ scrutinee_type, variant.variant.name, field.name.name });
+                                    const field_type = self.enum_variant_types.get(vkey) orelse "int64_t";
+                                    try self.writer.printLine("{s} {s} = {s}.data.{s}.{s};", .{
+                                        field_type,
                                         pat.kind.identifier.name.name,
                                         scrutinee,
                                         variant.variant.name,
                                         field.name.name,
                                     });
-                                    self.trackVariableType(pat.kind.identifier.name.name, "int64_t");
+                                    self.trackVariableType(pat.kind.identifier.name.name, field_type);
                                 }
                             }
                         }
@@ -2883,15 +3718,32 @@ pub const CodeGenerator = struct {
 
     /// Generate field access
     fn generateFieldAccess(self: *Self, field: *FieldAccess) anyerror!void {
-        // Check if the object is a pointer (self or mut param) - use -> instead of .
+        // Check if the object is a pointer (self, mut param, or Box type) - use -> instead of .
         const is_pointer = if (field.object.kind == .identifier) blk: {
             const name = field.object.kind.identifier.name;
-            break :blk std.mem.eql(u8, name, "self") or self.current_mut_params.contains(name);
-        } else false;
+            if (std.mem.eql(u8, name, "self") or self.current_mut_params.contains(name))
+                break :blk true;
+            // Box type detection: variable type ends with *
+            if (self.lookupVariableType(name)) |vtype| {
+                break :blk std.mem.endsWith(u8, vtype, "*");
+            }
+            break :blk false;
+        } else blk: {
+            // Non-identifier expressions: check inferred type
+            const obj_type = self.inferCTypeFromExpr(field.object);
+            break :blk std.mem.endsWith(u8, obj_type, "*");
+        };
 
         if (is_pointer) {
-            // Write the name directly (not dereferenced) and use ->
-            try self.writer.print("{s}->{s}", .{ field.object.kind.identifier.name, field.field.name });
+            if (field.object.kind == .identifier) {
+                // For identifier pointers, emit name->field directly
+                try self.writer.print("{s}->{s}", .{ field.object.kind.identifier.name, field.field.name });
+            } else {
+                // For complex expressions: (expr)->field
+                try self.writer.write("(");
+                try self.generateExpr(field.object);
+                try self.writer.print(")->{s}", .{field.field.name});
+            }
         } else {
             try self.generateExpr(field.object);
             try self.writer.print(".{s}", .{field.field.name});
@@ -2927,7 +3779,11 @@ pub const CodeGenerator = struct {
     fn generateMethodCall(self: *Self, method: *MethodCall) anyerror!void {
         // Convert obj.method(args) to dm_Type_method(&obj, args)
         // Infer the type name from the object expression
-        const obj_type = self.inferCTypeFromExpr(method.object);
+        var obj_type = self.inferCTypeFromExpr(method.object);
+        const is_box = std.mem.endsWith(u8, obj_type, "*");
+
+        // Strip pointer suffix for Box types
+        if (is_box) obj_type = obj_type[0 .. obj_type.len - 1];
 
         // Strip "dm_" prefix if present to get the raw type name for method lookup
         const type_name = if (std.mem.startsWith(u8, obj_type, "dm_"))
@@ -2936,7 +3792,13 @@ pub const CodeGenerator = struct {
             obj_type;
 
         try self.writer.print("dm_{s}_{s}(", .{ type_name, method.method.name });
-        try self.writer.write("&(");
+
+        if (is_box) {
+            // Box is already a pointer, pass directly
+            try self.writer.write("(");
+        } else {
+            try self.writer.write("&(");
+        }
         try self.generateExpr(method.object);
         try self.writer.write(")");
 
@@ -2957,9 +3819,19 @@ pub const CodeGenerator = struct {
             if (try self.generateBuiltinCall(name, call)) {
                 return;
             }
-            // User-defined function - mangle the name
-            mangled_name = try self.mangleFunctionName(name, null);
-            try self.writer.write(mangled_name.?);
+
+            // Check if this is a call to a generic function
+            if (self.generic_functions.get(name)) |generic_func| {
+                const concrete_types = try self.resolveGenericArgs(call, generic_func);
+                const mono_name = try self.getMonomorphizedName(name, null, concrete_types);
+                try self.requestMonomorphization(generic_func, null, concrete_types, generic_func.generic_params.?);
+                mangled_name = mono_name;
+                try self.writer.write(mono_name);
+            } else {
+                // User-defined function - mangle the name
+                mangled_name = try self.mangleFunctionName(name, null);
+                try self.writer.write(mangled_name.?);
+            }
         } else if (call.function.kind == .path) {
             // Path as function target - use generatePath (not generatePathExpr)
             // to avoid adding () for enum constructors that take arguments
@@ -3202,6 +4074,30 @@ pub const CodeGenerator = struct {
             // List_new() -> zero-initialized list struct
             // Type will be inferred from the let binding's type annotation
             try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
+            return true;
+        } else if (std.mem.eql(u8, name, "Box_new")) {
+            // Box_new(value) -> heap-allocate value via monomorphized helper
+            if (call.args.len > 0) {
+                const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                const safe_name = try self.sanitizeTypeName(arg_type);
+                const box_helper = try std.fmt.allocPrint(self.stringAllocator(), "dm_box_{s}", .{safe_name});
+                // Ensure the box helper has been generated
+                if (!self.generated_box_types.contains(box_helper)) {
+                    try self.generated_box_types.put(box_helper, arg_type);
+                    try self.emitBoxTypeDefinition(box_helper, arg_type);
+                }
+                try self.writer.print("{s}(", .{box_helper});
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "Box_null")) {
+            // Box_null() -> NULL pointer
+            try self.writer.write("NULL");
+            return true;
+        } else if (std.mem.eql(u8, name, "Map_new")) {
+            // Map_new() -> zero-initialized map struct
+            try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
             return true;
         }
 
