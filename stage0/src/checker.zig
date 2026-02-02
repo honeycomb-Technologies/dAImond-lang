@@ -546,6 +546,38 @@ pub const TypeChecker = struct {
         try self.env.defineGlobal(Symbol.init("HashMap", .type_def, try self.freshTypeVar()));
         try self.env.defineGlobal(Symbol.init("String", .type_def, str_id));
 
+        // Register Option and Result generic types
+        try self.env.defineGlobal(Symbol.init("Option", .type_def, try self.freshTypeVar()));
+        try self.env.defineGlobal(Symbol.init("Result", .type_def, try self.freshTypeVar()));
+
+        // Register Option/Result constructors as builtins
+        // Some(x) - creates an Option with a value
+        const some_fn_type = try self.type_ctx.makeFunction(
+            &[_]TypeId{try self.freshTypeVar()},
+            try self.freshTypeVar(),
+            EffectSet.init(self.allocator),
+        );
+        try self.env.defineGlobal(Symbol.init("Some", .function, some_fn_type));
+
+        // None - a value (no-argument constructor)
+        try self.env.defineGlobal(Symbol.init("None", .variable, try self.freshTypeVar()));
+
+        // Ok(x) - creates a Result with success value
+        const ok_fn_type = try self.type_ctx.makeFunction(
+            &[_]TypeId{try self.freshTypeVar()},
+            try self.freshTypeVar(),
+            EffectSet.init(self.allocator),
+        );
+        try self.env.defineGlobal(Symbol.init("Ok", .function, ok_fn_type));
+
+        // Err(x) - creates a Result with error value
+        const err_fn_type = try self.type_ctx.makeFunction(
+            &[_]TypeId{try self.freshTypeVar()},
+            try self.freshTypeVar(),
+            EffectSet.init(self.allocator),
+        );
+        try self.env.defineGlobal(Symbol.init("Err", .function, err_fn_type));
+
         // Register built-in functions
         // print function with IO effect
         var print_effects = EffectSet.init(self.allocator);
@@ -1080,6 +1112,28 @@ pub const TypeChecker = struct {
                 // Type variable (e.g., from generic container elements) - allow field access
                 return try self.freshTypeVar();
             },
+            .option => |opt| {
+                // Option[T] fields: has_value (bool), value (T)
+                if (std.mem.eql(u8, fa.field.name, "has_value")) {
+                    return try self.type_ctx.intern(.bool);
+                } else if (std.mem.eql(u8, fa.field.name, "value")) {
+                    return self.resolveType(opt);
+                }
+                try self.reportError(.undefined_field, "Option has no such field", fa.span);
+                return try self.type_ctx.intern(.error_type);
+            },
+            .result => |res| {
+                // Result[T, E] fields: is_ok (bool), ok (T), err (E)
+                if (std.mem.eql(u8, fa.field.name, "is_ok")) {
+                    return try self.type_ctx.intern(.bool);
+                } else if (std.mem.eql(u8, fa.field.name, "ok")) {
+                    return self.resolveType(res.ok_type);
+                } else if (std.mem.eql(u8, fa.field.name, "err")) {
+                    return self.resolveType(res.err_type);
+                }
+                try self.reportError(.undefined_field, "Result has no such field", fa.span);
+                return try self.type_ctx.intern(.error_type);
+            },
             else => {
                 try self.reportError(.expected_struct_type, "field access requires struct type", fa.span);
                 return try self.type_ctx.intern(.error_type);
@@ -1161,12 +1215,25 @@ pub const TypeChecker = struct {
             if (std.mem.eql(u8, name, "int_to_string") or std.mem.eql(u8, name, "bool_to_string") or
                 std.mem.eql(u8, name, "float_to_string") or std.mem.eql(u8, name, "substr") or
                 std.mem.eql(u8, name, "char_to_string") or std.mem.eql(u8, name, "file_read") or
-                std.mem.eql(u8, name, "args_get"))
+                std.mem.eql(u8, name, "args_get") or
+                std.mem.eql(u8, name, "string_trim") or std.mem.eql(u8, name, "string_replace") or
+                std.mem.eql(u8, name, "string_to_upper") or std.mem.eql(u8, name, "string_to_lower") or
+                std.mem.eql(u8, name, "path_dirname") or std.mem.eql(u8, name, "path_basename") or
+                std.mem.eql(u8, name, "path_extension") or std.mem.eql(u8, name, "path_stem") or
+                std.mem.eql(u8, name, "path_join"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
                 }
                 return try self.type_ctx.intern(.str);
+            }
+            // string_split returns a fresh type var (codegen handles the split_result struct)
+            if (std.mem.eql(u8, name, "string_split"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.freshTypeVar();
             }
             // Builtins returning bool
             if (std.mem.eql(u8, name, "is_alpha") or std.mem.eql(u8, name, "is_digit") or
@@ -2461,6 +2528,30 @@ pub const TypeChecker = struct {
                         if (args.len > 0) {
                             const inner = try self.resolveTypeExpr(args[0]);
                             return try self.type_ctx.makeBox(inner);
+                        }
+                    }
+                    return try self.freshTypeVar();
+                }
+                // Special handling for Option[T] -> creates a proper .option type
+                if (std.mem.eql(u8, name, "Option")) {
+                    if (named.generic_args) |args| {
+                        if (args.len > 0) {
+                            const inner = try self.resolveTypeExpr(args[0]);
+                            return try self.type_ctx.makeOption(inner);
+                        }
+                    }
+                    return try self.freshTypeVar();
+                }
+                // Special handling for Result[T, E] -> creates a proper .result type
+                if (std.mem.eql(u8, name, "Result")) {
+                    if (named.generic_args) |args| {
+                        if (args.len > 0) {
+                            const ok_type = try self.resolveTypeExpr(args[0]);
+                            const err_type = if (args.len > 1)
+                                try self.resolveTypeExpr(args[1])
+                            else
+                                try self.type_ctx.intern(.str);
+                            return try self.type_ctx.makeResult(ok_type, err_type);
                         }
                     }
                     return try self.freshTypeVar();

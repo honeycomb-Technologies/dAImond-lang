@@ -2256,6 +2256,355 @@ pub const import_tests = [_]TestCase{
     },
 };
 
+// Phase: Option/Result type tests
+pub const option_result_tests = [_]TestCase{
+    .{
+        .name = "option_some_none",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x: Option[int] = Some(42)
+            \\    if x.has_value {
+            \\        println(int_to_string(x.value))
+            \\    }
+            \\    let y: Option[int] = None
+            \\    if y.has_value {
+            \\        println("should not print")
+            \\    } else {
+            \\        println("none")
+            \\    }
+            \\}
+        ,
+        .expected_output = "42\nnone\n",
+    },
+    .{
+        .name = "option_unwrap",
+        .source =
+            \\module test
+            \\
+            \\fn find_positive(x: int) -> Option[int] {
+            \\    if x > 0 {
+            \\        return Some(x)
+            \\    }
+            \\    return None
+            \\}
+            \\
+            \\fn main() {
+            \\    let a = find_positive(10)
+            \\    if a.has_value {
+            \\        println(int_to_string(a.value))
+            \\    }
+            \\    let b = find_positive(-5)
+            \\    if b.has_value {
+            \\        println("should not print")
+            \\    } else {
+            \\        println("not found")
+            \\    }
+            \\}
+        ,
+        .expected_output = "10\nnot found\n",
+    },
+    .{
+        .name = "option_string",
+        .source =
+            \\module test
+            \\
+            \\fn maybe_greet(greet: bool) -> Option[string] {
+            \\    if greet {
+            \\        return Some("hello")
+            \\    }
+            \\    return None
+            \\}
+            \\
+            \\fn main() {
+            \\    let a = maybe_greet(true)
+            \\    if a.has_value {
+            \\        println(a.value)
+            \\    }
+            \\    let b = maybe_greet(false)
+            \\    if b.has_value {
+            \\        println(a.value)
+            \\    } else {
+            \\        println("no greeting")
+            \\    }
+            \\}
+        ,
+        .expected_output = "hello\nno greeting\n",
+    },
+    .{
+        .name = "result_ok_err",
+        .source =
+            \\module test
+            \\
+            \\fn safe_div(a: int, b: int) -> Result[int, string] {
+            \\    if b == 0 {
+            \\        return Err("division by zero")
+            \\    }
+            \\    return Ok(a / b)
+            \\}
+            \\
+            \\fn main() {
+            \\    let r1 = safe_div(10, 2)
+            \\    if r1.is_ok {
+            \\        println(int_to_string(r1.ok))
+            \\    }
+            \\    let r2 = safe_div(10, 0)
+            \\    if r2.is_ok {
+            \\        println("should not print")
+            \\    } else {
+            \\        println(r2.err)
+            \\    }
+            \\}
+        ,
+        .expected_output = "5\ndivision by zero\n",
+    },
+    .{
+        .name = "result_unwrap",
+        .source =
+            \\module test
+            \\
+            \\fn parse_positive(x: int) -> Result[int, string] {
+            \\    if x <= 0 {
+            \\        return Err("not positive")
+            \\    }
+            \\    return Ok(x * 10)
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = parse_positive(5)
+            \\    if r.is_ok {
+            \\        println(int_to_string(r.ok))
+            \\    }
+            \\}
+        ,
+        .expected_output = "50\n",
+    },
+};
+
+// Phase: Error propagation (?) operator tests
+pub const try_operator_tests = [_]TestCase{
+    .{
+        .name = "try_result_ok",
+        .source =
+            \\module test
+            \\
+            \\fn might_fail(x: int) -> Result[int, string] {
+            \\    if x < 0 {
+            \\        return Err("negative")
+            \\    }
+            \\    return Ok(x * 2)
+            \\}
+            \\
+            \\fn compute(x: int) -> Result[int, string] {
+            \\    let val: int = might_fail(x)?
+            \\    return Ok(val + 1)
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = compute(5)
+            \\    if r.is_ok {
+            \\        println(int_to_string(r.ok))
+            \\    }
+            \\}
+        ,
+        .expected_output = "11\n",
+    },
+    .{
+        .name = "try_result_err",
+        .source =
+            \\module test
+            \\
+            \\fn might_fail(x: int) -> Result[int, string] {
+            \\    if x < 0 {
+            \\        return Err("negative")
+            \\    }
+            \\    return Ok(x * 2)
+            \\}
+            \\
+            \\fn compute(x: int) -> Result[int, string] {
+            \\    let val: int = might_fail(x)?
+            \\    return Ok(val + 1)
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = compute(-3)
+            \\    if r.is_ok {
+            \\        println("should not print")
+            \\    } else {
+            \\        println(r.err)
+            \\    }
+            \\}
+        ,
+        .expected_output = "negative\n",
+    },
+};
+
+// Phase: String utility tests
+pub const string_util_tests = [_]TestCase{
+    .{
+        .name = "string_trim_whitespace",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let trimmed = string_trim("  hello  ")
+            \\    println(trimmed)
+            \\}
+        ,
+        .expected_output = "hello\n",
+    },
+    .{
+        .name = "string_replace_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let replaced = string_replace("hello world", "world", "dAImond")
+            \\    println(replaced)
+            \\}
+        ,
+        .expected_output = "hello dAImond\n",
+    },
+    .{
+        .name = "string_to_upper_lower",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let upper = string_to_upper("hello")
+            \\    println(upper)
+            \\    let lower = string_to_lower("HELLO")
+            \\    println(lower)
+            \\}
+        ,
+        .expected_output = "HELLO\nhello\n",
+    },
+    .{
+        .name = "string_split_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let parts = string_split("a,b,c", ",")
+            \\    println(int_to_string(parts.len))
+            \\    println(parts.parts[0])
+            \\    println(parts.parts[1])
+            \\    println(parts.parts[2])
+            \\}
+        ,
+        .expected_output = "3\na\nb\nc\n",
+    },
+};
+
+// Phase: Path utility tests
+pub const path_util_tests = [_]TestCase{
+    .{
+        .name = "path_dirname_basename",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let dir = path_dirname("/foo/bar/baz.dm")
+            \\    println(dir)
+            \\    let base = path_basename("/foo/bar/baz.dm")
+            \\    println(base)
+            \\}
+        ,
+        .expected_output = "/foo/bar\nbaz.dm\n",
+    },
+    .{
+        .name = "path_join_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let joined = path_join("src", "main.zig")
+            \\    println(joined)
+            \\}
+        ,
+        .expected_output = "src/main.zig\n",
+    },
+    .{
+        .name = "path_extension_stem",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let ext = path_extension("hello.dm")
+            \\    println(ext)
+            \\    let stem = path_stem("hello.dm")
+            \\    println(stem)
+            \\}
+        ,
+        .expected_output = ".dm\nhello\n",
+    },
+};
+
+// Phase: Higher-order function tests
+pub const higher_order_tests = [_]TestCase{
+    .{
+        .name = "fn_as_param",
+        .source =
+            \\module test
+            \\
+            \\fn double(x: int) -> int {
+            \\    return x * 2
+            \\}
+            \\
+            \\fn apply(f: fn(int) -> int, x: int) -> int {
+            \\    return f(x)
+            \\}
+            \\
+            \\fn main() {
+            \\    println(int_to_string(apply(double, 21)))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "fn_as_value",
+        .source =
+            \\module test
+            \\
+            \\fn triple(x: int) -> int {
+            \\    return x * 3
+            \\}
+            \\
+            \\fn main() {
+            \\    let f: fn(int) -> int = triple
+            \\    println(int_to_string(f(10)))
+            \\}
+        ,
+        .expected_output = "30\n",
+    },
+    .{
+        .name = "fn_apply_chain",
+        .source =
+            \\module test
+            \\
+            \\fn add_one(x: int) -> int {
+            \\    return x + 1
+            \\}
+            \\
+            \\fn mul_two(x: int) -> int {
+            \\    return x * 2
+            \\}
+            \\
+            \\fn apply(f: fn(int) -> int, x: int) -> int {
+            \\    return f(x)
+            \\}
+            \\
+            \\fn main() {
+            \\    let a = apply(add_one, 5)
+            \\    let b = apply(mul_two, a)
+            \\    println(int_to_string(b))
+            \\}
+        ,
+        .expected_output = "12\n",
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -2297,6 +2646,11 @@ pub fn main() !void {
         .{ .name = "Map Types", .tests = &map_tests },
         .{ .name = "Generic Functions", .tests = &generic_function_tests },
         .{ .name = "Imports", .tests = &import_tests },
+        .{ .name = "Option/Result", .tests = &option_result_tests },
+        .{ .name = "Try Operator", .tests = &try_operator_tests },
+        .{ .name = "String Utils", .tests = &string_util_tests },
+        .{ .name = "Path Utils", .tests = &path_util_tests },
+        .{ .name = "Higher-Order Fns", .tests = &higher_order_tests },
         .{ .name = "Compile Errors", .tests = &compile_error_tests },
     };
 
