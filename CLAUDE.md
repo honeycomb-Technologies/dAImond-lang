@@ -32,6 +32,12 @@ dAImond-lang/
 │   │   └── test_runtime.c      # Runtime unit tests
 │   └── tests/
 │       └── runner.zig     # Integration test harness
+├── stage1/                # Stage 1 self-hosting compiler (dAImond)
+│   ├── main.dm            # CLI entry, pipeline (single-file compiler)
+│   ├── token.dm           # Token kind constants and Token struct
+│   ├── lexer.dm           # Tokenizer (reusable module)
+│   ├── ast.dm             # AST node structs and constructors
+│   └── test_lexer.dm      # Lexer standalone test
 ├── examples/              # Example dAImond programs
 │   ├── hello.dm           # Hello World
 │   ├── arithmetic.dm      # Basic math operations
@@ -145,7 +151,7 @@ The runtime targets **C11** for portability.
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Only Stage 0 exists currently.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is in progress.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -206,13 +212,16 @@ The runtime targets **C11** for portability.
 - CLI with multiple commands (compile, run, lex, parse, check)
 - Integration test harness
 
+### In Progress
+- Stage 1 compiler (dAImond self-hosting) — lexer and AST complete, parser and codegen in development
+
 ### Not Yet Implemented
 - `fmt` command (code formatter)
 - Standard library (`stdlib/`)
-- Stage 1 compiler (dAImond self-hosting)
 - LLVM backend
 - Package management
 - Module system refinements
+- Multi-file imports for user programs
 
 ## Documentation Maintenance
 
@@ -223,6 +232,173 @@ The runtime targets **C11** for portability.
 - **Inline docs**: Update module-level `//!` comments and `///` doc comments in Zig source when public APIs change.
 
 Documentation that contradicts the code is worse than no documentation. When in doubt, check the source code -- it is always the ground truth.
+
+## Stage 0 Known Working Builtins
+
+These are the built-in functions available in dAImond programs compiled by Stage 0. They are recognized by name in `checker.zig` and emitted directly in `codegen.zig`.
+
+### I/O Functions
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `print(s)` | `string -> void` | Print to stdout (no newline) |
+| `println(s)` | `string -> void` | Print to stdout with newline |
+| `eprint(s)` | `string -> void` | Print to stderr |
+| `eprintln(s)` | `string -> void` | Print to stderr with newline |
+| `panic(s)` | `string -> void` | Print error and exit |
+| `exit(code)` | `int -> void` | Exit with code |
+
+### String Functions
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `len(s)` | `string -> int` | String length |
+| `char_at(s, i)` | `(string, int) -> string` | Get single-char string at index |
+| `substr(s, start, length)` | `(string, int, int) -> string` | Substring |
+| `int_to_string(n)` | `int -> string` | Convert int to string |
+| `float_to_string(f)` | `float -> string` | Convert float to string |
+| `bool_to_string(b)` | `bool -> string` | Convert bool to string |
+| `parse_int(s)` | `string -> int` | Parse string as int |
+| `parse_float(s)` | `string -> float` | Parse string as float |
+| `string_contains(s, sub)` | `(string, string) -> bool` | Check if contains substring |
+| `string_find(s, sub)` | `(string, string) -> int` | Find index (-1 if not found) |
+| `starts_with(s, prefix)` | `(string, string) -> bool` | Prefix check |
+| `ends_with(s, suffix)` | `(string, string) -> bool` | Suffix check |
+| `string_trim(s)` | `string -> string` | Trim whitespace |
+| `string_replace(s, old, new)` | `(string, string, string) -> string` | Replace all occurrences |
+| `string_to_upper(s)` | `string -> string` | Uppercase |
+| `string_to_lower(s)` | `string -> string` | Lowercase |
+
+### File I/O
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `file_read(path)` | `string -> string` | Read entire file |
+| `file_write(path, content)` | `(string, string) -> void` | Write file |
+
+### Command Line
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `args_len()` | `-> int` | Number of CLI arguments |
+| `args_get(i)` | `int -> string` | Get argument at index |
+| `system(cmd)` | `string -> int` | Run shell command, return exit code |
+
+### Box (Heap Allocation)
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `Box_new(value)` | `T -> Box[T]` | Heap-allocate a value |
+| `Box_null()` | `-> Box[T]` | Null pointer (type inferred) |
+
+### String Operators
+- `+` concatenates strings: `"hello" + " " + "world"`
+- `==` compares strings by value (uses `dm_string_eq`)
+- `>=`, `<=`, `>`, `<` compare strings lexicographically (uses `dm_string_cmp`)
+
+### List Methods
+- `let mut l: List[T] = []` — empty list (type annotation required)
+- `l.push(item)` — append
+- `l.pop()` — remove and return last
+- `l.len()` — get length as int
+- `l[i]` — index access
+- `for item in list { ... }` — iterate
+
+## Stage 0 Codegen Quirks and Workarounds
+
+These are known issues in Stage 0's C code generation that affect how dAImond programs should be written:
+
+### 1. Enum Payload Construction/Matching is Broken
+**Problem**: `Expr.IntLit(42)` generates incorrect C like `dm_int64_t_IntLit(&(Expr), 42)` instead of `dm_Expr_IntLit(42)`. Pattern matching on enum variants with payloads generates wrong tag comparisons.
+
+**Workaround**: Use struct-based nodes with integer kind tags instead of enum variants:
+```daimond
+-- DO NOT use:
+-- enum Expr { IntLit(int), Binary(BinaryExpr) }
+-- let e = Expr.IntLit(42)
+
+-- Instead use:
+fn EXPR_INT_LIT() -> int { return 1 }
+struct Expr { kind: int, int_val: int, ... }
+let mut e = null_expr()
+e.kind = EXPR_INT_LIT()
+e.int_val = 42
+```
+
+### 2. Nested `if` Without `else` Returns Wrong Type
+**Problem**: An `if` block without `else` that's the last statement in another `if` gets generated as a ternary expression, causing type mismatches.
+
+**Workaround**: Flatten nested conditions into a single `and` chain, or add explicit `else` branches:
+```daimond
+-- DO NOT use:
+-- if condition1 {
+--     if condition2 {
+--         do_something()
+--     }
+-- }
+
+-- Instead use:
+if condition1 and condition2 {
+    do_something()
+}
+-- Or use a flag:
+let mut should_do = false
+if condition1 and condition2 {
+    should_do = true
+}
+if should_do {
+    do_something()
+}
+```
+
+### 3. `Box.new()` / `Box.null()` vs `Box_new()` / `Box_null()`
+**Problem**: Method-call syntax `Box.new(val)` generates wrong C code. The codegen expects function-call syntax.
+
+**Workaround**: Always use `Box_new(value)` and `Box_null()` (underscore, not dot).
+
+### 4. `string.len()` Not Available
+**Problem**: The `.len()` method on strings generates `dm_string_len()` which is not defined in the runtime.
+
+**Workaround**: Use the free function `len(s)` instead of `s.len()`.
+
+### 5. `is_alpha()` / `is_digit()` Expect `char`, Not `string`
+**Problem**: These runtime functions take a C `char`, but dAImond passes `dm_string` from string literals.
+
+**Workaround**: Write your own helpers that compare single-char strings:
+```daimond
+fn is_alpha_char(ch: string) -> bool {
+    if ch >= "a" and ch <= "z" { return true }
+    if ch >= "A" and ch <= "Z" { return true }
+    if ch == "_" { return true }
+    return false
+}
+```
+
+### 6. Simple Enums (No Payloads) Work Fine
+Simple enums without payloads compile correctly to C enums.
+
+### 7. `string_split()` Returns Incompatible Type
+**Problem**: `string_split()` returns a `dm_split_result` struct, not a `List[string]`. The `.len()` method and `for` iteration don't work on it.
+
+**Workaround**: Avoid `string_split()`. Parse strings manually with `char_at()` and `substr()`.
+
+## Stage 1 Compiler Architecture
+
+Stage 1 is written in dAImond and compiled by Stage 0. It compiles a subset of dAImond to C11, sufficient to compile itself (bootstrap proof).
+
+### Design Decisions
+- **Single-file compiler**: Since Stage 0 doesn't support multi-file imports reliably, Stage 1's `main.dm` contains all code (lexer, parser, codegen) inlined.
+- **Struct-based AST**: Uses integer kind tags instead of enum payloads to work around codegen bugs.
+- **No type checker**: Generates C directly from AST; the C compiler catches type errors.
+- **String-based codegen**: Builds C code via string concatenation.
+- **Subset compiler**: Only supports features used within Stage 1 itself.
+
+### Building Stage 1
+```bash
+# Stage 0 compiles Stage 1
+cd stage0 && ./zig-out/bin/daimond compile ../stage1/main.dm -o stage1_compiler
+
+# Stage 1 compiles a test program
+./stage1_compiler test_program.dm
+
+# Run the result
+./test_program
+```
 
 ## Important Notes
 
