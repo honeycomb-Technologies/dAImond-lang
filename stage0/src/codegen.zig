@@ -267,7 +267,9 @@ pub const CodeGenerator = struct {
 
     // Track generated list types: maps list type name -> element C type
     generated_list_types: std.StringHashMap([]const u8),
-    // Deferred buffer for list type definitions
+    // Deferred buffer for list type struct definitions (emitted before user structs)
+    list_type_struct_writer: CWriter,
+    // Deferred buffer for list type function definitions (emitted after user structs)
     list_type_writer: CWriter,
 
     // Track generated box types: maps box helper name -> element C type
@@ -381,6 +383,7 @@ pub const CodeGenerator = struct {
             .function_return_types = std.StringHashMap([]const u8).init(allocator),
             .struct_field_types = std.StringHashMap([]const u8).init(allocator),
             .generated_list_types = std.StringHashMap([]const u8).init(allocator),
+            .list_type_struct_writer = CWriter.init(allocator),
             .list_type_writer = CWriter.init(allocator),
             .generated_box_types = std.StringHashMap([]const u8).init(allocator),
             .box_type_writer = CWriter.init(allocator),
@@ -424,6 +427,7 @@ pub const CodeGenerator = struct {
         self.function_return_types.deinit();
         self.struct_field_types.deinit();
         self.generated_list_types.deinit();
+        self.list_type_struct_writer.deinit();
         self.list_type_writer.deinit();
         self.generated_box_types.deinit();
         self.box_type_writer.deinit();
@@ -513,7 +517,51 @@ pub const CodeGenerator = struct {
         // Generate forward declarations
         try self.generateForwardDeclarations();
 
-        // Generate type definitions
+        // Pre-scan all declarations to discover List[T], Box[T], Option[T], Result[T,E],
+        // Map[K,V] types used in function parameters, return types, struct fields, let
+        // bindings, and function bodies. This triggers monomorphized type generation.
+        for (source.declarations) |decl| {
+            try self.scanForListTypes(decl);
+        }
+
+        // Insert monomorphized list type STRUCT definitions BEFORE user structs.
+        // List structs only contain T* pointers so they only need forward declarations.
+        // User structs may contain List[T] fields by value so they need these typedefs.
+        if (self.list_type_struct_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized List Types");
+            try self.writer.write(self.list_type_struct_writer.getOutput());
+        }
+
+        // Insert generated option type definitions (before user structs that may use them)
+        if (self.option_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Option Types");
+            try self.writer.write(self.option_type_writer.getOutput());
+        }
+
+        // Insert generated result type definitions (before user structs that may use them)
+        if (self.result_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Result Types");
+            try self.writer.write(self.result_type_writer.getOutput());
+        }
+
+        // Insert generated box helper definitions (before user structs)
+        if (self.box_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Box Helpers");
+            try self.writer.write(self.box_type_writer.getOutput());
+        }
+
+        // Insert generated map type definitions (before user structs)
+        if (self.map_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Map Types");
+            try self.writer.write(self.map_type_writer.getOutput());
+        }
+
+        // Generate user type definitions (structs and enums)
         for (source.declarations) |decl| {
             switch (decl.kind) {
                 .struct_def => |s| try self.generateStruct(s),
@@ -522,47 +570,12 @@ pub const CodeGenerator = struct {
             }
         }
 
-        // Pre-scan all declarations to discover List[T] types used in function parameters,
-        // return types, struct fields, let bindings, and function bodies. This triggers
-        // monomorphized list type generation so the definitions are available before
-        // function prototypes.
-        for (source.declarations) |decl| {
-            try self.scanForListTypes(decl);
-        }
-
-        // Insert generated list type definitions
+        // Insert monomorphized list type FUNCTION definitions AFTER user structs.
+        // Functions like _push use sizeof(T) which requires the full struct definition.
         if (self.list_type_writer.getOutput().len > 0) {
             try self.writer.blankLine();
-            try self.writer.writeLineComment("Monomorphized List Types");
+            try self.writer.writeLineComment("Monomorphized List Functions");
             try self.writer.write(self.list_type_writer.getOutput());
-        }
-
-        // Insert generated option type definitions
-        if (self.option_type_writer.getOutput().len > 0) {
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Monomorphized Option Types");
-            try self.writer.write(self.option_type_writer.getOutput());
-        }
-
-        // Insert generated result type definitions
-        if (self.result_type_writer.getOutput().len > 0) {
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Monomorphized Result Types");
-            try self.writer.write(self.result_type_writer.getOutput());
-        }
-
-        // Insert generated box helper definitions
-        if (self.box_type_writer.getOutput().len > 0) {
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Monomorphized Box Helpers");
-            try self.writer.write(self.box_type_writer.getOutput());
-        }
-
-        // Insert generated map type definitions
-        if (self.map_type_writer.getOutput().len > 0) {
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Monomorphized Map Types");
-            try self.writer.write(self.map_type_writer.getOutput());
         }
 
         try self.writer.blankLine();
@@ -1770,17 +1783,19 @@ pub const CodeGenerator = struct {
 
     /// Emit a monomorphized list type struct and helper functions
     fn emitListTypeDefinition(self: *Self, list_type_name: []const u8, elem_type: []const u8) !void {
-        var w = &self.list_type_writer;
+        // Struct definition goes to struct writer (emitted before user structs)
+        var sw = &self.list_type_struct_writer;
+        try sw.printLine("typedef struct {s} {{", .{list_type_name});
+        sw.indent();
+        try sw.printLine("{s}* data;", .{elem_type});
+        try sw.writeLine("size_t len;");
+        try sw.writeLine("size_t capacity;");
+        sw.dedent();
+        try sw.printLine("}} {s};", .{list_type_name});
+        try sw.blankLine();
 
-        // Struct definition
-        try w.printLine("typedef struct {s} {{", .{list_type_name});
-        w.indent();
-        try w.printLine("{s}* data;", .{elem_type});
-        try w.writeLine("size_t len;");
-        try w.writeLine("size_t capacity;");
-        w.dedent();
-        try w.printLine("}} {s};", .{list_type_name});
-        try w.blankLine();
+        // Function definitions go to function writer (emitted after user structs)
+        var w = &self.list_type_writer;
 
         // _new constructor
         try w.printLine("static inline {s} {s}_new(void) {{", .{ list_type_name, list_type_name });
