@@ -632,7 +632,19 @@ struct Compiler {
     -- Track all variable types: "|dm_var=c_type|..."
     var_types: string,
     -- Track struct field types: "|dm_StructName.fieldName=c_type|..."
-    struct_fields: string
+    struct_fields: string,
+    -- Track enum variant info: "|EnumName.Variant=unit|" or "|EnumName.Variant=tuple:type1,type2|"
+    enum_variants: string,
+    -- Track enum names (separate from struct_names)
+    enum_names: List[string],
+    -- Track generated Option/Result type defs to avoid duplicates
+    option_type_defs: string,
+    -- Counter for match expression temporaries
+    match_counter: int,
+    -- Expected type context for Some/None/Ok/Err inference
+    expected_type: string,
+    -- Current function return type for return statement context
+    current_fn_ret_type: string
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -644,6 +656,7 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
     let sdefs: List[string] = []
     let fdefs: List[string] = []
     let sv: List[string] = []
+    let en: List[string] = []
     return Compiler {
         tokens: tokens, pos: 0, output: "", indent: 0,
         errors: errs, struct_names: sn, fn_names: fnames,
@@ -652,7 +665,13 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         str_vars: sv, list_type_defs: "",
         list_elem_types: "",
         var_types: "",
-        struct_fields: ""
+        struct_fields: "",
+        enum_variants: "",
+        enum_names: en,
+        option_type_defs: "",
+        match_counter: 0,
+        expected_type: "",
+        current_fn_ret_type: ""
     }
 }
 
@@ -662,6 +681,27 @@ fn lookup_struct_field_type(c: Compiler, struct_type: string, field_name: string
     if pos < 0 { return "" }
     let start = pos + len(marker)
     let rest = substr(c.struct_fields, start, len(c.struct_fields) - start)
+    let end_pos = string_find(rest, "|")
+    if end_pos < 0 { return "" }
+    return substr(rest, 0, end_pos)
+}
+
+fn is_enum_name(c: Compiler, name: string) -> bool {
+    let mut i = 0
+    while i < c.enum_names.len() {
+        let cur = "" + c.enum_names[i]
+        if cur == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn lookup_enum_variant(c: Compiler, enum_name: string, variant_name: string) -> string {
+    let marker = "|" + enum_name + "." + variant_name + "="
+    let pos = string_find(c.enum_variants, marker)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let rest = substr(c.enum_variants, start, len(c.enum_variants) - start)
     let end_pos = string_find(rest, "|")
     if end_pos < 0 { return "" }
     return substr(rest, 0, end_pos)
@@ -974,8 +1014,50 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
             let tok = c_cur(result.c)
             let field = tok.value
             result.c = c_advance(result.c)
-            -- Check for method call
-            if c_peek(result.c) == TK_LPAREN() {
+            -- Check if this is an enum constructor: EnumName.Variant
+            -- result.code will be "dm_EnumName" if the base was an enum ident
+            let mut is_enum_ctor = false
+            let mut enum_base_name = ""
+            if starts_with(result.code, "dm_") {
+                let base_name = substr(result.code, 3, len(result.code) - 3)
+                if is_enum_name(result.c, base_name) {
+                    let vinfo = lookup_enum_variant(result.c, base_name, field)
+                    if vinfo != "" {
+                        is_enum_ctor = true
+                        enum_base_name = base_name
+                    }
+                }
+            }
+            if is_enum_ctor {
+                -- Enum constructor
+                let vinfo = lookup_enum_variant(result.c, enum_base_name, field)
+                if c_peek(result.c) == TK_LPAREN() {
+                    -- Constructor with args: EnumName.Variant(args)
+                    result.c = c_advance(result.c)
+                    let mut args_code = ""
+                    let mut first = true
+                    while c_peek(result.c) != TK_RPAREN() and c_peek(result.c) != TK_EOF() {
+                        if first == false {
+                            result.c = c_expect(result.c, TK_COMMA())
+                            args_code = args_code + ", "
+                        }
+                        first = false
+                        let arg = compile_expr(result.c)
+                        result.c = arg.c
+                        args_code = args_code + arg.code
+                    }
+                    result.c = c_expect(result.c, TK_RPAREN())
+                    result.code = dm_mangle(enum_base_name) + "_" + field + "(" + args_code + ")"
+                } else {
+                    -- Unit constructor: EnumName.Variant
+                    if vinfo == "unit" {
+                        result.code = dm_mangle(enum_base_name) + "_" + field + "()"
+                    } else {
+                        result.code = dm_mangle(enum_base_name) + "_" + field
+                    }
+                }
+            } else if c_peek(result.c) == TK_LPAREN() {
+                -- Method call
                 result.c = c_advance(result.c)
                 let mut args_code = ""
                 let mut first = true
@@ -1170,6 +1252,38 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         if name == "panic" {
             return ExprOut { c: cc, code: "dm_panic" }
         }
+        -- Option/Result constructors: Some, None, Ok, Err
+        -- Use expected_type or current_fn_ret_type for type context
+        if name == "Some" {
+            let etype = cc.expected_type
+            if etype != "" and starts_with(etype, "dm_option_") {
+                -- Some(value) -> dm_option_T_Some(value)
+                -- The value will be parsed by the subsequent LPAREN in postfix
+                return ExprOut { c: cc, code: etype + "_Some" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "None" {
+            let etype = cc.expected_type
+            if etype != "" and starts_with(etype, "dm_option_") {
+                return ExprOut { c: cc, code: etype + "_None()" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "Ok" {
+            let etype = cc.expected_type
+            if etype != "" and starts_with(etype, "dm_result_") {
+                return ExprOut { c: cc, code: etype + "_Ok" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "Err" {
+            let etype = cc.expected_type
+            if etype != "" and starts_with(etype, "dm_result_") {
+                return ExprOut { c: cc, code: etype + "_Err" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
         -- Check for struct literal: Name { field: value, ... }
         -- Only parse as struct literal if name is a known struct type
         let struct_try = try_compile_struct_lit(cc, name)
@@ -1185,6 +1299,9 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = inner.c
         cc = c_expect(cc, TK_RPAREN())
         return ExprOut { c: cc, code: "(" + inner.code + ")" }
+    }
+    if k == TK_MATCH() {
+        return compile_match_expr(cc)
     }
     -- Unknown primary
     cc = c_error(cc, "unexpected token in expression: " + token_kind_name(k))
@@ -1210,8 +1327,14 @@ fn compile_stmt(c: Compiler) -> Compiler {
         if c_peek(cc) == TK_NEWLINE() or c_peek(cc) == TK_RBRACE() or c_peek(cc) == TK_EOF() {
             cc.output = cc.output + ind + "return;\n"
         } else {
+            -- Set expected type for Some/None/Ok/Err from fn return type
+            let saved_expected = cc.expected_type
+            if cc.current_fn_ret_type != "" {
+                cc.expected_type = cc.current_fn_ret_type
+            }
             let val = compile_expr(cc)
             cc = val.c
+            cc.expected_type = saved_expected
             cc.output = cc.output + ind + "return " + val.code + ";\n"
         }
         return cc
@@ -1237,6 +1360,9 @@ fn compile_stmt(c: Compiler) -> Compiler {
     }
     if k == TK_LOOP() {
         return compile_loop_stmt(cc)
+    }
+    if k == TK_MATCH() {
+        return compile_match_stmt(cc)
     }
     -- Expression statement (possibly assignment)
     let lhs = compile_expr(cc)
@@ -1360,6 +1486,42 @@ fn infer_struct_lit_type(code: string) -> string {
     return type_name
 }
 
+fn infer_enum_ctor_type(code: string, c: Compiler) -> string {
+    -- Detect enum constructor: dm_EnumName_Variant(...) or dm_EnumName_Variant()
+    if starts_with(code, "dm_") == false { return "" }
+    let paren_pos = string_find(code, "(")
+    if paren_pos < 0 { return "" }
+    let ctor_name = substr(code, 3, paren_pos - 3)
+    -- Check each enum name to see if ctor_name starts with it + "_"
+    let mut i = 0
+    while i < c.enum_names.len() {
+        let ename = "" + c.enum_names[i]
+        let prefix = ename + "_"
+        if starts_with(ctor_name, prefix) {
+            return "dm_" + ename
+        }
+        i = i + 1
+    }
+    -- Check for Option/Result constructors (flattened to avoid nested if issue)
+    if starts_with(code, "dm_option_") and string_contains(code, "_Some(") {
+        let pos = string_find(code, "_Some(")
+        return substr(code, 0, pos)
+    }
+    if starts_with(code, "dm_option_") and string_contains(code, "_None(") {
+        let pos = string_find(code, "_None(")
+        return substr(code, 0, pos)
+    }
+    if starts_with(code, "dm_result_") and string_contains(code, "_Ok(") {
+        let pos = string_find(code, "_Ok(")
+        return substr(code, 0, pos)
+    }
+    if starts_with(code, "dm_result_") and string_contains(code, "_Err(") {
+        let pos = string_find(code, "_Err(")
+        return substr(code, 0, pos)
+    }
+    return ""
+}
+
 fn infer_type_from_code(code: string, c: Compiler) -> string {
     if code_is_string(code, c) { return "dm_string" }
     if code == "true" { return "bool" }
@@ -1367,6 +1529,9 @@ fn infer_type_from_code(code: string, c: Compiler) -> string {
     -- Struct literal: (dm_TypeName){ ... }
     let maybe_struct_type = infer_struct_lit_type(code)
     if maybe_struct_type != "" { return maybe_struct_type }
+    -- Enum constructor: dm_EnumName_Variant(...)
+    let maybe_enum_type = infer_enum_ctor_type(code, c)
+    if maybe_enum_type != "" { return maybe_enum_type }
     -- List element access: DM_LIST_GET(dm_var, idx)
     let list_elem = infer_list_get_type(code, c)
     if list_elem != "" { return list_elem }
@@ -1449,8 +1614,14 @@ fn compile_let_stmt(c: Compiler) -> Compiler {
     if c_peek(cc) == TK_LBRACKET() {
         return compile_let_list_init(cc, ind, type_str, var_name)
     }
+    -- Set expected type for Some/None/Ok/Err inference
+    let saved_expected = cc.expected_type
+    if has_type_ann {
+        cc.expected_type = type_str
+    }
     let val = compile_expr(cc)
     cc = val.c
+    cc.expected_type = saved_expected
     -- Infer type from value if no annotation
     if has_type_ann == false {
         type_str = infer_type_from_code(val.code, cc)
@@ -1479,6 +1650,65 @@ fn register_list_type(c: Compiler, list_type: string, elem_type: string) -> Comp
     return cc
 }
 
+fn emit_option_type_def(opt_type: string, val_type: string) -> string {
+    let mut d = "typedef enum " + opt_type + "_tag {\n"
+    d = d + "    " + opt_type + "_tag_None,\n"
+    d = d + "    " + opt_type + "_tag_Some\n"
+    d = d + "} " + opt_type + "_tag;\n\n"
+    d = d + "typedef struct " + opt_type + " {\n"
+    d = d + "    " + opt_type + "_tag tag;\n"
+    d = d + "    union { struct { " + val_type + " _0; } Some; } data;\n"
+    d = d + "} " + opt_type + ";\n\n"
+    d = d + "static inline " + opt_type + " " + opt_type + "_None(void) {\n"
+    d = d + "    " + opt_type + " _r; _r.tag = " + opt_type + "_tag_None; return _r;\n"
+    d = d + "}\n\n"
+    d = d + "static inline " + opt_type + " " + opt_type + "_Some(" + val_type + " _0) {\n"
+    d = d + "    " + opt_type + " _r; _r.tag = " + opt_type + "_tag_Some; _r.data.Some._0 = _0; return _r;\n"
+    d = d + "}\n\n"
+    return d
+}
+
+fn emit_result_type_def(res_type: string, ok_type: string, err_type: string) -> string {
+    let mut d = "typedef enum " + res_type + "_tag {\n"
+    d = d + "    " + res_type + "_tag_Ok,\n"
+    d = d + "    " + res_type + "_tag_Err\n"
+    d = d + "} " + res_type + "_tag;\n\n"
+    d = d + "typedef struct " + res_type + " {\n"
+    d = d + "    " + res_type + "_tag tag;\n"
+    d = d + "    union {\n"
+    d = d + "        struct { " + ok_type + " _0; } Ok;\n"
+    d = d + "        struct { " + err_type + " _0; } Err;\n"
+    d = d + "    } data;\n"
+    d = d + "} " + res_type + ";\n\n"
+    d = d + "static inline " + res_type + " " + res_type + "_Ok(" + ok_type + " _0) {\n"
+    d = d + "    " + res_type + " _r; _r.tag = " + res_type + "_tag_Ok; _r.data.Ok._0 = _0; return _r;\n"
+    d = d + "}\n\n"
+    d = d + "static inline " + res_type + " " + res_type + "_Err(" + err_type + " _0) {\n"
+    d = d + "    " + res_type + " _r; _r.tag = " + res_type + "_tag_Err; _r.data.Err._0 = _0; return _r;\n"
+    d = d + "}\n\n"
+    return d
+}
+
+fn register_option_type(c: Compiler, opt_type: string, val_type: string) -> Compiler {
+    let mut cc = c
+    if string_contains(cc.option_type_defs, "} " + opt_type + ";") { return cc }
+    cc.option_type_defs = cc.option_type_defs + emit_option_type_def(opt_type, val_type)
+    -- Register enum variants for match/constructor use
+    cc.enum_variants = cc.enum_variants + "|" + opt_type + ".None=unit|"
+    cc.enum_variants = cc.enum_variants + "|" + opt_type + ".Some=tuple:" + val_type + "|"
+    return cc
+}
+
+fn register_result_type(c: Compiler, res_type: string, ok_type: string, err_type: string) -> Compiler {
+    let mut cc = c
+    if string_contains(cc.option_type_defs, "} " + res_type + ";") { return cc }
+    cc.option_type_defs = cc.option_type_defs + emit_result_type_def(res_type, ok_type, err_type)
+    -- Register enum variants for match/constructor use
+    cc.enum_variants = cc.enum_variants + "|" + res_type + ".Ok=tuple:" + ok_type + "|"
+    cc.enum_variants = cc.enum_variants + "|" + res_type + ".Err=tuple:" + err_type + "|"
+    return cc
+}
+
 fn parse_type_for_c(c: Compiler) -> TypeCResult {
     let mut cc = c_skip_nl(c)
     let tok = c_cur(cc)
@@ -1487,11 +1717,19 @@ fn parse_type_for_c(c: Compiler) -> TypeCResult {
     }
     let name = tok.value
     cc = c_advance(cc)
-    -- Check for generic [T]
+    -- Check for generic [T] or [T, E]
     if c_peek(cc) == TK_LBRACKET() {
         cc = c_advance(cc)
         let inner = parse_type_for_c(cc)
         cc = inner.c
+        -- Check for second type arg (Result[T, E])
+        let mut second_type = ""
+        if c_peek(cc) == TK_COMMA() {
+            cc = c_advance(cc)
+            let inner2 = parse_type_for_c(cc)
+            cc = inner2.c
+            second_type = inner2.code
+        }
         cc = c_expect(cc, TK_RBRACKET())
         if name == "List" {
             let list_t = "dm_list_" + inner.code
@@ -1500,6 +1738,16 @@ fn parse_type_for_c(c: Compiler) -> TypeCResult {
         }
         if name == "Box" {
             return TypeCResult { c: cc, code: inner.code + "*" }
+        }
+        if name == "Option" {
+            let opt_t = "dm_option_" + inner.code
+            cc = register_option_type(cc, opt_t, inner.code)
+            return TypeCResult { c: cc, code: opt_t }
+        }
+        if name == "Result" and second_type != "" {
+            let res_t = "dm_result_" + inner.code + "_" + second_type
+            cc = register_result_type(cc, res_t, inner.code, second_type)
+            return TypeCResult { c: cc, code: res_t }
         }
         return TypeCResult { c: cc, code: "dm_" + name + "_" + inner.code }
     }
@@ -1628,6 +1876,341 @@ fn compile_block_body(c: Compiler) -> Compiler {
 }
 
 -- ============================================================
+-- MATCH EXPRESSION/STATEMENT COMPILER
+-- ============================================================
+
+fn infer_field_type_from_code(code: string, c: Compiler) -> string {
+    let dot_pos = string_find(code, ".")
+    if dot_pos < 0 { return "" }
+    let var_part = substr(code, 0, dot_pos)
+    let field_part = substr(code, dot_pos + 1, len(code) - dot_pos - 1)
+    let vtype = lookup_var_type(c, var_part)
+    if vtype == "" { return "" }
+    return lookup_struct_field_type(c, vtype, field_part)
+}
+
+-- Determine the enum type from a match subject C code string
+fn infer_match_subject_type(code: string, c: Compiler) -> string {
+    -- Look up variable type from var_types
+    let vt = lookup_var_type(c, code)
+    if vt != "" { return vt }
+    -- Try struct field access (delegated to helper to avoid nested-if codegen bug)
+    let field_result = infer_field_type_from_code(code, c)
+    if field_result != "" { return field_result }
+    -- Try function call inference
+    let fn_ret = infer_fn_call_type(code, c)
+    if fn_ret != "" { return fn_ret }
+    return ""
+}
+
+-- Compile a match arm pattern and return the condition code and any bindings
+-- Pattern kinds:
+--   EnumName.Variant(x, y) -> tag check + bindings
+--   EnumName.Variant -> tag check (unit)
+--   _ -> wildcard (always matches)
+--   literal int/string/bool -> equality check
+--   ident -> catch-all binding
+struct MatchArm {
+    c: Compiler,
+    condition: string,
+    bindings: string
+}
+
+fn compile_match_pattern(c: Compiler, subject_code: string, subject_type: string) -> MatchArm {
+    let mut cc = c_skip_nl(c)
+    let tok = c_cur(cc)
+
+    -- Wildcard: _
+    if tok.kind == TK_UNDERSCORE() {
+        cc = c_advance(cc)
+        return MatchArm { c: cc, condition: "", bindings: "" }
+    }
+
+    -- Literal integer
+    if tok.kind == TK_INTEGER() {
+        cc = c_advance(cc)
+        return MatchArm { c: cc, condition: "(" + subject_code + " == " + tok.value + ")", bindings: "" }
+    }
+
+    -- Literal string
+    if tok.kind == TK_STRING() {
+        cc = c_advance(cc)
+        return MatchArm { c: cc, condition: "dm_string_eq(" + subject_code + ", dm_string_from_cstr(\"" + tok.value + "\"))", bindings: "" }
+    }
+
+    -- true/false
+    if tok.kind == TK_TRUE() {
+        cc = c_advance(cc)
+        return MatchArm { c: cc, condition: "(" + subject_code + " == true)", bindings: "" }
+    }
+    if tok.kind == TK_FALSE() {
+        cc = c_advance(cc)
+        return MatchArm { c: cc, condition: "(" + subject_code + " == false)", bindings: "" }
+    }
+
+    -- Identifier: could be EnumName.Variant or catch-all binding
+    if tok.kind == TK_IDENT() {
+        let name = tok.value
+        cc = c_advance(cc)
+
+        -- Check for EnumName.Variant pattern
+        if c_peek(cc) == TK_DOT() {
+            cc = c_advance(cc)
+            let vtok = c_cur(cc)
+            let variant = vtok.value
+            cc = c_advance(cc)
+
+            -- Determine the C type name for the enum
+            let mangled_enum = dm_mangle(name)
+
+            -- Check if it's a tagged union (has variant info)
+            let vinfo = lookup_enum_variant(cc, name, variant)
+            -- Also check for Option/Result with dm_ prefix
+            let vinfo2 = lookup_enum_variant(cc, subject_type, variant)
+
+            let mut use_type = mangled_enum
+            let mut use_vinfo = vinfo
+            if vinfo == "" and vinfo2 != "" {
+                use_type = subject_type
+                use_vinfo = vinfo2
+            }
+
+            let condition = "(" + subject_code + ".tag == " + use_type + "_tag_" + variant + ")"
+
+            -- Check for payload bindings: (x, y)
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)  -- skip '('
+                let mut bindings = ""
+                let ind = indent_str(cc.indent + 1)
+                let mut field_idx = 0
+
+                -- Parse the payload types from vinfo to get C types
+                let mut payload_types = ""
+                if starts_with(use_vinfo, "tuple:") {
+                    payload_types = substr(use_vinfo, 6, len(use_vinfo) - 6)
+                }
+
+                while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+                    if field_idx > 0 {
+                        cc = c_expect(cc, TK_COMMA())
+                    }
+                    let bind_tok = c_cur(cc)
+                    cc = c_advance(cc)
+
+                    -- Get the type for this field from payload types
+                    let mut field_type = "int64_t"
+                    if payload_types != "" {
+                        let comma_pos = string_find(payload_types, ",")
+                        if comma_pos < 0 {
+                            field_type = payload_types
+                        } else {
+                            field_type = substr(payload_types, 0, comma_pos)
+                            payload_types = substr(payload_types, comma_pos + 1, len(payload_types) - comma_pos - 1)
+                        }
+                    }
+
+                    if bind_tok.value != "_" {
+                        bindings = bindings + ind + field_type + " " + dm_mangle(bind_tok.value) + " = " + subject_code + ".data." + variant + "._" + int_to_string(field_idx) + ";\n"
+                        -- Track the binding variable type
+                        cc = track_var_type(cc, dm_mangle(bind_tok.value), field_type)
+                        let is_str = field_type == "dm_string"
+                        cc = track_str_var(cc, dm_mangle(bind_tok.value), is_str)
+                    }
+                    field_idx = field_idx + 1
+                }
+                cc = c_expect(cc, TK_RPAREN())
+                return MatchArm { c: cc, condition: condition, bindings: bindings }
+            }
+            return MatchArm { c: cc, condition: condition, bindings: "" }
+        }
+
+        -- Simple identifier - catch-all binding
+        let ind = indent_str(cc.indent + 1)
+        let inferred = infer_match_subject_type(subject_code, cc)
+        let mut bind_type = "int64_t"
+        if inferred != "" {
+            bind_type = inferred
+        }
+        let bindings = ind + bind_type + " " + dm_mangle(name) + " = " + subject_code + ";\n"
+        cc = track_var_type(cc, dm_mangle(name), bind_type)
+        return MatchArm { c: cc, condition: "", bindings: bindings }
+    }
+
+    -- Fallback
+    return MatchArm { c: cc, condition: "", bindings: "" }
+}
+
+fn compile_match_stmt(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'match'
+    let ind = indent_str(cc.indent)
+    let subject = compile_expr(cc)
+    cc = subject.c
+    let subject_code = subject.code
+    let subject_type = infer_type_from_code(subject_code, cc)
+    cc = c_skip_nl(cc)
+    cc = c_expect(cc, TK_LBRACE())
+    cc = c_skip_nl(cc)
+
+    let mut first_arm = true
+    while c_peek(cc) != TK_RBRACE() and c_peek(cc) != TK_EOF() {
+        cc = c_skip_nl(cc)
+        if c_peek(cc) == TK_RBRACE() { break }
+
+        let arm = compile_match_pattern(cc, subject_code, subject_type)
+        cc = arm.c
+
+        cc = c_skip_nl(cc)
+        cc = c_expect(cc, TK_FAT_ARROW())
+        cc = c_skip_nl(cc)
+
+        if arm.condition == "" {
+            -- Wildcard or catch-all
+            if first_arm {
+                cc.output = cc.output + ind + "{\n"
+            } else {
+                cc.output = cc.output + ind + "} else {\n"
+            }
+        } else {
+            if first_arm {
+                cc.output = cc.output + ind + "if " + arm.condition + " {\n"
+            } else {
+                cc.output = cc.output + ind + "} else if " + arm.condition + " {\n"
+            }
+        }
+        first_arm = false
+
+        -- Emit bindings
+        cc.output = cc.output + arm.bindings
+
+        -- Compile arm body: either a block { ... } or a single expression
+        if c_peek(cc) == TK_LBRACE() {
+            cc = c_expect(cc, TK_LBRACE())
+            cc.indent = cc.indent + 1
+            cc = compile_block_body(cc)
+            cc = c_expect(cc, TK_RBRACE())
+            cc.indent = cc.indent - 1
+        } else {
+            -- Single expression as statement
+            cc.indent = cc.indent + 1
+            let body_ind = indent_str(cc.indent)
+            let body_expr = compile_expr(cc)
+            cc = body_expr.c
+            cc.output = cc.output + body_ind + body_expr.code + ";\n"
+            cc.indent = cc.indent - 1
+        }
+
+        -- Skip optional comma
+        cc = c_skip_nl(cc)
+        if c_peek(cc) == TK_COMMA() {
+            cc = c_advance(cc)
+        }
+        cc = c_skip_nl(cc)
+    }
+    cc = c_expect(cc, TK_RBRACE())
+    if first_arm == false {
+        cc.output = cc.output + ind + "}\n"
+    }
+    return cc
+}
+
+fn compile_match_expr(c: Compiler) -> ExprOut {
+    let mut cc = c_advance(c)  -- skip 'match'
+    let ind = indent_str(cc.indent)
+    let subject = compile_expr(cc)
+    cc = subject.c
+    let subject_code = subject.code
+    let subject_type = infer_type_from_code(subject_code, cc)
+    cc = c_skip_nl(cc)
+    cc = c_expect(cc, TK_LBRACE())
+    cc = c_skip_nl(cc)
+
+    -- Create a temp var for the result
+    let match_id = cc.match_counter
+    cc.match_counter = cc.match_counter + 1
+    let temp_var = "_match_" + int_to_string(match_id)
+
+    -- We need to determine the result type from the first arm
+    -- For now, emit the match as a statement block and use the temp var
+    -- The type will be inferred after we see the first arm's result
+    let mut first_arm = true
+    let mut result_type = "int64_t"
+    let mut match_output = ""
+
+    while c_peek(cc) != TK_RBRACE() and c_peek(cc) != TK_EOF() {
+        cc = c_skip_nl(cc)
+        if c_peek(cc) == TK_RBRACE() { break }
+
+        let arm = compile_match_pattern(cc, subject_code, subject_type)
+        cc = arm.c
+
+        cc = c_skip_nl(cc)
+        cc = c_expect(cc, TK_FAT_ARROW())
+        cc = c_skip_nl(cc)
+
+        if arm.condition == "" {
+            if first_arm {
+                match_output = match_output + ind + "{\n"
+            } else {
+                match_output = match_output + ind + "} else {\n"
+            }
+        } else {
+            if first_arm {
+                match_output = match_output + ind + "if " + arm.condition + " {\n"
+            } else {
+                match_output = match_output + ind + "} else if " + arm.condition + " {\n"
+            }
+        }
+
+        -- Emit bindings
+        match_output = match_output + arm.bindings
+
+        -- Compile arm expression
+        let arm_ind = indent_str(cc.indent + 1)
+        if c_peek(cc) == TK_LBRACE() {
+            -- Block body - the last expression should be the value
+            -- For simplicity, compile as a block and expect an assignment
+            cc = c_expect(cc, TK_LBRACE())
+            let saved_out = cc.output
+            cc.output = ""
+            cc.indent = cc.indent + 1
+            cc = compile_block_body(cc)
+            cc = c_expect(cc, TK_RBRACE())
+            cc.indent = cc.indent - 1
+            match_output = match_output + cc.output
+            cc.output = saved_out
+        } else {
+            let arm_expr = compile_expr(cc)
+            cc = arm_expr.c
+            if first_arm {
+                result_type = infer_type_from_code(arm_expr.code, cc)
+            }
+            match_output = match_output + arm_ind + temp_var + " = " + arm_expr.code + ";\n"
+        }
+        first_arm = false
+
+        -- Skip optional comma
+        cc = c_skip_nl(cc)
+        if c_peek(cc) == TK_COMMA() {
+            cc = c_advance(cc)
+        }
+        cc = c_skip_nl(cc)
+    }
+    cc = c_expect(cc, TK_RBRACE())
+    if first_arm == false {
+        match_output = match_output + ind + "}\n"
+    }
+
+    -- Emit the temp var declaration and match block into the output
+    cc.output = cc.output + ind + result_type + " " + temp_var + ";\n"
+    cc.output = cc.output + match_output
+    -- Track the temp var type so let inference works
+    cc = track_var_type(cc, temp_var, result_type)
+    let is_str = result_type == "dm_string"
+    cc = track_str_var(cc, temp_var, is_str)
+    return ExprOut { c: cc, code: temp_var }
+}
+
+-- ============================================================
 -- DECLARATION COMPILER
 -- ============================================================
 
@@ -1688,13 +2271,16 @@ fn compile_fn_decl(c: Compiler) -> Compiler {
 
     -- Save and reset output for body
     let saved_output = cc.output
+    let saved_fn_ret = cc.current_fn_ret_type
     cc.output = ""
     cc.indent = 1
+    cc.current_fn_ret_type = ret_type
     cc = compile_block_body(cc)
     cc = c_expect(cc, TK_RBRACE())
     body_out = body_out + cc.output + "}\n\n"
     cc.output = saved_output
     cc.indent = 0
+    cc.current_fn_ret_type = saved_fn_ret
     cc.fn_defs.push(body_out)
 
     return cc
@@ -1740,28 +2326,162 @@ fn compile_enum_decl(c: Compiler) -> Compiler {
     let name_tok = c_cur(cc)
     let enum_name = name_tok.value
     cc = c_advance(cc)
+    cc.enum_names.push(enum_name)
 
     cc = c_skip_nl(cc)
     cc = c_expect(cc, TK_LBRACE())
 
-    let mut def = "typedef enum " + dm_mangle(enum_name) + " {\n"
-    let mut idx = 0
+    -- First pass: collect variant names and their payload types
+    let mut variant_names: List[string] = []
+    let mut variant_payloads: List[string] = []
+    let mut has_any_payload = false
+
     cc = c_skip_nl(cc)
     while c_peek(cc) != TK_RBRACE() and c_peek(cc) != TK_EOF() {
         let vname_tok = c_cur(cc)
+        let vname = vname_tok.value
         cc = c_advance(cc)
-        def = def + "    " + dm_mangle(enum_name) + "_" + vname_tok.value
+        variant_names.push(vname)
+
+        -- Check for tuple payload: Variant(Type1, Type2, ...)
+        if c_peek(cc) == TK_LPAREN() {
+            cc = c_advance(cc)  -- skip '('
+            let mut payload_types = ""
+            let mut first = true
+            while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+                if first == false {
+                    cc = c_expect(cc, TK_COMMA())
+                    payload_types = payload_types + ","
+                }
+                first = false
+                let pt = parse_type_for_c(cc)
+                cc = pt.c
+                payload_types = payload_types + pt.code
+            }
+            cc = c_expect(cc, TK_RPAREN())
+            variant_payloads.push("tuple:" + payload_types)
+            has_any_payload = true
+            cc.enum_variants = cc.enum_variants + "|" + enum_name + "." + vname + "=tuple:" + payload_types + "|"
+        } else {
+            variant_payloads.push("unit")
+            cc.enum_variants = cc.enum_variants + "|" + enum_name + "." + vname + "=unit|"
+        }
+
+        -- Skip optional comma
         if c_peek(cc) == TK_COMMA() {
             cc = c_advance(cc)
-            def = def + ",\n"
-        } else {
-            def = def + "\n"
         }
         cc = c_skip_nl(cc)
-        idx = idx + 1
     }
     cc = c_expect(cc, TK_RBRACE())
-    def = def + "} " + dm_mangle(enum_name) + ";\n\n"
+
+    let mut def = ""
+    if has_any_payload == false {
+        -- Simple enum: no payloads, generate plain C enum
+        def = "typedef enum " + dm_mangle(enum_name) + " {\n"
+        let mut i = 0
+        while i < variant_names.len() {
+            def = def + "    " + dm_mangle(enum_name) + "_" + variant_names[i]
+            if i + 1 < variant_names.len() {
+                def = def + ","
+            }
+            def = def + "\n"
+            i = i + 1
+        }
+        def = def + "} " + dm_mangle(enum_name) + ";\n\n"
+    } else {
+        -- Tagged union enum: generate tag enum + union struct + constructors
+        let mangled = dm_mangle(enum_name)
+        -- Tag enum
+        def = def + "typedef enum " + mangled + "_tag {\n"
+        let mut i = 0
+        while i < variant_names.len() {
+            def = def + "    " + mangled + "_tag_" + variant_names[i]
+            if i + 1 < variant_names.len() {
+                def = def + ","
+            }
+            def = def + "\n"
+            i = i + 1
+        }
+        def = def + "} " + mangled + "_tag;\n\n"
+
+        -- Struct with tag + union
+        def = def + "typedef struct " + mangled + " {\n"
+        def = def + "    " + mangled + "_tag tag;\n"
+        def = def + "    union {\n"
+        i = 0
+        while i < variant_names.len() {
+            let payload = "" + variant_payloads[i]
+            if starts_with(payload, "tuple:") {
+                let types_str = substr(payload, 6, len(payload) - 6)
+                def = def + "        struct {"
+                -- Parse comma-separated types
+                let mut field_idx = 0
+                let mut tpos = 0
+                let mut tstr = types_str
+                let mut parse_done = false
+                while parse_done == false {
+                    let comma_pos = string_find(tstr, ",")
+                    if comma_pos < 0 {
+                        def = def + " " + tstr + " _" + int_to_string(field_idx) + ";"
+                        parse_done = true
+                    } else {
+                        let t = substr(tstr, 0, comma_pos)
+                        def = def + " " + t + " _" + int_to_string(field_idx) + ";"
+                        tstr = substr(tstr, comma_pos + 1, len(tstr) - comma_pos - 1)
+                        field_idx = field_idx + 1
+                    }
+                }
+                def = def + " } " + variant_names[i] + ";\n"
+            }
+            i = i + 1
+        }
+        def = def + "    } data;\n"
+        def = def + "} " + mangled + ";\n\n"
+
+        -- Constructor functions
+        i = 0
+        while i < variant_names.len() {
+            let payload = "" + variant_payloads[i]
+            let vname = "" + variant_names[i]
+            if payload == "unit" {
+                def = def + "static inline " + mangled + " " + mangled + "_" + vname + "(void) {\n"
+                def = def + "    " + mangled + " _r; _r.tag = " + mangled + "_tag_" + vname + "; return _r;\n"
+                def = def + "}\n\n"
+            } else if starts_with(payload, "tuple:") {
+                let types_str = substr(payload, 6, len(payload) - 6)
+                -- Build parameter list
+                let mut params = ""
+                let mut body = ""
+                let mut field_idx = 0
+                let mut tstr = types_str
+                let mut parse_done = false
+                while parse_done == false {
+                    let comma_pos = string_find(tstr, ",")
+                    if field_idx > 0 {
+                        params = params + ", "
+                    }
+                    if comma_pos < 0 {
+                        params = params + tstr + " _" + int_to_string(field_idx)
+                        body = body + "    _r.data." + vname + "._" + int_to_string(field_idx) + " = _" + int_to_string(field_idx) + ";\n"
+                        parse_done = true
+                    } else {
+                        let t = substr(tstr, 0, comma_pos)
+                        params = params + t + " _" + int_to_string(field_idx)
+                        body = body + "    _r.data." + vname + "._" + int_to_string(field_idx) + " = _" + int_to_string(field_idx) + ";\n"
+                        tstr = substr(tstr, comma_pos + 1, len(tstr) - comma_pos - 1)
+                        field_idx = field_idx + 1
+                    }
+                }
+                def = def + "static inline " + mangled + " " + mangled + "_" + vname + "(" + params + ") {\n"
+                def = def + "    " + mangled + " _r; _r.tag = " + mangled + "_tag_" + vname + ";\n"
+                def = def + body
+                def = def + "    return _r;\n"
+                def = def + "}\n\n"
+            }
+            i = i + 1
+        }
+    }
     cc.struct_defs.push(def)
 
     return cc
@@ -1849,7 +2569,7 @@ fn prescan_declarations(c: Compiler) -> Compiler {
                             let ret_tok = cc.tokens[j]
                             if ret_tok.kind == TK_IDENT() {
                                 let ret_name = ret_tok.value
-                                -- Check for generic: List[T] or Box[T]
+                                -- Check for generic: List[T], Box[T], Option[T], Result[T, E]
                                 if j + 2 < cc.tokens.len() {
                                     let maybe_bracket = cc.tokens[j + 1]
                                     if maybe_bracket.kind == TK_LBRACKET() {
@@ -1860,6 +2580,21 @@ fn prescan_declarations(c: Compiler) -> Compiler {
                                                 ret_type = "dm_list_" + inner_c
                                             } else if ret_name == "Box" {
                                                 ret_type = inner_c + "*"
+                                            } else if ret_name == "Option" {
+                                                ret_type = "dm_option_" + inner_c
+                                            } else if ret_name == "Result" {
+                                                -- Result[T, E] - look for comma and second type
+                                                let mut second_c = "dm_string"
+                                                if j + 4 < cc.tokens.len() {
+                                                    let maybe_comma = cc.tokens[j + 3]
+                                                    if maybe_comma.kind == TK_COMMA() {
+                                                        let second_tok = cc.tokens[j + 4]
+                                                        if second_tok.kind == TK_IDENT() {
+                                                            second_c = map_dm_type(second_tok.value)
+                                                        }
+                                                    }
+                                                }
+                                                ret_type = "dm_result_" + inner_c + "_" + second_c
                                             } else {
                                                 ret_type = "dm_" + ret_name + "_" + inner_c
                                             }
@@ -1884,6 +2619,12 @@ fn prescan_declarations(c: Compiler) -> Compiler {
             let name_tok = cc.tokens[i + 1]
             if name_tok.kind == TK_IDENT() {
                 cc.struct_names.push(name_tok.value)
+            }
+        }
+        if tok.kind == TK_ENUM() and i + 1 < cc.tokens.len() {
+            let name_tok = cc.tokens[i + 1]
+            if name_tok.kind == TK_IDENT() {
+                cc.enum_names.push(name_tok.value)
             }
         }
         i = i + 1
@@ -2169,6 +2910,9 @@ fn assemble_output(c: Compiler) -> string {
 
     -- List type definitions (after forward declarations, before full struct defs)
     out = out + c.list_type_defs
+
+    -- Option/Result type definitions
+    out = out + c.option_type_defs
 
     -- Struct/enum definitions
     let mut i = 0

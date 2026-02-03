@@ -213,7 +213,7 @@ The runtime targets **C11** for portability.
 - Integration test harness
 
 ### In Progress
-- Stage 1 compiler (dAImond self-hosting) — lexer and AST complete, parser and codegen in development
+- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete, expanding feature support (enum payloads, Option/Result, match expressions done; multi-file imports, lambdas, generics pending)
 
 ### Not Yet Implemented
 - `fmt` command (code formatter)
@@ -387,6 +387,14 @@ Stage 1 is written in dAImond and compiled by Stage 0. It compiles a subset of d
 - **No type checker**: Generates C directly from AST; the C compiler catches type errors.
 - **String-based codegen**: Builds C code via string concatenation.
 - **Subset compiler**: Only supports features used within Stage 1 itself.
+
+### Stage 1 Feature Support
+- **Core**: structs, simple enums, List[T], Box[T], if/else/while/for/loop/break/continue, functions, string ops, file I/O, method calls (.push/.len/.pop), struct literals, type inference, forward references
+- **Enum payloads**: `enum Shape { Circle(float), Rect(float, float), Point }` with constructor syntax `Shape.Circle(5.0)` and `Shape.Point`
+- **Option[T]**: `Option[int]` with `Some(val)` / `None` constructors (type annotation required on let bindings)
+- **Result[T, E]**: `Result[int, string]` with `Ok(val)` / `Err(msg)` constructors (type annotation required on let bindings)
+- **Match expressions**: `match expr { Pattern => body }` with enum variant patterns, payload binding, wildcard `_`, and literal patterns. Works as both statement and expression.
+- **Not yet supported**: multi-file imports, lambdas, generic monomorphization, pipeline operator, error propagation `?`, traits, effects, regions
 
 ### Building Stage 1
 ```bash
