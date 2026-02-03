@@ -57,7 +57,7 @@ zig build test-integration
 
 ```
 dAImond-lang/
-├── stage0/                    # Stage 0 compiler (written in Zig)
+├── stage0/                    # Stage 0 bootstrap compiler (written in Zig)
 │   ├── build.zig              # Zig build configuration
 │   ├── .mise.toml             # Tool version pinning (Zig 0.13.0)
 │   ├── src/
@@ -75,6 +75,19 @@ dAImond-lang/
 │   │   └── test_runtime.c     # Runtime unit tests
 │   └── tests/
 │       └── runner.zig         # Integration test harness
+├── stage1/                    # Stage 1 self-hosting compiler (written in dAImond)
+│   ├── main.dm                # Monolithic bootstrap file (generated)
+│   ├── main_split.dm          # Entry point with imports (for self-compilation)
+│   ├── token.dm               # Token kinds, Token struct, keyword lookup
+│   ├── lexer.dm               # Lexer struct, tokenize, character helpers
+│   ├── compiler.dm            # Compiler struct, parser helpers, type mapping
+│   ├── compile_expr.dm        # Expression compiler, lambdas, generics
+│   ├── compile_stmt.dm        # Statement compiler, type tracking/inference
+│   ├── compile_match.dm       # Match expressions and statements
+│   ├── compile_decl.dm        # Function/struct/enum/impl declarations
+│   ├── runtime.dm             # C runtime emission, output assembly
+│   ├── imports.dm             # Multi-file import resolver
+│   └── gen_bootstrap.sh       # Concatenates modules into main.dm
 ├── examples/                  # Example programs
 │   ├── hello.dm               # Hello World
 │   ├── arithmetic.dm          # Basic math operations
@@ -83,7 +96,14 @@ dAImond-lang/
 └── tests/                     # Integration test programs
     ├── arithmetic.dm          # Arithmetic validation
     ├── structs.dm             # Struct/enum/pattern matching
-    └── generics.dm            # Generics and traits
+    ├── generics.dm            # Generics and traits
+    ├── test_nested_for.dm     # Nested for-in loops
+    ├── test_for_types.dm      # For-in with typed lists
+    ├── test_compound_assign.dm # Compound assignment operators
+    ├── test_pipeline.dm       # Pipeline operator |>
+    ├── test_try_operator.dm   # Error propagation ?
+    ├── test_box.dm            # Box[T] heap allocation
+    └── test_builtins.dm       # All builtin functions
 ```
 
 ## Language Overview
@@ -201,18 +221,17 @@ fn main() with [IO, Console] {
 ## Bootstrap Path
 
 ```
-Stage 0 (Zig) → Stage 1 (dAImond) → Stage 2 (Self-compiled) → Stage 3 (LLVM)
+Stage 0 (Zig) ✅ → Stage 1 (dAImond) ✅ → Stage 2 (Self-compiled) ✅ → Stage 3 (LLVM)
 ```
 
-1. **Stage 0**: Hand-written compiler in Zig, compiles dAImond → C
-2. **Stage 1**: Compiler rewritten in dAImond, compiled by Stage 0
-3. **Stage 2**: Stage 1 compiles itself (verified identical output)
+1. **Stage 0** (Complete): Hand-written compiler in Zig, compiles dAImond → C
+2. **Stage 1** (Complete): Compiler rewritten in dAImond, compiled by Stage 0
+3. **Stage 2** (Complete): Stage 1 compiles itself — fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3**: LLVM backend for optimized native code
 
 ## Current Status
 
-### Stage 0 Compiler (Complete)
-- [x] Project structure
+### Stage 0 Compiler — Complete
 - [x] Lexer with comprehensive token support
 - [x] Recursive descent + Pratt parser
 - [x] AST definitions for all language constructs
@@ -225,13 +244,28 @@ Stage 0 (Zig) → Stage 1 (dAImond) → Stage 2 (Self-compiled) → Stage 3 (LLV
 - [x] Unit tests for all compiler modules
 - [x] Integration test harness
 
+### Stage 1 Self-Hosting Compiler — Complete
+- [x] Compiler rewritten in dAImond (~10 modules)
+- [x] Full feature parity with Stage 0 subset
+- [x] Verified fixed-point bootstrap (Stage 1 compiles itself with identical output)
+- [x] Multi-file import system with transitive dependency resolution
+- [x] Enum payloads, Option[T], Result[T, E], match expressions
+- [x] Lambda expressions (lifted to static functions)
+- [x] Generic function monomorphization (explicit and implicit)
+- [x] Pipeline operator `|>` and error propagation `?`
+- [x] Box[T] heap allocation support
+- [x] Compound assignment operators (`+=`, `-=`, `*=`, `/=`) and modulo `%`
+- [x] All builtins (I/O, string ops, file I/O, CLI args, system)
+- [x] CLI flag parity (`-o`, `-c`, `--emit-c`, `-v`, `--version`, `-h`)
+
 ### Upcoming
 - [ ] Code formatter (`fmt` command)
 - [ ] Standard library (`stdlib/`)
-- [ ] Stage 1 compiler (dAImond self-hosting)
-- [ ] LLVM backend
+- [ ] Traits and effects (deferred to Stage 2+)
+- [ ] Region-based memory management (deferred to Stage 2+)
+- [ ] LLVM backend (Stage 3)
 - [ ] Package management
-- [ ] Module system refinements
+- [ ] Multi-file imports for user programs in Stage 0
 
 ## Design Principles
 
