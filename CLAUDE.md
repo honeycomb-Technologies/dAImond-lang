@@ -55,7 +55,14 @@ dAImond-lang/
 └── tests/                 # Integration test programs (.dm files)
     ├── arithmetic.dm      # Arithmetic validation
     ├── structs.dm         # Struct/enum/pattern matching tests
-    └── generics.dm        # Generic functions and traits tests
+    ├── generics.dm        # Generic functions and traits tests
+    ├── test_nested_for.dm # Nested for-in loop validation (Stage 1)
+    ├── test_for_types.dm  # For-in with List[string]/List[struct] (Stage 1)
+    ├── test_compound_assign.dm # *=, /= operators (Stage 1)
+    ├── test_pipeline.dm   # Pipeline operator |> (Stage 1)
+    ├── test_try_operator.dm   # Error propagation ? (Stage 1)
+    ├── test_box.dm        # Box[T] support (Stage 1)
+    └── test_builtins.dm   # All builtins (Stage 1)
 ```
 
 ## Compiler Pipeline
@@ -160,7 +167,7 @@ The runtime targets **C11** for portability.
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is in progress.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is feature-complete with verified fixed-point bootstrap.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -222,7 +229,7 @@ The runtime targets **C11** for portability.
 - Integration test harness
 
 ### In Progress
-- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete, split into ~10 modules with verified fixed-point bootstrap. Feature support: enum payloads, Option/Result, match expressions, multi-file imports, lambdas, generic monomorphization done; pipeline operator, error propagation pending
+- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete, split into ~10 modules with verified fixed-point bootstrap. Full feature parity with Stage 0 subset: enum payloads, Option/Result, match expressions (including bare Ok/Err/Some/None patterns), multi-file imports, lambdas, generic monomorphization, pipeline operator `|>`, error propagation `?`, Box[T] support, compound assignment operators (`+=`, `-=`, `*=`, `/=`), modulo `%`, all builtins (including `eprint`, `parse_float`, `string_to_upper`, `string_to_lower`), CLI flag parity (`-o`, `-c`, `--emit-c`, `-v`, `--version`, `-h`), nested for-loop support, for-loop element type inference
 
 ### Not Yet Implemented
 - `fmt` command (code formatter)
@@ -421,11 +428,18 @@ Cross-module function calls (e.g., compile_stmt calls compile_expr) work because
 - **Enum payloads**: `enum Shape { Circle(float), Rect(float, float), Point }` with constructor syntax `Shape.Circle(5.0)` and `Shape.Point`
 - **Option[T]**: `Option[int]` with `Some(val)` / `None` constructors (type annotation required on let bindings)
 - **Result[T, E]**: `Result[int, string]` with `Ok(val)` / `Err(msg)` constructors (type annotation required on let bindings)
-- **Match expressions**: `match expr { Pattern => body }` with enum variant patterns, payload binding, wildcard `_`, and literal patterns. Works as both statement and expression.
+- **Match expressions**: `match expr { Pattern => body }` with enum variant patterns, payload binding, wildcard `_`, literal patterns, and bare `Ok(v)`/`Err(e)`/`Some(v)`/`None` patterns. Works as both statement and expression.
 - **Multi-file imports**: `import module_name` resolves to `module_name.dm` in same directory. `import std.helpers` resolves to `std/helpers.dm`. Transitive imports supported with deduplication (diamond imports handled). Source concatenated before tokenization.
 - **Lambda expressions**: `|x: int| x * 2` for expression body, `|a: int, b: int| { ... }` for block body. Lifted to static functions at file scope. Function pointer types generated automatically for variable declarations.
 - **Generic monomorphization**: `fn max[T](a: T, b: T) -> T { ... }` with explicit (`max[int](3, 7)`) or implicit (`max(3, 7)`) type arguments. Generates specialized copies at call sites with deduplication.
-- **Not yet supported**: pipeline operator, error propagation `?`, traits, effects, regions
+- **Pipeline operator**: `x |> f` desugars to `f(x)`, `x |> f(y)` desugars to `f(x, y)`. Supports chaining: `x |> f |> g`.
+- **Error propagation**: `expr?` on `Result[T, E]` unwraps `Ok` or early-returns `Err`. On `Option[T]` unwraps `Some` or early-returns `None`.
+- **Box[T]**: `Box_new(value)` heap-allocates, `Box_null()` returns NULL. Type `Box[T]` maps to `T*` in C.
+- **Compound assignment**: `+=`, `-=`, `*=`, `/=` operators
+- **Modulo**: `%` operator
+- **All builtins**: `print`, `println`, `eprint`, `eprintln`, `panic`, `exit`, `len`, `char_at`, `substr`, `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_replace`, `string_trim`, `string_to_upper`, `string_to_lower`, `file_read`, `file_write`, `args_get`, `args_len`, `system`, `Box_new`, `Box_null`
+- **CLI flags**: `-o`, `-c`, `--emit-c`, `-v`/`--verbose`, `--version`, `-h`/`--help`, `run`, `compile` commands
+- **Not yet supported**: traits, effects, regions (deferred to Stage 2)
 
 ### Building Stage 1
 ```bash

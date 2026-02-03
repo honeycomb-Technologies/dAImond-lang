@@ -191,7 +191,11 @@ struct Compiler {
     -- Track generic function token ranges: "|fn_name=start:end|"
     generic_fn_tokens: string,
     -- Track already-monomorphized generic functions: "|mangled_name|"
-    monomorphized_fns: string
+    monomorphized_fns: string,
+    -- Counter for unique for-loop iterator variables
+    for_counter: int,
+    -- Counter for unique try-operator temporaries
+    try_counter: int
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -222,7 +226,9 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         lambda_counter: 0,
         lambda_defs: "",
         generic_fn_tokens: "",
-        monomorphized_fns: ""
+        monomorphized_fns: "",
+        for_counter: 0,
+        try_counter: 0
     }
 }
 
@@ -296,6 +302,8 @@ fn code_is_string(code: string, c: Compiler) -> bool {
     if starts_with(code, "dm_args_get(") { return true }
     if starts_with(code, "dm_string_replace(") { return true }
     if starts_with(code, "dm_string_trim(") { return true }
+    if starts_with(code, "dm_string_to_upper(") { return true }
+    if starts_with(code, "dm_string_to_lower(") { return true }
     -- Check if it's a known string variable
     if str_list_contains(c.str_vars, code) { return true }
     -- Check var_types for dm_string

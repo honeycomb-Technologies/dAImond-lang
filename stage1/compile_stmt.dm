@@ -76,6 +76,16 @@ fn compile_stmt(c: Compiler) -> Compiler {
         let rhs = compile_expr(cc)
         cc = rhs.c
         cc.output = cc.output + ind + lhs.code + " = (" + lhs.code + " - " + rhs.code + ");\n"
+    } else if c_peek(cc) == TK_STAREQ() {
+        cc = c_advance(cc)
+        let rhs = compile_expr(cc)
+        cc = rhs.c
+        cc.output = cc.output + ind + lhs.code + " = (" + lhs.code + " * " + rhs.code + ");\n"
+    } else if c_peek(cc) == TK_SLASHEQ() {
+        cc = c_advance(cc)
+        let rhs = compile_expr(cc)
+        cc = rhs.c
+        cc.output = cc.output + ind + lhs.code + " = (" + lhs.code + " / " + rhs.code + ");\n"
     } else {
         cc.output = cc.output + ind + lhs.code + ";\n"
     }
@@ -159,9 +169,26 @@ fn lookup_var_type(c: Compiler, mangled_name: string) -> string {
     return substr(rest, 0, end_pos)
 }
 
+fn infer_builtin_ret_type(fn_code: string) -> string {
+    -- Builtins that return specific types
+    if starts_with(fn_code, "dm_parse_int(") { return "int64_t" }
+    if starts_with(fn_code, "dm_parse_float(") { return "double" }
+    if starts_with(fn_code, "dm_len(") { return "int64_t" }
+    if starts_with(fn_code, "dm_string_find(") { return "int64_t" }
+    if starts_with(fn_code, "dm_string_contains(") { return "bool" }
+    if starts_with(fn_code, "dm_string_starts_with(") { return "bool" }
+    if starts_with(fn_code, "dm_string_ends_with(") { return "bool" }
+    if starts_with(fn_code, "dm_args_len(") { return "int64_t" }
+    if starts_with(fn_code, "dm_system(") { return "int64_t" }
+    return ""
+}
+
 fn infer_fn_call_type(code: string, c: Compiler) -> string {
     if starts_with(code, "dm_") == false { return "" }
     if string_contains(code, "(") == false { return "" }
+    -- Check builtin return types first
+    let builtin_ret = infer_builtin_ret_type(code)
+    if builtin_ret != "" { return builtin_ret }
     let paren_pos = string_find(code, "(")
     let fn_name = substr(code, 3, paren_pos - 3)
     let ret = lookup_fn_ret_type(c, fn_name)
@@ -541,8 +568,20 @@ fn compile_for_stmt(c: Compiler) -> Compiler {
         return cc
     }
     -- List iteration: for x in list { ... }
-    cc.output = cc.output + ind + "for (size_t _fi = 0; _fi < " + start_expr.code + ".len; _fi++) {\n"
-    cc.output = cc.output + ind + "    int64_t " + dm_mangle(var_name) + " = " + start_expr.code + ".data[_fi];\n"
+    -- Use unique iterator variable to support nested loops
+    let fi_name = "_fi" + int_to_string(cc.for_counter)
+    cc.for_counter = cc.for_counter + 1
+    -- Infer element type from list type
+    let list_type = infer_type_from_code(start_expr.code, cc)
+    let mut elem_type = "int64_t"
+    if starts_with(list_type, "dm_list_") {
+        elem_type = substr(list_type, 8, len(list_type) - 8)
+    }
+    cc.output = cc.output + ind + "for (size_t " + fi_name + " = 0; " + fi_name + " < " + start_expr.code + ".len; " + fi_name + "++) {\n"
+    cc.output = cc.output + ind + "    " + elem_type + " " + dm_mangle(var_name) + " = " + start_expr.code + ".data[" + fi_name + "];\n"
+    -- Track the loop variable type
+    cc = track_var_type(cc, dm_mangle(var_name), elem_type)
+    cc = track_str_var(cc, dm_mangle(var_name), elem_type == "dm_string")
     cc = c_expect(cc, TK_LBRACE())
     cc.indent = cc.indent + 1
     cc = compile_block_body(cc)

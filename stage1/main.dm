@@ -349,13 +349,25 @@ fn tokenize(source: string) -> List[Token] {
                     lex.col = lex.col + 1
                 }
             } else if ch == "*" {
-                tokens.push(token_new(TK_STAR(), "*", sl, sc))
-                lex.pos = lex.pos + 1
-                lex.col = lex.col + 1
+                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
+                    tokens.push(token_new(TK_STAREQ(), "*=", sl, sc))
+                    lex.pos = lex.pos + 2
+                    lex.col = lex.col + 2
+                } else {
+                    tokens.push(token_new(TK_STAR(), "*", sl, sc))
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
+                }
             } else if ch == "/" {
-                tokens.push(token_new(TK_SLASH(), "/", sl, sc))
-                lex.pos = lex.pos + 1
-                lex.col = lex.col + 1
+                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
+                    tokens.push(token_new(TK_SLASHEQ(), "/=", sl, sc))
+                    lex.pos = lex.pos + 2
+                    lex.col = lex.col + 2
+                } else {
+                    tokens.push(token_new(TK_SLASH(), "/", sl, sc))
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
+                }
             } else if ch == "%" {
                 tokens.push(token_new(TK_PERCENT(), "%", sl, sc))
                 lex.pos = lex.pos + 1
@@ -660,7 +672,11 @@ struct Compiler {
     -- Track generic function token ranges: "|fn_name=start:end|"
     generic_fn_tokens: string,
     -- Track already-monomorphized generic functions: "|mangled_name|"
-    monomorphized_fns: string
+    monomorphized_fns: string,
+    -- Counter for unique for-loop iterator variables
+    for_counter: int,
+    -- Counter for unique try-operator temporaries
+    try_counter: int
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -691,7 +707,9 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         lambda_counter: 0,
         lambda_defs: "",
         generic_fn_tokens: "",
-        monomorphized_fns: ""
+        monomorphized_fns: "",
+        for_counter: 0,
+        try_counter: 0
     }
 }
 
@@ -765,6 +783,8 @@ fn code_is_string(code: string, c: Compiler) -> bool {
     if starts_with(code, "dm_args_get(") { return true }
     if starts_with(code, "dm_string_replace(") { return true }
     if starts_with(code, "dm_string_trim(") { return true }
+    if starts_with(code, "dm_string_to_upper(") { return true }
+    if starts_with(code, "dm_string_to_lower(") { return true }
     -- Check if it's a known string variable
     if str_list_contains(c.str_vars, code) { return true }
     -- Check var_types for dm_string
@@ -855,7 +875,36 @@ struct ExprOut {
 }
 
 fn compile_expr(c: Compiler) -> ExprOut {
-    return compile_or_expr(c)
+    return compile_pipe_expr(c)
+}
+
+fn compile_pipe_expr(c: Compiler) -> ExprOut {
+    let mut result = compile_or_expr(c)
+    while c_peek(result.c) == TK_PIPEGT() {
+        result.c = c_advance(result.c)
+        -- Parse the RHS: could be a bare identifier or a function call
+        let rhs = compile_or_expr(result.c)
+        result.c = rhs.c
+        -- If the RHS looks like a function call f(args...), insert lhs as first arg
+        -- RHS code will be like "dm_func(arg1, arg2)" — insert lhs after first '('
+        let paren_pos = string_find(rhs.code, "(")
+        if paren_pos >= 0 {
+            let fn_part = substr(rhs.code, 0, paren_pos + 1)
+            let args_part = substr(rhs.code, paren_pos + 1, len(rhs.code) - paren_pos - 1)
+            -- args_part is "arg1, arg2)" or ")"
+            if starts_with(args_part, ")") {
+                -- No args: f() -> f(lhs)
+                result.code = fn_part + result.code + ")"
+            } else {
+                -- Has args: f(args...) -> f(lhs, args...)
+                result.code = fn_part + result.code + ", " + args_part
+            }
+        } else {
+            -- Bare identifier: f -> f(lhs)
+            result.code = rhs.code + "(" + result.code + ")"
+        }
+    }
+    return result
 }
 
 fn compile_or_expr(c: Compiler) -> ExprOut {
@@ -1109,6 +1158,28 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 }
             } else {
                 result.code = result.code + "." + field
+            }
+        } else if k == TK_QUESTION() {
+            -- Error propagation: expr? unwraps Ok/Some or early-returns Err/None
+            result.c = c_advance(result.c)
+            let try_id = result.c.try_counter
+            result.c.try_counter = result.c.try_counter + 1
+            let tmp = "_try_" + int_to_string(try_id)
+            let ind = indent_str(result.c.indent)
+            let expr_type = infer_type_from_code(result.code, result.c)
+            if starts_with(expr_type, "dm_result_") {
+                -- Result[T, E]: check for Err, early-return it
+                result.c.output = result.c.output + ind + expr_type + " " + tmp + " = " + result.code + ";\n"
+                result.c.output = result.c.output + ind + "if (" + tmp + ".tag == " + expr_type + "_tag_Err) { return " + tmp + "; }\n"
+                result.code = tmp + ".data.Ok._0"
+            } else if starts_with(expr_type, "dm_option_") {
+                -- Option[T]: check for None, early-return it
+                result.c.output = result.c.output + ind + expr_type + " " + tmp + " = " + result.code + ";\n"
+                result.c.output = result.c.output + ind + "if (" + tmp + ".tag == " + expr_type + "_tag_None) { return " + tmp + "; }\n"
+                result.code = tmp + ".data.Some._0"
+            } else {
+                -- Unknown type: just pass through (C compiler will catch errors)
+                result.c.output = result.c.output + ind + "// try operator on unknown type\n"
             }
         } else if k == TK_LBRACKET() {
             result.c = c_advance(result.c)
@@ -1532,6 +1603,9 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         if name == "eprintln" {
             return ExprOut { c: cc, code: "dm_eprintln_str" }
         }
+        if name == "eprint" {
+            return ExprOut { c: cc, code: "dm_eprint_str" }
+        }
         if name == "int_to_string" {
             return ExprOut { c: cc, code: "dm_int_to_string" }
         }
@@ -1553,6 +1627,9 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         if name == "parse_int" {
             return ExprOut { c: cc, code: "dm_parse_int" }
         }
+        if name == "parse_float" {
+            return ExprOut { c: cc, code: "dm_parse_float" }
+        }
         if name == "string_contains" {
             return ExprOut { c: cc, code: "dm_string_contains" }
         }
@@ -1570,6 +1647,12 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         }
         if name == "string_trim" {
             return ExprOut { c: cc, code: "dm_string_trim" }
+        }
+        if name == "string_to_upper" {
+            return ExprOut { c: cc, code: "dm_string_to_upper" }
+        }
+        if name == "string_to_lower" {
+            return ExprOut { c: cc, code: "dm_string_to_lower" }
         }
         if name == "file_read" {
             return ExprOut { c: cc, code: "dm_file_read" }
@@ -1591,6 +1674,27 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         }
         if name == "panic" {
             return ExprOut { c: cc, code: "dm_panic" }
+        }
+        -- Box_new(val) and Box_null() builtins
+        if name == "Box_new" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg = compile_expr(cc)
+                cc = arg.c
+                cc = c_expect(cc, TK_RPAREN())
+                let val_type = infer_type_from_code(arg.code, cc)
+                let box_code = "({ " + val_type + "* _bp = (" + val_type + "*)malloc(sizeof(" + val_type + ")); *_bp = " + arg.code + "; _bp; })"
+                return ExprOut { c: cc, code: box_code }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "Box_null" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "NULL" }
+            }
+            return ExprOut { c: cc, code: "NULL" }
         }
         -- Option/Result constructors: Some, None, Ok, Err
         -- Use expected_type or current_fn_ret_type for type context
@@ -1743,6 +1847,16 @@ fn compile_stmt(c: Compiler) -> Compiler {
         let rhs = compile_expr(cc)
         cc = rhs.c
         cc.output = cc.output + ind + lhs.code + " = (" + lhs.code + " - " + rhs.code + ");\n"
+    } else if c_peek(cc) == TK_STAREQ() {
+        cc = c_advance(cc)
+        let rhs = compile_expr(cc)
+        cc = rhs.c
+        cc.output = cc.output + ind + lhs.code + " = (" + lhs.code + " * " + rhs.code + ");\n"
+    } else if c_peek(cc) == TK_SLASHEQ() {
+        cc = c_advance(cc)
+        let rhs = compile_expr(cc)
+        cc = rhs.c
+        cc.output = cc.output + ind + lhs.code + " = (" + lhs.code + " / " + rhs.code + ");\n"
     } else {
         cc.output = cc.output + ind + lhs.code + ";\n"
     }
@@ -1826,9 +1940,26 @@ fn lookup_var_type(c: Compiler, mangled_name: string) -> string {
     return substr(rest, 0, end_pos)
 }
 
+fn infer_builtin_ret_type(fn_code: string) -> string {
+    -- Builtins that return specific types
+    if starts_with(fn_code, "dm_parse_int(") { return "int64_t" }
+    if starts_with(fn_code, "dm_parse_float(") { return "double" }
+    if starts_with(fn_code, "dm_len(") { return "int64_t" }
+    if starts_with(fn_code, "dm_string_find(") { return "int64_t" }
+    if starts_with(fn_code, "dm_string_contains(") { return "bool" }
+    if starts_with(fn_code, "dm_string_starts_with(") { return "bool" }
+    if starts_with(fn_code, "dm_string_ends_with(") { return "bool" }
+    if starts_with(fn_code, "dm_args_len(") { return "int64_t" }
+    if starts_with(fn_code, "dm_system(") { return "int64_t" }
+    return ""
+}
+
 fn infer_fn_call_type(code: string, c: Compiler) -> string {
     if starts_with(code, "dm_") == false { return "" }
     if string_contains(code, "(") == false { return "" }
+    -- Check builtin return types first
+    let builtin_ret = infer_builtin_ret_type(code)
+    if builtin_ret != "" { return builtin_ret }
     let paren_pos = string_find(code, "(")
     let fn_name = substr(code, 3, paren_pos - 3)
     let ret = lookup_fn_ret_type(c, fn_name)
@@ -2208,8 +2339,20 @@ fn compile_for_stmt(c: Compiler) -> Compiler {
         return cc
     }
     -- List iteration: for x in list { ... }
-    cc.output = cc.output + ind + "for (size_t _fi = 0; _fi < " + start_expr.code + ".len; _fi++) {\n"
-    cc.output = cc.output + ind + "    int64_t " + dm_mangle(var_name) + " = " + start_expr.code + ".data[_fi];\n"
+    -- Use unique iterator variable to support nested loops
+    let fi_name = "_fi" + int_to_string(cc.for_counter)
+    cc.for_counter = cc.for_counter + 1
+    -- Infer element type from list type
+    let list_type = infer_type_from_code(start_expr.code, cc)
+    let mut elem_type = "int64_t"
+    if starts_with(list_type, "dm_list_") {
+        elem_type = substr(list_type, 8, len(list_type) - 8)
+    }
+    cc.output = cc.output + ind + "for (size_t " + fi_name + " = 0; " + fi_name + " < " + start_expr.code + ".len; " + fi_name + "++) {\n"
+    cc.output = cc.output + ind + "    " + elem_type + " " + dm_mangle(var_name) + " = " + start_expr.code + ".data[" + fi_name + "];\n"
+    -- Track the loop variable type
+    cc = track_var_type(cc, dm_mangle(var_name), elem_type)
+    cc = track_str_var(cc, dm_mangle(var_name), elem_type == "dm_string")
     cc = c_expect(cc, TK_LBRACE())
     cc.indent = cc.indent + 1
     cc = compile_block_body(cc)
@@ -2391,6 +2534,59 @@ fn compile_match_pattern(c: Compiler, subject_code: string, subject_type: string
                 cc = c_expect(cc, TK_RPAREN())
                 return MatchArm { c: cc, condition: condition, bindings: bindings }
             }
+            return MatchArm { c: cc, condition: condition, bindings: "" }
+        }
+
+        -- Check for bare Option/Result constructors: Some(x), None, Ok(x), Err(x)
+        let is_some = name == "Some" and starts_with(subject_type, "dm_option_")
+        let is_none = name == "None" and starts_with(subject_type, "dm_option_")
+        let is_ok = name == "Ok" and starts_with(subject_type, "dm_result_")
+        let is_err = name == "Err" and starts_with(subject_type, "dm_result_")
+
+        if is_some or is_ok or is_err {
+            -- Constructor with payload: Some(x), Ok(x), Err(e)
+            let condition = "(" + subject_code + ".tag == " + subject_type + "_tag_" + name + ")"
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let mut bindings = ""
+                let ind = indent_str(cc.indent + 1)
+                let mut field_idx = 0
+                -- Get payload type from variant info
+                let vinfo = lookup_enum_variant(cc, subject_type, name)
+                let mut payload_types = ""
+                if starts_with(vinfo, "tuple:") {
+                    payload_types = substr(vinfo, 6, len(vinfo) - 6)
+                }
+                while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+                    if field_idx > 0 {
+                        cc = c_expect(cc, TK_COMMA())
+                    }
+                    let bind_tok = c_cur(cc)
+                    cc = c_advance(cc)
+                    let mut field_type = "int64_t"
+                    if payload_types != "" {
+                        let comma_pos = string_find(payload_types, ",")
+                        if comma_pos < 0 {
+                            field_type = payload_types
+                        } else {
+                            field_type = substr(payload_types, 0, comma_pos)
+                            payload_types = substr(payload_types, comma_pos + 1, len(payload_types) - comma_pos - 1)
+                        }
+                    }
+                    if bind_tok.value != "_" {
+                        bindings = bindings + ind + field_type + " " + dm_mangle(bind_tok.value) + " = " + subject_code + ".data." + name + "._" + int_to_string(field_idx) + ";\n"
+                        cc = track_var_type(cc, dm_mangle(bind_tok.value), field_type)
+                        cc = track_str_var(cc, dm_mangle(bind_tok.value), field_type == "dm_string")
+                    }
+                    field_idx = field_idx + 1
+                }
+                cc = c_expect(cc, TK_RPAREN())
+                return MatchArm { c: cc, condition: condition, bindings: bindings }
+            }
+            return MatchArm { c: cc, condition: condition, bindings: "" }
+        }
+        if is_none {
+            let condition = "(" + subject_code + ".tag == " + subject_type + "_tag_None)"
             return MatchArm { c: cc, condition: condition, bindings: "" }
         }
 
@@ -3157,7 +3353,8 @@ fn emit_runtime() -> string {
     r = r + "}\n\n"
     r = r + "static inline void dm_print_str(dm_string s) { fwrite(s.data, 1, s.len, stdout); }\n"
     r = r + "static inline void dm_println_str(dm_string s) { fwrite(s.data, 1, s.len, stdout); putchar('\\n'); }\n"
-    r = r + "static inline void dm_eprintln_str(dm_string s) { fwrite(s.data, 1, s.len, stderr); fputc('\\n', stderr); }\n\n"
+    r = r + "static inline void dm_eprintln_str(dm_string s) { fwrite(s.data, 1, s.len, stderr); fputc('\\n', stderr); }\n"
+    r = r + "static inline void dm_eprint_str(dm_string s) { fwrite(s.data, 1, s.len, stderr); }\n\n"
     r = r + "static inline dm_string dm_int_to_string(int64_t n) {\n"
     r = r + "    char buf[32];\n"
     r = r + "    int len = snprintf(buf, sizeof(buf), \"%lld\", (long long)n);\n"
@@ -3175,14 +3372,15 @@ fn emit_runtime() -> string {
     r = r + "    memcpy(result, buf, len + 1);\n"
     r = r + "    return (dm_string){ .data = result, .len = (size_t)len, .capacity = (size_t)len };\n"
     r = r + "}\n\n"
-    r = r + "static inline void dm_panic(const char* msg) { fprintf(stderr, \"PANIC: %s\\n\", msg); exit(1); }\n"
+    r = r + "static inline void dm_panic_cstr(const char* msg) { fprintf(stderr, \"PANIC: %s\\n\", msg); exit(1); }\n"
+    r = r + "static inline void dm_panic(dm_string msg) { fprintf(stderr, \"PANIC: \"); fwrite(msg.data, 1, msg.len, stderr); fputc('\\n', stderr); exit(1); }\n"
     r = r + "static inline void dm_exit(int64_t code) { exit((int)code); }\n\n"
     -- Generic list macros (type-agnostic, works with any list struct)
     r = r + "#define DM_LIST_PUSH(list, val) do { \\\n"
     r = r + "    if ((list).len >= (list).capacity) { \\\n"
     r = r + "        size_t _nc = (list).capacity == 0 ? 8 : (list).capacity * 2; \\\n"
     r = r + "        void* _nd = realloc((list).data, _nc * sizeof(*(list).data)); \\\n"
-    r = r + "        if (!_nd) dm_panic(\"list push: out of memory\"); \\\n"
+    r = r + "        if (!_nd) dm_panic_cstr(\"list push: out of memory\"); \\\n"
     r = r + "        (list).data = _nd; \\\n"
     r = r + "        (list).capacity = _nc; \\\n"
     r = r + "    } \\\n"
@@ -3214,7 +3412,7 @@ fn emit_runtime() -> string {
     r = r + "    cpath[path.len] = '\\0';\n"
     r = r + "    FILE* f = fopen(cpath, \"rb\");\n"
     r = r + "    free(cpath);\n"
-    r = r + "    if (!f) dm_panic(\"file_read: cannot open file\");\n"
+    r = r + "    if (!f) dm_panic_cstr(\"file_read: cannot open file\");\n"
     r = r + "    fseek(f, 0, SEEK_END);\n"
     r = r + "    long sz = ftell(f);\n"
     r = r + "    fseek(f, 0, SEEK_SET);\n"
@@ -3230,7 +3428,7 @@ fn emit_runtime() -> string {
     r = r + "    cpath[path.len] = '\\0';\n"
     r = r + "    FILE* f = fopen(cpath, \"wb\");\n"
     r = r + "    free(cpath);\n"
-    r = r + "    if (!f) dm_panic(\"file_write: cannot open file\");\n"
+    r = r + "    if (!f) dm_panic_cstr(\"file_write: cannot open file\");\n"
     r = r + "    fwrite(content.data, 1, content.len, f);\n"
     r = r + "    fclose(f);\n"
     r = r + "}\n\n"
@@ -3249,6 +3447,31 @@ fn emit_runtime() -> string {
     r = r + "    memcpy(buf, s.data, cl);\n"
     r = r + "    buf[cl] = '\\0';\n"
     r = r + "    return (int64_t)atoll(buf);\n"
+    r = r + "}\n\n"
+    r = r + "static inline double dm_parse_float(dm_string s) {\n"
+    r = r + "    char buf[64];\n"
+    r = r + "    size_t cl = s.len < 63 ? s.len : 63;\n"
+    r = r + "    memcpy(buf, s.data, cl);\n"
+    r = r + "    buf[cl] = '\\0';\n"
+    r = r + "    return strtod(buf, NULL);\n"
+    r = r + "}\n\n"
+    r = r + "static inline dm_string dm_string_to_upper(dm_string s) {\n"
+    r = r + "    char* buf = (char*)malloc(s.len + 1);\n"
+    r = r + "    for (size_t i = 0; i < s.len; i++) {\n"
+    r = r + "        char c = s.data[i];\n"
+    r = r + "        buf[i] = (c >= 'a' && c <= 'z') ? (c - 32) : c;\n"
+    r = r + "    }\n"
+    r = r + "    buf[s.len] = '\\0';\n"
+    r = r + "    return (dm_string){ .data = buf, .len = s.len, .capacity = s.len };\n"
+    r = r + "}\n\n"
+    r = r + "static inline dm_string dm_string_to_lower(dm_string s) {\n"
+    r = r + "    char* buf = (char*)malloc(s.len + 1);\n"
+    r = r + "    for (size_t i = 0; i < s.len; i++) {\n"
+    r = r + "        char c = s.data[i];\n"
+    r = r + "        buf[i] = (c >= 'A' && c <= 'Z') ? (c + 32) : c;\n"
+    r = r + "    }\n"
+    r = r + "    buf[s.len] = '\\0';\n"
+    r = r + "    return (dm_string){ .data = buf, .len = s.len, .capacity = s.len };\n"
     r = r + "}\n\n"
     r = r + "static inline bool dm_string_contains(dm_string h, dm_string n) {\n"
     r = r + "    if (n.len == 0) return true;\n"
@@ -3682,27 +3905,111 @@ fn resolve_imports(source: string, filename: string) -> string {
 fn main() {
     let argc = args_len()
     if argc < 2 {
-        println("dAImond Stage 1 Compiler")
-        println("Usage: daimond1 <file.dm>")
-        println("       daimond1 run <file.dm>")
+        println("dAImond Stage 1 Compiler v0.2.0")
+        println("Usage: daimond1 [command] <file.dm> [options]")
+        println("")
+        println("Commands:")
+        println("  <file.dm>       Compile a dAImond source file")
+        println("  run <file.dm>   Compile and run")
+        println("  compile <file.dm>  Compile (same as no command)")
+        println("")
+        println("Options:")
+        println("  -o <file>       Output file path")
+        println("  -c              Compile to C only (no binary)")
+        println("  --emit-c        Emit C code alongside binary")
+        println("  -v, --verbose   Verbose output")
+        println("  --version       Show version")
+        println("  -h, --help      Show this help")
         exit(1)
     }
 
-    let mut filename = args_get(1)
+    -- Parse arguments
+    let mut filename = ""
     let mut do_run = false
-    if filename == "run" and argc > 2 {
-        do_run = true
-        filename = args_get(2)
+    let mut output_file = ""
+    let mut c_only = false
+    let mut emit_c = false
+    let mut verbose = false
+    let mut i = 1
+    while i < argc {
+        let arg = args_get(i)
+        if arg == "--version" {
+            println("dAImond Stage 1 Compiler v0.2.0")
+            exit(0)
+        }
+        if arg == "-h" or arg == "--help" {
+            println("dAImond Stage 1 Compiler v0.2.0")
+            println("Usage: daimond1 [command] <file.dm> [options]")
+            println("")
+            println("Commands:")
+            println("  <file.dm>       Compile a dAImond source file")
+            println("  run <file.dm>   Compile and run")
+            println("  compile <file.dm>  Compile (same as no command)")
+            println("")
+            println("Options:")
+            println("  -o <file>       Output file path")
+            println("  -c              Compile to C only (no binary)")
+            println("  --emit-c        Emit C code alongside binary")
+            println("  -v, --verbose   Verbose output")
+            println("  --version       Show version")
+            println("  -h, --help      Show this help")
+            exit(0)
+        }
+        if arg == "run" and filename == "" {
+            do_run = true
+            i = i + 1
+            continue
+        }
+        if arg == "compile" and filename == "" {
+            i = i + 1
+            continue
+        }
+        if arg == "-o" and i + 1 < argc {
+            i = i + 1
+            output_file = args_get(i)
+            i = i + 1
+            continue
+        }
+        if arg == "-c" {
+            c_only = true
+            i = i + 1
+            continue
+        }
+        if arg == "--emit-c" {
+            emit_c = true
+            i = i + 1
+            continue
+        }
+        if arg == "-v" or arg == "--verbose" {
+            verbose = true
+            i = i + 1
+            continue
+        }
+        if filename == "" {
+            filename = arg
+        }
+        i = i + 1
+    }
+
+    if filename == "" {
+        eprintln("Error: no input file specified")
+        exit(1)
     }
 
     -- Read source
     let raw_source = file_read(filename)
+    if verbose {
+        println("Reading: " + filename)
+    }
 
     -- Resolve imports (concatenate imported files before tokenizing)
     let source = resolve_imports(raw_source, filename)
 
     -- Tokenize
     let tokens = tokenize(source)
+    if verbose {
+        println("Tokens: " + int_to_string(tokens.len()))
+    }
 
     -- Compile
     let mut comp = compiler_new(tokens)
@@ -3711,10 +4018,10 @@ fn main() {
     -- Check for errors
     if comp.errors.len() > 0 {
         eprintln("Compilation errors:")
-        let mut i = 0
-        while i < comp.errors.len() {
-            eprintln(comp.errors[i])
-            i = i + 1
+        let mut ei = 0
+        while ei < comp.errors.len() {
+            eprintln(comp.errors[ei])
+            ei = ei + 1
         }
         exit(1)
     }
@@ -3722,14 +4029,31 @@ fn main() {
     -- Assemble C output
     let c_code = assemble_output(comp)
 
-    -- Write C file
+    -- Determine output paths
     let c_file = string_replace(filename, ".dm", ".c")
+    let mut bin_file = string_replace(filename, ".dm", "")
+    if output_file != "" {
+        bin_file = output_file
+    }
+
+    if c_only {
+        -- Only emit C, no binary
+        file_write(c_file, c_code)
+        println("Generated: " + c_file)
+        return
+    }
+
+    -- Write C file
     file_write(c_file, c_code)
-    println("Generated: " + c_file)
+    if verbose or emit_c {
+        println("Generated: " + c_file)
+    }
 
     -- Compile C to binary
-    let bin_file = string_replace(filename, ".dm", "")
     let compile_cmd = "cc -o " + bin_file + " " + c_file + " -lm"
+    if verbose {
+        println("Running: " + compile_cmd)
+    }
     let exit_code = system(compile_cmd)
     if exit_code != 0 {
         eprintln("C compilation failed")
@@ -3739,9 +4063,9 @@ fn main() {
 
     -- Optionally run
     if do_run {
-        println("Running:")
-        println("============================================================")
+        if verbose {
+            println("Running: " + bin_file)
+        }
         let run_code = system("./" + bin_file)
-        println("============================================================")
     }
 }

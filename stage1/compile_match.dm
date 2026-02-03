@@ -151,6 +151,59 @@ fn compile_match_pattern(c: Compiler, subject_code: string, subject_type: string
             return MatchArm { c: cc, condition: condition, bindings: "" }
         }
 
+        -- Check for bare Option/Result constructors: Some(x), None, Ok(x), Err(x)
+        let is_some = name == "Some" and starts_with(subject_type, "dm_option_")
+        let is_none = name == "None" and starts_with(subject_type, "dm_option_")
+        let is_ok = name == "Ok" and starts_with(subject_type, "dm_result_")
+        let is_err = name == "Err" and starts_with(subject_type, "dm_result_")
+
+        if is_some or is_ok or is_err {
+            -- Constructor with payload: Some(x), Ok(x), Err(e)
+            let condition = "(" + subject_code + ".tag == " + subject_type + "_tag_" + name + ")"
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let mut bindings = ""
+                let ind = indent_str(cc.indent + 1)
+                let mut field_idx = 0
+                -- Get payload type from variant info
+                let vinfo = lookup_enum_variant(cc, subject_type, name)
+                let mut payload_types = ""
+                if starts_with(vinfo, "tuple:") {
+                    payload_types = substr(vinfo, 6, len(vinfo) - 6)
+                }
+                while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+                    if field_idx > 0 {
+                        cc = c_expect(cc, TK_COMMA())
+                    }
+                    let bind_tok = c_cur(cc)
+                    cc = c_advance(cc)
+                    let mut field_type = "int64_t"
+                    if payload_types != "" {
+                        let comma_pos = string_find(payload_types, ",")
+                        if comma_pos < 0 {
+                            field_type = payload_types
+                        } else {
+                            field_type = substr(payload_types, 0, comma_pos)
+                            payload_types = substr(payload_types, comma_pos + 1, len(payload_types) - comma_pos - 1)
+                        }
+                    }
+                    if bind_tok.value != "_" {
+                        bindings = bindings + ind + field_type + " " + dm_mangle(bind_tok.value) + " = " + subject_code + ".data." + name + "._" + int_to_string(field_idx) + ";\n"
+                        cc = track_var_type(cc, dm_mangle(bind_tok.value), field_type)
+                        cc = track_str_var(cc, dm_mangle(bind_tok.value), field_type == "dm_string")
+                    }
+                    field_idx = field_idx + 1
+                }
+                cc = c_expect(cc, TK_RPAREN())
+                return MatchArm { c: cc, condition: condition, bindings: bindings }
+            }
+            return MatchArm { c: cc, condition: condition, bindings: "" }
+        }
+        if is_none {
+            let condition = "(" + subject_code + ".tag == " + subject_type + "_tag_None)"
+            return MatchArm { c: cc, condition: condition, bindings: "" }
+        }
+
         -- Simple identifier - catch-all binding
         let ind = indent_str(cc.indent + 1)
         let inferred = infer_match_subject_type(subject_code, cc)

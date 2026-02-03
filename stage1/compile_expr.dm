@@ -12,7 +12,36 @@ struct ExprOut {
 }
 
 fn compile_expr(c: Compiler) -> ExprOut {
-    return compile_or_expr(c)
+    return compile_pipe_expr(c)
+}
+
+fn compile_pipe_expr(c: Compiler) -> ExprOut {
+    let mut result = compile_or_expr(c)
+    while c_peek(result.c) == TK_PIPEGT() {
+        result.c = c_advance(result.c)
+        -- Parse the RHS: could be a bare identifier or a function call
+        let rhs = compile_or_expr(result.c)
+        result.c = rhs.c
+        -- If the RHS looks like a function call f(args...), insert lhs as first arg
+        -- RHS code will be like "dm_func(arg1, arg2)" — insert lhs after first '('
+        let paren_pos = string_find(rhs.code, "(")
+        if paren_pos >= 0 {
+            let fn_part = substr(rhs.code, 0, paren_pos + 1)
+            let args_part = substr(rhs.code, paren_pos + 1, len(rhs.code) - paren_pos - 1)
+            -- args_part is "arg1, arg2)" or ")"
+            if starts_with(args_part, ")") {
+                -- No args: f() -> f(lhs)
+                result.code = fn_part + result.code + ")"
+            } else {
+                -- Has args: f(args...) -> f(lhs, args...)
+                result.code = fn_part + result.code + ", " + args_part
+            }
+        } else {
+            -- Bare identifier: f -> f(lhs)
+            result.code = rhs.code + "(" + result.code + ")"
+        }
+    }
+    return result
 }
 
 fn compile_or_expr(c: Compiler) -> ExprOut {
@@ -266,6 +295,28 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 }
             } else {
                 result.code = result.code + "." + field
+            }
+        } else if k == TK_QUESTION() {
+            -- Error propagation: expr? unwraps Ok/Some or early-returns Err/None
+            result.c = c_advance(result.c)
+            let try_id = result.c.try_counter
+            result.c.try_counter = result.c.try_counter + 1
+            let tmp = "_try_" + int_to_string(try_id)
+            let ind = indent_str(result.c.indent)
+            let expr_type = infer_type_from_code(result.code, result.c)
+            if starts_with(expr_type, "dm_result_") {
+                -- Result[T, E]: check for Err, early-return it
+                result.c.output = result.c.output + ind + expr_type + " " + tmp + " = " + result.code + ";\n"
+                result.c.output = result.c.output + ind + "if (" + tmp + ".tag == " + expr_type + "_tag_Err) { return " + tmp + "; }\n"
+                result.code = tmp + ".data.Ok._0"
+            } else if starts_with(expr_type, "dm_option_") {
+                -- Option[T]: check for None, early-return it
+                result.c.output = result.c.output + ind + expr_type + " " + tmp + " = " + result.code + ";\n"
+                result.c.output = result.c.output + ind + "if (" + tmp + ".tag == " + expr_type + "_tag_None) { return " + tmp + "; }\n"
+                result.code = tmp + ".data.Some._0"
+            } else {
+                -- Unknown type: just pass through (C compiler will catch errors)
+                result.c.output = result.c.output + ind + "// try operator on unknown type\n"
             }
         } else if k == TK_LBRACKET() {
             result.c = c_advance(result.c)
@@ -689,6 +740,9 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         if name == "eprintln" {
             return ExprOut { c: cc, code: "dm_eprintln_str" }
         }
+        if name == "eprint" {
+            return ExprOut { c: cc, code: "dm_eprint_str" }
+        }
         if name == "int_to_string" {
             return ExprOut { c: cc, code: "dm_int_to_string" }
         }
@@ -710,6 +764,9 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         if name == "parse_int" {
             return ExprOut { c: cc, code: "dm_parse_int" }
         }
+        if name == "parse_float" {
+            return ExprOut { c: cc, code: "dm_parse_float" }
+        }
         if name == "string_contains" {
             return ExprOut { c: cc, code: "dm_string_contains" }
         }
@@ -727,6 +784,12 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         }
         if name == "string_trim" {
             return ExprOut { c: cc, code: "dm_string_trim" }
+        }
+        if name == "string_to_upper" {
+            return ExprOut { c: cc, code: "dm_string_to_upper" }
+        }
+        if name == "string_to_lower" {
+            return ExprOut { c: cc, code: "dm_string_to_lower" }
         }
         if name == "file_read" {
             return ExprOut { c: cc, code: "dm_file_read" }
@@ -748,6 +811,27 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         }
         if name == "panic" {
             return ExprOut { c: cc, code: "dm_panic" }
+        }
+        -- Box_new(val) and Box_null() builtins
+        if name == "Box_new" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg = compile_expr(cc)
+                cc = arg.c
+                cc = c_expect(cc, TK_RPAREN())
+                let val_type = infer_type_from_code(arg.code, cc)
+                let box_code = "({ " + val_type + "* _bp = (" + val_type + "*)malloc(sizeof(" + val_type + ")); *_bp = " + arg.code + "; _bp; })"
+                return ExprOut { c: cc, code: box_code }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "Box_null" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "NULL" }
+            }
+            return ExprOut { c: cc, code: "NULL" }
         }
         -- Option/Result constructors: Some, None, Ok, Err
         -- Use expected_type or current_fn_ret_type for type context
