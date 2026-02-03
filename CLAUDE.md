@@ -33,10 +33,19 @@ dAImond-lang/
 │   └── tests/
 │       └── runner.zig     # Integration test harness
 ├── stage1/                # Stage 1 self-hosting compiler (dAImond)
-│   ├── main.dm            # CLI entry, pipeline (single-file compiler)
-│   ├── token.dm           # Token kind constants and Token struct
-│   ├── lexer.dm           # Tokenizer (reusable module)
-│   ├── ast.dm             # AST node structs and constructors
+│   ├── main.dm            # Generated monolithic file (for Stage 0 bootstrap)
+│   ├── main_split.dm      # Entry point with imports (for Stage 1 self-compilation)
+│   ├── token.dm           # Token kind constants, Token struct, keyword_lookup
+│   ├── lexer.dm           # Lexer struct, tokenize, character helpers
+│   ├── compiler.dm        # Compiler struct, parser helpers, type mapping
+│   ├── compile_expr.dm    # Expression compiler chain, lambda, generics
+│   ├── compile_stmt.dm    # Statement compiler, type tracking/inference
+│   ├── compile_match.dm   # Match expressions and statements
+│   ├── compile_decl.dm    # Function/struct/enum/impl declarations, prescan
+│   ├── runtime.dm         # C runtime emission, output assembly
+│   ├── imports.dm         # Multi-file import resolver
+│   ├── gen_bootstrap.sh   # Concatenates modules into main.dm
+│   ├── ast.dm             # AST node structs and constructors (unused)
 │   └── test_lexer.dm      # Lexer standalone test
 ├── examples/              # Example dAImond programs
 │   ├── hello.dm           # Hello World
@@ -213,7 +222,7 @@ The runtime targets **C11** for portability.
 - Integration test harness
 
 ### In Progress
-- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete, expanding feature support (enum payloads, Option/Result, match expressions, multi-file imports, lambdas, generic monomorphization done; pipeline operator, error propagation pending)
+- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete, split into ~10 modules with verified fixed-point bootstrap. Feature support: enum payloads, Option/Result, match expressions, multi-file imports, lambdas, generic monomorphization done; pipeline operator, error propagation pending
 
 ### Not Yet Implemented
 - `fmt` command (code formatter)
@@ -382,11 +391,30 @@ Simple enums without payloads compile correctly to C enums.
 Stage 1 is written in dAImond and compiled by Stage 0. It compiles a subset of dAImond to C11, sufficient to compile itself (bootstrap proof).
 
 ### Design Decisions
-- **Single-file compiler**: Since Stage 0 doesn't support multi-file imports reliably, Stage 1's `main.dm` contains all code (lexer, parser, codegen) inlined.
+- **Modular source, monolithic bootstrap**: Development happens on split module files (`token.dm`, `lexer.dm`, etc.) using the multi-file import system. For Stage 0 bootstrap (which requires a single file), `gen_bootstrap.sh` concatenates all modules into `main.dm`.
 - **Struct-based AST**: Uses integer kind tags instead of enum payloads to work around codegen bugs.
 - **No type checker**: Generates C directly from AST; the C compiler catches type errors.
 - **String-based codegen**: Builds C code via string concatenation.
 - **Subset compiler**: Only supports features used within Stage 1 itself.
+
+### Module Layout
+```
+token.dm           (no imports)        — Token kinds, Token struct, keyword_lookup
+lexer.dm           → token             — Lexer struct, tokenize, character helpers
+compiler.dm        → token             — Compiler struct, parser helpers, type mapping
+compile_expr.dm    → compiler          — Expression compiler chain, lambda, generics
+compile_stmt.dm    → compiler          — Statement compiler, type tracking/inference
+compile_match.dm   → compiler          — Match expressions and statements
+compile_decl.dm    → compiler          — Function/struct/enum/impl declarations, prescan
+runtime.dm         → compiler          — C runtime emission, output assembly
+imports.dm         (no imports)        — Multi-file import resolver
+main_split.dm      → all of the above  — Entry point with main()
+```
+
+Cross-module function calls (e.g., compile_stmt calls compile_expr) work because:
+1. The import system concatenates all source before tokenization
+2. `prescan_declarations` registers all function names as forward references
+3. The C compiler sees forward declarations for all functions
 
 ### Stage 1 Feature Support
 - **Core**: structs, simple enums, List[T], Box[T], if/else/while/for/loop/break/continue, functions, string ops, file I/O, method calls (.push/.len/.pop), struct literals, type inference, forward references
@@ -401,7 +429,7 @@ Stage 1 is written in dAImond and compiled by Stage 0. It compiles a subset of d
 
 ### Building Stage 1
 ```bash
-# Stage 0 compiles Stage 1
+# Stage 0 compiles Stage 1 (from monolithic main.dm)
 cd stage0 && ./zig-out/bin/daimond compile ../stage1/main.dm -o stage1_compiler
 
 # Stage 1 compiles a test program
@@ -409,6 +437,20 @@ cd stage0 && ./zig-out/bin/daimond compile ../stage1/main.dm -o stage1_compiler
 
 # Run the result
 ./test_program
+
+# Stage 1 self-compiles from split modules
+./stage1_compiler ../stage1/main_split.dm
+
+# Regenerate monolithic main.dm from modules
+cd stage1 && bash gen_bootstrap.sh
+```
+
+### Bootstrap Chain
+```
+Stage 0 compiles main.dm (monolithic) → stage1_compiler
+stage1_compiler compiles main_split.dm (with imports) → stage1_v2
+stage1_v2 compiles main_split.dm → stage1_v3
+diff stage1_v2.c stage1_v3.c → fixed point ✓
 ```
 
 ## Important Notes

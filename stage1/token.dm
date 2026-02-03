@@ -1,15 +1,14 @@
 module token
 
--- Token kind constants
--- Literals
+-- ============================================================
+-- TOKEN KINDS
+-- ============================================================
 fn TK_EOF() -> int { return 0 }
 fn TK_INTEGER() -> int { return 1 }
 fn TK_FLOAT() -> int { return 2 }
 fn TK_STRING() -> int { return 3 }
 fn TK_IDENT() -> int { return 4 }
 fn TK_NEWLINE() -> int { return 5 }
-
--- Keywords
 fn TK_FN() -> int { return 10 }
 fn TK_LET() -> int { return 11 }
 fn TK_MUT() -> int { return 12 }
@@ -37,8 +36,6 @@ fn TK_IN() -> int { return 33 }
 fn TK_CONST() -> int { return 34 }
 fn TK_WITH() -> int { return 35 }
 fn TK_SELF() -> int { return 36 }
-
--- Operators
 fn TK_PLUS() -> int { return 50 }
 fn TK_MINUS() -> int { return 51 }
 fn TK_STAR() -> int { return 52 }
@@ -62,16 +59,12 @@ fn TK_PLUSEQ() -> int { return 69 }
 fn TK_MINUSEQ() -> int { return 70 }
 fn TK_STAREQ() -> int { return 71 }
 fn TK_SLASHEQ() -> int { return 72 }
-
--- Delimiters
 fn TK_LPAREN() -> int { return 80 }
 fn TK_RPAREN() -> int { return 81 }
 fn TK_LBRACE() -> int { return 82 }
 fn TK_RBRACE() -> int { return 83 }
 fn TK_LBRACKET() -> int { return 84 }
 fn TK_RBRACKET() -> int { return 85 }
-
--- Punctuation
 fn TK_DOT() -> int { return 90 }
 fn TK_DOTDOT() -> int { return 91 }
 fn TK_DOTDOTEQ() -> int { return 92 }
@@ -83,7 +76,6 @@ fn TK_SEMICOLON() -> int { return 97 }
 fn TK_AT() -> int { return 98 }
 fn TK_HASH() -> int { return 99 }
 
--- Token struct
 struct Token {
     kind: int,
     value: string,
@@ -93,90 +85,6 @@ struct Token {
 
 fn token_new(kind: int, value: string, line: int, col: int) -> Token {
     return Token { kind: kind, value: value, line: line, col: col }
-}
-
-fn token_kind_name(kind: int) -> string {
-    if kind == TK_EOF() { return "EOF" }
-    if kind == TK_INTEGER() { return "INTEGER" }
-    if kind == TK_FLOAT() { return "FLOAT" }
-    if kind == TK_STRING() { return "STRING" }
-    if kind == TK_IDENT() { return "IDENT" }
-    if kind == TK_NEWLINE() { return "NEWLINE" }
-    if kind == TK_FN() { return "fn" }
-    if kind == TK_LET() { return "let" }
-    if kind == TK_MUT() { return "mut" }
-    if kind == TK_IF() { return "if" }
-    if kind == TK_ELSE() { return "else" }
-    if kind == TK_MATCH() { return "match" }
-    if kind == TK_FOR() { return "for" }
-    if kind == TK_WHILE() { return "while" }
-    if kind == TK_LOOP() { return "loop" }
-    if kind == TK_BREAK() { return "break" }
-    if kind == TK_CONTINUE() { return "continue" }
-    if kind == TK_RETURN() { return "return" }
-    if kind == TK_STRUCT() { return "struct" }
-    if kind == TK_ENUM() { return "enum" }
-    if kind == TK_TRAIT() { return "trait" }
-    if kind == TK_IMPL() { return "impl" }
-    if kind == TK_IMPORT() { return "import" }
-    if kind == TK_MODULE() { return "module" }
-    if kind == TK_TRUE() { return "true" }
-    if kind == TK_FALSE() { return "false" }
-    if kind == TK_AND() { return "and" }
-    if kind == TK_OR() { return "or" }
-    if kind == TK_NOT() { return "not" }
-    if kind == TK_IN() { return "in" }
-    if kind == TK_CONST() { return "const" }
-    if kind == TK_WITH() { return "with" }
-    if kind == TK_SELF() { return "self" }
-    if kind == TK_PLUS() { return "+" }
-    if kind == TK_MINUS() { return "-" }
-    if kind == TK_STAR() { return "*" }
-    if kind == TK_SLASH() { return "/" }
-    if kind == TK_PERCENT() { return "%" }
-    if kind == TK_EQ() { return "=" }
-    if kind == TK_EQEQ() { return "==" }
-    if kind == TK_BANGEQ() { return "!=" }
-    if kind == TK_LT() { return "<" }
-    if kind == TK_GT() { return ">" }
-    if kind == TK_LTEQ() { return "<=" }
-    if kind == TK_GTEQ() { return ">=" }
-    if kind == TK_ARROW() { return "->" }
-    if kind == TK_FAT_ARROW() { return "=>" }
-    if kind == TK_QUESTION() { return "?" }
-    if kind == TK_PIPE() { return "|" }
-    if kind == TK_PIPEGT() { return "|>" }
-    if kind == TK_AMP() { return "&" }
-    if kind == TK_BANG() { return "!" }
-    if kind == TK_PLUSEQ() { return "+=" }
-    if kind == TK_MINUSEQ() { return "-=" }
-    if kind == TK_STAREQ() { return "*=" }
-    if kind == TK_SLASHEQ() { return "/=" }
-    if kind == TK_LPAREN() { return "(" }
-    if kind == TK_RPAREN() { return ")" }
-    if kind == TK_LBRACE() { return "{" }
-    if kind == TK_RBRACE() { return "}" }
-    if kind == TK_LBRACKET() { return "[" }
-    if kind == TK_RBRACKET() { return "]" }
-    if kind == TK_DOT() { return "." }
-    if kind == TK_DOTDOT() { return ".." }
-    if kind == TK_DOTDOTEQ() { return "..=" }
-    if kind == TK_COLON() { return ":" }
-    if kind == TK_COLONCOLON() { return "::" }
-    if kind == TK_COMMA() { return "," }
-    if kind == TK_UNDERSCORE() { return "_" }
-    if kind == TK_SEMICOLON() { return ";" }
-    if kind == TK_AT() { return "@" }
-    if kind == TK_HASH() { return "#" }
-    return "UNKNOWN(" + int_to_string(kind) + ")"
-}
-
-fn token_to_string(tok: Token) -> string {
-    let name = token_kind_name(tok.kind)
-    if tok.kind == TK_INTEGER() or tok.kind == TK_FLOAT() or tok.kind == TK_STRING() or tok.kind == TK_IDENT() {
-        return name + "(" + tok.value + ")"
-    }
-    return name
 }
 
 fn keyword_lookup(name: string) -> int {
@@ -208,4 +116,53 @@ fn keyword_lookup(name: string) -> int {
     if name == "with" { return TK_WITH() }
     if name == "self" { return TK_SELF() }
     return TK_IDENT()
+}
+
+fn token_kind_name(kind: int) -> string {
+    if kind == TK_EOF() { return "EOF" }
+    if kind == TK_INTEGER() { return "integer" }
+    if kind == TK_FLOAT() { return "float" }
+    if kind == TK_STRING() { return "string" }
+    if kind == TK_IDENT() { return "identifier" }
+    if kind == TK_NEWLINE() { return "newline" }
+    if kind == TK_FN() { return "'fn'" }
+    if kind == TK_LET() { return "'let'" }
+    if kind == TK_MUT() { return "'mut'" }
+    if kind == TK_IF() { return "'if'" }
+    if kind == TK_ELSE() { return "'else'" }
+    if kind == TK_RETURN() { return "'return'" }
+    if kind == TK_STRUCT() { return "'struct'" }
+    if kind == TK_ENUM() { return "'enum'" }
+    if kind == TK_MODULE() { return "'module'" }
+    if kind == TK_IMPORT() { return "'import'" }
+    if kind == TK_FOR() { return "'for'" }
+    if kind == TK_WHILE() { return "'while'" }
+    if kind == TK_MATCH() { return "'match'" }
+    if kind == TK_IMPL() { return "'impl'" }
+    if kind == TK_TRAIT() { return "'trait'" }
+    if kind == TK_TRUE() { return "'true'" }
+    if kind == TK_FALSE() { return "'false'" }
+    if kind == TK_PLUS() { return "'+'" }
+    if kind == TK_MINUS() { return "'-'" }
+    if kind == TK_STAR() { return "'*'" }
+    if kind == TK_SLASH() { return "'/'" }
+    if kind == TK_EQ() { return "'='" }
+    if kind == TK_EQEQ() { return "'=='" }
+    if kind == TK_BANGEQ() { return "'!='" }
+    if kind == TK_LT() { return "'<'" }
+    if kind == TK_GT() { return "'>'" }
+    if kind == TK_LTEQ() { return "'<='" }
+    if kind == TK_GTEQ() { return "'>='" }
+    if kind == TK_ARROW() { return "'->'" }
+    if kind == TK_FAT_ARROW() { return "'=>'" }
+    if kind == TK_LPAREN() { return "'('" }
+    if kind == TK_RPAREN() { return "')'" }
+    if kind == TK_LBRACE() { return "'{'" }
+    if kind == TK_RBRACE() { return "'}'" }
+    if kind == TK_LBRACKET() { return "'['" }
+    if kind == TK_RBRACKET() { return "']'" }
+    if kind == TK_DOT() { return "'.'" }
+    if kind == TK_COLON() { return "':'" }
+    if kind == TK_COMMA() { return "','" }
+    return "token(" + int_to_string(kind) + ")"
 }
