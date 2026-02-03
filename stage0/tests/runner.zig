@@ -2605,6 +2605,349 @@ pub const higher_order_tests = [_]TestCase{
     },
 };
 
+// ============================================================================
+// Stage 1 Readiness Tests
+// ============================================================================
+
+pub const list_method_tests = [_]TestCase{
+    .{
+        .name = "list_len_method",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut items: List[int] = List_new()
+            \\    items.push(1)
+            \\    items.push(2)
+            \\    items.push(3)
+            \\    println(int_to_string(items.len()))
+            \\}
+        ,
+        .expected_output = "3\n",
+    },
+    .{
+        .name = "list_contains",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut items: List[int] = List_new()
+            \\    items.push(10)
+            \\    items.push(20)
+            \\    items.push(30)
+            \\    println(bool_to_string(items.contains(20)))
+            \\    println(bool_to_string(items.contains(42)))
+            \\}
+        ,
+        .expected_output = "true\nfalse\n",
+    },
+    .{
+        .name = "list_string_contains",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut words: List[string] = List_new()
+            \\    words.push("hello")
+            \\    words.push("world")
+            \\    println(bool_to_string(words.contains("hello")))
+            \\    println(bool_to_string(words.contains("missing")))
+            \\}
+        ,
+        .expected_output = "true\nfalse\n",
+    },
+};
+
+pub const match_option_result_tests = [_]TestCase{
+    .{
+        .name = "match_option_some",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let opt: Option[int] = Some(42)
+            \\    match opt {
+            \\        Some(v) => println(int_to_string(v))
+            \\        _ => println("none")
+            \\    }
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "match_option_none",
+        .source =
+            \\module test
+            \\
+            \\fn make_none() -> Option[int] {
+            \\    return None
+            \\}
+            \\
+            \\fn main() {
+            \\    let opt: Option[int] = make_none()
+            \\    match opt {
+            \\        Some(v) => println(int_to_string(v))
+            \\        _ => println("none")
+            \\    }
+            \\}
+        ,
+        .expected_output = "none\n",
+    },
+    .{
+        .name = "match_result_ok",
+        .source =
+            \\module test
+            \\
+            \\fn safe_div(a: int, b: int) -> Result[int, string] {
+            \\    if b == 0 {
+            \\        return Err("division by zero")
+            \\    }
+            \\    return Ok(a / b)
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = safe_div(10, 2)
+            \\    match r {
+            \\        Ok(v) => println(int_to_string(v))
+            \\        _ => println("error")
+            \\    }
+            \\}
+        ,
+        .expected_output = "5\n",
+    },
+    .{
+        .name = "match_result_err",
+        .source =
+            \\module test
+            \\
+            \\fn safe_div(a: int, b: int) -> Result[int, string] {
+            \\    if b == 0 {
+            \\        return Err("division by zero")
+            \\    }
+            \\    return Ok(a / b)
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = safe_div(10, 0)
+            \\    match r {
+            \\        Err(e) => println(e)
+            \\        _ => println("ok")
+            \\    }
+            \\}
+        ,
+        .expected_output = "division by zero\n",
+    },
+};
+
+pub const map_iteration_tests = [_]TestCase{
+    .{
+        .name = "map_keys_iteration",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("hello", 1)
+            \\    let keys = m.keys()
+            \\    println(int_to_string(keys.len()))
+            \\}
+        ,
+        .expected_output = "1\n",
+    },
+    .{
+        .name = "map_set_alias",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.set("x", 10)
+            \\    m.set("y", 20)
+            \\    println(int_to_string(m.get("x")))
+            \\    println(int_to_string(m.get("y")))
+            \\}
+        ,
+        .expected_output = "10\n20\n",
+    },
+    .{
+        .name = "map_values_iteration",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("a", 100)
+            \\    let vals = m.values()
+            \\    println(int_to_string(vals.len()))
+            \\}
+        ,
+        .expected_output = "1\n",
+    },
+};
+
+pub const lambda_tests = [_]TestCase{
+    .{
+        .name = "lambda_as_arg",
+        .source =
+            \\module test
+            \\
+            \\fn apply(f: fn(int) -> int, x: int) -> int {
+            \\    return f(x)
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = apply(|x: int| -> int x * 2, 21)
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "lambda_assigned",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let f: fn(int) -> int = |x: int| -> int x + 10
+            \\    println(int_to_string(f(32)))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+};
+
+pub const string_ops_extra_tests = [_]TestCase{
+    .{
+        .name = "string_to_int_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let n = string_to_int("42")
+            \\    println(int_to_string(n))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "parse_float_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let f = parse_float("3.14")
+            \\    -- Just verify it parses without error by printing > 3
+            \\    if f > 3.0 {
+            \\        println("ok")
+            \\    }
+            \\}
+        ,
+        .expected_output = "ok\n",
+    },
+    .{
+        .name = "char_at_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hello"
+            \\    let c = char_at(s, 0)
+            \\    println(c)
+            \\}
+        ,
+        .expected_output = "h\n",
+    },
+};
+
+pub const trait_tests = [_]TestCase{
+    .{
+        .name = "trait_basic_impl",
+        .source =
+            \\module test
+            \\
+            \\struct Circle {
+            \\    radius: int,
+            \\}
+            \\
+            \\trait Describable {
+            \\    fn describe(self: &Self) -> string
+            \\}
+            \\
+            \\impl Describable for Circle {
+            \\    fn describe(self: &Self) -> string {
+            \\        return "circle"
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let c = Circle { radius: 5 }
+            \\    println(c.describe())
+            \\}
+        ,
+        .expected_output = "circle\n",
+    },
+};
+
+pub const comprehensive_test = [_]TestCase{
+    .{
+        .name = "stage1_comprehensive",
+        .source =
+            \\module test
+            \\
+            \\fn double(x: int) -> int {
+            \\    return x * 2
+            \\}
+            \\
+            \\fn safe_div(a: int, b: int) -> Result[int, string] {
+            \\    if b == 0 { return Err("division by zero") }
+            \\    return Ok(a / b)
+            \\}
+            \\
+            \\fn compute(a: int, b: int) -> Result[int, string] {
+            \\    let result: int = safe_div(a, b)?
+            \\    return Ok(result * 2)
+            \\}
+            \\
+            \\fn apply(f: fn(int) -> int, x: int) -> int {
+            \\    return f(x)
+            \\}
+            \\
+            \\fn main() {
+            \\    -- Match on Result
+            \\    let r = compute(10, 2)
+            \\    match r {
+            \\        Ok(v) => println(int_to_string(v))
+            \\        _ => println("error")
+            \\    }
+            \\
+            \\    -- Match on Option
+            \\    let opt: Option[int] = Some(42)
+            \\    match opt {
+            \\        Some(v) => println(int_to_string(v))
+            \\        _ => println("none")
+            \\    }
+            \\
+            \\    -- List method calls
+            \\    let mut items: List[int] = List_new()
+            \\    items.push(10)
+            \\    items.push(20)
+            \\    println(int_to_string(items.len()))
+            \\
+            \\    -- Higher-order with named function
+            \\    println(int_to_string(apply(double, 21)))
+            \\
+            \\    -- String utils
+            \\    let n = string_to_int("42")
+            \\    println(int_to_string(n))
+            \\
+            \\    let trimmed = string_trim("  hello  ")
+            \\    println(trimmed)
+            \\}
+        ,
+        .expected_output = "10\n42\n2\n42\n42\nhello\n",
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -2652,6 +2995,13 @@ pub fn main() !void {
         .{ .name = "Path Utils", .tests = &path_util_tests },
         .{ .name = "Higher-Order Fns", .tests = &higher_order_tests },
         .{ .name = "Compile Errors", .tests = &compile_error_tests },
+        .{ .name = "List Methods", .tests = &list_method_tests },
+        .{ .name = "Match Option/Result", .tests = &match_option_result_tests },
+        .{ .name = "Map Iteration", .tests = &map_iteration_tests },
+        .{ .name = "Lambdas", .tests = &lambda_tests },
+        .{ .name = "String Ops Extra", .tests = &string_ops_extra_tests },
+        .{ .name = "Traits", .tests = &trait_tests },
+        .{ .name = "Comprehensive", .tests = &comprehensive_test },
     };
 
     try stdout.print("\n============================================================\n", .{});

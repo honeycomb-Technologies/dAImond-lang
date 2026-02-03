@@ -1203,6 +1203,7 @@ pub const TypeChecker = struct {
             }
             // Builtins returning int
             if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "parse_int") or
+                std.mem.eql(u8, name, "string_to_int") or
                 std.mem.eql(u8, name, "string_find") or std.mem.eql(u8, name, "args_len") or
                 std.mem.eql(u8, name, "system"))
             {
@@ -1211,10 +1212,19 @@ pub const TypeChecker = struct {
                 }
                 return try self.type_ctx.intern(.{ .int = .i64 });
             }
+            // Builtins returning float
+            if (std.mem.eql(u8, name, "parse_float"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.type_ctx.intern(.{ .float = .f64 });
+            }
             // Builtins returning string
             if (std.mem.eql(u8, name, "int_to_string") or std.mem.eql(u8, name, "bool_to_string") or
                 std.mem.eql(u8, name, "float_to_string") or std.mem.eql(u8, name, "substr") or
-                std.mem.eql(u8, name, "char_to_string") or std.mem.eql(u8, name, "file_read") or
+                std.mem.eql(u8, name, "char_to_string") or std.mem.eql(u8, name, "char_at") or
+                std.mem.eql(u8, name, "file_read") or
                 std.mem.eql(u8, name, "args_get") or
                 std.mem.eql(u8, name, "string_trim") or std.mem.eql(u8, name, "string_replace") or
                 std.mem.eql(u8, name, "string_to_upper") or std.mem.eql(u8, name, "string_to_lower") or

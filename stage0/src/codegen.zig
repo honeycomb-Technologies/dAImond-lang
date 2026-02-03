@@ -214,6 +214,14 @@ pub const CWriter = struct {
         try self.writeLine("}");
     }
 
+    /// Truncate output to specified length
+    pub fn truncate(self: *Self, len: usize) void {
+        if (len < self.buffer.items.len) {
+            self.buffer.shrinkRetainingCapacity(len);
+            self.at_line_start = (len == 0 or self.buffer.items[len - 1] == '\n');
+        }
+    }
+
     /// Write a C comment
     pub fn writeComment(self: *Self, comment: []const u8) !void {
         try self.print("/* {s} */", .{comment});
@@ -297,6 +305,10 @@ pub const CodeGenerator = struct {
 
     // Stack for tracking lambda/closure context
     lambda_depth: usize,
+
+    // Lambda hoisting support: counter for unique names and deferred buffer
+    lambda_counter: usize,
+    lambda_writer: CWriter,
 
     // Expected type context for expression generation (used for Option/Result constructors)
     expected_type: ?[]const u8,
@@ -386,6 +398,8 @@ pub const CodeGenerator = struct {
             .mono_emit_queue = std.ArrayList(MonoQueueItem).init(allocator),
             .temp_counter = 0,
             .lambda_depth = 0,
+            .lambda_counter = 0,
+            .lambda_writer = CWriter.init(allocator),
             .current_function = null,
             .current_function_is_void = false,
             .expected_type = null,
@@ -429,6 +443,7 @@ pub const CodeGenerator = struct {
         self.function_mut_info.deinit();
         self.region_stack.deinit();
         self.known_functions.deinit();
+        self.lambda_writer.deinit();
     }
 
     /// Get arena allocator for temporary strings
@@ -649,7 +664,10 @@ pub const CodeGenerator = struct {
             }
         }
 
-        // Generate function implementations
+        // Save position before function implementations so we can insert lambdas
+        const pre_functions_len = self.writer.getOutput().len;
+
+        // Generate function implementations (lambdas may be hoisted during this phase)
         for (source.declarations) |decl| {
             switch (decl.kind) {
                 .function => |f| try self.generateFunction(f, null),
@@ -664,6 +682,21 @@ pub const CodeGenerator = struct {
 
         // Generate monomorphized function implementations
         try self.emitMonomorphizedImplementations();
+
+        // Insert hoisted lambda definitions before function implementations
+        if (self.lambda_writer.getOutput().len > 0) {
+            // Extract the function code that was generated after pre_functions_len
+            const function_code = try self.allocator.dupe(u8, self.writer.getOutput()[pre_functions_len..]);
+            defer self.allocator.free(function_code);
+            // Truncate writer back to pre-function position
+            self.writer.truncate(pre_functions_len);
+            // Write lambda definitions
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Hoisted Lambda Functions");
+            try self.writer.write(self.lambda_writer.getOutput());
+            // Re-append the function code
+            try self.writer.write(function_code);
+        }
 
         // Generate main entry point that calls dm_main
         try self.writer.blankLine();
@@ -1007,6 +1040,17 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("memcpy(buf, s.data, copy_len);");
         try self.writer.writeLine("buf[copy_len] = '\\0';");
         try self.writer.writeLine("return (int64_t)atoll(buf);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline double dm_parse_float(dm_string s) {");
+        self.writer.indent();
+        try self.writer.writeLine("char buf[64];");
+        try self.writer.writeLine("size_t copy_len = s.len < 63 ? s.len : 63;");
+        try self.writer.writeLine("memcpy(buf, s.data, copy_len);");
+        try self.writer.writeLine("buf[copy_len] = '\\0';");
+        try self.writer.writeLine("return atof(buf);");
         self.writer.dedent();
         try self.writer.writeLine("}");
         try self.writer.blankLine();
@@ -1782,6 +1826,55 @@ pub const CodeGenerator = struct {
         w.dedent();
         try w.writeLine("}");
         try w.blankLine();
+
+        // _len
+        try w.printLine("static inline int64_t {s}_len({s}* list) {{", .{ list_type_name, list_type_name });
+        w.indent();
+        try w.writeLine("return (int64_t)list->len;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _contains (only for types that support == comparison in C)
+        const is_comparable = std.mem.eql(u8, elem_type, "int64_t") or
+            std.mem.eql(u8, elem_type, "double") or
+            std.mem.eql(u8, elem_type, "bool") or
+            std.mem.eql(u8, elem_type, "char") or
+            std.mem.eql(u8, elem_type, "dm_string") or
+            std.mem.endsWith(u8, elem_type, "*");
+        if (is_comparable) {
+            try w.printLine("static inline bool {s}_contains({s}* list, {s} value) {{", .{ list_type_name, list_type_name, elem_type });
+            w.indent();
+            try w.writeLine("for (size_t i = 0; i < list->len; i++) {");
+            w.indent();
+            if (std.mem.eql(u8, elem_type, "dm_string")) {
+                try w.writeLine("if (dm_string_eq(list->data[i], value)) return true;");
+            } else {
+                try w.writeLine("if (list->data[i] == value) return true;");
+            }
+            w.dedent();
+            try w.writeLine("}");
+            try w.writeLine("return false;");
+            w.dedent();
+            try w.writeLine("}");
+            try w.blankLine();
+        }
+
+        // Track method return types for inference
+        const stripped_name = if (std.mem.startsWith(u8, list_type_name, "dm_"))
+            list_type_name[3..]
+        else
+            list_type_name;
+        const push_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_push", .{stripped_name});
+        const get_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_get", .{stripped_name});
+        const pop_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_pop", .{stripped_name});
+        const len_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_len", .{stripped_name});
+        const contains_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_contains", .{stripped_name});
+        self.trackFunctionReturnType(push_key, "void");
+        self.trackFunctionReturnType(get_key, elem_type);
+        self.trackFunctionReturnType(pop_key, elem_type);
+        self.trackFunctionReturnType(len_key, "int64_t");
+        self.trackFunctionReturnType(contains_key, "bool");
     }
 
     /// Generate Box helper name and emit monomorphized allocation helper if not already done
@@ -2070,6 +2163,14 @@ pub const CodeGenerator = struct {
         try w.writeLine("}");
         try w.blankLine();
 
+        // _set (alias for _insert)
+        try w.printLine("static inline void {s}_set({s}* map, {s} key, {s} value) {{", .{ map_type_name, map_type_name, key_type, val_type });
+        w.indent();
+        try w.printLine("{s}_insert(map, key, value);", .{map_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
         // Track method return types for inference.
         // The method lookup in inferCTypeFromExpr uses "{type_name}_{method}" where
         // type_name has the "dm_" prefix stripped, so for "dm_map_X_Y" it becomes "map_X_Y".
@@ -2078,6 +2179,7 @@ pub const CodeGenerator = struct {
         else
             map_type_name;
         const insert_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_insert", .{stripped_name});
+        const set_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_set", .{stripped_name});
         const get_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_get", .{stripped_name});
         const contains_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_contains", .{stripped_name});
         const remove_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_remove", .{stripped_name});
@@ -2085,6 +2187,7 @@ pub const CodeGenerator = struct {
         const keys_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_keys", .{stripped_name});
         const values_key = try std.fmt.allocPrint(self.stringAllocator(), "{s}_values", .{stripped_name});
         self.trackFunctionReturnType(insert_key, "void");
+        self.trackFunctionReturnType(set_key, "void");
         self.trackFunctionReturnType(get_key, val_type);
         self.trackFunctionReturnType(contains_key, "bool");
         self.trackFunctionReturnType(remove_key, "bool");
@@ -2506,15 +2609,18 @@ pub const CodeGenerator = struct {
                     // Check known built-in return types
                     if (std.mem.eql(u8, name, "len") or
                         std.mem.eql(u8, name, "parse_int") or
+                        std.mem.eql(u8, name, "string_to_int") or
                         std.mem.eql(u8, name, "string_find") or
                         std.mem.eql(u8, name, "args_len") or
                         std.mem.eql(u8, name, "system")) break :blk "int64_t";
+                    if (std.mem.eql(u8, name, "parse_float")) break :blk "double";
                     if (std.mem.eql(u8, name, "to_string") or
                         std.mem.eql(u8, name, "int_to_string") or
                         std.mem.eql(u8, name, "bool_to_string") or
                         std.mem.eql(u8, name, "float_to_string") or
                         std.mem.eql(u8, name, "substr") or
                         std.mem.eql(u8, name, "char_to_string") or
+                        std.mem.eql(u8, name, "char_at") or
                         std.mem.eql(u8, name, "file_read") or
                         std.mem.eql(u8, name, "args_get") or
                         std.mem.eql(u8, name, "string_trim") or
@@ -2599,6 +2705,13 @@ pub const CodeGenerator = struct {
             .identifier => |ident| blk: {
                 // Look up in known variable types
                 if (self.lookupVariableType(ident.name)) |var_type| break :blk var_type;
+                // Check if this is a function reference - look up its return type
+                if (self.known_functions.contains(ident.name)) {
+                    // Function references used as values; the type depends on context
+                    // but for inference we can't construct a full fn pointer type here.
+                    // Callers with type annotations will get correct types via mapType.
+                    break :blk "void*";
+                }
                 break :blk "int64_t"; // Default to int64_t for identifiers
             },
             .index_access => |idx| blk: {
@@ -3602,7 +3715,7 @@ pub const CodeGenerator = struct {
                 try self.writer.write(" else if (");
             }
 
-            try self.generatePatternCondition(arm.pattern, temp);
+            try self.generatePatternCondition(arm.pattern, temp, scrutinee_type);
 
             // Guard condition
             if (arm.guard) |guard| {
@@ -3641,7 +3754,7 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate pattern condition for match
-    fn generatePatternCondition(self: *Self, pattern: *Pattern, scrutinee: []const u8) anyerror!void {
+    fn generatePatternCondition(self: *Self, pattern: *Pattern, scrutinee: []const u8, scrutinee_type: []const u8) anyerror!void {
         switch (pattern.kind) {
             .literal => |lit| {
                 // For string literals, use dm_string_eq
@@ -3662,9 +3775,27 @@ pub const CodeGenerator = struct {
                 try self.writer.write("true");
             },
             .enum_variant => |variant| {
-                // Check tag/value for enum variant
                 const variant_name = variant.variant.name;
-                if (variant.type_path) |path| {
+                // Check if scrutinee is an Option type
+                if (std.mem.startsWith(u8, scrutinee_type, "dm_option_")) {
+                    if (std.mem.eql(u8, variant_name, "Some")) {
+                        try self.writer.print("{s}.has_value", .{scrutinee});
+                    } else if (std.mem.eql(u8, variant_name, "None")) {
+                        try self.writer.print("!{s}.has_value", .{scrutinee});
+                    } else {
+                        try self.writer.write("true /* unknown option variant */");
+                    }
+                } else if (std.mem.startsWith(u8, scrutinee_type, "dm_result_")) {
+                    // Check if scrutinee is a Result type
+                    if (std.mem.eql(u8, variant_name, "Ok")) {
+                        try self.writer.print("{s}.is_ok", .{scrutinee});
+                    } else if (std.mem.eql(u8, variant_name, "Err")) {
+                        try self.writer.print("!{s}.is_ok", .{scrutinee});
+                    } else {
+                        try self.writer.write("true /* unknown result variant */");
+                    }
+                } else if (variant.type_path) |path| {
+                    // Check tag/value for enum variant
                     const type_name = path.segments[path.segments.len - 1].name;
                     const mangled = try self.mangleTypeName(type_name);
                     // Check if this is a simple enum (plain C enum vs tagged union)
@@ -3681,7 +3812,7 @@ pub const CodeGenerator = struct {
                 try self.writer.write("(");
                 for (or_pat.patterns, 0..) |sub_pat, i| {
                     if (i > 0) try self.writer.write(" || ");
-                    try self.generatePatternCondition(sub_pat, scrutinee);
+                    try self.generatePatternCondition(sub_pat, scrutinee, scrutinee_type);
                 }
                 try self.writer.write(")");
             },
@@ -3717,6 +3848,56 @@ pub const CodeGenerator = struct {
                 self.trackVariableType(ident.name.name, scrutinee_type);
             },
             .enum_variant => |variant| {
+                const variant_name = variant.variant.name;
+                // Option type pattern bindings
+                if (std.mem.startsWith(u8, scrutinee_type, "dm_option_")) {
+                    if (std.mem.eql(u8, variant_name, "Some")) {
+                        switch (variant.payload) {
+                            .tuple => |patterns| {
+                                if (patterns.len == 1 and patterns[0].kind == .identifier) {
+                                    const inner_type = self.generated_option_types.get(scrutinee_type) orelse "int64_t";
+                                    const bind_name = patterns[0].kind.identifier.name.name;
+                                    try self.writer.printLine("{s} {s} = {s}.value;", .{ inner_type, bind_name, scrutinee });
+                                    self.trackVariableType(bind_name, inner_type);
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    // None has no bindings
+                    return;
+                }
+                // Result type pattern bindings
+                if (std.mem.startsWith(u8, scrutinee_type, "dm_result_")) {
+                    const result_info = self.generated_result_types.get(scrutinee_type);
+                    if (std.mem.eql(u8, variant_name, "Ok")) {
+                        switch (variant.payload) {
+                            .tuple => |patterns| {
+                                if (patterns.len == 1 and patterns[0].kind == .identifier) {
+                                    const ok_type = if (result_info) |ri| ri.ok_type else "int64_t";
+                                    const bind_name = patterns[0].kind.identifier.name.name;
+                                    try self.writer.printLine("{s} {s} = {s}.ok;", .{ ok_type, bind_name, scrutinee });
+                                    self.trackVariableType(bind_name, ok_type);
+                                }
+                            },
+                            else => {},
+                        }
+                    } else if (std.mem.eql(u8, variant_name, "Err")) {
+                        switch (variant.payload) {
+                            .tuple => |patterns| {
+                                if (patterns.len == 1 and patterns[0].kind == .identifier) {
+                                    const err_type = if (result_info) |ri| ri.err_type else "dm_string";
+                                    const bind_name = patterns[0].kind.identifier.name.name;
+                                    try self.writer.printLine("{s} {s} = {s}.err;", .{ err_type, bind_name, scrutinee });
+                                    self.trackVariableType(bind_name, err_type);
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    return;
+                }
+                // Regular enum variant bindings
                 switch (variant.payload) {
                     .none => {},
                     .tuple => |patterns| {
@@ -4799,6 +4980,31 @@ pub const CodeGenerator = struct {
                 }
             }
             return true;
+        } else if (std.mem.eql(u8, name, "string_to_int")) {
+            // string_to_int is alias for parse_int
+            if (call.args.len > 0) {
+                try self.writer.write("dm_parse_int(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "char_at")) {
+            // char_at(s, i) -> character at index as string
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_char_to_string((");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(").data[");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write("])");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "parse_float")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_parse_float(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
         }
 
         return false;
@@ -5039,7 +5245,7 @@ pub const CodeGenerator = struct {
 
             // Generate pattern condition
             try self.writer.write("(");
-            try self.generatePatternCondition(arm.pattern, "_dm_unreachable");
+            try self.generatePatternCondition(arm.pattern, "_dm_unreachable", "int64_t");
 
             // Add guard condition if present
             if (arm.guard) |guard| {
@@ -5091,32 +5297,71 @@ pub const CodeGenerator = struct {
         }
     }
 
-    /// Generate lambda expression
-    /// Note: Full lambda support requires closure conversion which is complex.
-    /// For Stage 0, we implement simple non-capturing lambdas using GCC statement expressions.
+    /// Generate lambda expression by hoisting to a static C function.
+    /// For Stage 0, only non-capturing lambdas are supported.
     fn generateLambdaExpr(self: *Self, lambda: *LambdaExpr) anyerror!void {
         self.lambda_depth += 1;
         defer self.lambda_depth -= 1;
 
-        // For simple expression lambdas, we can inline them directly
-        // For complex cases, we need proper closure conversion (Stage 1+)
+        const lambda_name = try std.fmt.allocPrint(self.stringAllocator(), "__dm_lambda_{d}", .{self.lambda_counter});
+        self.lambda_counter += 1;
+
+        // Determine return type
+        const ret_type: []const u8 = if (lambda.return_type) |rt|
+            self.mapType(rt) catch "int64_t"
+        else blk: {
+            // Infer from body expression type
+            switch (lambda.body) {
+                .expression => |expr| break :blk self.inferCTypeFromExpr(expr),
+                .block => |block| {
+                    if (block.result) |result| break :blk self.inferCTypeFromExpr(result);
+                    break :blk "void";
+                },
+            }
+        };
+
+        // Emit static function definition to lambda_writer
+        var w = &self.lambda_writer;
+        try w.print("static {s} {s}(", .{ ret_type, lambda_name });
+        for (lambda.params, 0..) |param, i| {
+            if (i > 0) try w.write(", ");
+            const param_type: []const u8 = if (param.type_expr) |te|
+                self.mapType(te) catch "int64_t"
+            else
+                "int64_t";
+            try w.print("{s} {s}", .{ param_type, param.name.name });
+        }
+        if (lambda.params.len == 0) try w.write("void");
+        try w.writeLine(") {");
+        w.indent();
+
+        // Save and swap writer so generateExpr/generateBlock writes to lambda_writer
+        const saved_writer = self.writer;
+        self.writer = self.lambda_writer;
+
         switch (lambda.body) {
             .expression => |expr| {
-                // Generate as inline expression (works for simple uses)
-                try self.writer.write("(");
+                if (!std.mem.eql(u8, ret_type, "void")) {
+                    try self.writer.write("return ");
+                }
                 try self.generateExpr(expr);
-                try self.writer.write(")");
+                try self.writer.writeLine(";");
             },
             .block => |block| {
-                // For block bodies, emit statements then result expression
-                try self.writer.write("(");
                 try self.generateBlock(block);
-                if (block.result) |result| {
-                    try self.generateExpr(result);
-                }
-                try self.writer.write(")");
             },
         }
+
+        // Restore writers
+        self.lambda_writer = self.writer;
+        self.writer = saved_writer;
+
+        self.lambda_writer.dedent();
+        try self.lambda_writer.writeLine("}");
+        try self.lambda_writer.blankLine();
+
+        // In the main code, reference the lambda by its hoisted name
+        try self.writer.write(lambda_name);
     }
 
     /// Generate pipeline expression (transformed to nested calls)
