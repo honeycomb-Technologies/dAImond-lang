@@ -213,7 +213,7 @@ The runtime targets **C11** for portability.
 - Integration test harness
 
 ### In Progress
-- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete, expanding feature support (enum payloads, Option/Result, match expressions, multi-file imports done; lambdas, generics pending)
+- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete, expanding feature support (enum payloads, Option/Result, match expressions, multi-file imports, lambdas, generic monomorphization done; pipeline operator, error propagation pending)
 
 ### Not Yet Implemented
 - `fmt` command (code formatter)
@@ -395,7 +395,9 @@ Stage 1 is written in dAImond and compiled by Stage 0. It compiles a subset of d
 - **Result[T, E]**: `Result[int, string]` with `Ok(val)` / `Err(msg)` constructors (type annotation required on let bindings)
 - **Match expressions**: `match expr { Pattern => body }` with enum variant patterns, payload binding, wildcard `_`, and literal patterns. Works as both statement and expression.
 - **Multi-file imports**: `import module_name` resolves to `module_name.dm` in same directory. `import std.helpers` resolves to `std/helpers.dm`. Transitive imports supported with deduplication (diamond imports handled). Source concatenated before tokenization.
-- **Not yet supported**: lambdas, generic monomorphization, pipeline operator, error propagation `?`, traits, effects, regions
+- **Lambda expressions**: `|x: int| x * 2` for expression body, `|a: int, b: int| { ... }` for block body. Lifted to static functions at file scope. Function pointer types generated automatically for variable declarations.
+- **Generic monomorphization**: `fn max[T](a: T, b: T) -> T { ... }` with explicit (`max[int](3, 7)`) or implicit (`max(3, 7)`) type arguments. Generates specialized copies at call sites with deduplication.
+- **Not yet supported**: pipeline operator, error propagation `?`, traits, effects, regions
 
 ### Building Stage 1
 ```bash
