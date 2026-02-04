@@ -135,7 +135,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 184 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 186 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -267,7 +267,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Error diagnostics with colored output
 - C runtime library (strings, arenas, option/result, I/O, networking sockets, threading)
 - CLI with commands: compile, run, lex, parse, check, fmt, test, pkg
-- Integration test harness (184 pass, 0 fail, 0 skipped)
+- Integration test harness (186 pass, 0 fail, 0 skipped)
 - Map[K,V] type with full method support (insert, get, contains, remove, len, keys, values, set, indexing)
 - String split returning List[string]
 - Multi-file imports in Stage 0 (import resolution, stdlib path resolution, diamond import deduplication)
@@ -432,6 +432,8 @@ The following issues from earlier versions are now resolved:
 - **Comptime const type inference** — `const SIZE = comptime 4 * 1024` now emits correct C type (`int64_t`) instead of `const void*`
 - **Closure block body** — `|x: int| -> int { return x + 1 }` now compiles correctly
 - **Stdlib name collisions** — `import std.os`, `import std.fs`, `import std.collections` no longer produce C compilation errors from conflicting `extern fn` declarations
+- **Extern string wrapper** — `extern fn getenv(name: string) -> string` now generates a static wrapper that converts between `dm_string` and `const char*`, avoiding C type conflicts with system headers
+- **Monomorphization forward declarations** — nested generic calls (e.g., `apply_double[T]` calling `double[T]`) now emit forward declarations before implementations via writer splicing, preventing implicit function declaration errors in C
 
 ## Stage 1 Compiler Architecture
 
