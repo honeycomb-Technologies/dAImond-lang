@@ -1,2 +1,8 @@
 # Generated C files from test compilation
 *.c
+
+# Compiled test binaries
+*.o
+*.out
+test_*
+!test_*.dm

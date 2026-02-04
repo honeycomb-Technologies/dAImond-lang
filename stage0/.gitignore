@@ -2,15 +2,17 @@
 .zig-cache/
 zig-out/
 
-# Generated files
+# Generated C files (but keep runtime source)
 *.c
 !src/*.c
+!runtime/*.c
 
-# Compiled binaries
+# Compiled binaries and objects
+*.o
+*.out
 main
 hello
 test
 test_*
 stage1_compiler
-*.o
 /tmp/

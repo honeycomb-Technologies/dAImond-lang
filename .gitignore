@@ -1,5 +1,13 @@
-# Object files
+# Compiled binaries
 *.o
+*.out
 
 # Generated C files at root
 /main.c
+
+# Editor/IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
