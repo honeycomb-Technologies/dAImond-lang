@@ -1,413 +1,286 @@
--- dAImond Scientific Calculator
--- This is the first real program for the dAImond language.
--- It demonstrates lexing, parsing, evaluation, and error handling.
+-- dAImond Calculator
+-- Demonstrates basic parsing and evaluation of arithmetic expressions.
+-- Supports: +, -, *, /, parentheses, decimal numbers
 
 module calculator
 
-import std.io { print, read_line }
-import std.math { sin, cos, tan, sqrt, log, ln, exp, pow, PI, E }
-import std.map { Map }
-
--- Token types for the calculator's own lexer
-enum Token {
-    Number(float),
-    Plus, Minus, Star, Slash, Caret, Percent,
-    LParen, RParen,
-    Identifier(str),
-    Let, Equals,
-    Eof,
+-- Check if a character is a digit (0-9)
+fn is_digit_char(ch: string) -> bool {
+    return ch >= "0" and ch <= "9"
 }
 
--- Expression AST
-enum Expr {
-    Number(float),
-    Variable(str),
-    Unary { op: UnaryOp, operand: Box[Expr] },
-    Binary { op: BinaryOp, left: Box[Expr], right: Box[Expr] },
-    Call { name: str, arg: Box[Expr] },
+-- Check if a character is whitespace
+fn is_space_char(ch: string) -> bool {
+    return ch == " " or ch == "\t"
 }
 
-enum UnaryOp { Neg }
-enum BinaryOp { Add, Sub, Mul, Div, Pow, Mod }
+-- Token types as integer constants
+-- 0 = Number, 1 = Plus, 2 = Minus, 3 = Star, 4 = Slash,
+-- 5 = LParen, 6 = RParen, 7 = Eof, 8 = Error
 
--- Lexer for calculator expressions
-struct Lexer {
-    input: str,
-    pos: uint,
+struct Token {
+    kind: int,
+    value: string,
 }
 
-impl Lexer {
-    fn new(input: str) -> Lexer {
-        return Lexer { input, pos: 0 }
-    }
-
-    fn next_token(mut self) -> Result[Token, LexError] {
-        self.skip_whitespace()
-
-        if self.pos >= self.input.len() {
-            return Ok(Token.Eof)
-        }
-
-        let c = self.input[self.pos]
-
-        match c {
-            '+' => { self.pos += 1; return Ok(Token.Plus) },
-            '-' => { self.pos += 1; return Ok(Token.Minus) },
-            '*' => { self.pos += 1; return Ok(Token.Star) },
-            '/' => { self.pos += 1; return Ok(Token.Slash) },
-            '^' => { self.pos += 1; return Ok(Token.Caret) },
-            '%' => { self.pos += 1; return Ok(Token.Percent) },
-            '(' => { self.pos += 1; return Ok(Token.LParen) },
-            ')' => { self.pos += 1; return Ok(Token.RParen) },
-            '=' => { self.pos += 1; return Ok(Token.Equals) },
-            _ => {}
-        }
-
-        if c.is_digit() or c == '.' {
-            return self.read_number()
-        }
-
-        if c.is_alpha() {
-            return self.read_identifier()
-        }
-
-        return Err(LexError.UnexpectedChar(c))
-    }
-
-    private fn skip_whitespace(mut self) {
-        while self.pos < self.input.len() and self.input[self.pos].is_whitespace() {
-            self.pos += 1
-        }
-    }
-
-    private fn read_number(mut self) -> Result[Token, LexError] {
-        let start = self.pos
-        while self.pos < self.input.len() and (self.input[self.pos].is_digit() or self.input[self.pos] == '.') {
-            self.pos += 1
-        }
-        -- Handle scientific notation
-        if self.pos < self.input.len() and (self.input[self.pos] == 'e' or self.input[self.pos] == 'E') {
-            self.pos += 1
-            if self.pos < self.input.len() and (self.input[self.pos] == '+' or self.input[self.pos] == '-') {
-                self.pos += 1
-            }
-            while self.pos < self.input.len() and self.input[self.pos].is_digit() {
-                self.pos += 1
-            }
-        }
-        let text = self.input.slice(start, self.pos)
-        match text.parse_float() {
-            Ok(n) => Ok(Token.Number(n)),
-            Err(_) => Err(LexError.InvalidNumber(text)),
-        }
-    }
-
-    private fn read_identifier(mut self) -> Result[Token, LexError] {
-        let start = self.pos
-        while self.pos < self.input.len() and self.input[self.pos].is_alphanumeric() {
-            self.pos += 1
-        }
-        let text = self.input.slice(start, self.pos)
-        match text {
-            "let" => Ok(Token.Let),
-            _ => Ok(Token.Identifier(text)),
-        }
-    }
+struct Tokenizer {
+    input: string,
+    pos: int,
 }
 
--- Parser using recursive descent
-struct Parser {
-    lexer: Lexer,
-    current: Token,
+fn tokenizer_new(input: string) -> Tokenizer {
+    return Tokenizer { input: input, pos: 0 }
 }
 
-impl Parser {
-    fn new(input: str) -> Result[Parser, ParseError] {
-        let mut lexer = Lexer.new(input)
-        let current = lexer.next_token()?
-        return Ok(Parser { lexer, current })
-    }
-
-    fn parse(mut self) -> Result[Expr, ParseError] {
-        return self.expression()
-    }
-
-    private fn advance(mut self) -> Result[(), ParseError] {
-        self.current = self.lexer.next_token()?
-        return Ok(())
-    }
-
-    private fn expression(mut self) -> Result[Expr, ParseError] {
-        return self.addition()
-    }
-
-    private fn addition(mut self) -> Result[Expr, ParseError] {
-        let mut left = self.multiplication()?
-
-        while self.current == Token.Plus or self.current == Token.Minus {
-            let op = if self.current == Token.Plus { BinaryOp.Add } else { BinaryOp.Sub }
-            self.advance()?
-            let right = self.multiplication()?
-            left = Expr.Binary { op, left: Box.new(left), right: Box.new(right) }
-        }
-
-        return Ok(left)
-    }
-
-    private fn multiplication(mut self) -> Result[Expr, ParseError] {
-        let mut left = self.power()?
-
-        while self.current == Token.Star or self.current == Token.Slash or self.current == Token.Percent {
-            let op = match self.current {
-                Token.Star => BinaryOp.Mul,
-                Token.Slash => BinaryOp.Div,
-                Token.Percent => BinaryOp.Mod,
-                _ => unreachable(),
-            }
-            self.advance()?
-            let right = self.power()?
-            left = Expr.Binary { op, left: Box.new(left), right: Box.new(right) }
-        }
-
-        return Ok(left)
-    }
-
-    private fn power(mut self) -> Result[Expr, ParseError] {
-        let base = self.unary()?
-
-        if self.current == Token.Caret {
-            self.advance()?
-            let exp = self.power()?  -- right associative
-            return Ok(Expr.Binary { op: BinaryOp.Pow, left: Box.new(base), right: Box.new(exp) })
-        }
-
-        return Ok(base)
-    }
-
-    private fn unary(mut self) -> Result[Expr, ParseError] {
-        if self.current == Token.Minus {
-            self.advance()?
-            let operand = self.unary()?
-            return Ok(Expr.Unary { op: UnaryOp.Neg, operand: Box.new(operand) })
-        }
-        return self.call()
-    }
-
-    private fn call(mut self) -> Result[Expr, ParseError] {
-        if let Token.Identifier(name) = self.current {
-            self.advance()?
-            if self.current == Token.LParen {
-                self.advance()?
-                let arg = self.expression()?
-                if self.current != Token.RParen {
-                    return Err(ParseError.ExpectedRParen)
-                }
-                self.advance()?
-                return Ok(Expr.Call { name, arg: Box.new(arg) })
-            }
-            return Ok(Expr.Variable(name))
-        }
-        return self.primary()
-    }
-
-    private fn primary(mut self) -> Result[Expr, ParseError] {
-        match self.current {
-            Token.Number(n) => {
-                self.advance()?
-                return Ok(Expr.Number(n))
-            },
-            Token.LParen => {
-                self.advance()?
-                let expr = self.expression()?
-                if self.current != Token.RParen {
-                    return Err(ParseError.ExpectedRParen)
-                }
-                self.advance()?
-                return Ok(expr)
-            },
-            _ => return Err(ParseError.UnexpectedToken(self.current)),
-        }
-    }
-}
-
--- Evaluator
-struct Evaluator {
-    variables: Map[str, float],
-    ans: float,
-}
-
-impl Evaluator {
-    fn new() -> Evaluator {
-        let mut vars = Map.new()
-        vars.insert("pi", PI)
-        vars.insert("e", E)
-        return Evaluator { variables: vars, ans: 0.0 }
-    }
-
-    fn eval(mut self, expr: Expr) -> Result[float, EvalError] {
-        let result = self.eval_expr(expr)?
-        self.ans = result
-        self.variables.insert("ans", result)
-        return Ok(result)
-    }
-
-    fn set_variable(mut self, name: str, value: float) {
-        self.variables.insert(name, value)
-    }
-
-    private fn eval_expr(self, expr: Expr) -> Result[float, EvalError] {
-        match expr {
-            Expr.Number(n) => Ok(n),
-
-            Expr.Variable(name) => {
-                match self.variables.get(name) {
-                    Some(v) => Ok(v),
-                    None => Err(EvalError.UnknownVariable(name)),
-                }
-            },
-
-            Expr.Unary { op: UnaryOp.Neg, operand } => {
-                let v = self.eval_expr(*operand)?
-                Ok(-v)
-            },
-
-            Expr.Binary { op, left, right } => {
-                let l = self.eval_expr(*left)?
-                let r = self.eval_expr(*right)?
-                match op {
-                    BinaryOp.Add => Ok(l + r),
-                    BinaryOp.Sub => Ok(l - r),
-                    BinaryOp.Mul => Ok(l * r),
-                    BinaryOp.Div => {
-                        if r == 0.0 {
-                            return Err(EvalError.DivisionByZero)
-                        }
-                        Ok(l / r)
-                    },
-                    BinaryOp.Pow => Ok(pow(l, r)),
-                    BinaryOp.Mod => {
-                        if r == 0.0 {
-                            return Err(EvalError.DivisionByZero)
-                        }
-                        Ok(l % r)
-                    },
-                }
-            },
-
-            Expr.Call { name, arg } => {
-                let v = self.eval_expr(*arg)?
-                match name {
-                    "sin" => Ok(sin(v)),
-                    "cos" => Ok(cos(v)),
-                    "tan" => Ok(tan(v)),
-                    "sqrt" => {
-                        if v < 0.0 {
-                            return Err(EvalError.NegativeSqrt)
-                        }
-                        Ok(sqrt(v))
-                    },
-                    "log" => {
-                        if v <= 0.0 {
-                            return Err(EvalError.LogOfNonPositive)
-                        }
-                        Ok(log(v))
-                    },
-                    "ln" => {
-                        if v <= 0.0 {
-                            return Err(EvalError.LogOfNonPositive)
-                        }
-                        Ok(ln(v))
-                    },
-                    "exp" => Ok(exp(v)),
-                    "abs" => Ok(v.abs()),
-                    "floor" => Ok(v.floor()),
-                    "ceil" => Ok(v.ceil()),
-                    _ => Err(EvalError.UnknownFunction(name)),
-                }
-            },
-        }
-    }
-}
-
--- Error types
-enum LexError {
-    UnexpectedChar(char),
-    InvalidNumber(str),
-}
-
-enum ParseError {
-    UnexpectedToken(Token),
-    ExpectedRParen,
-    UnexpectedEof,
-}
-
-enum EvalError {
-    DivisionByZero,
-    NegativeSqrt,
-    LogOfNonPositive,
-    UnknownVariable(str),
-    UnknownFunction(str),
-}
-
--- REPL entry point
-fn main() with [Console, IO] {
-    print("dAImond Scientific Calculator")
-    print("Type 'exit' to quit")
-    print("")
-
-    let mut eval = Evaluator.new()
-
-    loop {
-        print("> ")
-        let line = read_line()
-
-        if line == "exit" {
+fn tokenizer_skip_whitespace(mut tok: Tokenizer) -> Tokenizer {
+    while tok.pos < len(tok.input) {
+        let ch = char_at(tok.input, tok.pos)
+        if is_space_char(ch) {
+            tok.pos = tok.pos + 1
+        } else {
             break
         }
+    }
+    return tok
+}
 
-        if line.starts_with("let ") {
-            -- Handle variable assignment: "let x = 5"
-            let rest = line.slice(4, line.len()).trim()
-            match rest.split_once("=") {
-                Some((name, expr_str)) => {
-                    let name = name.trim()
-                    let expr_str = expr_str.trim()
-                    match Parser.new(expr_str) {
-                        Ok(mut parser) => {
-                            match parser.parse() {
-                                Ok(expr) => {
-                                    match eval.eval(expr) {
-                                        Ok(value) => {
-                                            eval.set_variable(name, value)
-                                            print("{name} = {value}")
-                                        },
-                                        Err(e) => print("Error: {e}"),
-                                    }
-                                },
-                                Err(e) => print("Parse error: {e}"),
-                            }
-                        },
-                        Err(e) => print("Lex error: {e}"),
-                    }
-                },
-                None => print("Invalid let syntax. Use: let x = <expression>"),
-            }
+fn tokenizer_read_number(mut tok: Tokenizer) -> Tokenizer {
+    let mut has_dot = false
+    while tok.pos < len(tok.input) {
+        let ch = char_at(tok.input, tok.pos)
+        if is_digit_char(ch) {
+            tok.pos = tok.pos + 1
         } else {
-            -- Evaluate expression
-            match Parser.new(line) {
-                Ok(mut parser) => {
-                    match parser.parse() {
-                        Ok(expr) => {
-                            match eval.eval(expr) {
-                                Ok(value) => print("{value}"),
-                                Err(e) => print("Error: {e}"),
-                            }
-                        },
-                        Err(e) => print("Parse error: {e}"),
-                    }
-                },
-                Err(e) => print("Lex error: {e}"),
+            if ch == "." and not has_dot {
+                has_dot = true
+                tok.pos = tok.pos + 1
+            } else {
+                break
             }
         }
     }
+    return tok
+}
+
+fn tokenizer_next(mut tok: Tokenizer, start_pos: int) -> Token {
+    tok = tokenizer_skip_whitespace(tok)
+    if tok.pos >= len(tok.input) {
+        return Token { kind: 7, value: "" }
+    }
+    let ch = char_at(tok.input, tok.pos)
+    if is_digit_char(ch) or ch == "." {
+        return Token { kind: 0, value: "num" }
+    }
+    tok.pos = tok.pos + 1
+    if ch == "+" { return Token { kind: 1, value: "+" } }
+    if ch == "-" { return Token { kind: 2, value: "-" } }
+    if ch == "*" { return Token { kind: 3, value: "*" } }
+    if ch == "/" { return Token { kind: 4, value: "/" } }
+    if ch == "(" { return Token { kind: 5, value: "(" } }
+    if ch == ")" { return Token { kind: 6, value: ")" } }
+    return Token { kind: 8, value: ch }
+}
+
+fn main() {
+    println("dAImond Calculator")
+    println("==================")
+
+    let expr1 = "2 + 3"
+    println(expr1 + " = " + float_to_string(eval_expr_string(expr1)))
+
+    let expr2 = "10 - 4 * 2"
+    println(expr2 + " = " + float_to_string(eval_expr_string(expr2)))
+
+    let expr3 = "(1 + 2) * (3 + 4)"
+    println(expr3 + " = " + float_to_string(eval_expr_string(expr3)))
+
+    let expr4 = "100 / 4 / 5"
+    println(expr4 + " = " + float_to_string(eval_expr_string(expr4)))
+
+    let expr5 = "-3 + 5"
+    println(expr5 + " = " + float_to_string(eval_expr_string(expr5)))
+
+    let expr6 = "3.14 * 2"
+    println(expr6 + " = " + float_to_string(eval_expr_string(expr6)))
+
+    println("==================")
+    println("Done")
+}
+
+-- Global parser state
+-- We use global mutable state to avoid the double-pointer codegen bug
+-- that occurs when methods call other methods on mut self.
+
+struct ParseState {
+    input: string,
+    pos: int,
+    cur_kind: int,
+    cur_value: string,
+}
+
+fn ps_new(input: string) -> ParseState {
+    return ParseState { input: input, pos: 0, cur_kind: 7, cur_value: "" }
+}
+
+fn ps_skip_ws(mut ps: ParseState) -> ParseState {
+    while ps.pos < len(ps.input) {
+        let ch = char_at(ps.input, ps.pos)
+        if is_space_char(ch) {
+            ps.pos = ps.pos + 1
+        } else {
+            break
+        }
+    }
+    return ps
+}
+
+fn ps_read_number(mut ps: ParseState) -> ParseState {
+    let start = ps.pos
+    let mut has_dot = false
+    while ps.pos < len(ps.input) {
+        let ch = char_at(ps.input, ps.pos)
+        if is_digit_char(ch) {
+            ps.pos = ps.pos + 1
+        } else {
+            if ch == "." and not has_dot {
+                has_dot = true
+                ps.pos = ps.pos + 1
+            } else {
+                break
+            }
+        }
+    }
+    ps.cur_kind = 0
+    ps.cur_value = substr(ps.input, start, ps.pos - start)
+    return ps
+}
+
+fn ps_advance(mut ps: ParseState) -> ParseState {
+    ps = ps_skip_ws(ps)
+    if ps.pos >= len(ps.input) {
+        ps.cur_kind = 7
+        ps.cur_value = ""
+        return ps
+    }
+    let ch = char_at(ps.input, ps.pos)
+    if is_digit_char(ch) or ch == "." {
+        ps = ps_read_number(ps)
+        return ps
+    }
+    ps.pos = ps.pos + 1
+    if ch == "+" {
+        ps.cur_kind = 1
+        ps.cur_value = "+"
+    } else {
+        if ch == "-" {
+            ps.cur_kind = 2
+            ps.cur_value = "-"
+        } else {
+            if ch == "*" {
+                ps.cur_kind = 3
+                ps.cur_value = "*"
+            } else {
+                if ch == "/" {
+                    ps.cur_kind = 4
+                    ps.cur_value = "/"
+                } else {
+                    if ch == "(" {
+                        ps.cur_kind = 5
+                        ps.cur_value = "("
+                    } else {
+                        if ch == ")" {
+                            ps.cur_kind = 6
+                            ps.cur_value = ")"
+                        } else {
+                            ps.cur_kind = 8
+                            ps.cur_value = ch
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return ps
+}
+
+-- Recursive descent parser returning (result, updated_state) via struct
+
+struct ParseResult {
+    value: float,
+    ps: ParseState,
+}
+
+fn parse_factor(mut ps: ParseState) -> ParseResult {
+    -- Unary minus
+    if ps.cur_kind == 2 {
+        ps = ps_advance(ps)
+        let inner = parse_factor(ps)
+        return ParseResult { value: 0.0 - inner.value, ps: inner.ps }
+    }
+    -- Parenthesized expression
+    if ps.cur_kind == 5 {
+        ps = ps_advance(ps)
+        let inner = parse_expr(ps)
+        ps = inner.ps
+        if ps.cur_kind != 6 {
+            panic("Expected closing parenthesis")
+            return ParseResult { value: 0.0, ps: ps }
+        }
+        ps = ps_advance(ps)
+        return ParseResult { value: inner.value, ps: ps }
+    }
+    -- Number
+    if ps.cur_kind == 0 {
+        let val = parse_float(ps.cur_value)
+        ps = ps_advance(ps)
+        return ParseResult { value: val, ps: ps }
+    }
+    panic("Unexpected token: " + ps.cur_value)
+    return ParseResult { value: 0.0, ps: ps }
+}
+
+fn parse_term(mut ps: ParseState) -> ParseResult {
+    let mut result = parse_factor(ps)
+    ps = result.ps
+    let mut left = result.value
+    while ps.cur_kind == 3 or ps.cur_kind == 4 {
+        let op = ps.cur_kind
+        ps = ps_advance(ps)
+        result = parse_factor(ps)
+        ps = result.ps
+        if op == 3 {
+            left = left * result.value
+        } else {
+            if result.value == 0.0 {
+                panic("Division by zero")
+            }
+            left = left / result.value
+        }
+    }
+    return ParseResult { value: left, ps: ps }
+}
+
+fn parse_expr(mut ps: ParseState) -> ParseResult {
+    let mut result = parse_term(ps)
+    ps = result.ps
+    let mut left = result.value
+    while ps.cur_kind == 1 or ps.cur_kind == 2 {
+        let op = ps.cur_kind
+        ps = ps_advance(ps)
+        result = parse_term(ps)
+        ps = result.ps
+        if op == 1 {
+            left = left + result.value
+        } else {
+            left = left - result.value
+        }
+    }
+    return ParseResult { value: left, ps: ps }
+}
+
+fn eval_expr_string(input: string) -> float {
+    let mut ps = ps_new(input)
+    ps = ps_advance(ps)
+    let result = parse_expr(ps)
+    return result.value
 }

@@ -180,6 +180,7 @@ pub const Parser = struct {
     allocator: Allocator,
     errors: std.ArrayList(ParseError),
     panic_mode: bool,
+    current_impl_type: ?*TypeExpr = null,
 
     const Self = @This();
 
@@ -631,8 +632,12 @@ pub const Parser = struct {
             const name = try self.expectIdentifier("parameter name");
             const name_ident = makeIdentifier(name, start_loc);
 
-            try self.expect(.colon, "':' after parameter name");
-            const type_ann = try self.parseTypeExpr();
+            const type_ann = if (std.mem.eql(u8, name, "self") and !self.check(.colon) and self.current_impl_type != null)
+                self.current_impl_type.?
+            else blk: {
+                try self.expect(.colon, "':' after parameter name");
+                break :blk try self.parseTypeExpr();
+            };
 
             var default_val: ?*Expr = null;
             if (self.match(.eq)) {
@@ -872,7 +877,9 @@ pub const Parser = struct {
             const visibility: Declaration.Visibility = if (self.match(.kw_private)) .private else .public;
 
             if (self.match(.kw_fn)) {
+                self.current_impl_type = target_type;
                 const func = try self.parseFunction();
+                self.current_impl_type = null;
                 const item = try self.astAllocator().create(ImplItem);
                 item.* = .{
                     .kind = .{ .function = func },

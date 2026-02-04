@@ -135,7 +135,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 179 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 184 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -267,7 +267,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Error diagnostics with colored output
 - C runtime library (strings, arenas, option/result, I/O, networking sockets, threading)
 - CLI with commands: compile, run, lex, parse, check, fmt, test, pkg
-- Integration test harness (179 pass, 0 fail, 0 skipped)
+- Integration test harness (184 pass, 0 fail, 0 skipped)
 - Map[K,V] type with full method support (insert, get, contains, remove, len, keys, values, set, indexing)
 - String split returning List[string]
 - Multi-file imports in Stage 0 (import resolution, stdlib path resolution, diamond import deduplication)
@@ -277,6 +277,8 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Trait static dispatch with trait bounds on generic functions
 - Closures with variable capture (free variables captured into closure struct)
 - Operator overloading via impl methods (+, -, *, /, ==, !=, <, >, <=, >=)
+- Bare `self` / `mut self` parameter syntax in impl methods (no explicit type annotation needed)
+- Implicit generic type inference for multiple call sites with different types
 - Enum payload construction and pattern matching
 - Nested if-without-else codegen fix (statement vs value position detection)
 - Region memory allocation redirection (arena allocator for allocations within region blocks)
@@ -425,6 +427,11 @@ The following issues from earlier versions are now resolved:
 - **Enum payload construction/matching** — fixed with proper name mangling and tag comparisons
 - **Nested if-without-else type errors** — fixed with statement/value position detection
 - **`string_split()` type mismatch** — now correctly returns `List[string]`
+- **Bare `self` in impl methods** — `fn greet(self)` and `fn update(mut self)` now work without explicit type annotation inside `impl` blocks
+- **Implicit generic multi-type calls** — calling a generic function like `identity(42)` then `identity("hello")` now works without explicit `[T]` type arguments
+- **Comptime const type inference** — `const SIZE = comptime 4 * 1024` now emits correct C type (`int64_t`) instead of `const void*`
+- **Closure block body** — `|x: int| -> int { return x + 1 }` now compiles correctly
+- **Stdlib name collisions** — `import std.os`, `import std.fs`, `import std.collections` no longer produce C compilation errors from conflicting `extern fn` declarations
 
 ## Stage 1 Compiler Architecture
 

@@ -87,7 +87,7 @@ dAImond-lang/
 │   │   ├── daimond_runtime.c  # Runtime implementation
 │   │   └── test_runtime.c     # Runtime unit tests
 │   └── tests/
-│       └── runner.zig         # Integration test harness (179 tests)
+│       └── runner.zig         # Integration test harness (184 tests)
 ├── stage1/                    # Stage 1 self-hosting compiler (written in dAImond)
 │   ├── main.dm                # Monolithic bootstrap file (generated)
 │   ├── main_split.dm          # Entry point with imports (for self-compilation)
@@ -180,8 +180,11 @@ struct Point {
 }
 
 impl Point {
-    fn magnitude(self) -> float {
+    fn magnitude(self) -> float {           -- bare self (type inferred from impl block)
         return sqrt(self.x * self.x + self.y * self.y)
+    }
+    fn translate(self: Point, dx: float, dy: float) -> Point {  -- explicit self type also works
+        return Point { x: self.x + dx, y: self.y + dy }
     }
 }
 
@@ -352,7 +355,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Error diagnostics with colored output
 - [x] C runtime library (strings, arenas, option/result, I/O, networking, threading)
 - [x] CLI: compile, run, lex, parse, check, fmt, test, pkg
-- [x] 179 integration tests passing, 0 failing, 0 skipped
+- [x] 184 integration tests passing, 0 failing, 0 skipped
 
 ### Language Features -- Complete
 - [x] Map[K,V] with full method support (insert, get, contains, remove, len, keys, values, indexing)
@@ -364,6 +367,8 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Dynamic trait dispatch (`dyn Trait` with vtable-based fat pointers)
 - [x] Closures with variable capture
 - [x] Operator overloading via impl methods (+, -, *, /, ==, !=, <, >, <=, >=)
+- [x] Bare `self` / `mut self` syntax in impl methods (type inferred from impl block)
+- [x] Implicit generic type inference across multiple call sites with different types
 - [x] Enum payloads with construction and pattern matching
 - [x] Region memory allocation redirection (arena allocator)
 - [x] Comptime evaluation (arithmetic and boolean expressions)

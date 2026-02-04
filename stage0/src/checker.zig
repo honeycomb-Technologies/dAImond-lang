@@ -456,6 +456,8 @@ pub const TypeChecker = struct {
     source: ?[]const u8,
     /// Source file name
     source_file: ?[]const u8,
+    /// Names of functions that have generic parameters
+    generic_function_names: std.StringHashMap(void),
 
     const Self = @This();
 
@@ -475,6 +477,7 @@ pub const TypeChecker = struct {
             .current_effects = EffectSet.pure,
             .source = null,
             .source_file = null,
+            .generic_function_names = std.StringHashMap(void).init(allocator),
         };
 
         // Register built-in types and functions
@@ -489,6 +492,7 @@ pub const TypeChecker = struct {
         self.diagnostics.deinit();
         self.union_find.deinit();
         self.constraints.deinit();
+        self.generic_function_names.deinit();
         self.type_ctx.deinit();
         self.allocator.destroy(self.type_ctx);
     }
@@ -1323,6 +1327,19 @@ pub const TypeChecker = struct {
                 return try self.freshTypeVar();
             }
 
+            // Implicit generic function calls: identity(42), identity("hello")
+            // If the function is known to be generic but called without explicit type args,
+            // treat it the same as an explicit generic call: infer arg types and return fresh type var.
+            // The codegen handles monomorphization from concrete argument types.
+            if (fc.generic_args == null or fc.generic_args.?.len == 0) {
+                if (self.generic_function_names.contains(name)) {
+                    for (fc.args) |arg| {
+                        _ = try self.inferExpr(arg.value);
+                    }
+                    return try self.freshTypeVar();
+                }
+            }
+
             // Generic function calls: identity[int](42)
             // If the call has explicit generic args, infer argument types and
             // return a fresh type variable (codegen handles monomorphization)
@@ -1589,17 +1606,32 @@ pub const TypeChecker = struct {
             try self.env.define(Symbol.init(param.name.name, .variable, param_type));
         }
 
+        // If the lambda has an explicit return type annotation, resolve it and
+        // set it on the function scope so that return statements inside the
+        // block body can be properly type-checked against it.
+        const declared_return_type = if (lam.return_type) |rt|
+            try self.resolveTypeExpr(rt)
+        else
+            null;
+
+        if (declared_return_type) |rt| {
+            self.env.current.return_type = rt;
+        }
+
         const body_type = switch (lam.body) {
             .expression => |expr| try self.inferExpr(expr),
             .block => |blk| try self.inferBlock(blk),
         };
 
-        const return_type = if (lam.return_type) |rt|
-            try self.resolveTypeExpr(rt)
-        else
-            body_type;
+        const return_type = declared_return_type orelse body_type;
 
-        try self.unify(body_type, return_type, lam.span);
+        // Only unify body_type with return_type if the body has a result expression.
+        // For block bodies with return statements (body_type == unit), the return
+        // type is determined by the explicit annotation or the return statements.
+        const unit_type = try self.type_ctx.intern(.unit);
+        if (body_type != unit_type or declared_return_type == null) {
+            try self.unify(body_type, return_type, lam.span);
+        }
 
         return try self.type_ctx.makeFunction(param_types.items, return_type, EffectSet.pure);
     }
@@ -2226,6 +2258,7 @@ pub const TypeChecker = struct {
         // For generic functions, register generic type params in a temporary scope
         const has_generics = func.generic_params != null and func.generic_params.?.len > 0;
         if (has_generics) {
+            try self.generic_function_names.put(func.name.name, {});
             try self.env.pushScope(.function);
             for (func.generic_params.?) |gp| {
                 try self.env.define(Symbol.init(gp.name.name, .type_param, try self.freshTypeVar()));

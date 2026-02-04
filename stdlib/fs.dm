@@ -1,12 +1,9 @@
 module fs
 
 -- Standard Filesystem Module
--- File system operations via extern fn and builtins.
-
-extern fn mkdir(path: string, mode: int) -> int
-extern fn rmdir(path: string) -> int
-extern fn remove(path: string) -> int
-extern fn rename(old_path: string, new_path: string) -> int
+-- File system operations via builtins.
+-- Note: mkdir/rmdir/remove/rename use system() calls since
+-- extern fn with string types conflicts with C stdlib declarations.
 
 -- Read entire file contents
 fn fs_read(path: string) -> string {
@@ -18,22 +15,32 @@ fn fs_write(path: string, content: string) {
     file_write(path, content)
 }
 
--- Create a directory (mode 0755)
+-- Append content to file
+fn fs_append(path: string, content: string) {
+    file_append(path, content)
+}
+
+-- Check if a file exists
+fn fs_exists(path: string) -> bool {
+    return file_exists(path)
+}
+
+-- Create a directory (uses shell command)
 fn fs_mkdir(path: string) -> int {
-    return mkdir(path, 493)
+    return system("mkdir -p " + path)
 }
 
--- Remove a directory
+-- Remove a directory (uses shell command)
 fn fs_rmdir(path: string) -> int {
-    return rmdir(path)
+    return system("rmdir " + path)
 }
 
--- Remove a file
+-- Remove a file (uses shell command)
 fn fs_remove(path: string) -> int {
-    return remove(path)
+    return system("rm -f " + path)
 }
 
--- Rename/move a file
+-- Rename/move a file (uses shell command)
 fn fs_rename(old_path: string, new_path: string) -> int {
-    return rename(old_path, new_path)
+    return system("mv " + old_path + " " + new_path)
 }

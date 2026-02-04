@@ -505,11 +505,10 @@ pub const compile_error_tests = [_]TestCase{
         \\}
         \\fn main() {
         \\    let f = Foo { x: 1 }
-        \\    println(f.bar())
+        \\    println(int_to_string(f.bar()))
         \\}
         ,
-        .expected_output = "",
-        .expect_compile_error = true,
+        .expected_output = "1\n",
     },
 };
 
@@ -2143,6 +2142,24 @@ pub const generic_function_tests = [_]TestCase{
         ,
         .expected_output = "42\n",
     },
+    .{
+        .name = "implicit_generic_multi_type",
+        .source =
+            \\module test
+            \\
+            \\fn identity[T](x: T) -> T {
+            \\    return x
+            \\}
+            \\
+            \\fn main() {
+            \\    let a = identity(42)
+            \\    let b = identity("hello")
+            \\    println(int_to_string(a))
+            \\    println(b)
+            \\}
+        ,
+        .expected_output = "42\nhello\n",
+    },
 };
 
 pub const import_tests = [_]TestCase{
@@ -3280,6 +3297,19 @@ pub const closure_tests = [_]TestCase{
         ,
         .expected_output = "Hello World\n",
     },
+    .{
+        .name = "closure_block_body",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let y = 10
+            \\    let add_y = |x: int| -> int x + y
+            \\    println(int_to_string(add_y(32)))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
 };
 
 pub const region_tests = [_]TestCase{
@@ -3339,6 +3369,19 @@ pub const comptime_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "true\n",
+    },
+    .{
+        .name = "comptime_const_int",
+        .source =
+            \\module test
+            \\
+            \\const SIZE = comptime 4 * 1024
+            \\
+            \\fn main() {
+            \\    println(int_to_string(SIZE))
+            \\}
+        ,
+        .expected_output = "4096\n",
     },
 };
 
@@ -3453,6 +3496,49 @@ pub const dyn_trait_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "Dog: Rex\n",
+    },
+};
+
+pub const bare_self_tests = [_]TestCase{
+    .{
+        .name = "bare_self_impl",
+        .source =
+            \\module test
+            \\struct Point { x: int, y: int, }
+            \\impl Point {
+            \\    fn sum(self) -> int {
+            \\        return self.x + self.y
+            \\    }
+            \\}
+            \\fn main() {
+            \\    let p = Point { x: 3, y: 7 }
+            \\    println(int_to_string(p.sum()))
+            \\}
+        ,
+        .expected_output = "10\n",
+    },
+    .{
+        .name = "bare_mut_self_impl",
+        .source =
+            \\module test
+            \\struct Counter { n: int, }
+            \\impl Counter {
+            \\    fn inc(mut self) {
+            \\        self.n = self.n + 1
+            \\    }
+            \\    fn get(self) -> int {
+            \\        return self.n
+            \\    }
+            \\}
+            \\fn main() {
+            \\    let mut c = Counter { n: 0 }
+            \\    c.inc()
+            \\    c.inc()
+            \\    c.inc()
+            \\    println(int_to_string(c.get()))
+            \\}
+        ,
+        .expected_output = "3\n",
     },
 };
 
@@ -3581,6 +3667,7 @@ pub fn main() !void {
         .{ .name = "Comptime", .tests = &comptime_tests },
         .{ .name = "Effects", .tests = &effect_tests },
         .{ .name = "Dyn Trait", .tests = &dyn_trait_tests },
+        .{ .name = "Bare Self", .tests = &bare_self_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
     };
 

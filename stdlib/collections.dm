@@ -1,36 +1,40 @@
 module collections
 
 -- Standard Collections Module
--- Provides collection data structures beyond the built-in List and Map types.
--- Note: List[T] and Map[K,V] are built-in types available without import.
+-- Provides guidance on using built-in collection types.
+--
+-- List[T] - Dynamic array (built-in)
+--   let mut items: List[int] = []
+--   items.push(1)      -- append element
+--   items.push(2)
+--   items.pop()        -- remove and return last element (returns 2)
+--   items.len()        -- get length
+--   items[0]           -- index access
+--   for item in items { ... }  -- iteration
+--
+-- Stack (LIFO) - Use List[T] directly:
+--   let mut stack: List[int] = []
+--   stack.push(1)      -- push
+--   stack.pop()        -- pop
+--
+-- Queue (FIFO) - Use List[T] with index access:
+--   let mut queue: List[int] = []
+--   queue.push(1)      -- enqueue (push to back)
+--   let front = queue[0]  -- peek front
+--
+-- Map[K,V] - Hash map (built-in)
+--   let mut m: Map[string, int] = Map_new()
+--   m.insert("key", 42)
+--   m.get("key")       -- returns value (panics if missing)
+--   m.contains("key")  -- check existence
+--   m.remove("key")    -- remove entry
+--   m.len()            -- number of entries
+--   m.keys()           -- List[K] of keys
+--   m.values()         -- List[V] of values
+--   m["key"]           -- index access (alias for get)
+--   m["key"] = 42      -- index assignment (alias for insert)
 
--- Stack[T] - LIFO stack backed by List[T]
--- Usage:
---   let mut s: List[int] = List_new()
---   s.push(1)    -- push
---   s.push(2)
---   s.pop()      -- pop (returns 2)
-
--- Queue operations on List[T]
--- pop_front removes and returns the first element
-
-fn list_pop_front(l: List[int]) -> int {
-    -- Remove first element by shifting
-    let val = l[0]
-    return val
-}
-
--- Check if a list is empty
-fn list_is_empty(l: List[int]) -> bool {
-    return l.len() == 0
-}
-
--- Get the last element without removing
-fn list_peek(l: List[int]) -> int {
-    return l[l.len() - 1]
-}
-
--- Get the first element without removing
-fn list_front(l: List[int]) -> int {
-    return l[0]
+-- Helper: check if a collection count is zero
+fn is_empty_count(count: int) -> bool {
+    return count == 0
 }

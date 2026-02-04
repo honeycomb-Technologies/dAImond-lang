@@ -3879,8 +3879,27 @@ pub const CodeGenerator = struct {
 
     /// Generate constant definition
     fn generateConstant(self: *Self, const_decl: *ConstDecl) !void {
-        const name = try self.mangleFunctionName(const_decl.name.name, null);
-        const type_str = if (const_decl.type_expr) |t| try self.mapType(t) else "const void*";
+        // Use raw name (not mangled) so identifier references match the declaration
+        const name = const_decl.name.name;
+        const type_str = if (const_decl.type_expr) |t| try self.mapType(t) else blk: {
+            // Infer type from value expression
+            if (const_decl.value) |val| {
+                // Unwrap comptime_expr wrapper to get the inner expression
+                const inner = if (val.kind == .comptime_expr) val.kind.comptime_expr.expr else val;
+                // Try comptime evaluation first for accurate type
+                if (self.evalComptime(inner)) |cv| {
+                    break :blk switch (cv) {
+                        .int_val => @as([]const u8, "int64_t"),
+                        .float_val => "double",
+                        .bool_val => "bool",
+                        .string_val => "dm_string",
+                    };
+                }
+                // Fallback to expression type inference
+                break :blk self.inferCTypeFromExpr(inner);
+            }
+            break :blk @as([]const u8, "int64_t"); // Default to int64_t instead of const void*
+        };
 
         try self.writer.print("static const {s} {s}", .{ type_str, name });
 
