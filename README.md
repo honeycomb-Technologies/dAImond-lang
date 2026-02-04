@@ -31,6 +31,17 @@ zig build
 # Compile and run in one step
 ./zig-out/bin/daimond run examples/hello.dm
 
+# Format source code
+./zig-out/bin/daimond fmt myfile.dm
+
+# Run tests (discovers fn test_*() functions)
+./zig-out/bin/daimond test myfile.dm
+
+# Package management
+./zig-out/bin/daimond pkg init
+./zig-out/bin/daimond pkg add mylib 1.0.0
+./zig-out/bin/daimond pkg list
+
 # View tokens (for debugging)
 ./zig-out/bin/daimond lex examples/hello.dm
 
@@ -68,13 +79,15 @@ dAImond-lang/
 │   │   ├── types.zig          # Type system, inference, effects
 │   │   ├── checker.zig        # Type checker, symbol tables, unification
 │   │   ├── codegen.zig        # C11 code generator
-│   │   └── errors.zig         # Diagnostic reporting, colored output
+│   │   ├── errors.zig         # Diagnostic reporting, colored output
+│   │   ├── package.zig        # Package manager (TOML manifest, dependencies)
+│   │   └── lsp.zig            # Language Server Protocol implementation
 │   ├── runtime/               # C runtime library
-│   │   ├── daimond_runtime.h  # Runtime API (strings, arenas, option/result, I/O)
+│   │   ├── daimond_runtime.h  # Runtime API (strings, arenas, I/O, sockets, threads)
 │   │   ├── daimond_runtime.c  # Runtime implementation
 │   │   └── test_runtime.c     # Runtime unit tests
 │   └── tests/
-│       └── runner.zig         # Integration test harness
+│       └── runner.zig         # Integration test harness (179 tests)
 ├── stage1/                    # Stage 1 self-hosting compiler (written in dAImond)
 │   ├── main.dm                # Monolithic bootstrap file (generated)
 │   ├── main_split.dm          # Entry point with imports (for self-compilation)
@@ -88,22 +101,22 @@ dAImond-lang/
 │   ├── runtime.dm             # C runtime emission, output assembly
 │   ├── imports.dm             # Multi-file import resolver
 │   └── gen_bootstrap.sh       # Concatenates modules into main.dm
+├── stdlib/                    # Standard library modules
+│   ├── io.dm                  # I/O (print, file operations, read_line)
+│   ├── math.dm                # Math (sin, cos, sqrt, pow, PI, E)
+│   ├── collections.dm         # Set, Queue, Stack wrappers
+│   ├── string.dm              # String utilities (split, join, repeat, etc.)
+│   ├── os.dm                  # OS functions (env, cwd, exit, args)
+│   ├── fs.dm                  # Filesystem (mkdir, readdir, rename, etc.)
+│   ├── net.dm                 # Networking (TCP sockets)
+│   ├── thread.dm              # Concurrency (spawn, join, mutex)
+│   └── test.dm                # Testing framework docs
 ├── examples/                  # Example programs
 │   ├── hello.dm               # Hello World
 │   ├── arithmetic.dm          # Basic math operations
 │   ├── fibonacci.dm           # Recursive functions
 │   └── calculator.dm          # Scientific calculator
-└── tests/                     # Integration test programs
-    ├── arithmetic.dm          # Arithmetic validation
-    ├── structs.dm             # Struct/enum/pattern matching
-    ├── generics.dm            # Generics and traits
-    ├── test_nested_for.dm     # Nested for-in loops
-    ├── test_for_types.dm      # For-in with typed lists
-    ├── test_compound_assign.dm # Compound assignment operators
-    ├── test_pipeline.dm       # Pipeline operator |>
-    ├── test_try_operator.dm   # Error propagation ?
-    ├── test_box.dm            # Box[T] heap allocation
-    └── test_builtins.dm       # All builtin functions
+└── tests/                     # Integration test programs (.dm files)
 ```
 
 ## Language Overview
@@ -113,10 +126,8 @@ dAImond-lang/
 ```dm
 module hello
 
-import std.io { print }
-
-fn main() with [Console] {
-    print("Hello, dAImond!")
+fn main() {
+    println("Hello, dAImond!")
 }
 ```
 
@@ -146,12 +157,18 @@ fn add(a: int, b: int) -> int {
 fn double(x: int) -> int = x * 2
 
 -- Generic function
-fn first[T](list: List[T]) -> Option[T] {
-    if list.len() == 0 {
-        return None
-    }
-    return Some(list[0])
+fn max[T](a: T, b: T) -> T {
+    if a > b { return a }
+    return b
 }
+```
+
+### String Interpolation
+
+```dm
+let name = "world"
+let age = 42
+println(f"Hello {name}, you are {age} years old")
 ```
 
 ### Structs and Enums
@@ -162,15 +179,40 @@ struct Point {
     y: float,
 }
 
-enum Option[T] {
-    Some(T),
-    None,
+impl Point {
+    fn magnitude(self) -> float {
+        return sqrt(self.x * self.x + self.y * self.y)
+    }
 }
 
-enum Result[T, E] {
-    Ok(T),
-    Err(E),
+enum Shape {
+    Circle(float),
+    Rect(float, float),
+    Point,
 }
+```
+
+### Traits
+
+```dm
+trait Display {
+    fn show(self) -> string
+}
+
+impl Display for Point {
+    fn show(self) -> string {
+        return f"({self.x}, {self.y})"
+    }
+}
+
+-- Static dispatch with trait bounds
+fn print_any[T: Display](x: T) {
+    println(x.show())
+}
+
+-- Dynamic dispatch
+let d: dyn Display = my_point
+println(d.show())
 ```
 
 ### Pattern Matching
@@ -180,20 +222,44 @@ match value {
     Some(x) => use(x),
     None => handle_missing(),
 }
+
+match shape {
+    Shape.Circle(r) => println(f"Circle with radius {r}"),
+    Shape.Rect(w, h) => println(f"Rectangle {w}x{h}"),
+    Shape.Point => println("Just a point"),
+}
 ```
 
 ### Error Handling
 
 ```dm
-fn parse_int(s: str) -> Result[int, ParseError] {
-    ...
+fn parse_config(path: string) -> Result[Config, string] {
+    let content = file_read(path)
+    let val = parse_int(content)?  -- propagate error with ?
+    return Ok(Config { value: val })
+}
+```
+
+### Closures
+
+```dm
+let x = 10
+let add_x = |y: int| x + y   -- captures x from outer scope
+println(int_to_string(add_x(5)))  -- prints 15
+```
+
+### Operator Overloading
+
+```dm
+struct Vec2 { x: int, y: int }
+
+impl Vec2 {
+    fn add(self, other: Vec2) -> Vec2 {
+        return Vec2 { x: self.x + other.x, y: self.y + other.y }
+    }
 }
 
--- Propagation with ?
-fn process(input: str) -> Result[Output, Error] {
-    let num = parse_int(input)?
-    return Ok(compute(num))
-}
+let v = v1 + v2  -- calls Vec2.add
 ```
 
 ### Regions (Memory Management)
@@ -208,64 +274,130 @@ region scratch {
 ### Effects
 
 ```dm
-fn read_file(path: str) -> str with [IO] {
-    ...
+fn read_file(path: string) -> string with [IO, FileSystem] {
+    return file_read(path)
 }
 
-fn main() with [IO, Console] {
-    let data = read_file("input.txt")
-    print("Done!")
+fn pure_add(a: int, b: int) -> int {
+    -- no effects needed for pure computation
+    return a + b
 }
+```
+
+### Imports
+
+```dm
+module myapp
+
+import helpers          -- imports helpers.dm from same directory
+import std.math         -- imports stdlib/math.dm
+```
+
+### FFI (Foreign Function Interface)
+
+```dm
+extern fn sqrt(x: float) -> float
+extern fn puts(s: string) -> int
+
+fn main() {
+    let val = sqrt(2.0)
+    puts(f"sqrt(2) = {val}")
+}
+```
+
+### Testing
+
+```dm
+module my_tests
+
+fn test_addition() {
+    assert_eq(2 + 3, 5)
+}
+
+fn test_strings() {
+    let s = "hello" + " world"
+    assert_eq(s, "hello world")
+}
+
+fn main() {
+    println("Run with: daimond test my_tests.dm")
+}
+```
+
+```bash
+$ daimond test my_tests.dm
+Found 2 test(s) in my_tests.dm
+
+  test test_addition ... PASS
+  test test_strings ... PASS
+
+2 passed, 0 failed
 ```
 
 ## Bootstrap Path
 
 ```
-Stage 0 (Zig) ✅ → Stage 1 (dAImond) ✅ → Stage 2 (Self-compiled) ✅ → Stage 3 (LLVM)
+Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 ```
 
-1. **Stage 0** (Complete): Hand-written compiler in Zig, compiles dAImond → C
+1. **Stage 0** (Complete): Hand-written compiler in Zig, compiles dAImond -> C
 2. **Stage 1** (Complete): Compiler rewritten in dAImond, compiled by Stage 0
-3. **Stage 2** (Complete): Stage 1 compiles itself — fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
+3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3**: LLVM backend for optimized native code
 
 ## Current Status
 
-### Stage 0 Compiler — Complete
-- [x] Lexer with comprehensive token support
-- [x] Recursive descent + Pratt parser
-- [x] AST definitions for all language constructs
-- [x] Type system with Hindley-Milner inference and unification
-- [x] Type checker with symbol tables and scope management
-- [x] C11 code generator
+### Stage 0 Compiler -- Complete
+- [x] Lexer, parser, AST, type system, type checker, C11 code generator
 - [x] Error diagnostics with colored output
-- [x] C runtime library (strings, arenas, option/result, I/O)
-- [x] CLI with multiple commands (compile, run, lex, parse, check)
-- [x] Unit tests for all compiler modules
-- [x] Integration test harness
+- [x] C runtime library (strings, arenas, option/result, I/O, networking, threading)
+- [x] CLI: compile, run, lex, parse, check, fmt, test, pkg
+- [x] 179 integration tests passing, 0 failing, 0 skipped
 
-### Stage 1 Self-Hosting Compiler — Complete
+### Language Features -- Complete
+- [x] Map[K,V] with full method support (insert, get, contains, remove, len, keys, values, indexing)
+- [x] Multi-file imports with stdlib path resolution and diamond import deduplication
+- [x] String interpolation (`f"Hello {name}"`)
+- [x] FFI / extern function declarations
+- [x] All numeric types (i8, i16, i32, u8, u16, u32, i64, u64, f32, f64) with `as` casts
+- [x] Trait static dispatch with trait bounds on generic functions
+- [x] Dynamic trait dispatch (`dyn Trait` with vtable-based fat pointers)
+- [x] Closures with variable capture
+- [x] Operator overloading via impl methods (+, -, *, /, ==, !=, <, >, <=, >=)
+- [x] Enum payloads with construction and pattern matching
+- [x] Region memory allocation redirection (arena allocator)
+- [x] Comptime evaluation (arithmetic and boolean expressions)
+- [x] Effect system enforcement (opt-in via `with [IO, Console, FileSystem]`)
+- [x] Concurrency primitives (thread spawn/join, mutex)
+
+### Stage 1 Self-Hosting Compiler -- Complete
 - [x] Compiler rewritten in dAImond (~10 modules)
 - [x] Full feature parity with Stage 0 subset
 - [x] Verified fixed-point bootstrap (Stage 1 compiles itself with identical output)
 - [x] Multi-file import system with transitive dependency resolution
 - [x] Enum payloads, Option[T], Result[T, E], match expressions
-- [x] Lambda expressions (lifted to static functions)
-- [x] Generic function monomorphization (explicit and implicit)
-- [x] Pipeline operator `|>` and error propagation `?`
-- [x] Box[T] heap allocation support
-- [x] Compound assignment operators (`+=`, `-=`, `*=`, `/=`) and modulo `%`
-- [x] All builtins (I/O, string ops, file I/O, CLI args, system)
-- [x] CLI flag parity (`-o`, `-c`, `--emit-c`, `-v`, `--version`, `-h`)
+- [x] Lambda expressions, generic monomorphization
+- [x] Pipeline operator `|>`, error propagation `?`, Box[T]
+- [x] Compound assignment (`+=`, `-=`, `*=`, `/=`), modulo `%`
+
+### Standard Library -- Complete
+- [x] `std.io` -- I/O functions (print, file read/write/append, read_line)
+- [x] `std.math` -- Math functions (sin, cos, sqrt, pow, log, PI, E)
+- [x] `std.collections` -- Set, Queue, Stack wrappers
+- [x] `std.string` -- String utilities (split, join, repeat, pad, reverse)
+- [x] `std.os` -- OS functions (env, cwd, exit, args)
+- [x] `std.fs` -- Filesystem (mkdir, readdir, rename, remove, is_dir)
+- [x] `std.net` -- TCP networking (listen, accept, connect, read, write)
+- [x] `std.thread` -- Concurrency (spawn, join, mutex)
+
+### Tooling -- Complete
+- [x] `daimond fmt` -- Code formatter (indent normalization)
+- [x] `daimond test` -- Testing framework (test_* discovery, panic catching, assert/assert_eq)
+- [x] `daimond pkg` -- Package manager (TOML manifest, version/path/git dependencies)
+- [x] `daimond-lsp` -- Language Server Protocol (diagnostics, completion, hover)
 
 ### Upcoming
-- [ ] Code formatter (`fmt` command)
-- [ ] Standard library (`stdlib/`)
-- [ ] Traits and effects (deferred to Stage 2+)
-- [ ] Region-based memory management (deferred to Stage 2+)
 - [ ] LLVM backend (Stage 3)
-- [ ] Package management
-- [ ] Multi-file imports for user programs in Stage 0
 
 ## Design Principles
 
@@ -277,7 +409,7 @@ Stage 0 (Zig) ✅ → Stage 1 (dAImond) ✅ → Stage 2 (Self-compiled) ✅ → 
 
 ## Contributing
 
-This project is in early development. See `CLAUDE.md` for detailed development guidance.
+See `CLAUDE.md` for detailed development guidance.
 
 ## License
 
