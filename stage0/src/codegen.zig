@@ -1249,6 +1249,50 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
+        // File append
+        try self.writer.writeLine("static inline void dm_append_file(dm_string path, dm_string content) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cpath = (char*)malloc(path.len + 1);");
+        try self.writer.writeLine("memcpy(cpath, path.data, path.len);");
+        try self.writer.writeLine("cpath[path.len] = '\\0';");
+        try self.writer.writeLine("FILE* f = fopen(cpath, \"ab\");");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("if (!f) dm_panic(\"file_append: cannot open file\");");
+        try self.writer.writeLine("fwrite(content.data, 1, content.len, f);");
+        try self.writer.writeLine("fclose(f);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // File exists
+        try self.writer.writeLine("static inline bool dm_file_exists(dm_string path) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cpath = (char*)malloc(path.len + 1);");
+        try self.writer.writeLine("memcpy(cpath, path.data, path.len);");
+        try self.writer.writeLine("cpath[path.len] = '\\0';");
+        try self.writer.writeLine("FILE* f = fopen(cpath, \"r\");");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("if (f) { fclose(f); return true; }");
+        try self.writer.writeLine("return false;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Read line from stdin
+        try self.writer.writeLine("static inline dm_string dm_read_line(void) {");
+        self.writer.indent();
+        try self.writer.writeLine("char buf[4096];");
+        try self.writer.writeLine("if (fgets(buf, sizeof(buf), stdin) == NULL) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("size_t len = strlen(buf);");
+        try self.writer.writeLine("if (len > 0 && buf[len-1] == '\\n') len--;");
+        try self.writer.writeLine("char* result = (char*)malloc(len + 1);");
+        try self.writer.writeLine("memcpy(result, buf, len);");
+        try self.writer.writeLine("result[len] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = result, .len = len, .capacity = len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
         // String trim (remove leading and trailing whitespace)
         try self.writer.writeLine("static inline dm_string dm_string_trim(dm_string s) {");
         self.writer.indent();
