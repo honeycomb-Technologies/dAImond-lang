@@ -678,9 +678,28 @@ pub const CodeGenerator = struct {
                     const ret_type = if (f.return_type) |rt| try self.mapType(rt) else "void";
                     self.trackFunctionReturnType(f.name.name, ret_type);
                     if (f.is_extern) {
-                        // Extern functions use raw C name
-                        try self.known_functions.put(f.name.name, f.name.name);
-                        try self.extern_functions.put(f.name.name, {});
+                        // Check if extern fn has string types — if so, a wrapper
+                        // will be generated and call sites should use dm_{name}
+                        var extern_has_string = std.mem.eql(u8, ret_type, "dm_string");
+                        if (!extern_has_string) {
+                            for (f.params) |param| {
+                                const pt = try self.mapType(param.type_expr);
+                                if (std.mem.eql(u8, pt, "dm_string")) {
+                                    extern_has_string = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (extern_has_string) {
+                            // String-typed extern: wrapper dm_{name} will be emitted,
+                            // call sites use normal mangling path (not extern_functions)
+                            const mangled = try self.mangleFunctionName(f.name.name, null);
+                            try self.known_functions.put(f.name.name, mangled);
+                        } else {
+                            // Non-string extern: use raw C name directly
+                            try self.known_functions.put(f.name.name, f.name.name);
+                            try self.extern_functions.put(f.name.name, {});
+                        }
                     } else {
                         // Track as known function for higher-order function references
                         const mangled = try self.mangleFunctionName(f.name.name, null);
@@ -3575,17 +3594,56 @@ pub const CodeGenerator = struct {
     }
 
     /// Emit a C extern function declaration (no body, raw C name)
+    /// For extern functions with string types, generates a wrapper that converts
+    /// between dm_string and const char* to match the real C function signature.
     fn emitExternDeclaration(self: *Self, func: *FunctionDecl) !void {
         const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
         const func_name = func.name.name;
 
-        // Track the function so it's recognized at call sites
-        self.trackFunctionReturnType(func_name, ret_type);
-        try self.known_functions.put(func_name, func_name);
-        try self.extern_functions.put(func_name, {});
+        // Check if any param or return uses dm_string
+        var has_string = std.mem.eql(u8, ret_type, "dm_string");
+        for (func.params) |param| {
+            const pt = try self.mapType(param.type_expr);
+            if (std.mem.eql(u8, pt, "dm_string")) {
+                has_string = true;
+                break;
+            }
+        }
 
-        // Emit extern declaration without dm_ prefix
-        try self.writer.print("extern {s} {s}(", .{ ret_type, func_name });
+        if (!has_string) {
+            // No string types — existing behavior unchanged
+            self.trackFunctionReturnType(func_name, ret_type);
+            try self.known_functions.put(func_name, func_name);
+            try self.extern_functions.put(func_name, {});
+
+            // Emit extern declaration without dm_ prefix
+            try self.writer.print("extern {s} {s}(", .{ ret_type, func_name });
+
+            var first = true;
+            for (func.params) |param| {
+                if (!first) try self.writer.write(", ");
+                first = false;
+                const param_type = try self.mapType(param.type_expr);
+                try self.writer.print("{s} {s}", .{ param_type, param.name.name });
+            }
+
+            if (func.params.len == 0) {
+                try self.writer.write("void");
+            }
+
+            try self.writer.writeLine(");");
+            return;
+        }
+
+        // String types detected — emit wrapper function that converts dm_string <-> const char*.
+        // We do NOT emit an extern declaration for the C function because it may already
+        // be declared in system headers (e.g., getenv in <stdlib.h>) and re-declaring it
+        // with different types (const char* vs char*) would cause a C compilation error.
+        // The function is expected to be available at link time.
+        const wrapper_name = try self.mangleFunctionName(func_name, null);
+
+        // Emit static wrapper function dm_{name} that converts types
+        try self.writer.print("static {s} {s}(", .{ ret_type, wrapper_name });
 
         var first = true;
         for (func.params) |param| {
@@ -3599,7 +3657,49 @@ pub const CodeGenerator = struct {
             try self.writer.write("void");
         }
 
+        try self.writer.writeLine(") {");
+
+        // Call the real C function with type conversions
+        const is_void_ret = std.mem.eql(u8, ret_type, "void");
+        const is_string_ret = std.mem.eql(u8, ret_type, "dm_string");
+
+        if (is_void_ret) {
+            try self.writer.print("    {s}(", .{func_name});
+        } else if (is_string_ret) {
+            try self.writer.print("    const char* __ret = {s}(", .{func_name});
+        } else {
+            try self.writer.print("    {s} __ret = {s}(", .{ ret_type, func_name });
+        }
+
+        first = true;
+        for (func.params) |param| {
+            if (!first) try self.writer.write(", ");
+            first = false;
+            const param_type = try self.mapType(param.type_expr);
+            if (std.mem.eql(u8, param_type, "dm_string")) {
+                try self.writer.print("{s}.data", .{param.name.name});
+            } else {
+                try self.writer.write(param.name.name);
+            }
+        }
+
         try self.writer.writeLine(");");
+
+        // Return with conversion
+        if (is_void_ret) {
+            // No return needed
+        } else if (is_string_ret) {
+            try self.writer.writeLine("    return __ret ? dm_string_from_cstr(__ret) : dm_string_from_cstr(\"\");");
+        } else {
+            try self.writer.writeLine("    return __ret;");
+        }
+
+        try self.writer.writeLine("}");
+
+        // 3. Register wrapper — NOT as extern, call sites use dm_{name} via normal mangling
+        self.trackFunctionReturnType(func_name, ret_type);
+        self.trackFunctionReturnType(wrapper_name, ret_type);
+        // Don't add to extern_functions — call sites will mangle to dm_{name}
     }
 
     /// Emit a full function definition with optional name override (for monomorphized functions)
@@ -3828,16 +3928,25 @@ pub const CodeGenerator = struct {
         }
     }
 
-    /// Emit implementations for all queued monomorphized functions
+    /// Emit implementations for all queued monomorphized functions.
+    /// When implementations discover new monomorphizations (e.g., a generic function
+    /// calling another generic), their forward declarations are collected and spliced
+    /// in before the implementation section to ensure proper C declaration ordering.
     fn emitMonomorphizedImplementations(self: *Self) !void {
-        // Emit implementations for all queued items
-        var i: usize = 0;
-        while (i < self.mono_emit_queue.items.len) : (i += 1) {
-            const item = self.mono_emit_queue.items[i];
+        // Save position before implementations so we can insert late-discovered prototypes
+        const pre_impl_len = self.writer.getOutput().len;
+
+        // Collect late-discovered prototypes in a separate buffer
+        var late_prototype_writer = CWriter.init(self.allocator);
+        defer late_prototype_writer.deinit();
+
+        // Emit implementations for already-prototyped items from mono_emit_queue
+        for (self.mono_emit_queue.items) |item| {
             try self.emitMonomorphizedFunction(item.name, item.req);
         }
 
-        // Handle any new monomorphizations discovered during implementation emission
+        // Handle any new monomorphizations discovered during implementation emission.
+        // Write their prototypes to late_prototype_writer and implementations to main writer.
         while (self.pending_monomorphizations.count() > 0) {
             var new_items = std.ArrayList(MonoQueueItem).init(self.allocator);
             defer new_items.deinit();
@@ -3848,10 +3957,45 @@ pub const CodeGenerator = struct {
             }
             self.pending_monomorphizations.clearRetainingCapacity();
 
+            // Emit forward declarations to late_prototype_writer (NOT the main writer)
             for (new_items.items) |item| {
                 try self.generated_monomorphizations.put(item.name, {});
+
+                var subs = std.StringHashMap([]const u8).init(self.allocator);
+                for (item.req.generic_param_names, 0..) |param_name, j| {
+                    if (j < item.req.concrete_types.len) {
+                        try subs.put(param_name, item.req.concrete_types[j]);
+                    }
+                }
+                const saved_subs = self.active_type_substitutions;
+                self.active_type_substitutions = subs;
+
+                // Temporarily swap writer to capture prototype in late_prototype_writer
+                const saved_writer = self.writer;
+                self.writer = late_prototype_writer;
+                try self.emitFunctionPrototype(item.req.func, item.req.type_prefix, item.name);
+                late_prototype_writer = self.writer;
+                self.writer = saved_writer;
+
+                const ret_type = if (item.req.func.return_type) |rt| try self.mapType(rt) else "void";
+                self.trackFunctionReturnType(item.name, ret_type);
+                self.active_type_substitutions = saved_subs;
+                subs.deinit();
+            }
+
+            // Emit implementations to main writer
+            for (new_items.items) |item| {
                 try self.emitMonomorphizedFunction(item.name, item.req);
             }
+        }
+
+        // Splice late-discovered prototypes before the implementations
+        if (late_prototype_writer.getOutput().len > 0) {
+            const impl_code = try self.allocator.dupe(u8, self.writer.getOutput()[pre_impl_len..]);
+            defer self.allocator.free(impl_code);
+            self.writer.truncate(pre_impl_len);
+            try self.writer.write(late_prototype_writer.getOutput());
+            try self.writer.write(impl_code);
         }
     }
 

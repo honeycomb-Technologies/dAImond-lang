@@ -2160,6 +2160,26 @@ pub const generic_function_tests = [_]TestCase{
         ,
         .expected_output = "42\nhello\n",
     },
+    .{
+        .name = "nested_generic_monomorphization",
+        .source =
+            \\module test
+            \\
+            \\fn double[T](x: T) -> T {
+            \\    return x + x
+            \\}
+            \\
+            \\fn apply_double[T](x: T) -> T {
+            \\    return double(x)
+            \\}
+            \\
+            \\fn main() {
+            \\    println(int_to_string(apply_double(5)))
+            \\    println(apply_double("ab"))
+            \\}
+        ,
+        .expected_output = "10\nabab\n",
+    },
 };
 
 pub const import_tests = [_]TestCase{
@@ -2991,6 +3011,24 @@ pub const extern_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "extern declared ok\n",
+    },
+    .{
+        .name = "extern_string_wrapper",
+        .source =
+            \\module test
+            \\
+            \\extern fn getenv(name: string) -> string
+            \\
+            \\fn main() {
+            \\    let path = getenv("PATH")
+            \\    if len(path) > 0 {
+            \\        println("has path")
+            \\    } else {
+            \\        println("no path")
+            \\    }
+            \\}
+        ,
+        .expected_output = "has path\n",
     },
 };
 
