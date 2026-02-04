@@ -581,6 +581,127 @@ void dm_runtime_init(void);
  */
 void dm_runtime_cleanup(void);
 
+/* ============================================================================
+ * Threading Primitives (POSIX pthreads)
+ * ============================================================================ */
+
+#ifdef _WIN32
+/* TODO: Windows threading support */
+#else
+#include <pthread.h>
+
+/**
+ * Thread handle type.
+ */
+typedef struct dm_thread {
+    pthread_t handle;
+} dm_thread;
+
+/**
+ * Mutex type.
+ */
+typedef struct dm_mutex {
+    pthread_mutex_t handle;
+} dm_mutex;
+
+/**
+ * Spawn a new thread running a function.
+ * The function takes no arguments and returns void.
+ */
+dm_thread dm_thread_spawn(void (*func)(void));
+
+/**
+ * Wait for a thread to finish.
+ */
+void dm_thread_join(dm_thread thread);
+
+/**
+ * Create a new mutex.
+ */
+dm_mutex dm_mutex_new(void);
+
+/**
+ * Lock a mutex.
+ */
+void dm_mutex_lock(dm_mutex* mutex);
+
+/**
+ * Unlock a mutex.
+ */
+void dm_mutex_unlock(dm_mutex* mutex);
+
+/**
+ * Destroy a mutex.
+ */
+void dm_mutex_destroy(dm_mutex* mutex);
+
+#endif /* _WIN32 */
+
+/* ============================================================================
+ * Networking Primitives (BSD Sockets)
+ * ============================================================================ */
+
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <netdb.h>
+
+/**
+ * TCP listener - listens for incoming connections.
+ */
+typedef struct dm_tcp_listener {
+    int fd;
+} dm_tcp_listener;
+
+/**
+ * TCP stream - a connected socket.
+ */
+typedef struct dm_tcp_stream {
+    int fd;
+} dm_tcp_stream;
+
+/**
+ * Bind a TCP listener to an address (e.g., "0.0.0.0:8080").
+ */
+dm_tcp_listener dm_tcp_listen(dm_string addr);
+
+/**
+ * Accept a connection on a listener.
+ * Blocks until a client connects.
+ */
+dm_tcp_stream dm_tcp_accept(dm_tcp_listener* listener);
+
+/**
+ * Connect to a remote TCP address (e.g., "127.0.0.1:8080").
+ */
+dm_tcp_stream dm_tcp_connect(dm_string addr);
+
+/**
+ * Read up to max_bytes from a TCP stream.
+ * Returns the data read as a string.
+ */
+dm_string dm_tcp_read(dm_tcp_stream* stream, int64_t max_bytes);
+
+/**
+ * Write data to a TCP stream.
+ * Returns the number of bytes written.
+ */
+int64_t dm_tcp_write(dm_tcp_stream* stream, dm_string data);
+
+/**
+ * Close a TCP stream.
+ */
+void dm_tcp_close(dm_tcp_stream* stream);
+
+/**
+ * Close a TCP listener.
+ */
+void dm_tcp_listener_close(dm_tcp_listener* listener);
+
+#endif /* _WIN32 */
+
 #ifdef __cplusplus
 }
 #endif

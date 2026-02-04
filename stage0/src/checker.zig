@@ -933,6 +933,7 @@ pub const TypeChecker = struct {
             .range => |rng| self.inferRange(rng),
             .cast => |cast| self.inferCast(cast),
             .type_check => |tc| self.inferTypeCheck(tc),
+            .string_interpolation => |si| self.inferStringInterpolation(si),
             .grouped => |inner| self.inferExpr(inner),
             .comptime_expr => |ce| self.inferExpr(ce.expr),
         };
@@ -1192,12 +1193,25 @@ pub const TypeChecker = struct {
             const name = fc.function.kind.identifier.name;
             // Builtins returning void/unit
             if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
-                std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "panic") or
+                std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "panic") or
                 std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln") or
-                std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "file_write"))
+                std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "file_write") or
+                std.mem.eql(u8, name, "file_append"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
+                }
+                // Effect tracking for builtins
+                if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
+                    std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln"))
+                {
+                    self.current_effects.addBuiltin(.io);
+                    self.current_effects.addBuiltin(.console);
+                } else if (std.mem.eql(u8, name, "panic") or std.mem.eql(u8, name, "exit")) {
+                    self.current_effects.addBuiltin(.io);
+                    self.current_effects.addBuiltin(.diverge);
+                } else if (std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_append")) {
+                    self.current_effects.addBuiltin(.file_system);
                 }
                 return try self.type_ctx.intern(.unit);
             }
@@ -1209,6 +1223,12 @@ pub const TypeChecker = struct {
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
+                }
+                // Effect tracking
+                if (std.mem.eql(u8, name, "system")) {
+                    self.current_effects.addBuiltin(.io);
+                } else if (std.mem.eql(u8, name, "args_len")) {
+                    self.current_effects.addBuiltin(.io);
                 }
                 return try self.type_ctx.intern(.{ .int = .i64 });
             }
@@ -1230,10 +1250,19 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, name, "string_to_upper") or std.mem.eql(u8, name, "string_to_lower") or
                 std.mem.eql(u8, name, "path_dirname") or std.mem.eql(u8, name, "path_basename") or
                 std.mem.eql(u8, name, "path_extension") or std.mem.eql(u8, name, "path_stem") or
-                std.mem.eql(u8, name, "path_join"))
+                std.mem.eql(u8, name, "path_join") or std.mem.eql(u8, name, "read_line"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
+                }
+                // Effect tracking
+                if (std.mem.eql(u8, name, "file_read")) {
+                    self.current_effects.addBuiltin(.file_system);
+                } else if (std.mem.eql(u8, name, "read_line")) {
+                    self.current_effects.addBuiltin(.io);
+                    self.current_effects.addBuiltin(.console);
+                } else if (std.mem.eql(u8, name, "args_get")) {
+                    self.current_effects.addBuiltin(.io);
                 }
                 return try self.type_ctx.intern(.str);
             }
@@ -1249,10 +1278,14 @@ pub const TypeChecker = struct {
             if (std.mem.eql(u8, name, "is_alpha") or std.mem.eql(u8, name, "is_digit") or
                 std.mem.eql(u8, name, "is_alnum") or std.mem.eql(u8, name, "is_whitespace") or
                 std.mem.eql(u8, name, "string_contains") or std.mem.eql(u8, name, "starts_with") or
-                std.mem.eql(u8, name, "ends_with"))
+                std.mem.eql(u8, name, "ends_with") or std.mem.eql(u8, name, "file_exists"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
+                }
+                // Effect tracking
+                if (std.mem.eql(u8, name, "file_exists")) {
+                    self.current_effects.addBuiltin(.file_system);
                 }
                 return try self.type_ctx.intern(.bool);
             }
@@ -1657,6 +1690,19 @@ pub const TypeChecker = struct {
         return try self.type_ctx.intern(.bool);
     }
 
+    fn inferStringInterpolation(self: *Self, si: *const ast.StringInterpolation) anyerror!TypeId {
+        // Type-check all expression parts; the result is always string
+        for (si.parts) |part| {
+            switch (part) {
+                .expr => |expr| {
+                    _ = try self.inferExpr(expr);
+                },
+                .literal => {},
+            }
+        }
+        return try self.type_ctx.intern(.str);
+    }
+
     // ========================================================================
     // STATEMENT CHECKING
     // ========================================================================
@@ -1680,22 +1726,71 @@ pub const TypeChecker = struct {
     }
 
     fn checkLetBinding(self: *Self, lb: *const ast.LetBinding) !void {
-        const value_type = if (lb.value) |val|
-            try self.inferExpr(val)
-        else
-            try self.freshTypeVar();
-
         const declared_type = if (lb.type_annotation) |ta|
             try self.resolveTypeExpr(ta)
         else
-            value_type;
+            null;
 
-        if (lb.value != null and lb.type_annotation != null) {
-            try self.unify(value_type, declared_type, lb.span);
+        // If there's a type annotation and the value is an unsuffixed numeric literal,
+        // use the declared type directly (allows `let x: i32 = 42`)
+        const value_type = if (lb.value) |val| blk: {
+            if (declared_type) |dt| {
+                if (self.isUnsuffixedNumericLiteral(val, dt)) {
+                    break :blk dt;
+                }
+            }
+            break :blk try self.inferExpr(val);
+        } else try self.freshTypeVar();
+
+        const final_type = declared_type orelse value_type;
+
+        if (lb.value != null and declared_type != null) {
+            // Skip unification for dyn Trait assignments — any concrete type
+            // that implements the trait is valid (checked at codegen time)
+            const is_dyn = if (lb.type_annotation) |ta| ta.kind == .trait_object else false;
+            if (!is_dyn) {
+                try self.unify(value_type, final_type, lb.span);
+            }
         }
 
         // Bind pattern
-        try self.bindPattern(lb.pattern, declared_type, lb.is_mut);
+        try self.bindPattern(lb.pattern, final_type, lb.is_mut);
+    }
+
+    /// Check if an expression is an unsuffixed integer or float literal that
+    /// can adopt the given target type.
+    fn isUnsuffixedNumericLiteral(self: *Self, expr: *const ast.Expr, target_type: TypeId) bool {
+        switch (expr.kind) {
+            .literal => |lit| {
+                switch (lit.kind) {
+                    .int => |int_lit| {
+                        if (int_lit.suffix != null) return false;
+                        // Target must be an integer type
+                        if (self.type_ctx.get(target_type)) |t| {
+                            return std.meta.activeTag(t) == .int;
+                        }
+                        return false;
+                    },
+                    .float => |float_lit| {
+                        if (float_lit.suffix != null) return false;
+                        // Target must be a float type
+                        if (self.type_ctx.get(target_type)) |t| {
+                            return std.meta.activeTag(t) == .float;
+                        }
+                        return false;
+                    },
+                    else => return false,
+                }
+            },
+            .unary => |un| {
+                // Handle negative literals: -42
+                if (un.op == .neg) {
+                    return self.isUnsuffixedNumericLiteral(un.operand, target_type);
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     fn checkReturn(self: *Self, rs: *const ast.ReturnStmt) !void {
@@ -2254,6 +2349,11 @@ pub const TypeChecker = struct {
 
         // Check body
         if (func.body) |body| {
+            // Save and reset effect tracking for this function
+            const saved_effects = self.current_effects;
+            self.current_effects = EffectSet.pure;
+            defer self.current_effects = saved_effects;
+
             switch (body) {
                 .block => |blk| {
                     const body_type = try self.inferBlock(blk);
@@ -2268,6 +2368,18 @@ pub const TypeChecker = struct {
                     const body_type = try self.inferExpr(expr);
                     try self.unify(body_type, return_type, func.span);
                 },
+            }
+
+            // Effect enforcement: if the function declares effects (with [...]),
+            // verify the observed effects don't exceed the declared set.
+            if (func.effects) |_| {
+                if (!self.current_effects.isSubsetOf(effects)) {
+                    try self.reportError(
+                        .unhandled_effect,
+                        "function uses effects not declared in its 'with' clause",
+                        func.span,
+                    );
+                }
             }
 
             // Check ensures contracts
@@ -2632,6 +2744,13 @@ pub const TypeChecker = struct {
                 else
                     try self.type_ctx.intern(.str);
                 return try self.type_ctx.makeResult(ok, err);
+            },
+            .trait_object => |to| {
+                // Resolve the trait type, then create a trait_object type
+                const trait_type = try self.resolveTypeExpr(to.trait_type);
+                const trait_ids = try self.allocator.alloc(TypeId, 1);
+                trait_ids[0] = trait_type;
+                return try self.type_ctx.intern(.{ .trait_object = trait_ids });
             },
             .infer => try self.freshTypeVar(),
             .never => try self.type_ctx.intern(.never),

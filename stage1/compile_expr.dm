@@ -15,6 +15,34 @@ fn compile_expr(c: Compiler) -> ExprOut {
     return compile_pipe_expr(c)
 }
 
+-- Find the position of the outermost function call's opening paren.
+-- Returns -1 if the expression is not a function call.
+-- Skips past nested parens in the function name position (e.g. casts).
+fn find_call_paren(code: string) -> int {
+    let code_len = len(code)
+    -- Must end with ')' to be a function call
+    if code_len == 0 { return -1 }
+    if char_at(code, code_len - 1) != ")" { return -1 }
+    -- Walk backwards from the closing ')' to find the matching '('
+    let mut depth = 0
+    let mut i = code_len - 1
+    while i >= 0 {
+        let ch = char_at(code, i)
+        if ch == ")" {
+            depth = depth + 1
+        } else if ch == "(" {
+            depth = depth - 1
+            if depth == 0 {
+                -- This is the matching open paren
+                if i > 0 { return i }
+                return -1
+            }
+        }
+        i = i - 1
+    }
+    return -1
+}
+
 fn compile_pipe_expr(c: Compiler) -> ExprOut {
     let mut result = compile_or_expr(c)
     while c_peek(result.c) == TK_PIPEGT() {
@@ -22,9 +50,8 @@ fn compile_pipe_expr(c: Compiler) -> ExprOut {
         -- Parse the RHS: could be a bare identifier or a function call
         let rhs = compile_or_expr(result.c)
         result.c = rhs.c
-        -- If the RHS looks like a function call f(args...), insert lhs as first arg
-        -- RHS code will be like "dm_func(arg1, arg2)" — insert lhs after first '('
-        let paren_pos = string_find(rhs.code, "(")
+        -- If the RHS is a function call f(args...), insert lhs as first arg
+        let paren_pos = find_call_paren(rhs.code)
         if paren_pos >= 0 {
             let fn_part = substr(rhs.code, 0, paren_pos + 1)
             let args_part = substr(rhs.code, paren_pos + 1, len(rhs.code) - paren_pos - 1)
@@ -309,11 +336,13 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 result.c.output = result.c.output + ind + expr_type + " " + tmp + " = " + result.code + ";\n"
                 result.c.output = result.c.output + ind + "if (" + tmp + ".tag == " + expr_type + "_tag_Err) { return " + tmp + "; }\n"
                 result.code = tmp + ".data.Ok._0"
+                result.c = track_var_type(result.c, tmp, expr_type)
             } else if starts_with(expr_type, "dm_option_") {
                 -- Option[T]: check for None, early-return it
                 result.c.output = result.c.output + ind + expr_type + " " + tmp + " = " + result.code + ";\n"
                 result.c.output = result.c.output + ind + "if (" + tmp + ".tag == " + expr_type + "_tag_None) { return " + tmp + "; }\n"
                 result.code = tmp + ".data.Some._0"
+                result.c = track_var_type(result.c, tmp, expr_type)
             } else {
                 -- Unknown type: just pass through (C compiler will catch errors)
                 result.c.output = result.c.output + ind + "// try operator on unknown type\n"
@@ -675,6 +704,11 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     temp_cc.list_elem_types = cc.list_elem_types
     temp_cc.generic_fn_tokens = cc.generic_fn_tokens
     temp_cc.monomorphized_fns = cc.monomorphized_fns
+    -- Propagate counters to avoid name collisions with the caller context
+    temp_cc.lambda_counter = cc.lambda_counter
+    temp_cc.match_counter = cc.match_counter
+    temp_cc.for_counter = cc.for_counter
+    temp_cc.try_counter = cc.try_counter
 
     -- Skip 'fn' keyword to enter compile_fn_decl properly
     temp_cc = compile_fn_decl(temp_cc)
@@ -698,6 +732,13 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     -- Copy fn_names/ret_types (the monomorphized fn was added)
     cc.fn_names = temp_cc.fn_names
     cc.fn_ret_types = temp_cc.fn_ret_types
+    -- Copy counters back so subsequent code doesn't collide
+    cc.lambda_counter = temp_cc.lambda_counter
+    cc.match_counter = temp_cc.match_counter
+    cc.for_counter = temp_cc.for_counter
+    cc.try_counter = temp_cc.try_counter
+    -- Copy lambda definitions generated inside the generic function
+    cc.lambda_defs = cc.lambda_defs + temp_cc.lambda_defs
 
     return cc
 }

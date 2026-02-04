@@ -180,6 +180,19 @@ fn infer_builtin_ret_type(fn_code: string) -> string {
     if starts_with(fn_code, "dm_string_ends_with(") { return "bool" }
     if starts_with(fn_code, "dm_args_len(") { return "int64_t" }
     if starts_with(fn_code, "dm_system(") { return "int64_t" }
+    -- String-returning builtins
+    if starts_with(fn_code, "dm_string_trim(") { return "dm_string" }
+    if starts_with(fn_code, "dm_string_replace(") { return "dm_string" }
+    if starts_with(fn_code, "dm_string_to_upper(") { return "dm_string" }
+    if starts_with(fn_code, "dm_string_to_lower(") { return "dm_string" }
+    if starts_with(fn_code, "dm_char_at(") { return "dm_string" }
+    if starts_with(fn_code, "dm_substr(") { return "dm_string" }
+    if starts_with(fn_code, "dm_args_get(") { return "dm_string" }
+    if starts_with(fn_code, "dm_file_read(") { return "dm_string" }
+    if starts_with(fn_code, "dm_int_to_string(") { return "dm_string" }
+    if starts_with(fn_code, "dm_float_to_string(") { return "dm_string" }
+    if starts_with(fn_code, "dm_bool_to_string(") { return "dm_string" }
+    if starts_with(fn_code, "dm_string_concat(") { return "dm_string" }
     return ""
 }
 
@@ -261,7 +274,25 @@ fn infer_type_from_code(code: string, c: Compiler) -> string {
     -- Variable reference: look up known variable types
     let var_type = lookup_var_type(c, code)
     if var_type != "" { return var_type }
+    -- Ternary expression: infer from first branch
+    let ternary_type = infer_ternary_type(code, c)
+    if ternary_type != "" { return ternary_type }
+    -- Default fallback (uncomment for debugging):
+    -- eprintln("warning: defaulting to int64_t for: " + code)
     return "int64_t"
+}
+
+fn infer_ternary_type(code: string, c: Compiler) -> string {
+    if starts_with(code, "(") == false { return "" }
+    if string_contains(code, " ? ") == false { return "" }
+    let q_pos = string_find(code, " ? ")
+    let after_q = substr(code, q_pos + 3, len(code) - q_pos - 3)
+    let colon_pos = string_find(after_q, " : ")
+    if colon_pos < 0 { return "" }
+    let branch = substr(after_q, 0, colon_pos)
+    let branch_type = infer_type_from_code(branch, c)
+    if branch_type != "int64_t" { return branch_type }
+    return ""
 }
 
 fn track_str_var(c: Compiler, mangled_name: string, is_str: bool) -> Compiler {

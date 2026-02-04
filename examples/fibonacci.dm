@@ -10,6 +10,5 @@ fn fib(n: int) -> int {
 
 fn main() {
     let result = fib(10)
-    print("fib(10) = ")
-    print_int(result)
+    println("fib(10) = " + int_to_string(result))
 }

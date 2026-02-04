@@ -62,7 +62,10 @@ pub const PipelineExpr = ast.PipelineExpr;
 pub const ErrorPropagateExpr = ast.ErrorPropagateExpr;
 pub const CoalesceExpr = ast.CoalesceExpr;
 pub const RangeExpr = ast.RangeExpr;
+pub const CastExpr = ast.CastExpr;
 pub const ComptimeExpr = ast.ComptimeExpr;
+pub const StringInterpolation = ast.StringInterpolation;
+pub const RegionBlock = ast.RegionBlock;
 pub const Pattern = ast.Pattern;
 pub const TuplePattern = ast.TuplePattern;
 pub const StructPattern = ast.StructPattern;
@@ -239,6 +242,106 @@ pub const Parser = struct {
         return buf.toOwnedSlice();
     }
 
+    /// Parse an interpolated string f"prefix {expr} suffix" into a StringInterpolation node.
+    /// The lexeme is like: f"prefix {expr} suffix"
+    /// We split it into alternating literal and expression parts.
+    fn parseInterpolatedString(self: *Self, start_loc: SourceLocation) !*Expr {
+        const lexeme = self.previous().lexeme;
+        // Strip f"..." prefix (2 chars) and suffix (1 char)
+        const content = if (lexeme.len >= 3) lexeme[2 .. lexeme.len - 1] else "";
+
+        var parts = std.ArrayList(StringInterpolation.InterpolPart).init(self.allocator);
+
+        var i: usize = 0;
+        var lit_start: usize = 0;
+
+        while (i < content.len) {
+            if (content[i] == '\\' and i + 1 < content.len) {
+                // Skip escaped characters (including \{ )
+                i += 2;
+                continue;
+            }
+            if (content[i] == '{') {
+                // Emit literal part before this expression
+                if (i > lit_start) {
+                    const raw_lit = content[lit_start..i];
+                    const processed = try self.processStringEscapes(raw_lit);
+                    try parts.append(.{ .literal = processed });
+                }
+
+                // Find matching closing brace
+                i += 1; // skip '{'
+                const expr_start = i;
+                var depth: usize = 1;
+                while (i < content.len and depth > 0) {
+                    if (content[i] == '{') {
+                        depth += 1;
+                    } else if (content[i] == '}') {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    } else if (content[i] == '"') {
+                        // Skip nested string literals
+                        i += 1;
+                        while (i < content.len and content[i] != '"') {
+                            if (content[i] == '\\') i += 1;
+                            i += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                // i now points at the closing '}' (or past end if unmatched)
+                const expr_src = content[expr_start..i];
+                if (i < content.len) i += 1; // skip past '}'
+
+                // Lex and parse the expression text
+                if (expr_src.len > 0) {
+                    const parsed_expr = try self.parseSubExpression(expr_src, start_loc);
+                    try parts.append(.{ .expr = parsed_expr });
+                }
+
+                lit_start = i;
+                continue;
+            }
+            i += 1;
+        }
+
+        // Emit trailing literal part
+        if (lit_start < content.len) {
+            const raw_lit = content[lit_start..content.len];
+            const processed = try self.processStringEscapes(raw_lit);
+            try parts.append(.{ .literal = processed });
+        }
+
+        // If no interpolation parts were found, just return an empty string literal
+        if (parts.items.len == 0) {
+            try parts.append(.{ .literal = "" });
+        }
+
+        const interp = try self.astAllocator().create(StringInterpolation);
+        interp.* = .{
+            .parts = try self.astAllocator().dupe(StringInterpolation.InterpolPart, parts.items),
+            .span = makeSpan(start_loc, self.previousLocation()),
+        };
+
+        const expr = try self.astAllocator().create(Expr);
+        expr.* = .{
+            .kind = .{ .string_interpolation = interp },
+            .span = interp.span,
+        };
+        return expr;
+    }
+
+    /// Parse a sub-expression from a string fragment (used by f-string parsing)
+    fn parseSubExpression(self: *Self, expr_text: []const u8, _: SourceLocation) !*Expr {
+        // Lex the expression text
+        var sub_lexer = Lexer.init(expr_text, self.allocator);
+        const sub_tokens = try sub_lexer.scanAll();
+
+        // Parse the tokens as an expression
+        var sub_parser = Self.init(sub_tokens, self.allocator);
+        return try sub_parser.parseExpr();
+    }
+
     // ========================================================================
     // Entry Point
     // ========================================================================
@@ -268,7 +371,7 @@ pub const Parser = struct {
                     // Guarantee forward progress to avoid infinite loops
                     if (!self.isAtEnd() and !self.check(.kw_fn) and !self.check(.kw_struct) and
                         !self.check(.kw_enum) and !self.check(.kw_trait) and !self.check(.kw_impl) and
-                        !self.check(.kw_import) and !self.check(.kw_const))
+                        !self.check(.kw_import) and !self.check(.kw_const) and !self.check(.kw_extern))
                     {
                         _ = self.advance();
                     }
@@ -336,7 +439,19 @@ pub const Parser = struct {
 
         const decl = try self.astAllocator().create(Declaration);
 
-        if (self.match(.kw_fn)) {
+        if (self.match(.kw_extern)) {
+            // extern fn Name(params) -> RetType
+            if (!self.match(.kw_fn)) {
+                return self.errorAtCurrent("expected 'fn' after 'extern'");
+            }
+            const func = try self.parseFunction();
+            func.is_extern = true;
+            decl.* = .{
+                .kind = .{ .function = func },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+        } else if (self.match(.kw_fn)) {
             decl.* = .{
                 .kind = .{ .function = try self.parseFunction() },
                 .visibility = visibility,
@@ -455,6 +570,7 @@ pub const Parser = struct {
             .contracts = contracts,
             .body = body,
             .is_comptime = is_comptime,
+            .is_extern = false,
             .span = makeSpan(start_loc, self.previousLocation()),
         };
         return func;
@@ -801,7 +917,7 @@ pub const Parser = struct {
         const first = try self.expectIdentifier("module path");
         try segments.append(makeIdentifier(first, self.previousLocation()));
 
-        while (self.match(.colon_colon)) {
+        while (self.match(.colon_colon) or self.match(.dot)) {
             if (self.check(.lbrace)) break; // import foo::bar::{...}
             const seg = try self.expectIdentifier("module path segment");
             try segments.append(makeIdentifier(seg, self.previousLocation()));
@@ -901,6 +1017,21 @@ pub const Parser = struct {
             };
             type_expr.* = .{
                 .kind = .{ .reference = ref_type },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+            return type_expr;
+        }
+
+        // Dynamic trait object type: dyn Trait
+        if (self.match(.kw_dyn)) {
+            const trait_type = try self.parseTypeExpr();
+            const trait_obj = try self.astAllocator().create(ast.TraitObjectType);
+            trait_obj.* = .{
+                .trait_type = trait_type,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+            type_expr.* = .{
+                .kind = .{ .trait_object = trait_obj },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
             return type_expr;
@@ -1153,6 +1284,26 @@ pub const Parser = struct {
             const stmt = try self.astAllocator().create(Statement);
             stmt.* = .{
                 .kind = .{ .discard = discard },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+            return stmt;
+        }
+
+        // Region block: region name { ... }
+        if (self.match(.kw_region)) {
+            const name = try self.expectIdentifier("Expected region name");
+            const body = try self.parseBlockExpr();
+
+            const region = try self.astAllocator().create(RegionBlock);
+            region.* = .{
+                .name = makeIdentifier(name, start_loc),
+                .body = body,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const stmt = try self.astAllocator().create(Statement);
+            stmt.* = .{
+                .kind = .{ .region_block = region },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
             return stmt;
@@ -1443,6 +1594,27 @@ pub const Parser = struct {
                 new_left.* = .{
                     .kind = .{ .pipeline = pipeline },
                     .span = pipeline.span,
+                };
+                left = new_left;
+                continue;
+            }
+
+            // Handle `as` type cast operator
+            if (self.check(.kw_as)) {
+                _ = self.advance();
+                const target_type = try self.parseTypeExpr();
+
+                const cast = try self.astAllocator().create(CastExpr);
+                cast.* = .{
+                    .expr = left,
+                    .target_type = target_type,
+                    .span = Span.merge(left.span, target_type.span),
+                };
+
+                const new_left = try self.astAllocator().create(Expr);
+                new_left.* = .{
+                    .kind = .{ .cast = cast },
+                    .span = cast.span,
                 };
                 left = new_left;
                 continue;
@@ -1879,6 +2051,11 @@ pub const Parser = struct {
                 .span = lit.span,
             };
             return expr;
+        }
+
+        // Interpolated string: f"..."
+        if (self.match(.f_string)) {
+            return try self.parseInterpolatedString(start_loc);
         }
 
         // Character literal
@@ -2630,6 +2807,7 @@ pub const Parser = struct {
             .plus, .minus => .term,
             .star, .slash, .percent => .factor,
             .dot_dot, .dot_dot_eq => .comparison,
+            .kw_as => .comparison,
             else => .none,
         };
     }

@@ -1,0 +1,8 @@
+# Generated C files
+*.c
+
+# Compiled binaries
+main
+stage1_compiler
+test_*
+*.o

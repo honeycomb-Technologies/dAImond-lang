@@ -14,6 +14,7 @@ pub const TokenType = enum {
     string, // "hello"
     raw_string, // r"raw\nstring"
     byte_string, // b"bytes"
+    f_string, // f"hello {name}"
     char_literal, // 'a'
     identifier, // foo, bar_baz
 
@@ -35,11 +36,14 @@ pub const TokenType = enum {
     kw_enum,
     kw_trait,
     kw_impl,
+    kw_dyn,
     kw_import,
     kw_module,
     kw_with,
     kw_region,
     kw_comptime,
+    kw_extern,
+    kw_as,
     kw_true,
     kw_false,
     kw_and,
@@ -248,6 +252,12 @@ pub const Lexer = struct {
             return self.byteString();
         }
 
+        // Interpolated strings: f"..." (check before identifiers)
+        if (c == 'f' and self.peek() == '"') {
+            _ = self.advance(); // consume "
+            return self.fString();
+        }
+
         // Identifiers and keywords
         if (isAlpha(c)) return self.identifier();
 
@@ -363,11 +373,14 @@ pub const Lexer = struct {
             .{ "enum", .kw_enum },
             .{ "trait", .kw_trait },
             .{ "impl", .kw_impl },
+            .{ "dyn", .kw_dyn },
             .{ "import", .kw_import },
             .{ "module", .kw_module },
             .{ "with", .kw_with },
             .{ "region", .kw_region },
             .{ "comptime", .kw_comptime },
+            .{ "extern", .kw_extern },
+            .{ "as", .kw_as },
             .{ "true", .kw_true },
             .{ "false", .kw_false },
             .{ "and", .kw_and },
@@ -470,6 +483,52 @@ pub const Lexer = struct {
 
         _ = self.advance(); // closing quote
         return self.makeToken(.byte_string);
+    }
+
+    /// Scan an interpolated string literal f"...{expr}..."
+    fn fString(self: *Self) Token {
+        while (self.peek() != '"' and !self.isAtEnd()) {
+            if (self.peek() == '\n') {
+                self.line += 1;
+                self.column = 0;
+                self.line_start = self.current + 1;
+            }
+            // Handle escape sequences
+            if (self.peek() == '\\' and !self.isAtEnd()) {
+                _ = self.advance(); // consume backslash
+            }
+            // Handle interpolation blocks - track brace nesting
+            if (self.peek() == '{') {
+                var depth: usize = 0;
+                _ = self.advance(); // consume '{'
+                depth += 1;
+                while (depth > 0 and !self.isAtEnd()) {
+                    const ch = self.peek();
+                    if (ch == '{') depth += 1;
+                    if (ch == '}') depth -= 1;
+                    if (ch == '"') {
+                        // Nested string in expression - skip it
+                        _ = self.advance(); // consume opening quote
+                        while (self.peek() != '"' and !self.isAtEnd()) {
+                            if (self.peek() == '\\') _ = self.advance();
+                            _ = self.advance();
+                        }
+                        if (!self.isAtEnd()) _ = self.advance(); // consume closing quote
+                        continue;
+                    }
+                    if (depth > 0) _ = self.advance();
+                }
+                continue;
+            }
+            _ = self.advance();
+        }
+
+        if (self.isAtEnd()) {
+            return self.errorToken("Unterminated interpolated string");
+        }
+
+        _ = self.advance(); // closing quote
+        return self.makeToken(.f_string);
     }
 
     /// Scan a character literal
@@ -683,7 +742,7 @@ test "lex basic tokens" {
 test "lex all keywords" {
     const source =
         \\fn let mut const if else match for while loop
-        \\break continue return struct enum trait impl
+        \\break continue return struct enum trait impl dyn
         \\import module with region comptime true false
         \\and or not in private requires ensures discard expect
     ;
@@ -697,7 +756,7 @@ test "lex all keywords" {
     const expected_keywords = [_]TokenType{
         .kw_fn,       .kw_let,      .kw_mut,      .kw_const,    .kw_if,      .kw_else,
         .kw_match,    .kw_for,      .kw_while,    .kw_loop,     .kw_break,   .kw_continue,
-        .kw_return,   .kw_struct,   .kw_enum,     .kw_trait,    .kw_impl,    .kw_import,
+        .kw_return,   .kw_struct,   .kw_enum,     .kw_trait,    .kw_impl,    .kw_dyn,     .kw_import,
         .kw_module,   .kw_with,     .kw_region,   .kw_comptime, .kw_true,    .kw_false,
         .kw_and,      .kw_or,       .kw_not,      .kw_in,       .kw_private, .kw_requires,
         .kw_ensures,  .kw_discard,  .kw_expect,

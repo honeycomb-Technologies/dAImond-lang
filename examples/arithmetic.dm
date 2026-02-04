@@ -9,6 +9,5 @@ fn main() {
     let x = 10
     let y = 20
     let sum = add(x, y)
-    print("Sum: ")
-    print_int(sum)
+    println("Sum: " + int_to_string(sum))
 }

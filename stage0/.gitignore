@@ -9,4 +9,8 @@ zig-out/
 # Compiled binaries
 main
 hello
+test
+test_*
+stage1_compiler
+*.o
 /tmp/

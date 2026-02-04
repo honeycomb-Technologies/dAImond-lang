@@ -337,7 +337,44 @@ pub const CodeGenerator = struct {
     // Used to distinguish function references from variable references in expressions
     known_functions: std.StringHashMap([]const u8),
 
+    // Track extern functions: use raw C name without dm_ prefix
+    extern_functions: std.StringHashMap(void),
+
+    // Track closure variables: maps variable name to its closure info
+    // When inside a capturing lambda, identifiers that are captured are read from __env
+    closure_captures: ?*const std.ArrayList(CapturedVar),
+
+    // Track which local variables are closures (need env passed at call site)
+    closure_info: std.StringHashMap(ClosureInfo),
+
+    // Track trait definitions for dyn Trait vtable generation
+    trait_defs: std.StringHashMap([]const TraitMethodSig),
+    // Track which dyn Trait types have been generated
+    generated_dyn_traits: std.StringHashMap(void),
+    // Deferred buffer for dyn trait vtable/struct definitions
+    dyn_trait_writer: CWriter,
+    // Track variable types for dyn dispatch: maps var name -> trait name if dyn
+    dyn_var_traits: std.StringHashMap([]const u8),
+
     const Self = @This();
+
+    const CapturedVar = struct {
+        name: []const u8,
+        c_type: []const u8,
+    };
+
+    const ClosureInfo = struct {
+        lambda_name: []const u8,
+        env_var: []const u8,
+        captures: []const CapturedVar,
+        return_type: []const u8,
+    };
+
+    const TraitMethodSig = struct {
+        name: []const u8,
+        param_types: []const []const u8, // C types for params (excluding self)
+        return_type: []const u8, // C return type
+    };
 
     const ImplMethodInfo = struct {
         target_type: []const u8,
@@ -411,6 +448,13 @@ pub const CodeGenerator = struct {
             .function_mut_info = std.StringHashMap([]const bool).init(allocator),
             .region_stack = std.ArrayList([]const u8).init(allocator),
             .known_functions = std.StringHashMap([]const u8).init(allocator),
+            .extern_functions = std.StringHashMap(void).init(allocator),
+            .closure_captures = null,
+            .closure_info = std.StringHashMap(ClosureInfo).init(allocator),
+            .trait_defs = std.StringHashMap([]const TraitMethodSig).init(allocator),
+            .generated_dyn_traits = std.StringHashMap(void).init(allocator),
+            .dyn_trait_writer = CWriter.init(allocator),
+            .dyn_var_traits = std.StringHashMap([]const u8).init(allocator),
         };
     }
 
@@ -447,7 +491,13 @@ pub const CodeGenerator = struct {
         self.function_mut_info.deinit();
         self.region_stack.deinit();
         self.known_functions.deinit();
+        self.extern_functions.deinit();
+        self.closure_info.deinit();
         self.lambda_writer.deinit();
+        self.trait_defs.deinit();
+        self.generated_dyn_traits.deinit();
+        self.dyn_trait_writer.deinit();
+        self.dyn_var_traits.deinit();
     }
 
     /// Get arena allocator for temporary strings
@@ -547,20 +597,6 @@ pub const CodeGenerator = struct {
             try self.writer.write(self.result_type_writer.getOutput());
         }
 
-        // Insert generated box helper definitions (before user structs)
-        if (self.box_type_writer.getOutput().len > 0) {
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Monomorphized Box Helpers");
-            try self.writer.write(self.box_type_writer.getOutput());
-        }
-
-        // Insert generated map type definitions (before user structs)
-        if (self.map_type_writer.getOutput().len > 0) {
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Monomorphized Map Types");
-            try self.writer.write(self.map_type_writer.getOutput());
-        }
-
         // Generate user type definitions (structs and enums)
         for (source.declarations) |decl| {
             switch (decl.kind) {
@@ -568,6 +604,14 @@ pub const CodeGenerator = struct {
                 .enum_def => |e| try self.generateEnum(e),
                 else => {},
             }
+        }
+
+        // Insert generated box helper definitions AFTER user struct definitions.
+        // Box helpers use sizeof(T) which requires the full struct definition to be visible.
+        if (self.box_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Box Helpers");
+            try self.writer.write(self.box_type_writer.getOutput());
         }
 
         // Insert monomorphized list type FUNCTION definitions AFTER user structs.
@@ -578,7 +622,30 @@ pub const CodeGenerator = struct {
             try self.writer.write(self.list_type_writer.getOutput());
         }
 
+        // Emit string_split implementation now that dm_list_dm_string is defined
+        if (self.generated_list_types.contains("dm_list_dm_string")) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("string_split implementation (returns dm_list_dm_string)");
+            try self.emitStringSplitImpl();
+        }
+
+        // Insert generated map type definitions AFTER list functions,
+        // because map helpers (keys/values) call list functions.
+        if (self.map_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Map Types");
+            try self.writer.write(self.map_type_writer.getOutput());
+        }
+
         try self.writer.blankLine();
+
+        // Collect trait definitions for dyn Trait vtable generation
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .trait_def => |trait| try self.collectTraitDef(trait),
+                else => {},
+            }
+        }
 
         // Pre-scan all function declarations to record mutable parameter info
         for (source.declarations) |decl| {
@@ -610,9 +677,15 @@ pub const CodeGenerator = struct {
                     if (f.generic_params != null and f.generic_params.?.len > 0) continue;
                     const ret_type = if (f.return_type) |rt| try self.mapType(rt) else "void";
                     self.trackFunctionReturnType(f.name.name, ret_type);
-                    // Track as known function for higher-order function references
-                    const mangled = try self.mangleFunctionName(f.name.name, null);
-                    try self.known_functions.put(f.name.name, mangled);
+                    if (f.is_extern) {
+                        // Extern functions use raw C name
+                        try self.known_functions.put(f.name.name, f.name.name);
+                        try self.extern_functions.put(f.name.name, {});
+                    } else {
+                        // Track as known function for higher-order function references
+                        const mangled = try self.mangleFunctionName(f.name.name, null);
+                        try self.known_functions.put(f.name.name, mangled);
+                    }
                 },
                 .impl_block => |impl| {
                     const target_name = try self.extractTypeName(impl.target_type);
@@ -644,6 +717,30 @@ pub const CodeGenerator = struct {
         // Generate impl method prototypes
         for (self.impl_methods.items) |info| {
             try self.generateFunctionPrototype(info.method, info.target_type);
+        }
+
+        // Generate dyn Trait vtable structs and instances for all trait impls
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .impl_block => |impl| {
+                    if (impl.trait_type) |trait_te| {
+                        const trait_name = try self.extractTypeName(trait_te);
+                        const target_name = try self.extractTypeName(impl.target_type);
+                        if (self.trait_defs.contains(trait_name)) {
+                            try self.emitDynTraitTypes(trait_name);
+                            try self.emitVtableInstance(trait_name, target_name);
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Insert dyn trait type definitions
+        if (self.dyn_trait_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Dynamic Trait (dyn) Vtables");
+            try self.writer.write(self.dyn_trait_writer.getOutput());
         }
 
         // Pre-scan all function bodies to discover generic function calls
@@ -1220,53 +1317,8 @@ pub const CodeGenerator = struct {
         try self.writer.blankLine();
 
         // String split - returns a list of strings (requires dm_list_dm_string to be generated)
-        // This is a self-contained implementation that uses a simple array
-        try self.writer.writeLine("typedef struct dm_split_result {");
-        self.writer.indent();
-        try self.writer.writeLine("dm_string* parts;");
-        try self.writer.writeLine("size_t len;");
-        try self.writer.writeLine("size_t capacity;");
-        self.writer.dedent();
-        try self.writer.writeLine("} dm_split_result;");
-        try self.writer.blankLine();
-
-        try self.writer.writeLine("static inline dm_split_result dm_string_split(dm_string s, dm_string delimiter) {");
-        self.writer.indent();
-        try self.writer.writeLine("dm_split_result result = { .parts = NULL, .len = 0, .capacity = 0 };");
-        try self.writer.writeLine("if (s.len == 0) return result;");
-        try self.writer.writeLine("if (delimiter.len == 0) {");
-        self.writer.indent();
-        try self.writer.writeLine("result.parts = (dm_string*)malloc(sizeof(dm_string));");
-        try self.writer.writeLine("result.parts[0] = s;");
-        try self.writer.writeLine("result.len = 1; result.capacity = 1;");
-        try self.writer.writeLine("return result;");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        try self.writer.writeLine("size_t cap = 8;");
-        try self.writer.writeLine("result.parts = (dm_string*)malloc(cap * sizeof(dm_string));");
-        try self.writer.writeLine("size_t start = 0;");
-        try self.writer.writeLine("for (size_t i = 0; i <= s.len - delimiter.len; i++) {");
-        self.writer.indent();
-        try self.writer.writeLine("if (memcmp(s.data + i, delimiter.data, delimiter.len) == 0) {");
-        self.writer.indent();
-        try self.writer.writeLine("if (result.len >= cap) { cap *= 2; result.parts = (dm_string*)realloc(result.parts, cap * sizeof(dm_string)); }");
-        try self.writer.writeLine("size_t plen = i - start;");
-        try self.writer.writeLine("char* pbuf = (char*)malloc(plen + 1); memcpy(pbuf, s.data + start, plen); pbuf[plen] = '\\0';");
-        try self.writer.writeLine("result.parts[result.len++] = (dm_string){ .data = pbuf, .len = plen, .capacity = plen };");
-        try self.writer.writeLine("i += delimiter.len - 1; start = i + 1;");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        try self.writer.writeLine("if (result.len >= cap) { cap *= 2; result.parts = (dm_string*)realloc(result.parts, cap * sizeof(dm_string)); }");
-        try self.writer.writeLine("size_t plen = s.len - start;");
-        try self.writer.writeLine("char* pbuf = (char*)malloc(plen + 1); memcpy(pbuf, s.data + start, plen); pbuf[plen] = '\\0';");
-        try self.writer.writeLine("result.parts[result.len++] = (dm_string){ .data = pbuf, .len = plen, .capacity = plen };");
-        try self.writer.writeLine("result.capacity = cap;");
-        try self.writer.writeLine("return result;");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        try self.writer.blankLine();
+        // string_split implementation is emitted after list type definitions
+        // (since it returns dm_list_dm_string which needs to be defined first)
 
         // Path utilities
         try self.writer.writeLine("static inline dm_string dm_path_dirname(dm_string path) {");
@@ -1390,6 +1442,14 @@ pub const CodeGenerator = struct {
             .tuple => |tup| self.mapTupleType(tup),
             .option => |opt| self.mapOptionType(opt),
             .result => |res| self.mapResultType(res),
+            .trait_object => |to| {
+                // dyn Trait generates a fat pointer struct
+                if (to.trait_type.kind == .named) {
+                    const trait_name = to.trait_type.kind.named.path.segments[0].name;
+                    return try std.fmt.allocPrint(self.stringAllocator(), "dm_dyn_{s}", .{trait_name});
+                }
+                return "dm_dyn_object";
+            },
             .infer => "void*", // Fallback for inferred types
             .never => "void",
             .self_type => "void*", // Should be resolved earlier
@@ -2211,6 +2271,41 @@ pub const CodeGenerator = struct {
         self.trackFunctionReturnType(values_key, val_list_type);
     }
 
+    /// Emit the string_split function body that returns dm_list_dm_string
+    fn emitStringSplitImpl(self: *Self) !void {
+        var w = &self.writer;
+        try w.writeLine("static inline dm_list_dm_string dm_string_split(dm_string s, dm_string delimiter) {");
+        w.indent();
+        try w.writeLine("dm_list_dm_string result = { .data = NULL, .len = 0, .capacity = 0 };");
+        try w.writeLine("if (s.len == 0) return result;");
+        try w.writeLine("if (delimiter.len == 0) {");
+        w.indent();
+        try w.writeLine("dm_list_dm_string_push(&result, s);");
+        try w.writeLine("return result;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("size_t start = 0;");
+        try w.writeLine("for (size_t i = 0; i <= s.len - delimiter.len; i++) {");
+        w.indent();
+        try w.writeLine("if (memcmp(s.data + i, delimiter.data, delimiter.len) == 0) {");
+        w.indent();
+        try w.writeLine("size_t plen = i - start;");
+        try w.writeLine("char* pbuf = (char*)malloc(plen + 1); memcpy(pbuf, s.data + start, plen); pbuf[plen] = '\\0';");
+        try w.writeLine("dm_list_dm_string_push(&result, (dm_string){ .data = pbuf, .len = plen, .capacity = plen });");
+        try w.writeLine("i += delimiter.len - 1; start = i + 1;");
+        w.dedent();
+        try w.writeLine("}");
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("size_t plen = s.len - start;");
+        try w.writeLine("char* pbuf = (char*)malloc(plen + 1); memcpy(pbuf, s.data + start, plen); pbuf[plen] = '\\0';");
+        try w.writeLine("dm_list_dm_string_push(&result, (dm_string){ .data = pbuf, .len = plen, .capacity = plen });");
+        try w.writeLine("return result;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+    }
+
     /// Sanitize type name for use in identifier
     fn sanitizeTypeName(self: *Self, name: []const u8) ![]const u8 {
         var result = std.ArrayList(u8).init(self.stringAllocator());
@@ -2276,13 +2371,17 @@ pub const CodeGenerator = struct {
         }
     }
 
-    /// Scan a block for let bindings with List type annotations
+    /// Scan a block for let bindings with List type annotations and string_split calls
     fn scanBlockForListTypes(self: *Self, block: *BlockExpr) !void {
         for (block.statements) |stmt| {
             switch (stmt.kind) {
                 .let_binding => |let_bind| {
                     if (let_bind.type_annotation) |ta| {
                         try self.scanTypeExprForLists(ta);
+                    }
+                    // Scan the initializer expression for string_split calls
+                    if (let_bind.value) |val| {
+                        try self.scanExprForBuiltinListTypes(val);
                     }
                 },
                 .if_stmt => |if_expr| {
@@ -2299,8 +2398,43 @@ pub const CodeGenerator = struct {
                 .for_loop => |for_stmt| try self.scanBlockForListTypes(for_stmt.body),
                 .while_loop => |while_stmt| try self.scanBlockForListTypes(while_stmt.body),
                 .loop_stmt => |loop| try self.scanBlockForListTypes(loop.body),
+                .expression => |expr| try self.scanExprForBuiltinListTypes(expr),
                 else => {},
             }
+        }
+    }
+
+    /// Scan an expression for builtin calls that return list types (e.g. string_split)
+    fn scanExprForBuiltinListTypes(self: *Self, expr: *Expr) anyerror!void {
+        switch (expr.kind) {
+            .function_call => |fc| {
+                if (fc.function.kind == .identifier) {
+                    const name = fc.function.kind.identifier.name;
+                    if (std.mem.eql(u8, name, "string_split")) {
+                        _ = try self.generateListTypeByName("dm_string");
+                    }
+                }
+                // Also scan arguments
+                for (fc.args) |arg| {
+                    try self.scanExprForBuiltinListTypes(arg.value);
+                }
+            },
+            .method_call => |mc| {
+                try self.scanExprForBuiltinListTypes(mc.object);
+                for (mc.args) |arg| {
+                    try self.scanExprForBuiltinListTypes(arg);
+                }
+            },
+            .binary => |bin| {
+                try self.scanExprForBuiltinListTypes(bin.left);
+                try self.scanExprForBuiltinListTypes(bin.right);
+            },
+            .unary => |un| try self.scanExprForBuiltinListTypes(un.operand),
+            .if_expr => |if_expr| {
+                try self.scanExprForBuiltinListTypes(if_expr.condition);
+                try self.scanBlockForListTypes(if_expr.then_branch);
+            },
+            else => {},
         }
     }
 
@@ -2526,6 +2660,18 @@ pub const CodeGenerator = struct {
     }
 
     /// Mangle a type name
+    /// Check if a type has a specific impl method
+    fn hasImplMethod(self: *Self, type_name: []const u8, method_name: []const u8) bool {
+        for (self.impl_methods.items) |info| {
+            if (std.mem.eql(u8, info.target_type, type_name) and
+                std.mem.eql(u8, info.method.name.name, method_name))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn mangleTypeName(self: *Self, name: []const u8) ![]const u8 {
         return try std.fmt.allocPrint(self.stringAllocator(), "dm_{s}", .{name});
     }
@@ -2564,14 +2710,47 @@ pub const CodeGenerator = struct {
                 .null_lit => "void*",
             },
             .binary => |bin| blk: {
+                const left_type_b = self.inferCTypeFromExpr(bin.left);
+                // Check for operator overloading on user-defined types
+                if (!std.mem.eql(u8, left_type_b, "int64_t") and
+                    !std.mem.eql(u8, left_type_b, "double") and
+                    !std.mem.eql(u8, left_type_b, "float") and
+                    !std.mem.eql(u8, left_type_b, "bool") and
+                    !std.mem.eql(u8, left_type_b, "dm_string"))
+                {
+                    const op_method: ?[]const u8 = switch (bin.op) {
+                        .add => "add",
+                        .sub => "sub",
+                        .mul => "mul",
+                        .div => "div",
+                        .mod => "mod",
+                        .eq, .ne, .lt, .gt, .le, .ge => "eq",
+                        else => null,
+                    };
+                    if (op_method) |mname| {
+                        const raw_type_b = if (std.mem.startsWith(u8, left_type_b, "dm_"))
+                            left_type_b[3..]
+                        else
+                            left_type_b;
+                        if (self.hasImplMethod(raw_type_b, mname)) {
+                            // For comparison operators, return bool
+                            if (bin.op == .eq or bin.op == .ne or bin.op == .lt or
+                                bin.op == .gt or bin.op == .le or bin.op == .ge)
+                            {
+                                break :blk "bool";
+                            }
+                            // For arithmetic, return the left type (same as struct type)
+                            break :blk left_type_b;
+                        }
+                    }
+                }
                 // Comparison and logical ops produce bool
                 break :blk switch (bin.op) {
                     .eq, .ne, .lt, .le, .gt, .ge, .@"and", .@"or", .in => "bool",
                     .add, .sub, .mul, .div, .mod, .bit_and, .bit_or, .bit_xor, .shl, .shr => inner: {
                         // Check if either operand is a float or string
-                        const left_type = self.inferCTypeFromExpr(bin.left);
-                        if (std.mem.eql(u8, left_type, "double") or std.mem.eql(u8, left_type, "float")) break :inner left_type;
-                        if (std.mem.eql(u8, left_type, "dm_string")) break :inner "dm_string";
+                        if (std.mem.eql(u8, left_type_b, "double") or std.mem.eql(u8, left_type_b, "float")) break :inner left_type_b;
+                        if (std.mem.eql(u8, left_type_b, "dm_string")) break :inner "dm_string";
                         const right_type = self.inferCTypeFromExpr(bin.right);
                         if (std.mem.eql(u8, right_type, "double") or std.mem.eql(u8, right_type, "float")) break :inner right_type;
                         if (std.mem.eql(u8, right_type, "dm_string")) break :inner "dm_string";
@@ -2646,15 +2825,17 @@ pub const CodeGenerator = struct {
                         std.mem.eql(u8, name, "path_basename") or
                         std.mem.eql(u8, name, "path_extension") or
                         std.mem.eql(u8, name, "path_stem") or
-                        std.mem.eql(u8, name, "path_join")) break :blk "dm_string";
-                    if (std.mem.eql(u8, name, "string_split")) break :blk "dm_split_result";
+                        std.mem.eql(u8, name, "path_join") or
+                        std.mem.eql(u8, name, "read_line")) break :blk "dm_string";
+                    if (std.mem.eql(u8, name, "string_split")) break :blk "dm_list_dm_string";
                     if (std.mem.eql(u8, name, "is_alpha") or
                         std.mem.eql(u8, name, "is_digit") or
                         std.mem.eql(u8, name, "is_alnum") or
                         std.mem.eql(u8, name, "is_whitespace") or
                         std.mem.eql(u8, name, "string_contains") or
                         std.mem.eql(u8, name, "starts_with") or
-                        std.mem.eql(u8, name, "ends_with")) break :blk "bool";
+                        std.mem.eql(u8, name, "ends_with") or
+                        std.mem.eql(u8, name, "file_exists")) break :blk "bool";
                     if (std.mem.eql(u8, name, "char")) break :blk "char";
                     // Look up in function declarations tracked during generation
                     if (self.lookupFunctionReturnType(name)) |ret_type| break :blk ret_type;
@@ -2664,6 +2845,8 @@ pub const CodeGenerator = struct {
                         const mono_name = self.getMonomorphizedName(name, null, concrete_types) catch break :blk "int64_t";
                         if (self.lookupFunctionReturnType(mono_name)) |ret_type| break :blk ret_type;
                     }
+                    // Check if this is a closure call - use the closure's return type
+                    if (self.closure_info.get(name)) |ci| break :blk ci.return_type;
                 }
                 // Check if calling an enum variant constructor: Type::Variant(args)
                 if (call.function.kind == .path) {
@@ -2743,6 +2926,25 @@ pub const CodeGenerator = struct {
                 break :blk "int64_t";
             },
             .method_call => |mc| blk: {
+                // Check for enum constructor: EnumName.Variant(args)
+                if (mc.object.kind == .identifier) {
+                    const name = mc.object.kind.identifier.name;
+                    // Check if object is a dyn trait variable
+                    if (self.dyn_var_traits.get(name)) |trait_name| {
+                        if (self.trait_defs.get(trait_name)) |methods| {
+                            for (methods) |m| {
+                                if (std.mem.eql(u8, m.name, mc.method.name)) {
+                                    break :blk m.return_type;
+                                }
+                            }
+                        }
+                        break :blk "int64_t";
+                    }
+                    const enum_mangled = self.mangleTypeName(name) catch break :blk "int64_t";
+                    if (self.generated_enums.contains(enum_mangled)) {
+                        break :blk enum_mangled;
+                    }
+                }
                 // Try to infer method return type from the method name
                 var obj_type = self.inferCTypeFromExpr(mc.object);
                 // Strip pointer for Box types
@@ -2779,13 +2981,6 @@ pub const CodeGenerator = struct {
                     }
                     break :blk "int64_t";
                 }
-                // Handle dm_split_result field access: len -> int64_t, parts -> dm_string*
-                if (std.mem.eql(u8, obj_type, "dm_split_result")) {
-                    if (std.mem.eql(u8, fa.field.name, "len")) break :blk "int64_t";
-                    if (std.mem.eql(u8, fa.field.name, "parts")) break :blk "dm_string*";
-                    if (std.mem.eql(u8, fa.field.name, "capacity")) break :blk "int64_t";
-                    break :blk "int64_t";
-                }
                 const key = std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ obj_type, fa.field.name }) catch break :blk "int64_t";
                 if (self.struct_field_types.get(key)) |field_type| break :blk field_type;
                 break :blk "int64_t";
@@ -2805,6 +3000,7 @@ pub const CodeGenerator = struct {
             .tuple_literal => "void*",
             .lambda => "void*",
             .type_check => "bool",
+            .string_interpolation => "dm_string",
             .range => "void*",
             else => "int64_t", // Default to int64_t rather than void*
         };
@@ -3099,6 +3295,135 @@ pub const CodeGenerator = struct {
     }
 
     // ========================================================================
+    // DYN TRAIT SUPPORT
+    // ========================================================================
+
+    /// Collect trait definitions for vtable generation
+    fn collectTraitDef(self: *Self, trait: *ast.TraitDecl) !void {
+        var methods = std.ArrayList(TraitMethodSig).init(self.allocator);
+        for (trait.items) |item| {
+            switch (item.kind) {
+                .function => |func| {
+                    // Collect parameter C types (skip 'self')
+                    var param_types = std.ArrayList([]const u8).init(self.allocator);
+                    for (func.params) |param| {
+                        const param_name = param.name.name;
+                        if (std.mem.eql(u8, param_name, "self")) continue;
+                        const c_type = try self.mapType(param.type_expr);
+                        try param_types.append(c_type);
+                    }
+                    const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+                    try methods.append(.{
+                        .name = func.name.name,
+                        .param_types = try param_types.toOwnedSlice(),
+                        .return_type = ret_type,
+                    });
+                },
+                else => {},
+            }
+        }
+        try self.trait_defs.put(trait.name.name, try methods.toOwnedSlice());
+    }
+
+    /// Generate vtable struct and fat pointer struct for a dyn Trait type
+    fn emitDynTraitTypes(self: *Self, trait_name: []const u8) !void {
+        if (self.generated_dyn_traits.contains(trait_name)) return;
+        try self.generated_dyn_traits.put(trait_name, {});
+
+        const methods = self.trait_defs.get(trait_name) orelse return;
+        const w = &self.dyn_trait_writer;
+
+        // Emit vtable struct
+        try w.writeLineComment(try std.fmt.allocPrint(self.stringAllocator(), "Vtable for dyn {s}", .{trait_name}));
+        try w.writeLine(try std.fmt.allocPrint(self.stringAllocator(), "typedef struct dm_vtable_{s} {{", .{trait_name}));
+        for (methods) |m| {
+            // Function pointer: return_type (*method_name)(void* self, param_types...)
+            var sig = std.ArrayList(u8).init(self.allocator);
+            defer sig.deinit();
+            try sig.appendSlice("    ");
+            try sig.appendSlice(m.return_type);
+            try sig.appendSlice(" (*");
+            try sig.appendSlice(m.name);
+            try sig.appendSlice(")(void*");
+            for (m.param_types) |pt| {
+                try sig.appendSlice(", ");
+                try sig.appendSlice(pt);
+            }
+            try sig.appendSlice(");");
+            try w.writeLine(try self.stringAllocator().dupe(u8, sig.items));
+        }
+        try w.writeLine(try std.fmt.allocPrint(self.stringAllocator(), "}} dm_vtable_{s};", .{trait_name}));
+        try w.blankLine();
+
+        // Emit fat pointer struct
+        try w.writeLine(try std.fmt.allocPrint(self.stringAllocator(), "typedef struct dm_dyn_{s} {{", .{trait_name}));
+        try w.writeLine("    void* data;");
+        try w.writeLine(try std.fmt.allocPrint(self.stringAllocator(), "    dm_vtable_{s}* vtable;", .{trait_name}));
+        try w.writeLine(try std.fmt.allocPrint(self.stringAllocator(), "}} dm_dyn_{s};", .{trait_name}));
+        try w.blankLine();
+    }
+
+    /// Generate vtable instance for a concrete type implementing a trait
+    fn emitVtableInstance(self: *Self, trait_name: []const u8, target_type: []const u8) !void {
+        const methods = self.trait_defs.get(trait_name) orelse return;
+        const w = &self.dyn_trait_writer;
+
+        // For each method, generate a wrapper that casts void* to the concrete type
+        for (methods) |m| {
+            var sig = std.ArrayList(u8).init(self.allocator);
+            defer sig.deinit();
+
+            // static return_type dm_TargetType_method_dyn(void* __self, params...)
+            try sig.appendSlice("static ");
+            try sig.appendSlice(m.return_type);
+            try sig.appendSlice(" dm_");
+            try sig.appendSlice(target_type);
+            try sig.appendSlice("_");
+            try sig.appendSlice(m.name);
+            try sig.appendSlice("_dyn(void* __self");
+            for (m.param_types, 0..) |pt, i| {
+                try sig.appendSlice(", ");
+                try sig.appendSlice(pt);
+                try sig.appendSlice(try std.fmt.allocPrint(self.stringAllocator(), " __p{d}", .{i}));
+            }
+            try sig.appendSlice(") {");
+            try w.writeLine(try self.stringAllocator().dupe(u8, sig.items));
+
+            // Body: cast self and call the concrete method
+            // The impl method takes a pointer (self: &Self), so pass the cast pointer directly
+            var call = std.ArrayList(u8).init(self.allocator);
+            defer call.deinit();
+            if (!std.mem.eql(u8, m.return_type, "void")) {
+                try call.appendSlice("    return ");
+            } else {
+                try call.appendSlice("    ");
+            }
+            try call.appendSlice("dm_");
+            try call.appendSlice(target_type);
+            try call.appendSlice("_");
+            try call.appendSlice(m.name);
+            try call.appendSlice("((dm_");
+            try call.appendSlice(target_type);
+            try call.appendSlice("*)__self");
+            for (m.param_types, 0..) |_, i| {
+                try call.appendSlice(try std.fmt.allocPrint(self.stringAllocator(), ", __p{d}", .{i}));
+            }
+            try call.appendSlice(");");
+            try w.writeLine(try self.stringAllocator().dupe(u8, call.items));
+            try w.writeLine("}");
+            try w.blankLine();
+        }
+
+        // Generate the vtable static instance
+        try w.writeLine(try std.fmt.allocPrint(self.stringAllocator(), "static dm_vtable_{s} dm_vtable_{s}_for_{s} = {{", .{ trait_name, trait_name, target_type }));
+        for (methods) |m| {
+            try w.writeLine(try std.fmt.allocPrint(self.stringAllocator(), "    .{s} = dm_{s}_{s}_dyn,", .{ m.name, target_type, m.name }));
+        }
+        try w.writeLine("};");
+        try w.blankLine();
+    }
+
+    // ========================================================================
     // FUNCTION GENERATION
     // ========================================================================
 
@@ -3143,6 +3468,9 @@ pub const CodeGenerator = struct {
             try self.generic_functions.put(func.name.name, func);
             return;
         }
+
+        // Skip extern functions - they are declared as extern, not prototyped
+        if (func.is_extern) return;
 
         try self.emitFunctionPrototype(func, type_prefix, null);
     }
@@ -3193,7 +3521,41 @@ pub const CodeGenerator = struct {
             return;
         }
 
+        // Extern functions: emit declaration only, no body
+        if (func.is_extern) {
+            try self.emitExternDeclaration(func);
+            return;
+        }
+
         try self.emitFunctionDefinition(func, type_prefix, null);
+    }
+
+    /// Emit a C extern function declaration (no body, raw C name)
+    fn emitExternDeclaration(self: *Self, func: *FunctionDecl) !void {
+        const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+        const func_name = func.name.name;
+
+        // Track the function so it's recognized at call sites
+        self.trackFunctionReturnType(func_name, ret_type);
+        try self.known_functions.put(func_name, func_name);
+        try self.extern_functions.put(func_name, {});
+
+        // Emit extern declaration without dm_ prefix
+        try self.writer.print("extern {s} {s}(", .{ ret_type, func_name });
+
+        var first = true;
+        for (func.params) |param| {
+            if (!first) try self.writer.write(", ");
+            first = false;
+            const param_type = try self.mapType(param.type_expr);
+            try self.writer.print("{s} {s}", .{ param_type, param.name.name });
+        }
+
+        if (func.params.len == 0) {
+            try self.writer.write("void");
+        }
+
+        try self.writer.writeLine(");");
     }
 
     /// Emit a full function definition with optional name override (for monomorphized functions)
@@ -3510,9 +3872,20 @@ pub const CodeGenerator = struct {
                     try self.writer.writeLine(";");
                 }
             } else {
-                try self.writer.write("return ");
-                try self.generateExpr(result);
-                try self.writer.writeLine(";");
+                // For if/match expressions in return position, use statement form
+                // to avoid ternary problems with missing else branches
+                if (result.kind == .if_expr) {
+                    try self.generateIfStatementWithReturn(result.kind.if_expr);
+                } else if (result.kind == .match_expr) {
+                    // Match in return position: generate as statement with returns
+                    try self.writer.write("return ");
+                    try self.generateExpr(result);
+                    try self.writer.writeLine(";");
+                } else {
+                    try self.writer.write("return ");
+                    try self.generateExpr(result);
+                    try self.writer.writeLine(";");
+                }
             }
         }
     }
@@ -3575,6 +3948,88 @@ pub const CodeGenerator = struct {
                 if (let.value) |val| {
                     if (val.kind == .error_propagate) {
                         try self.generateErrorPropagateLetBinding(ident.name.name, type_str, val.kind.error_propagate);
+                        return;
+                    }
+                }
+
+                // Check if value is a capturing lambda - if so, handle specially
+                if (let.value) |val| {
+                    if (val.kind == .lambda) {
+                        const lam = val.kind.lambda;
+
+                        // Pre-scan for captures to determine if this is a closure
+                        var pre_param_names = std.ArrayList([]const u8).init(self.stringAllocator());
+                        for (lam.params) |p| {
+                            try pre_param_names.append(p.name.name);
+                        }
+                        var pre_captures = std.ArrayList(CapturedVar).init(self.stringAllocator());
+                        switch (lam.body) {
+                            .expression => |expr| self.collectFreeVars(expr, pre_param_names.items, &pre_captures),
+                            .block => |block| self.collectFreeVarsBlock(block, pre_param_names.items, &pre_captures),
+                        }
+
+                        if (pre_captures.items.len > 0) {
+                            // This is a closure. generateExpr hoists the lambda function
+                            // definition but does not emit to the main writer.
+                            try self.generateExpr(val);
+
+                            const lambda_name_key = try std.fmt.allocPrint(self.stringAllocator(), "__dm_lambda_{d}", .{self.lambda_counter - 1});
+                            if (self.closure_info.get(lambda_name_key)) |info| {
+                                // Emit closure struct init
+                                try self.writer.newline();
+                                try self.writer.print("static {s} {s};", .{
+                                    try std.fmt.allocPrint(self.stringAllocator(), "__dm_closure_{d}", .{self.lambda_counter - 1}),
+                                    info.env_var,
+                                });
+                                try self.writer.newline();
+                                for (info.captures) |cap| {
+                                    try self.writer.print("{s}.{s} = {s};", .{ info.env_var, cap.name, cap.name });
+                                    try self.writer.newline();
+                                }
+
+                                // Emit the let binding
+                                try self.emitVarDecl(type_str, ident.name.name);
+                                try self.writer.print(" = (void*){s};", .{lambda_name_key});
+                                try self.writer.newline();
+
+                                // Map variable name to closure info
+                                try self.closure_info.put(ident.name.name, info);
+                                return;
+                            }
+                        }
+
+                        // Non-capturing lambda - handle normally
+                        try self.emitVarDecl(type_str, ident.name.name);
+                        try self.writer.write(" = ");
+                        try self.generateExpr(val);
+                        try self.writer.writeLine(";");
+                        return;
+                    }
+                }
+
+                // Check if this is a dyn Trait binding
+                if (let.type_annotation) |ta| {
+                    if (ta.kind == .trait_object) {
+                        const trait_name = try self.extractTypeName(ta.kind.trait_object.trait_type);
+                        // Track this variable as a dyn trait object
+                        try self.dyn_var_traits.put(ident.name.name, trait_name);
+                        // Infer concrete type from the value expression
+                        if (let.value) |val| {
+                            const concrete_type = self.inferCTypeFromExpr(val);
+                            try self.writer.print("{s} {s};", .{ type_str, ident.name.name });
+                            try self.writer.newline();
+                            try self.writer.print("{s}.data = malloc(sizeof({s}));", .{ ident.name.name, concrete_type });
+                            try self.writer.newline();
+                            try self.writer.print("*({s}*){s}.data = ", .{ concrete_type, ident.name.name });
+                            try self.generateExpr(val);
+                            try self.writer.writeLine(";");
+                            try self.writer.print("{s}.vtable = &dm_vtable_{s}_for_{s};", .{
+                                ident.name.name,
+                                trait_name,
+                                concrete_type[3..], // strip "dm_" prefix
+                            });
+                            try self.writer.newline();
+                        }
                         return;
                     }
                 }
@@ -3678,6 +4133,57 @@ pub const CodeGenerator = struct {
                 .else_if => |else_if| {
                     try self.writer.write(" else ");
                     try self.generateIfStatement(else_if);
+                },
+            }
+        } else {
+            try self.writer.newline();
+        }
+    }
+
+    /// Generate if statement where each branch returns its result.
+    /// Used for if-expressions in return position of non-void functions.
+    fn generateIfStatementWithReturn(self: *Self, if_expr: *IfExpr) anyerror!void {
+        try self.writer.write("if (");
+        try self.generateExpr(if_expr.condition);
+        try self.writer.write(")");
+        try self.writer.beginBlock();
+        // Generate then branch with return
+        for (if_expr.then_branch.statements) |stmt| {
+            try self.generateStatement(stmt);
+        }
+        if (if_expr.then_branch.result) |result| {
+            if (result.kind == .if_expr) {
+                try self.generateIfStatementWithReturn(result.kind.if_expr);
+            } else {
+                try self.writer.write("return ");
+                try self.generateExpr(result);
+                try self.writer.writeLine(";");
+            }
+        }
+        try self.writer.closeBraceInline();
+
+        if (if_expr.else_branch) |else_br| {
+            switch (else_br) {
+                .else_block => |block| {
+                    try self.writer.write(" else");
+                    try self.writer.beginBlock();
+                    for (block.statements) |stmt| {
+                        try self.generateStatement(stmt);
+                    }
+                    if (block.result) |result| {
+                        if (result.kind == .if_expr) {
+                            try self.generateIfStatementWithReturn(result.kind.if_expr);
+                        } else {
+                            try self.writer.write("return ");
+                            try self.generateExpr(result);
+                            try self.writer.writeLine(";");
+                        }
+                    }
+                    try self.writer.endBlock();
+                },
+                .else_if => |else_if| {
+                    try self.writer.write(" else ");
+                    try self.generateIfStatementWithReturn(else_if);
                 },
             }
         } else {
@@ -4243,10 +4749,20 @@ pub const CodeGenerator = struct {
                 try self.generateExpr(inner);
                 try self.writer.write(")");
             },
+            .string_interpolation => |si| try self.generateStringInterpolation(si),
             .comptime_expr => |comp| {
-                // Comptime expressions should be evaluated at compile time
-                try self.writer.writeComment("comptime expression");
-                try self.generateExpr(comp.expr);
+                // Try to evaluate at compile time
+                if (self.evalComptime(comp.expr)) |result| {
+                    switch (result) {
+                        .int_val => |v| try self.writer.print("{d}", .{v}),
+                        .float_val => |v| try self.writer.print("{d}", .{v}),
+                        .bool_val => |v| try self.writer.write(if (v) "true" else "false"),
+                        .string_val => |v| try self.writer.print("dm_string_from_cstr(\"{s}\")", .{v}),
+                    }
+                } else {
+                    // Fall back to runtime evaluation
+                    try self.generateExpr(comp.expr);
+                }
             },
         }
     }
@@ -4385,6 +4901,46 @@ pub const CodeGenerator = struct {
             try self.writer.write(cmp_op);
             try self.writer.write("0)");
             return;
+        }
+
+        // Operator overloading: check if left type has an impl method for this operator
+        if (!std.mem.eql(u8, left_type, "int64_t") and
+            !std.mem.eql(u8, left_type, "double") and
+            !std.mem.eql(u8, left_type, "float") and
+            !std.mem.eql(u8, left_type, "bool") and
+            !std.mem.eql(u8, left_type, "dm_string"))
+        {
+            const method_name: ?[]const u8 = switch (bin.op) {
+                .add => "add",
+                .sub => "sub",
+                .mul => "mul",
+                .div => "div",
+                .mod => "mod",
+                .eq => "eq",
+                .ne => "neq",
+                .lt => "lt",
+                .gt => "gt",
+                .le => "le",
+                .ge => "ge",
+                else => null,
+            };
+
+            if (method_name) |mname| {
+                // Check if this type has a matching impl method
+                const raw_type = if (std.mem.startsWith(u8, left_type, "dm_"))
+                    left_type[3..]
+                else
+                    left_type;
+
+                if (self.hasImplMethod(raw_type, mname)) {
+                    try self.writer.print("dm_{s}_{s}(&(", .{ raw_type, mname });
+                    try self.generateExpr(bin.left);
+                    try self.writer.write("), ");
+                    try self.generateExpr(bin.right);
+                    try self.writer.write(")");
+                    return;
+                }
+            }
         }
 
         try self.writer.write("(");
@@ -4529,6 +5085,38 @@ pub const CodeGenerator = struct {
 
     /// Generate method call (converted to function call)
     fn generateMethodCall(self: *Self, method: *MethodCall) anyerror!void {
+        // Check if this is a dyn Trait method call — dispatch through vtable
+        if (method.object.kind == .identifier) {
+            const obj_name = method.object.kind.identifier.name;
+            if (self.dyn_var_traits.get(obj_name)) |_| {
+                // Dynamic dispatch: obj.vtable->method(obj.data, args...)
+                try self.writer.print("{s}.vtable->{s}({s}.data", .{ obj_name, method.method.name, obj_name });
+                for (method.args) |arg| {
+                    try self.writer.write(", ");
+                    try self.generateExpr(arg);
+                }
+                try self.writer.write(")");
+                return;
+            }
+        }
+
+        // Check if this is an enum constructor: EnumName.Variant(args)
+        // where the object is an identifier matching a known enum type
+        if (method.object.kind == .identifier) {
+            const name = method.object.kind.identifier.name;
+            const mangled = self.mangleTypeName(name) catch "";
+            if (self.generated_enums.contains(mangled)) {
+                // This is an enum constructor call: EnumName.Variant(args)
+                try self.writer.print("{s}_{s}(", .{ mangled, method.method.name });
+                for (method.args, 0..) |arg, i| {
+                    if (i > 0) try self.writer.write(", ");
+                    try self.generateExpr(arg);
+                }
+                try self.writer.write(")");
+                return;
+            }
+        }
+
         // Convert obj.method(args) to dm_Type_method(&obj, args)
         // Infer the type name from the object expression
         var obj_type = self.inferCTypeFromExpr(method.object);
@@ -4572,6 +5160,18 @@ pub const CodeGenerator = struct {
                 return;
             }
 
+            // Check if this is a closure variable - call with env pointer
+            if (self.closure_info.get(name)) |info| {
+                try self.writer.write(info.lambda_name);
+                try self.writer.write("(");
+                try self.writer.print("&{s}", .{info.env_var});
+                for (call.args) |arg| {
+                    try self.writer.write(", ");
+                    try self.generateExpr(arg.value);
+                }
+                try self.writer.write(")");
+                return;
+            }
             // Check if this is a variable holding a function pointer (local var or parameter)
             if (self.variable_types.contains(name) or self.current_mut_params.contains(name)) {
                 // Variable call - function pointer, use name as-is
@@ -4583,6 +5183,10 @@ pub const CodeGenerator = struct {
                 try self.requestMonomorphization(generic_func, null, concrete_types, generic_func.generic_params.?);
                 mangled_name = mono_name;
                 try self.writer.write(mono_name);
+            } else if (self.extern_functions.contains(name)) {
+                // Extern function - use raw C name without dm_ prefix
+                mangled_name = name;
+                try self.writer.write(name);
             } else {
                 // User-defined function - mangle the name
                 mangled_name = try self.mangleFunctionName(name, null);
@@ -4654,6 +5258,27 @@ pub const CodeGenerator = struct {
                 try self.generateExpr(call.args[0].value);
             }
             try self.writer.write(", \"assertion failed\")");
+            return true;
+        } else if (std.mem.eql(u8, name, "assert_eq")) {
+            // assert_eq(actual, expected) — compare two values, panic with message if not equal
+            if (call.args.len >= 2) {
+                const lhs_type = self.inferCTypeFromExpr(call.args[0].value);
+                if (std.mem.eql(u8, lhs_type, "dm_string")) {
+                    // String comparison
+                    try self.writer.write("if (!dm_string_eq(");
+                    try self.generateExpr(call.args[0].value);
+                    try self.writer.write(", ");
+                    try self.generateExpr(call.args[1].value);
+                    try self.writer.write(")) dm_panic(\"assert_eq failed: strings not equal\")");
+                } else {
+                    // Numeric/bool comparison
+                    try self.writer.write("if ((");
+                    try self.generateExpr(call.args[0].value);
+                    try self.writer.write(") != (");
+                    try self.generateExpr(call.args[1].value);
+                    try self.writer.write(")) dm_panic(\"assert_eq failed: values not equal\")");
+                }
+            }
             return true;
         } else if (std.mem.eql(u8, name, "len")) {
             // len(x) -> get length of string or array
@@ -4790,6 +5415,25 @@ pub const CodeGenerator = struct {
                 try self.writer.write(")");
             }
             return true;
+        } else if (std.mem.eql(u8, name, "file_append")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_append_file(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "file_exists")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_file_exists(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "read_line")) {
+            try self.writer.write("dm_read_line()");
+            return true;
         } else if (std.mem.eql(u8, name, "eprint")) {
             if (call.args.len > 0) {
                 try self.generateEprintCall(call.args[0].value, false);
@@ -4856,6 +5500,8 @@ pub const CodeGenerator = struct {
             try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
             return true;
         } else if (std.mem.eql(u8, name, "string_split")) {
+            // Ensure dm_list_dm_string type is generated
+            _ = try self.generateListTypeByName("dm_string");
             if (call.args.len >= 2) {
                 try self.writer.write("dm_string_split(");
                 try self.generateExpr(call.args[0].value);
@@ -5312,8 +5958,281 @@ pub const CodeGenerator = struct {
         }
     }
 
+    // ========================================================================
+    // Comptime Evaluation
+    // ========================================================================
+
+    const ComptimeValue = union(enum) {
+        int_val: i64,
+        float_val: f64,
+        bool_val: bool,
+        string_val: []const u8,
+    };
+
+    /// Try to evaluate an expression at compile time.
+    /// Returns null if the expression cannot be evaluated statically.
+    fn evalComptime(self: *Self, expr: *const Expr) ?ComptimeValue {
+        switch (expr.kind) {
+            .literal => |lit| {
+                return switch (lit.kind) {
+                    .int => |i| blk: {
+                        const v = std.fmt.parseInt(i64, i.value, 10) catch break :blk null;
+                        break :blk ComptimeValue{ .int_val = v };
+                    },
+                    .float => |f| blk: {
+                        const v = std.fmt.parseFloat(f64, f.value) catch break :blk null;
+                        break :blk ComptimeValue{ .float_val = v };
+                    },
+                    .bool => |b| ComptimeValue{ .bool_val = b },
+                    .string => |s| ComptimeValue{ .string_val = s.value },
+                    else => null,
+                };
+            },
+            .unary => |un| {
+                const operand = self.evalComptime(un.operand) orelse return null;
+                return switch (un.op) {
+                    .neg => switch (operand) {
+                        .int_val => |v| ComptimeValue{ .int_val = -v },
+                        .float_val => |v| ComptimeValue{ .float_val = -v },
+                        else => null,
+                    },
+                    .not => switch (operand) {
+                        .bool_val => |v| ComptimeValue{ .bool_val = !v },
+                        else => null,
+                    },
+                    else => null,
+                };
+            },
+            .binary => |bin| {
+                const left = self.evalComptime(bin.left) orelse return null;
+                const right = self.evalComptime(bin.right) orelse return null;
+                return self.evalComptimeBinary(bin.op, left, right);
+            },
+            .grouped => |inner| return self.evalComptime(inner),
+            else => return null,
+        }
+    }
+
+    /// Evaluate a binary operation on comptime values.
+    fn evalComptimeBinary(_: *Self, op: BinaryExpr.BinaryOp, left: ComptimeValue, right: ComptimeValue) ?ComptimeValue {
+        // Integer arithmetic
+        if (left == .int_val and right == .int_val) {
+            const l = left.int_val;
+            const r = right.int_val;
+            return switch (op) {
+                .add => ComptimeValue{ .int_val = l + r },
+                .sub => ComptimeValue{ .int_val = l - r },
+                .mul => ComptimeValue{ .int_val = l * r },
+                .div => if (r != 0) ComptimeValue{ .int_val = @divTrunc(l, r) } else null,
+                .mod => if (r != 0) ComptimeValue{ .int_val = @mod(l, r) } else null,
+                .eq => ComptimeValue{ .bool_val = l == r },
+                .ne => ComptimeValue{ .bool_val = l != r },
+                .lt => ComptimeValue{ .bool_val = l < r },
+                .le => ComptimeValue{ .bool_val = l <= r },
+                .gt => ComptimeValue{ .bool_val = l > r },
+                .ge => ComptimeValue{ .bool_val = l >= r },
+                .bit_and => ComptimeValue{ .int_val = l & r },
+                .bit_or => ComptimeValue{ .int_val = l | r },
+                .bit_xor => ComptimeValue{ .int_val = l ^ r },
+                .shl => ComptimeValue{ .int_val = l << @as(u6, @intCast(@min(r, 63))) },
+                .shr => ComptimeValue{ .int_val = l >> @as(u6, @intCast(@min(r, 63))) },
+                else => null,
+            };
+        }
+
+        // Float arithmetic
+        if ((left == .float_val or left == .int_val) and (right == .float_val or right == .int_val)) {
+            const l: f64 = switch (left) {
+                .float_val => |v| v,
+                .int_val => |v| @as(f64, @floatFromInt(v)),
+                else => return null,
+            };
+            const r: f64 = switch (right) {
+                .float_val => |v| v,
+                .int_val => |v| @as(f64, @floatFromInt(v)),
+                else => return null,
+            };
+            return switch (op) {
+                .add => ComptimeValue{ .float_val = l + r },
+                .sub => ComptimeValue{ .float_val = l - r },
+                .mul => ComptimeValue{ .float_val = l * r },
+                .div => if (r != 0) ComptimeValue{ .float_val = l / r } else null,
+                .eq => ComptimeValue{ .bool_val = l == r },
+                .ne => ComptimeValue{ .bool_val = l != r },
+                .lt => ComptimeValue{ .bool_val = l < r },
+                .le => ComptimeValue{ .bool_val = l <= r },
+                .gt => ComptimeValue{ .bool_val = l > r },
+                .ge => ComptimeValue{ .bool_val = l >= r },
+                else => null,
+            };
+        }
+
+        // Boolean logic
+        if (left == .bool_val and right == .bool_val) {
+            const l = left.bool_val;
+            const r = right.bool_val;
+            return switch (op) {
+                .@"and" => ComptimeValue{ .bool_val = l and r },
+                .@"or" => ComptimeValue{ .bool_val = l or r },
+                .eq => ComptimeValue{ .bool_val = l == r },
+                .ne => ComptimeValue{ .bool_val = l != r },
+                else => null,
+            };
+        }
+
+        return null;
+    }
+
+    // ========================================================================
+    // Closure Support
+    // ========================================================================
+
+    /// Collect free variables in an expression that are not lambda params and exist in variable_types.
+    fn collectFreeVars(self: *Self, expr: *const Expr, param_names: []const []const u8, result: *std.ArrayList(CapturedVar)) void {
+        switch (expr.kind) {
+            .identifier => |ident| {
+                const name = ident.name;
+                // Skip if it's a lambda parameter
+                for (param_names) |pn| {
+                    if (std.mem.eql(u8, name, pn)) return;
+                }
+                // Skip if it's a known function
+                if (self.known_functions.contains(name)) return;
+                if (self.extern_functions.contains(name)) return;
+                // Skip if it's already captured
+                for (result.items) |cap| {
+                    if (std.mem.eql(u8, cap.name, name)) return;
+                }
+                // Check if it's a variable in scope
+                if (self.variable_types.get(name)) |c_type| {
+                    result.append(.{ .name = name, .c_type = c_type }) catch {};
+                } else if (self.current_mut_params.contains(name)) {
+                    result.append(.{ .name = name, .c_type = "int64_t" }) catch {};
+                }
+            },
+            .binary => |bin| {
+                self.collectFreeVars(bin.left, param_names, result);
+                self.collectFreeVars(bin.right, param_names, result);
+            },
+            .unary => |un| {
+                self.collectFreeVars(un.operand, param_names, result);
+            },
+            .function_call => |fc| {
+                self.collectFreeVars(fc.function, param_names, result);
+                for (fc.args) |arg| {
+                    self.collectFreeVars(arg.value, param_names, result);
+                }
+            },
+            .method_call => |mc| {
+                self.collectFreeVars(mc.object, param_names, result);
+                for (mc.args) |arg| {
+                    self.collectFreeVars(arg, param_names, result);
+                }
+            },
+            .field_access => |fa| {
+                self.collectFreeVars(fa.object, param_names, result);
+            },
+            .index_access => |idx| {
+                self.collectFreeVars(idx.object, param_names, result);
+                self.collectFreeVars(idx.index, param_names, result);
+            },
+            .if_expr => |ie| {
+                self.collectFreeVars(ie.condition, param_names, result);
+                self.collectFreeVarsBlock(ie.then_branch, param_names, result);
+                if (ie.else_branch) |eb| {
+                    switch (eb) {
+                        .else_block => |blk| self.collectFreeVarsBlock(blk, param_names, result),
+                        .else_if => |elif| {
+                            self.collectFreeVars(elif.condition, param_names, result);
+                            self.collectFreeVarsBlock(elif.then_branch, param_names, result);
+                        },
+                    }
+                }
+            },
+            .struct_literal => |sl| {
+                for (sl.fields) |f| {
+                    self.collectFreeVars(f.value, param_names, result);
+                }
+            },
+            .grouped => |inner| {
+                self.collectFreeVars(inner, param_names, result);
+            },
+            .string_interpolation => |si| {
+                for (si.parts) |part| {
+                    switch (part) {
+                        .expr => |e| self.collectFreeVars(e, param_names, result),
+                        .literal => {},
+                    }
+                }
+            },
+            .block => |blk| {
+                self.collectFreeVarsBlock(blk, param_names, result);
+            },
+            .lambda => |inner_lambda| {
+                // Nested lambda: collect free vars from its body too, but add its params to exclusion
+                var extended_params = std.ArrayList([]const u8).init(self.stringAllocator());
+                for (param_names) |pn| extended_params.append(pn) catch {};
+                for (inner_lambda.params) |p| extended_params.append(p.name.name) catch {};
+                switch (inner_lambda.body) {
+                    .expression => |e| self.collectFreeVars(e, extended_params.items, result),
+                    .block => |b| self.collectFreeVarsBlock(b, extended_params.items, result),
+                }
+            },
+            else => {}, // Literals, paths, etc. have no free variables
+        }
+    }
+
+    /// Collect free variables from a block expression.
+    fn collectFreeVarsBlock(self: *Self, block: *const BlockExpr, param_names: []const []const u8, result: *std.ArrayList(CapturedVar)) void {
+        for (block.statements) |stmt| {
+            self.collectFreeVarsStmt(stmt, param_names, result);
+        }
+        if (block.result) |res| {
+            self.collectFreeVars(res, param_names, result);
+        }
+    }
+
+    /// Collect free variables from a statement.
+    fn collectFreeVarsStmt(self: *Self, stmt: *const Statement, param_names: []const []const u8, result: *std.ArrayList(CapturedVar)) void {
+        switch (stmt.kind) {
+            .expression => |e| self.collectFreeVars(e, param_names, result),
+            .let_binding => |lb| {
+                if (lb.value) |v| self.collectFreeVars(v, param_names, result);
+            },
+            .assignment => |a| {
+                self.collectFreeVars(a.target, param_names, result);
+                self.collectFreeVars(a.value, param_names, result);
+            },
+            .return_stmt => |rs| {
+                if (rs.value) |v| self.collectFreeVars(v, param_names, result);
+            },
+            .if_stmt => |is| {
+                self.collectFreeVars(is.condition, param_names, result);
+                self.collectFreeVarsBlock(is.then_branch, param_names, result);
+                if (is.else_branch) |eb| {
+                    switch (eb) {
+                        .else_block => |blk| self.collectFreeVarsBlock(blk, param_names, result),
+                        .else_if => |elif| {
+                            self.collectFreeVars(elif.condition, param_names, result);
+                            self.collectFreeVarsBlock(elif.then_branch, param_names, result);
+                        },
+                    }
+                }
+            },
+            .for_loop => |fl| {
+                self.collectFreeVars(fl.iterator, param_names, result);
+                self.collectFreeVarsBlock(fl.body, param_names, result);
+            },
+            .while_loop => |wl| {
+                self.collectFreeVars(wl.condition, param_names, result);
+                self.collectFreeVarsBlock(wl.body, param_names, result);
+            },
+            else => {},
+        }
+    }
+
     /// Generate lambda expression by hoisting to a static C function.
-    /// For Stage 0, only non-capturing lambdas are supported.
+    /// Supports both non-capturing and capturing (closure) lambdas.
     fn generateLambdaExpr(self: *Self, lambda: *LambdaExpr) anyerror!void {
         self.lambda_depth += 1;
         defer self.lambda_depth -= 1;
@@ -5335,9 +6254,50 @@ pub const CodeGenerator = struct {
             }
         };
 
-        // Emit static function definition to lambda_writer
+        // Collect parameter names
+        var param_names = std.ArrayList([]const u8).init(self.stringAllocator());
+        for (lambda.params) |p| {
+            try param_names.append(p.name.name);
+        }
+
+        // Scan for captured variables
+        var captures = std.ArrayList(CapturedVar).init(self.stringAllocator());
+        switch (lambda.body) {
+            .expression => |expr| self.collectFreeVars(expr, param_names.items, &captures),
+            .block => |block| self.collectFreeVarsBlock(block, param_names.items, &captures),
+        }
+
+        const has_captures = captures.items.len > 0;
+        const closure_struct_name = if (has_captures)
+            try std.fmt.allocPrint(self.stringAllocator(), "__dm_closure_{d}", .{self.lambda_counter - 1})
+        else
+            "";
+
+        // Emit closure struct definition if there are captures
         var w = &self.lambda_writer;
+        if (has_captures) {
+            try w.print("typedef struct {s} {{", .{closure_struct_name});
+            try w.newline();
+            w.indent();
+            for (captures.items) |cap| {
+                try w.print("{s} {s};", .{ cap.c_type, cap.name });
+                try w.newline();
+            }
+            w.dedent();
+            try w.print("}} {s};", .{closure_struct_name});
+            try w.newline();
+            try w.blankLine();
+        }
+
+        // Emit static function definition to lambda_writer
         try w.print("static {s} {s}(", .{ ret_type, lambda_name });
+
+        // If capturing, first param is void* __env
+        if (has_captures) {
+            try w.write("void* __env");
+            if (lambda.params.len > 0) try w.write(", ");
+        }
+
         for (lambda.params, 0..) |param, i| {
             if (i > 0) try w.write(", ");
             const param_type: []const u8 = if (param.type_expr) |te|
@@ -5346,13 +6306,26 @@ pub const CodeGenerator = struct {
                 "int64_t";
             try w.print("{s} {s}", .{ param_type, param.name.name });
         }
-        if (lambda.params.len == 0) try w.write("void");
+        if (!has_captures and lambda.params.len == 0) try w.write("void");
         try w.writeLine(") {");
         w.indent();
+
+        // If capturing, unpack the closure struct
+        if (has_captures) {
+            try w.print("{s}* __c = ({s}*)__env;", .{ closure_struct_name, closure_struct_name });
+            try w.newline();
+            for (captures.items) |cap| {
+                try w.print("{s} {s} = __c->{s};", .{ cap.c_type, cap.name, cap.name });
+                try w.newline();
+            }
+        }
 
         // Save and swap writer so generateExpr/generateBlock writes to lambda_writer
         const saved_writer = self.writer;
         self.writer = self.lambda_writer;
+
+        // Set up closure capture context so identifiers are resolved from __c-> if needed
+        // (Not needed since we unpacked to local variables above)
 
         switch (lambda.body) {
             .expression => |expr| {
@@ -5375,8 +6348,23 @@ pub const CodeGenerator = struct {
         try self.lambda_writer.writeLine("}");
         try self.lambda_writer.blankLine();
 
-        // In the main code, reference the lambda by its hoisted name
-        try self.writer.write(lambda_name);
+        if (has_captures) {
+            const env_var = try std.fmt.allocPrint(self.stringAllocator(), "__dm_env_{d}", .{self.lambda_counter - 1});
+
+            // Track closure info so call sites and let bindings can use it
+            try self.closure_info.put(lambda_name, .{
+                .lambda_name = lambda_name,
+                .env_var = env_var,
+                .captures = captures.items,
+                .return_type = ret_type,
+            });
+
+            // Don't emit anything to the main writer here.
+            // The closure struct init and variable binding are handled by generateLetBinding.
+        } else {
+            // In the main code, reference the lambda by its hoisted name
+            try self.writer.write(lambda_name);
+        }
     }
 
     /// Generate pipeline expression (transformed to nested calls)
@@ -5526,6 +6514,78 @@ pub const CodeGenerator = struct {
     }
 
     /// Generate cast expression
+    /// Generate string interpolation as nested dm_string_concat calls
+    fn generateStringInterpolation(self: *Self, si: *const ast.StringInterpolation) anyerror!void {
+        // Build a chain: dm_string_concat(part1, dm_string_concat(part2, ...))
+        // Special case: single part
+        if (si.parts.len == 0) {
+            try self.writer.write("dm_string_from_cstr(\"\")");
+            return;
+        }
+        if (si.parts.len == 1) {
+            try self.generateInterpolPart(si.parts[0]);
+            return;
+        }
+
+        // Multiple parts: nested concat
+        // Open N-1 concat calls
+        for (0..si.parts.len - 1) |_| {
+            try self.writer.write("dm_string_concat(");
+        }
+
+        // First part
+        try self.generateInterpolPart(si.parts[0]);
+
+        // Remaining parts
+        for (si.parts[1..]) |part| {
+            try self.writer.write(", ");
+            try self.generateInterpolPart(part);
+            try self.writer.write(")");
+        }
+    }
+
+    fn generateInterpolPart(self: *Self, part: ast.StringInterpolation.InterpolPart) anyerror!void {
+        switch (part) {
+            .literal => |lit| {
+                try self.writer.write("dm_string_from_cstr(");
+                try self.writeCStringLiteral(lit);
+                try self.writer.write(")");
+            },
+            .expr => |expr| {
+                // Infer the type to decide if conversion is needed
+                const expr_type = self.inferCTypeFromExpr(expr);
+                if (std.mem.eql(u8, expr_type, "dm_string")) {
+                    try self.generateExpr(expr);
+                } else if (std.mem.eql(u8, expr_type, "int64_t") or
+                    std.mem.eql(u8, expr_type, "int32_t") or
+                    std.mem.eql(u8, expr_type, "int16_t") or
+                    std.mem.eql(u8, expr_type, "int8_t") or
+                    std.mem.eql(u8, expr_type, "uint64_t") or
+                    std.mem.eql(u8, expr_type, "uint32_t") or
+                    std.mem.eql(u8, expr_type, "uint16_t") or
+                    std.mem.eql(u8, expr_type, "uint8_t"))
+                {
+                    try self.writer.write("dm_int_to_string((int64_t)(");
+                    try self.generateExpr(expr);
+                    try self.writer.write("))");
+                } else if (std.mem.eql(u8, expr_type, "double") or std.mem.eql(u8, expr_type, "float")) {
+                    try self.writer.write("dm_float_to_string((double)(");
+                    try self.generateExpr(expr);
+                    try self.writer.write("))");
+                } else if (std.mem.eql(u8, expr_type, "bool")) {
+                    try self.writer.write("dm_bool_to_string(");
+                    try self.generateExpr(expr);
+                    try self.writer.write(")");
+                } else {
+                    // Default: try int_to_string as fallback
+                    try self.writer.write("dm_int_to_string((int64_t)(");
+                    try self.generateExpr(expr);
+                    try self.writer.write("))");
+                }
+            },
+        }
+    }
+
     fn generateCast(self: *Self, cast: *CastExpr) anyerror!void {
         const target_type = try self.mapType(cast.target_type);
         try self.writer.print("(({s})(", .{target_type});

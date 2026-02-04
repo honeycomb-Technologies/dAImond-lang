@@ -1,0 +1,46 @@
+module test
+
+-- Standard Testing Module
+-- Provides assertion functions for use with `daimond test`.
+--
+-- Test functions are any function whose name starts with `test_`.
+-- The test runner (`daimond test <file>`) discovers them automatically,
+-- runs each one, and catches panics as test failures.
+--
+-- Available assertion builtins:
+--   assert(condition: bool)          -- panics if condition is false
+--   assert_eq(actual, expected)      -- panics if actual != expected (works for int, string, bool, float)
+--   panic(message: string)           -- always fails the test with a message
+--
+-- Example:
+--   module my_tests
+--
+--   fn test_addition() {
+--       assert_eq(2 + 3, 5)
+--   }
+--
+--   fn test_strings() {
+--       let s = "hello" + " world"
+--       assert_eq(s, "hello world")
+--   }
+--
+--   fn test_condition() {
+--       let x = 42
+--       assert(x > 0)
+--   }
+--
+--   fn main() {
+--       println("Run with: daimond test my_tests.dm")
+--   }
+--
+-- Usage:
+--   daimond test my_tests.dm
+--
+-- Output:
+--   Found 3 test(s) in my_tests.dm
+--
+--     test test_addition ... PASS
+--     test test_strings ... PASS
+--     test test_condition ... PASS
+--
+--   3 passed, 0 failed

@@ -1,0 +1,5 @@
+# Object files
+*.o
+
+# Generated C files at root
+/main.c

@@ -129,6 +129,7 @@ pub const FunctionDecl = struct {
     contracts: ?Contracts,
     body: ?FunctionBody,
     is_comptime: bool,
+    is_extern: bool,
     span: Span,
 
     pub const FunctionBody = union(enum) {
@@ -428,6 +429,9 @@ pub const Expr = struct {
         cast: *CastExpr,
         type_check: *TypeCheckExpr,
 
+        // String interpolation
+        string_interpolation: *StringInterpolation,
+
         // Special
         grouped: *Expr, // parenthesized expression
         comptime_expr: *ComptimeExpr,
@@ -720,6 +724,19 @@ pub const ComptimeExpr = struct {
     span: Span,
 };
 
+/// String interpolation expression: f"prefix {expr} suffix"
+/// Represented as alternating literal strings and expressions
+pub const StringInterpolation = struct {
+    /// Interleaved parts: literal strings and embedded expressions
+    parts: []InterpolPart,
+    span: Span,
+
+    pub const InterpolPart = union(enum) {
+        literal: []const u8,
+        expr: *Expr,
+    };
+};
+
 // ============================================================================
 // Patterns
 // ============================================================================
@@ -836,6 +853,7 @@ pub const TypeExpr = struct {
         tuple: *TupleType,
         option: *OptionType, // T? sugar
         result: *ResultType, // T! sugar or Result[T, E]
+        trait_object: *TraitObjectType, // dyn Trait
         infer, // _ for type inference
         never, // ! for never type
         self_type, // Self in traits
@@ -846,6 +864,12 @@ pub const TypeExpr = struct {
 pub const NamedType = struct {
     path: Path,
     generic_args: ?[]const *TypeExpr,
+    span: Span,
+};
+
+/// Dynamic trait object type: `dyn Trait`
+pub const TraitObjectType = struct {
+    trait_type: *TypeExpr, // The trait (named type)
     span: Span,
 };
 

@@ -24,6 +24,7 @@ const checker_mod = @import("checker.zig");
 const TypeChecker = checker_mod.TypeChecker;
 const codegen = @import("codegen.zig");
 const CodeGenerator = codegen.CodeGenerator;
+const package = @import("package.zig");
 
 const version = "0.1.0";
 
@@ -55,6 +56,8 @@ const Command = enum {
     parse, // daimond parse <file.dm> - Show AST
     check, // daimond check <file.dm> - Type check only
     fmt, // daimond fmt <file.dm> - Format code
+    test_run, // daimond test <file.dm> - Run test functions
+    pkg, // daimond pkg <subcommand> - Package management
 };
 
 const CompilerOptions = struct {
@@ -82,6 +85,7 @@ const ExitCode = enum(u8) {
     success = 0,
     error_compile = 1,
     error_usage = 2,
+    error_runtime = 3,
 };
 
 // ============================================================================
@@ -146,9 +150,22 @@ pub fn main() !void {
         return;
     }
 
-    // Need an input file for most commands
-    if (opts.input_file == null) {
+    // Need an input file for most commands (but not pkg)
+    if (opts.input_file == null and opts.command != .pkg) {
         try printUsage();
+        return;
+    }
+
+    // Pkg command doesn't need output paths
+    if (opts.command == .pkg) {
+        const exit_code = executePkgCommand(args, allocator) catch |err| {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Package error: {}\n", .{err});
+            std.process.exit(@intFromEnum(ExitCode.error_compile));
+        };
+        if (exit_code != .success) {
+            std.process.exit(@intFromEnum(exit_code));
+        }
         return;
     }
 
@@ -233,6 +250,18 @@ fn parseArgs(args: []const []const u8) !CompilerOptions {
         if (std.mem.eql(u8, arg, "fmt")) {
             opts.command = .fmt;
             continue;
+        }
+
+        if (std.mem.eql(u8, arg, "test")) {
+            opts.command = .test_run;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "pkg")) {
+            opts.command = .pkg;
+            // Remaining args are pkg subcommand args, stored via input_file hack
+            // We'll handle them in executePkgCommand
+            return opts;
         }
 
         // Options with arguments
@@ -346,6 +375,8 @@ fn executeCommand(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         .parse => try parseFile(opts, allocator),
         .check => try checkFile(opts, allocator),
         .fmt => try formatFile(opts, allocator),
+        .test_run => try testFile(opts, allocator),
+        .pkg => unreachable, // handled in main() before executeCommand
     };
 }
 
@@ -699,14 +730,394 @@ fn formatFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     const path = opts.input_file.?;
     const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
 
-    _ = allocator;
+    // Read source file
+    const source = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch |err| {
+        try stdout.print("{s}Error:{s} Cannot read file '{s}': {}\n", .{
+            colors.error_style(), colors.reset(), path, err,
+        });
+        return .error_compile;
+    };
+    defer allocator.free(source);
 
-    // TODO: Implement formatter
-    try stdout.print("{s}Note:{s} Formatter is not yet implemented.\n", .{
-        colors.warning_style(),
-        colors.reset(),
-    });
-    try stdout.print("File: {s}\n", .{path});
+    // Format the source
+    const formatted = formatSource(source, allocator) catch |err| {
+        try stdout.print("{s}Error:{s} Formatting failed: {}\n", .{
+            colors.error_style(), colors.reset(), err,
+        });
+        return .error_compile;
+    };
+    defer allocator.free(formatted);
+
+    // If output file specified, write there; otherwise write to stdout
+    if (opts.output_file) |out_path| {
+        const file = try std.fs.cwd().createFile(out_path, .{});
+        defer file.close();
+        try file.writeAll(formatted);
+        try stdout.print("Formatted: {s}\n", .{out_path});
+    } else {
+        // Write back to the original file
+        const file = try std.fs.cwd().createFile(path, .{});
+        defer file.close();
+        try file.writeAll(formatted);
+        try stdout.print("Formatted: {s}\n", .{path});
+    }
+
+    return .success;
+}
+
+/// Format dAImond source code with consistent indentation and spacing.
+/// Uses a line-by-line approach: normalizes indentation based on braces.
+fn formatSource(source: []const u8, allocator: Allocator) ![]const u8 {
+    var result = std.ArrayList(u8).init(allocator);
+    defer result.deinit();
+
+    var indent_level: usize = 0;
+    const indent_str = "    "; // 4 spaces
+
+    var lines = std.mem.splitSequence(u8, source, "\n");
+    var first_line = true;
+    while (lines.next()) |raw_line| {
+        if (!first_line) try result.append('\n');
+        first_line = false;
+
+        // Trim leading/trailing whitespace from the line
+        const trimmed = std.mem.trim(u8, raw_line, " \t\r");
+
+        // Skip empty lines (preserve them as blank lines)
+        if (trimmed.len == 0) {
+            continue;
+        }
+
+        // Check if line starts with a closing brace — dedent before writing
+        if (trimmed[0] == '}' and indent_level > 0) {
+            indent_level -= 1;
+        }
+
+        // Write indentation
+        for (0..indent_level) |_| {
+            try result.appendSlice(indent_str);
+        }
+
+        // Write the trimmed line content
+        try result.appendSlice(trimmed);
+
+        // Count braces to adjust indent level for subsequent lines
+        var in_string = false;
+        var in_comment = false;
+        var prev_char: u8 = 0;
+        for (trimmed) |ch| {
+            if (in_comment) break;
+            if (ch == '"' and prev_char != '\\') {
+                in_string = !in_string;
+            }
+            if (!in_string) {
+                if (ch == '-' and prev_char == '-') {
+                    in_comment = true;
+                    continue;
+                }
+                if (ch == '{') {
+                    indent_level += 1;
+                } else if (ch == '}' and trimmed[0] != '}') {
+                    // Closing brace not at start of line (inline)
+                    if (indent_level > 0) indent_level -= 1;
+                }
+            }
+            prev_char = ch;
+        }
+    }
+
+    // Ensure file ends with newline
+    if (result.items.len > 0 and result.items[result.items.len - 1] != '\n') {
+        try result.append('\n');
+    }
+
+    return try result.toOwnedSlice();
+}
+
+// ============================================================================
+// TEST Command
+// ============================================================================
+
+fn testFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
+    const stdout = std.io.getStdOut().writer();
+    const path = opts.input_file.?;
+    const colors = if (opts.no_color) ColorConfig.never() else ColorConfig.detect();
+
+    // Read source
+    const source = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+        try stdout.print("{s}Error:{s} Cannot read '{s}': {}\n", .{
+            colors.error_style(), colors.reset(), path, err,
+        });
+        return .error_compile;
+    };
+    defer allocator.free(source);
+
+    // Lex
+    var lexer = Lexer.init(source, allocator);
+    defer lexer.deinit();
+    const tokens = try lexer.scanAll();
+    defer allocator.free(tokens);
+    if (lexer.hasErrors()) {
+        // Display lex errors via the lexer's error infrastructure
+        try stdout.print("Lex errors in {s}\n", .{path});
+        return .error_compile;
+    }
+
+    // Parse
+    var parser = Parser.init(tokens, allocator);
+    defer parser.deinit();
+    const ast_result = try parser.parse();
+    if (parser.hasErrors()) {
+        try displayParseErrors(&parser, source, path, colors, stdout);
+        return .error_compile;
+    }
+
+    // Scan for test functions (fn test_*())
+    var test_names = std.ArrayList([]const u8).init(allocator);
+    defer test_names.deinit();
+    for (ast_result.declarations) |decl| {
+        switch (decl.kind) {
+            .function => |f| {
+                if (std.mem.startsWith(u8, f.name.name, "test_")) {
+                    try test_names.append(f.name.name);
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (test_names.items.len == 0) {
+        try stdout.print("No test functions found (functions starting with 'test_').\n", .{});
+        return .success;
+    }
+
+    try stdout.print("Found {d} test(s) in {s}\n\n", .{ test_names.items.len, path });
+
+    // Type check
+    var type_checker = TypeChecker.init(allocator) catch |err| {
+        try stdout.print("{s}Error:{s} Type checker init failed: {}\n", .{
+            colors.error_style(), colors.reset(), err,
+        });
+        return .error_compile;
+    };
+    defer type_checker.deinit();
+    type_checker.setSource(source);
+    type_checker.setSourceFile(path);
+    type_checker.checkSourceFile(ast_result) catch {};
+    if (type_checker.hasErrors()) {
+        try displayTypeErrors(&type_checker, colors, stdout);
+        return .error_compile;
+    }
+
+    // Generate C code
+    var code_generator = CodeGenerator.init(allocator);
+    defer code_generator.deinit();
+    if (type_checker.getTypeContext()) |ctx| {
+        code_generator.setTypeContext(ctx);
+    }
+    const c_code = code_generator.generate(ast_result) catch |err| {
+        try stdout.print("{s}Error:{s} Code generation failed: {}\n", .{
+            colors.error_style(), colors.reset(), err,
+        });
+        return .error_compile;
+    };
+
+    // Append test runner to generated C code
+    var full_code = std.ArrayList(u8).init(allocator);
+    defer full_code.deinit();
+
+    // Replace dm_panic with a test-aware version that uses setjmp/longjmp
+    // to catch panics and report them as test failures instead of aborting.
+    const panic_needle = "static inline void dm_panic(const char* message) {\n    fprintf(stderr, \"PANIC: %s\\n\", message);\n    exit(1);\n}";
+    const panic_replacement =
+        "#include <setjmp.h>\n" ++
+        "static jmp_buf __test_jmp;\n" ++
+        "static int __test_active = 0;\n" ++
+        "static const char* __test_fail_msg = NULL;\n" ++
+        "static inline void dm_panic(const char* message) {\n" ++
+        "    if (__test_active) {\n" ++
+        "        __test_fail_msg = message;\n" ++
+        "        longjmp(__test_jmp, 1);\n" ++
+        "    }\n" ++
+        "    fprintf(stderr, \"PANIC: %s\\n\", message);\n" ++
+        "    exit(1);\n" ++
+        "}";
+
+    if (std.mem.indexOf(u8, c_code, panic_needle)) |panic_pos| {
+        try full_code.appendSlice(c_code[0..panic_pos]);
+        try full_code.appendSlice(panic_replacement);
+        try full_code.appendSlice(c_code[panic_pos + panic_needle.len ..]);
+    } else {
+        // Fallback: just use the original code
+        try full_code.appendSlice(c_code);
+    }
+
+    // Now replace main() with our test runner
+    const main_code = full_code.items;
+    if (std.mem.indexOf(u8, main_code, "int main(int argc, char** argv)")) |main_pos| {
+        // Rebuild: everything before main + test runner
+        var final_code = std.ArrayList(u8).init(allocator);
+        defer final_code.deinit();
+        try final_code.appendSlice(main_code[0..main_pos]);
+
+        // Add test runner main
+        try final_code.appendSlice("int main(int argc, char** argv) {\n");
+        try final_code.appendSlice("    dm_argc = argc;\n");
+        try final_code.appendSlice("    dm_argv = argv;\n");
+        try final_code.appendSlice("    int __passed = 0, __failed = 0;\n");
+
+        for (test_names.items) |test_name| {
+            try final_code.appendSlice("    printf(\"  test ");
+            try final_code.appendSlice(test_name);
+            try final_code.appendSlice(" ... \");\n");
+            try final_code.appendSlice("    fflush(stdout);\n");
+            try final_code.appendSlice("    __test_active = 1;\n");
+            try final_code.appendSlice("    __test_fail_msg = NULL;\n");
+            try final_code.appendSlice("    if (setjmp(__test_jmp) == 0) {\n");
+            try final_code.appendSlice("        dm_");
+            try final_code.appendSlice(test_name);
+            try final_code.appendSlice("();\n");
+            try final_code.appendSlice("        __test_active = 0;\n");
+            try final_code.appendSlice("        printf(\"PASS\\n\"); __passed++;\n");
+            try final_code.appendSlice("    } else {\n");
+            try final_code.appendSlice("        __test_active = 0;\n");
+            try final_code.appendSlice("        if (__test_fail_msg) printf(\"FAIL: %s\\n\", __test_fail_msg);\n");
+            try final_code.appendSlice("        else printf(\"FAIL\\n\");\n");
+            try final_code.appendSlice("        __failed++;\n");
+            try final_code.appendSlice("    }\n");
+        }
+
+        try final_code.appendSlice("    printf(\"\\n%d passed, %d failed\\n\", __passed, __failed);\n");
+        try final_code.appendSlice("    return __failed > 0 ? 1 : 0;\n");
+        try final_code.appendSlice("}\n");
+
+        // Replace full_code contents with final_code
+        full_code.clearRetainingCapacity();
+        try full_code.appendSlice(final_code.items);
+    }
+
+    // Write C file to temp location
+    const c_path = try std.fmt.allocPrint(allocator, "/tmp/daimond_test_{d}.c", .{std.time.milliTimestamp()});
+    defer allocator.free(c_path);
+    const bin_path = try std.fmt.allocPrint(allocator, "/tmp/daimond_test_{d}", .{std.time.milliTimestamp()});
+    defer allocator.free(bin_path);
+
+    {
+        const file = try std.fs.cwd().createFile(c_path, .{});
+        defer file.close();
+        try file.writeAll(full_code.items);
+    }
+    defer std.fs.cwd().deleteFile(c_path) catch {};
+    defer std.fs.cwd().deleteFile(bin_path) catch {};
+
+    // Compile C code
+    const cc = findCCompiler() orelse {
+        try stdout.print("{s}Error:{s} No C compiler found\n", .{ colors.error_style(), colors.reset() });
+        return .error_compile;
+    };
+
+    {
+        var child = std.process.Child.init(&[_][]const u8{ cc, "-o", bin_path, c_path, "-lm", "-lpthread" }, allocator);
+        child.stderr_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.spawn() catch |err| {
+            try stdout.print("{s}Error:{s} Cannot spawn C compiler: {}\n", .{
+                colors.error_style(), colors.reset(), err,
+            });
+            return .error_compile;
+        };
+        const cc_wait = child.wait() catch {
+            return .error_compile;
+        };
+        switch (cc_wait) {
+            .Exited => |code| {
+                if (code != 0) {
+                    try stdout.print("{s}Error:{s} C compilation failed (exit code {d})\n", .{
+                        colors.error_style(), colors.reset(), code,
+                    });
+                    return .error_compile;
+                }
+            },
+            else => return .error_compile,
+        }
+    }
+
+    // Run tests
+    {
+        var child = std.process.Child.init(&[_][]const u8{bin_path}, allocator);
+        child.stderr_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.spawn() catch |err| {
+            try stdout.print("{s}Error:{s} Cannot spawn test binary: {}\n", .{
+                colors.error_style(), colors.reset(), err,
+            });
+            return .error_compile;
+        };
+
+        // Read stdout/stderr
+        const child_stdout = child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024) catch "";
+        defer allocator.free(child_stdout);
+        const child_stderr = child.stderr.?.reader().readAllAlloc(allocator, 1024 * 1024) catch "";
+        defer allocator.free(child_stderr);
+
+        const wait_result = child.wait() catch {
+            return .error_runtime;
+        };
+
+        try stdout.writeAll(child_stdout);
+        if (child_stderr.len > 0) {
+            try stdout.writeAll(child_stderr);
+        }
+
+        switch (wait_result) {
+            .Exited => |code| {
+                if (code != 0) return .error_runtime;
+            },
+            else => return .error_runtime,
+        }
+    }
+
+    return .success;
+}
+
+// ============================================================================
+// PKG Command
+// ============================================================================
+
+fn executePkgCommand(args: []const []const u8, allocator: Allocator) !ExitCode {
+    // Find "pkg" in args, subcommand args follow it
+    var pkg_args_start: usize = 0;
+    for (args, 0..) |arg, idx| {
+        if (std.mem.eql(u8, arg, "pkg")) {
+            pkg_args_start = idx + 1;
+            break;
+        }
+    }
+    const pkg_args = if (pkg_args_start < args.len) args[pkg_args_start..] else &[_][]const u8{};
+
+    const parsed = package.parsePkgCommand(pkg_args);
+
+    switch (parsed.cmd) {
+        .init_pkg => {
+            try package.executePkgInit(allocator);
+        },
+        .add => {
+            if (parsed.args.len == 0) {
+                const stdout = std.io.getStdOut().writer();
+                try stdout.print("Usage: daimond pkg add <name> [version|--path <path>|--git <url>]\n", .{});
+                return .error_usage;
+            }
+            const dep_name = parsed.args[0];
+            const extra = if (parsed.args.len > 1) parsed.args[1..] else &[_][]const u8{};
+            try package.executePkgAdd(dep_name, extra, allocator);
+        },
+        .list => {
+            try package.executePkgList(allocator);
+        },
+        .help => {
+            try package.printPkgHelp();
+        },
+    }
 
     return .success;
 }
@@ -790,6 +1201,48 @@ fn findRuntimeRelative(allocator: Allocator) ![]const u8 {
     return error.RuntimeNotFound;
 }
 
+/// Find the stdlib directory relative to the compiler executable or working directory.
+/// Stdlib is at `<project_root>/stdlib/`.
+/// Executable is at `<project_root>/stage0/zig-out/bin/daimond`.
+fn findStdlibDir(allocator: Allocator) ![]const u8 {
+    // Try relative to executable first
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (std.fs.selfExePath(&buf)) |exe_path| {
+        const exe_dir = std.fs.path.dirname(exe_path) orelse ".";
+
+        // Check ../../../stdlib (exe is in stage0/zig-out/bin/)
+        const path1 = try std.fs.path.join(allocator, &.{ exe_dir, "..", "..", "..", "stdlib" });
+        if (std.fs.cwd().access(path1, .{})) |_| {
+            return path1;
+        } else |_| {
+            allocator.free(path1);
+        }
+
+        // Check ../../stdlib (exe is in zig-out/bin/)
+        const path2 = try std.fs.path.join(allocator, &.{ exe_dir, "..", "..", "stdlib" });
+        if (std.fs.cwd().access(path2, .{})) |_| {
+            return path2;
+        } else |_| {
+            allocator.free(path2);
+        }
+    } else |_| {}
+
+    // Try relative paths from working directory
+    const paths = [_][]const u8{
+        "stdlib",
+        "../stdlib",
+        "stage0/../stdlib",
+    };
+
+    for (paths) |path| {
+        if (std.fs.cwd().access(path, .{})) |_| {
+            return try allocator.dupe(u8, path);
+        } else |_| {}
+    }
+
+    return error.StdlibNotFound;
+}
+
 // ============================================================================
 // Module Loader (Multi-file Import Support)
 // ============================================================================
@@ -830,9 +1283,42 @@ const ModuleLoader = struct {
     /// Resolve an import path to a file system path.
     /// `import foo` -> `<dir>/foo.dm`
     /// `import foo::bar` -> `<dir>/foo/bar.dm`
+    /// `import std.io` -> `<stdlib_dir>/io.dm`
     fn resolveImportPath(self: *ModuleLoader, import_decl: *const ast.ImportDecl, importing_dir: []const u8) ![]const u8 {
         const segments = import_decl.path.segments;
         if (segments.len == 0) return error.EmptyImportPath;
+
+        // Check if this is a stdlib import (first segment is "std")
+        if (segments.len >= 2 and std.mem.eql(u8, segments[0].name, "std")) {
+            // Try to find stdlib directory relative to compiler executable
+            if (findStdlibDir(self.allocator)) |stdlib_dir| {
+                defer self.allocator.free(stdlib_dir);
+
+                var path_parts = std.ArrayList([]const u8).init(self.allocator);
+                defer path_parts.deinit();
+
+                try path_parts.append(stdlib_dir);
+                // Skip the "std" segment, use remaining segments
+                for (segments[1..]) |seg| {
+                    try path_parts.append(seg.name);
+                }
+
+                const joined = try std.fs.path.join(self.allocator, path_parts.items);
+                defer self.allocator.free(joined);
+
+                const full_path = try std.fmt.allocPrint(self.allocator, "{s}.dm", .{joined});
+
+                // Verify file exists before returning
+                if (std.fs.cwd().access(full_path, .{})) |_| {
+                    return full_path;
+                } else |_| {
+                    self.allocator.free(full_path);
+                    // Fall through to relative path resolution
+                }
+            } else |_| {
+                // Can't find stdlib dir, fall through to relative path resolution
+            }
+        }
 
         // Build path: join segments with '/' and append '.dm'
         var path_parts = std.ArrayList([]const u8).init(self.allocator);
@@ -1248,6 +1734,11 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     try cc_args.append("-Wall");
     try cc_args.append("-Wextra");
     try cc_args.append("-pedantic");
+
+    // Link math library (needed for extern fn wrapping math.h)
+    try cc_args.append("-lm");
+    // Link pthread library (needed for threading primitives)
+    try cc_args.append("-lpthread");
 
     if (opts.verbose) {
         try stdout.print("\n        Running: ", .{});

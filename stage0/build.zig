@@ -14,6 +14,16 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // LSP server executable
+    const lsp_exe = b.addExecutable(.{
+        .name = "daimond-lsp",
+        .root_source_file = b.path("src/lsp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    b.installArtifact(lsp_exe);
+
     // Run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -88,6 +98,24 @@ pub fn build(b: *std.Build) void {
 
     const run_checker_tests = b.addRunArtifact(checker_tests);
 
+    // Unit tests for package
+    const package_tests = b.addTest(.{
+        .root_source_file = b.path("src/package.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const run_package_tests = b.addRunArtifact(package_tests);
+
+    // Unit tests for LSP
+    const lsp_tests = b.addTest(.{
+        .root_source_file = b.path("src/lsp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const run_lsp_tests = b.addRunArtifact(lsp_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lexer_tests.step);
     test_step.dependOn(&run_errors_tests.step);
@@ -96,6 +124,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_parser_tests.step);
     test_step.dependOn(&run_codegen_tests.step);
     test_step.dependOn(&run_checker_tests.step);
+    test_step.dependOn(&run_package_tests.step);
+    test_step.dependOn(&run_lsp_tests.step);
 
     // Integration test runner executable
     const integration_exe = b.addExecutable(.{

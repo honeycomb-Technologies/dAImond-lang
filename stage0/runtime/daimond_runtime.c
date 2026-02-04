@@ -712,3 +712,210 @@ void dm_runtime_cleanup(void) {
      * - Memory leak detection in debug mode
      */
 }
+
+/* ============================================================================
+ * Threading Primitives
+ * ============================================================================ */
+
+#ifndef _WIN32
+
+/* Trampoline for thread spawn: pthreads expects void* (*)(void*) but
+ * dAImond spawns void (*)(void) functions. */
+typedef struct {
+    void (*func)(void);
+} dm_thread_trampoline_arg;
+
+static void* dm_thread_trampoline(void* arg) {
+    dm_thread_trampoline_arg* ta = (dm_thread_trampoline_arg*)arg;
+    void (*func)(void) = ta->func;
+    free(ta);
+    func();
+    return NULL;
+}
+
+dm_thread dm_thread_spawn(void (*func)(void)) {
+    dm_thread t;
+    dm_thread_trampoline_arg* arg = (dm_thread_trampoline_arg*)malloc(sizeof(dm_thread_trampoline_arg));
+    arg->func = func;
+    pthread_create(&t.handle, NULL, dm_thread_trampoline, arg);
+    return t;
+}
+
+void dm_thread_join(dm_thread thread) {
+    pthread_join(thread.handle, NULL);
+}
+
+dm_mutex dm_mutex_new(void) {
+    dm_mutex m;
+    pthread_mutex_init(&m.handle, NULL);
+    return m;
+}
+
+void dm_mutex_lock(dm_mutex* mutex) {
+    pthread_mutex_lock(&mutex->handle);
+}
+
+void dm_mutex_unlock(dm_mutex* mutex) {
+    pthread_mutex_unlock(&mutex->handle);
+}
+
+void dm_mutex_destroy(dm_mutex* mutex) {
+    pthread_mutex_destroy(&mutex->handle);
+}
+
+/* ============================================================================
+ * Networking Primitives (BSD Sockets)
+ * ============================================================================ */
+
+/**
+ * Parse "host:port" from a dm_string into host/port components.
+ * Returns 0 on success, -1 on failure.
+ */
+static int dm_parse_addr(dm_string addr, char* host_buf, size_t host_size, int* port) {
+    /* Find the last ':' separator */
+    size_t colon_pos = addr.len;
+    for (size_t i = addr.len; i > 0; i--) {
+        if (addr.data[i - 1] == ':') {
+            colon_pos = i - 1;
+            break;
+        }
+    }
+    if (colon_pos >= addr.len) return -1;
+
+    size_t host_len = colon_pos < host_size - 1 ? colon_pos : host_size - 1;
+    memcpy(host_buf, addr.data, host_len);
+    host_buf[host_len] = '\0';
+
+    char port_buf[16];
+    size_t port_len = addr.len - colon_pos - 1;
+    if (port_len >= sizeof(port_buf)) port_len = sizeof(port_buf) - 1;
+    memcpy(port_buf, addr.data + colon_pos + 1, port_len);
+    port_buf[port_len] = '\0';
+    *port = atoi(port_buf);
+    return 0;
+}
+
+dm_tcp_listener dm_tcp_listen(dm_string addr) {
+    dm_tcp_listener listener = { .fd = -1 };
+    char host[256];
+    int port = 0;
+
+    if (dm_parse_addr(addr, host, sizeof(host), &port) < 0) {
+        fprintf(stderr, "dm_tcp_listen: invalid address format\n");
+        return listener;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("dm_tcp_listen: socket");
+        return listener;
+    }
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (strlen(host) == 0 || strcmp(host, "0.0.0.0") == 0) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        inet_pton(AF_INET, host, &sa.sin_addr);
+    }
+
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        perror("dm_tcp_listen: bind");
+        close(fd);
+        return listener;
+    }
+
+    if (listen(fd, 128) < 0) {
+        perror("dm_tcp_listen: listen");
+        close(fd);
+        return listener;
+    }
+
+    listener.fd = fd;
+    return listener;
+}
+
+dm_tcp_stream dm_tcp_accept(dm_tcp_listener* listener) {
+    dm_tcp_stream stream = { .fd = -1 };
+    struct sockaddr_in client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+
+    int client_fd = accept(listener->fd, (struct sockaddr*)&client_addr, &addr_len);
+    if (client_fd < 0) {
+        perror("dm_tcp_accept: accept");
+        return stream;
+    }
+
+    stream.fd = client_fd;
+    return stream;
+}
+
+dm_tcp_stream dm_tcp_connect(dm_string addr) {
+    dm_tcp_stream stream = { .fd = -1 };
+    char host[256];
+    int port = 0;
+
+    if (dm_parse_addr(addr, host, sizeof(host), &port) < 0) {
+        fprintf(stderr, "dm_tcp_connect: invalid address format\n");
+        return stream;
+    }
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("dm_tcp_connect: socket");
+        return stream;
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    inet_pton(AF_INET, host, &sa.sin_addr);
+
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        perror("dm_tcp_connect: connect");
+        close(fd);
+        return stream;
+    }
+
+    stream.fd = fd;
+    return stream;
+}
+
+dm_string dm_tcp_read(dm_tcp_stream* stream, int64_t max_bytes) {
+    if (max_bytes <= 0) max_bytes = 4096;
+    char* buf = (char*)malloc((size_t)max_bytes + 1);
+    ssize_t n = read(stream->fd, buf, (size_t)max_bytes);
+    if (n <= 0) {
+        free(buf);
+        return (dm_string){ .data = "", .len = 0, .cap = 0 };
+    }
+    buf[n] = '\0';
+    return (dm_string){ .data = buf, .len = (size_t)n, .cap = (size_t)max_bytes };
+}
+
+int64_t dm_tcp_write(dm_tcp_stream* stream, dm_string data) {
+    ssize_t n = write(stream->fd, data.data, data.len);
+    return (int64_t)(n < 0 ? 0 : n);
+}
+
+void dm_tcp_close(dm_tcp_stream* stream) {
+    if (stream->fd >= 0) {
+        close(stream->fd);
+        stream->fd = -1;
+    }
+}
+
+void dm_tcp_listener_close(dm_tcp_listener* listener) {
+    if (listener->fd >= 0) {
+        close(listener->fd);
+        listener->fd = -1;
+    }
+}
+
+#endif /* _WIN32 */

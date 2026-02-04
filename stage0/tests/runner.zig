@@ -18,6 +18,7 @@ pub const TestCase = struct {
     expected_exit_code: u8 = 0,
     expect_compile_error: bool = false,
     extra_files: ?[]const TestFile = null,
+    skip: bool = false,
 };
 
 pub const TestResult = struct {
@@ -1959,10 +1960,11 @@ pub const box_tests = [_]TestCase{
     },
 };
 
-// Tests for Map[K,V] hash map types
+// Tests for Map[K,V] hash map types (skipped — Map deferred to Stage 2)
 pub const map_tests = [_]TestCase{
     .{
         .name = "map_create_insert_get",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -1978,6 +1980,7 @@ pub const map_tests = [_]TestCase{
     },
     .{
         .name = "map_contains",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -1992,6 +1995,7 @@ pub const map_tests = [_]TestCase{
     },
     .{
         .name = "map_remove",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2007,6 +2011,7 @@ pub const map_tests = [_]TestCase{
     },
     .{
         .name = "map_update_value",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2022,6 +2027,7 @@ pub const map_tests = [_]TestCase{
     },
     .{
         .name = "map_int_keys",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2037,6 +2043,7 @@ pub const map_tests = [_]TestCase{
     },
     .{
         .name = "map_len",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2055,6 +2062,7 @@ pub const map_tests = [_]TestCase{
     },
     .{
         .name = "map_remove_then_insert",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2487,10 +2495,10 @@ pub const string_util_tests = [_]TestCase{
             \\
             \\fn main() {
             \\    let parts = string_split("a,b,c", ",")
-            \\    println(int_to_string(parts.len))
-            \\    println(parts.parts[0])
-            \\    println(parts.parts[1])
-            \\    println(parts.parts[2])
+            \\    println(int_to_string(parts.len()))
+            \\    println(parts[0])
+            \\    println(parts[1])
+            \\    println(parts[2])
             \\}
         ,
         .expected_output = "3\na\nb\nc\n",
@@ -2742,6 +2750,7 @@ pub const match_option_result_tests = [_]TestCase{
 pub const map_iteration_tests = [_]TestCase{
     .{
         .name = "map_keys_iteration",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2756,6 +2765,7 @@ pub const map_iteration_tests = [_]TestCase{
     },
     .{
         .name = "map_set_alias",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2771,6 +2781,7 @@ pub const map_iteration_tests = [_]TestCase{
     },
     .{
         .name = "map_values_iteration",
+        .skip = false,
         .source =
             \\module test
             \\
@@ -2857,6 +2868,35 @@ pub const string_ops_extra_tests = [_]TestCase{
         ,
         .expected_output = "h\n",
     },
+    .{
+        .name = "string_split_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let parts = string_split("a,b,c", ",")
+            \\    println(int_to_string(parts.len()))
+            \\    println(parts[0])
+            \\    println(parts[1])
+            \\    println(parts[2])
+            \\}
+        ,
+        .expected_output = "3\na\nb\nc\n",
+    },
+    .{
+        .name = "string_split_iterate",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let words = string_split("hello world", " ")
+            \\    for w in words {
+            \\        println(w)
+            \\    }
+            \\}
+        ,
+        .expected_output = "hello\nworld\n",
+    },
 };
 
 pub const trait_tests = [_]TestCase{
@@ -2885,6 +2925,534 @@ pub const trait_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "circle\n",
+    },
+    .{
+        .name = "trait_multiple_impls",
+        .source =
+            \\module test
+            \\
+            \\struct Point { x: int, y: int }
+            \\struct Circle { radius: int }
+            \\
+            \\trait HasArea {
+            \\    fn area(self: &Self) -> int
+            \\}
+            \\
+            \\impl HasArea for Point {
+            \\    fn area(self: &Self) -> int {
+            \\        return self.x * self.y
+            \\    }
+            \\}
+            \\
+            \\impl HasArea for Circle {
+            \\    fn area(self: &Self) -> int {
+            \\        return self.radius * self.radius * 3
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point { x: 3, y: 4 }
+            \\    let c = Circle { radius: 5 }
+            \\    println(int_to_string(p.area()))
+            \\    println(int_to_string(c.area()))
+            \\}
+        ,
+        .expected_output = "12\n75\n",
+    },
+};
+
+pub const extern_tests = [_]TestCase{
+    .{
+        .name = "extern_fn_declaration",
+        .source =
+            \\module test
+            \\
+            \\extern fn my_custom_add(a: int, b: int) -> int
+            \\
+            \\fn main() {
+            \\    println("extern declared ok")
+            \\}
+        ,
+        .expected_output = "extern declared ok\n",
+    },
+};
+
+pub const numeric_type_tests = [_]TestCase{
+    .{
+        .name = "i32_variable",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x: i32 = 42
+            \\    let y: i64 = x as i64
+            \\    println(int_to_string(y))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "u8_variable",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a: u8 = 255
+            \\    let b: i64 = a as i64
+            \\    println(int_to_string(b))
+            \\}
+        ,
+        .expected_output = "255\n",
+    },
+    .{
+        .name = "i16_arithmetic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a: i16 = 100
+            \\    let b: i16 = 200
+            \\    let sum: i16 = (a + b) as i16
+            \\    let result: i64 = sum as i64
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "300\n",
+    },
+    .{
+        .name = "cast_between_types",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x: int = 1000
+            \\    let narrow: i16 = x as i16
+            \\    let wide: i64 = narrow as i64
+            \\    println(int_to_string(wide))
+            \\}
+        ,
+        .expected_output = "1000\n",
+    },
+    .{
+        .name = "f32_variable",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x: f32 = 3.14
+            \\    let y: f64 = x as f64
+            \\    println(float_to_string(y))
+            \\}
+        ,
+        .expected_output = "3.14\n",
+    },
+};
+
+pub const operator_overload_tests = [_]TestCase{
+    .{
+        .name = "operator_overload_add",
+        .source =
+            \\module test
+            \\
+            \\struct Vec2 {
+            \\    x: int,
+            \\    y: int
+            \\}
+            \\
+            \\impl Vec2 {
+            \\    fn add(self: &Self, other: Vec2) -> Vec2 {
+            \\        return Vec2 { x: self.x + other.x, y: self.y + other.y }
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let a = Vec2 { x: 1, y: 2 }
+            \\    let b = Vec2 { x: 3, y: 4 }
+            \\    let c = a + b
+            \\    println(int_to_string(c.x))
+            \\    println(int_to_string(c.y))
+            \\}
+        ,
+        .expected_output = "4\n6\n",
+    },
+    .{
+        .name = "operator_overload_eq",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int
+            \\}
+            \\
+            \\impl Point {
+            \\    fn eq(self: &Self, other: Point) -> bool {
+            \\        return self.x == other.x and self.y == other.y
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let a = Point { x: 1, y: 2 }
+            \\    let b = Point { x: 1, y: 2 }
+            \\    let c = Point { x: 3, y: 4 }
+            \\    if a == b {
+            \\        println("equal")
+            \\    } else {
+            \\        println("not equal")
+            \\    }
+            \\    if a == c {
+            \\        println("equal")
+            \\    } else {
+            \\        println("not equal")
+            \\    }
+            \\}
+        ,
+        .expected_output = "equal\nnot equal\n",
+    },
+};
+
+pub const enum_dot_tests = [_]TestCase{
+    .{
+        .name = "enum_dot_constructor",
+        .source =
+            \\module test
+            \\
+            \\enum Shape {
+            \\    Circle(int),
+            \\    Square(int),
+            \\    Empty
+            \\}
+            \\
+            \\fn area(s: Shape) -> int {
+            \\    match s {
+            \\        Shape::Circle(r) => { return r * r }
+            \\        Shape::Square(s) => { return s * s }
+            \\        _ => { return 0 }
+            \\    }
+            \\    return 0
+            \\}
+            \\
+            \\fn main() {
+            \\    let c = Shape.Circle(5)
+            \\    let sq = Shape.Square(4)
+            \\    println(int_to_string(area(c)))
+            \\    println(int_to_string(area(sq)))
+            \\}
+        ,
+        .expected_output = "25\n16\n",
+    },
+};
+
+pub const nested_if_tests = [_]TestCase{
+    .{
+        .name = "nested_if_no_else",
+        .source =
+            \\module test
+            \\
+            \\fn check(x: int) -> string {
+            \\    if x > 10 {
+            \\        if x > 20 {
+            \\            return "big"
+            \\        }
+            \\    }
+            \\    return "small"
+            \\}
+            \\
+            \\fn main() {
+            \\    println(check(25))
+            \\    println(check(15))
+            \\    println(check(5))
+            \\}
+        ,
+        .expected_output = "big\nsmall\nsmall\n",
+    },
+    .{
+        .name = "if_as_return_value",
+        .source =
+            \\module test
+            \\
+            \\fn abs(x: int) -> int {
+            \\    if x < 0 {
+            \\        return 0 - x
+            \\    }
+            \\    return x
+            \\}
+            \\
+            \\fn main() {
+            \\    println(int_to_string(abs(-5)))
+            \\    println(int_to_string(abs(3)))
+            \\}
+        ,
+        .expected_output = "5\n3\n",
+    },
+};
+
+pub const string_interp_tests = [_]TestCase{
+    .{
+        .name = "fstring_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let name = "world"
+            \\    println(f"Hello {name}!")
+            \\}
+        ,
+        .expected_output = "Hello world!\n",
+    },
+    .{
+        .name = "fstring_int",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x = 42
+            \\    println(f"x is {int_to_string(x)}")
+            \\}
+        ,
+        .expected_output = "x is 42\n",
+    },
+    .{
+        .name = "fstring_multiple",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a = "foo"
+            \\    let b = "bar"
+            \\    println(f"{a} and {b}")
+            \\}
+        ,
+        .expected_output = "foo and bar\n",
+    },
+    .{
+        .name = "fstring_auto_convert_int",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x = 42
+            \\    println(f"value: {x}")
+            \\}
+        ,
+        .expected_output = "value: 42\n",
+    },
+};
+
+pub const closure_tests = [_]TestCase{
+    .{
+        .name = "closure_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x = 10
+            \\    let f = |y: int| -> int x + y
+            \\    println(int_to_string(f(5)))
+            \\}
+        ,
+        .expected_output = "15\n",
+    },
+    .{
+        .name = "closure_multiple_captures",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a = 100
+            \\    let b = 200
+            \\    let f = |x: int| -> int a + b + x
+            \\    println(int_to_string(f(3)))
+            \\}
+        ,
+        .expected_output = "303\n",
+    },
+    .{
+        .name = "closure_string_capture",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let greeting = "Hello"
+            \\    let f = |name: string| -> string greeting + " " + name
+            \\    println(f("World"))
+            \\}
+        ,
+        .expected_output = "Hello World\n",
+    },
+};
+
+pub const region_tests = [_]TestCase{
+    .{
+        .name = "region_basic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    region r {
+            \\        let x = 42
+            \\        println(int_to_string(x))
+            \\    }
+            \\    println("after region")
+            \\}
+        ,
+        .expected_output = "42\nafter region\n",
+    },
+    .{
+        .name = "region_with_strings",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    region mem {
+            \\        let s = "hello" + " " + "world"
+            \\        println(s)
+            \\    }
+            \\    println("done")
+            \\}
+        ,
+        .expected_output = "hello world\ndone\n",
+    },
+};
+
+pub const comptime_tests = [_]TestCase{
+    .{
+        .name = "comptime_arithmetic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x = comptime 2 + 3 * 4
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "14\n",
+    },
+    .{
+        .name = "comptime_bool",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x = comptime 10 > 5
+            \\    println(bool_to_string(x))
+            \\}
+        ,
+        .expected_output = "true\n",
+    },
+};
+
+pub const effect_tests = [_]TestCase{
+    .{
+        .name = "effect_correct_declaration",
+        .source =
+            \\module test
+            \\fn greet(name: string) with [IO, Console] {
+            \\    println("Hello " + name)
+            \\}
+            \\fn main() {
+            \\    greet("world")
+            \\}
+        ,
+        .expected_output = "Hello world\n",
+    },
+    .{
+        .name = "effect_missing_declaration",
+        .source =
+            \\module test
+            \\fn read_data() -> string with [IO] {
+            \\    return file_read("nonexistent.txt")
+            \\}
+            \\fn main() {
+            \\    let s = read_data()
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+    .{
+        .name = "effect_pure_no_annotation",
+        .source =
+            \\module test
+            \\fn add(a: int, b: int) -> int {
+            \\    return a + b
+            \\}
+            \\fn main() {
+            \\    println(int_to_string(add(3, 4)))
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+};
+
+pub const dyn_trait_tests = [_]TestCase{
+    .{
+        .name = "dyn_basic_dispatch",
+        .source =
+            \\module test
+            \\
+            \\trait Display {
+            \\    fn show(self: &Self) -> string
+            \\}
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int
+            \\}
+            \\
+            \\struct Circle {
+            \\    radius: int
+            \\}
+            \\
+            \\impl Display for Point {
+            \\    fn show(self: &Self) -> string {
+            \\        return "Point"
+            \\    }
+            \\}
+            \\
+            \\impl Display for Circle {
+            \\    fn show(self: &Self) -> string {
+            \\        return "Circle"
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point { x: 1, y: 2 }
+            \\    let c = Circle { radius: 5 }
+            \\    let d1: dyn Display = p
+            \\    let d2: dyn Display = c
+            \\    println(d1.show())
+            \\    println(d2.show())
+            \\}
+        ,
+        .expected_output = "Point\nCircle\n",
+    },
+    .{
+        .name = "dyn_with_fields",
+        .source =
+            \\module test
+            \\
+            \\trait Describable {
+            \\    fn describe(self: &Self) -> string
+            \\}
+            \\
+            \\struct Dog {
+            \\    name: string
+            \\}
+            \\
+            \\impl Describable for Dog {
+            \\    fn describe(self: &Self) -> string {
+            \\        return "Dog: " + self.name
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let d = Dog { name: "Rex" }
+            \\    let obj: dyn Describable = d
+            \\    println(obj.describe())
+            \\}
+        ,
+        .expected_output = "Dog: Rex\n",
     },
 };
 
@@ -2960,6 +3528,7 @@ pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     var total_passed: usize = 0;
     var total_failed: usize = 0;
+    var total_skipped: usize = 0;
 
     // Run all test suites
     const suites = [_]struct { name: []const u8, tests: []const TestCase }{
@@ -3001,6 +3570,17 @@ pub fn main() !void {
         .{ .name = "Lambdas", .tests = &lambda_tests },
         .{ .name = "String Ops Extra", .tests = &string_ops_extra_tests },
         .{ .name = "Traits", .tests = &trait_tests },
+        .{ .name = "Extern Functions", .tests = &extern_tests },
+        .{ .name = "Numeric Types", .tests = &numeric_type_tests },
+        .{ .name = "Operator Overloading", .tests = &operator_overload_tests },
+        .{ .name = "Enum Dot Notation", .tests = &enum_dot_tests },
+        .{ .name = "Nested If", .tests = &nested_if_tests },
+        .{ .name = "String Interpolation", .tests = &string_interp_tests },
+        .{ .name = "Closures", .tests = &closure_tests },
+        .{ .name = "Regions", .tests = &region_tests },
+        .{ .name = "Comptime", .tests = &comptime_tests },
+        .{ .name = "Effects", .tests = &effect_tests },
+        .{ .name = "Dyn Trait", .tests = &dyn_trait_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
     };
 
@@ -3012,6 +3592,12 @@ pub fn main() !void {
         try stdout.print("--- {s} Tests ---\n", .{suite.name});
 
         for (suite.tests) |case| {
+            if (case.skip) {
+                try stdout.print("  SKIP: {s}\n", .{case.name});
+                total_skipped += 1;
+                continue;
+            }
+
             const result = runTest(allocator, case, compiler_path) catch |err| {
                 try stdout.print("  FAIL: {s} - Error: {}\n", .{ case.name, err });
                 total_failed += 1;
@@ -3030,7 +3616,7 @@ pub fn main() !void {
     }
 
     try stdout.print("============================================================\n", .{});
-    try stdout.print("  Results: {d} passed, {d} failed\n", .{ total_passed, total_failed });
+    try stdout.print("  Results: {d} passed, {d} failed, {d} skipped\n", .{ total_passed, total_failed, total_skipped });
     try stdout.print("============================================================\n", .{});
 
     if (total_failed > 0) {
