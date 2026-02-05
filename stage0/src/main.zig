@@ -2181,7 +2181,7 @@ fn printUsage() !void {
         \\  lex <file.dm>       Tokenize and display tokens (debugging)
         \\  parse <file.dm>     Parse and display AST structure (debugging)
         \\  check <file.dm>     Type check only, don't generate code
-        \\  fmt <file.dm>       Format source code (not yet implemented)
+        \\  fmt <file.dm>       Format source code
         \\  clean               Remove compilation cache
         \\
         \\{s}Options:{s}

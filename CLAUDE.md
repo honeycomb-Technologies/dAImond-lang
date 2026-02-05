@@ -27,6 +27,7 @@ dAImond-lang/
 │   │   ├── codegen.zig    # C11 code generation from typed AST
 │   │   ├── errors.zig     # Diagnostic reporting, colored output, error codes
 │   │   ├── package.zig    # Package manager (TOML manifest, dependency resolution)
+│   │   ├── cache.zig      # Compilation cache (SHA-256 content hashing)
 │   │   └── lsp.zig        # Language Server Protocol implementation
 │   ├── runtime/           # C runtime library linked into compiled programs
 │   │   ├── daimond_runtime.h   # Runtime API (strings, arenas, option/result, I/O, sockets, threads)
@@ -135,7 +136,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 196 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 195 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -220,6 +221,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 | `daimond pkg init` | Create daimond.toml manifest |
 | `daimond pkg add <name>` | Add a dependency |
 | `daimond pkg list` | List dependencies |
+| `daimond clean` | Remove compilation cache |
 | `-o <file>` | Output file path |
 | `-c` | Compile to C only (no binary) |
 | `--emit-c` | Emit C code alongside binary |
@@ -420,10 +422,10 @@ These are remaining known issues in Stage 0's C code generation:
 
 **Workaround**: Always use `Box_new(value)` and `Box_null()` (underscore, not dot).
 
-### 2. `string.len()` Not Available
-**Problem**: The `.len()` method on strings generates `dm_string_len()` which is not defined in the runtime.
+### 2. `string.len()` Method Call Syntax
+**Problem**: The `.len()` method on strings generates `dm_string_len()` which returns `size_t` instead of `int64_t`, causing type mismatches in some contexts.
 
-**Workaround**: Use the free function `len(s)` instead of `s.len()`.
+**Workaround**: Use the free function `len(s)` instead of `s.len()` for consistent `int` return type.
 
 ### 3. `is_alpha()` / `is_digit()` Expect `char`, Not `string`
 **Problem**: These runtime functions take a C `char`, but dAImond passes `dm_string` from string literals.

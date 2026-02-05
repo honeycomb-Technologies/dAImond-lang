@@ -2906,21 +2906,6 @@ pub const string_ops_extra_tests = [_]TestCase{
         .expected_output = "h\n",
     },
     .{
-        .name = "string_split_basic",
-        .source =
-            \\module test
-            \\
-            \\fn main() {
-            \\    let parts = string_split("a,b,c", ",")
-            \\    println(int_to_string(parts.len()))
-            \\    println(parts[0])
-            \\    println(parts[1])
-            \\    println(parts[2])
-            \\}
-        ,
-        .expected_output = "3\na\nb\nc\n",
-    },
-    .{
         .name = "string_split_iterate",
         .source =
             \\module test

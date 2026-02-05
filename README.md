@@ -50,6 +50,9 @@ zig build
 
 # Type check only
 ./zig-out/bin/daimond check examples/hello.dm
+
+# Clean compilation cache
+./zig-out/bin/daimond clean
 ```
 
 ### Running Tests
@@ -87,7 +90,7 @@ dAImond-lang/
 │   │   ├── daimond_runtime.c  # Runtime implementation
 │   │   └── test_runtime.c     # Runtime unit tests
 │   └── tests/
-│       └── runner.zig         # Integration test harness (196 tests)
+│       └── runner.zig         # Integration test harness (195 tests)
 ├── stage1/                    # Stage 1 self-hosting compiler (written in dAImond)
 │   ├── main.dm                # Monolithic bootstrap file (generated)
 │   ├── main_split.dm          # Entry point with imports (for self-compilation)
@@ -274,6 +277,19 @@ region scratch {
 }   -- big_buffer freed here, all at once, O(1)
 ```
 
+### Async/Await
+
+```dm
+async fn compute(x: int, y: int) -> int {
+    return x + y
+}
+
+fn main() {
+    let result = await compute(10, 20)
+    println(int_to_string(result))  -- prints 30
+}
+```
+
 ### Effects
 
 ```dm
@@ -355,7 +371,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Error diagnostics with colored output
 - [x] C runtime library (strings, arenas, option/result, I/O, networking, threading)
 - [x] CLI: compile, run, lex, parse, check, fmt, test, pkg
-- [x] 196 integration tests passing, 0 failing, 0 skipped
+- [x] 195 integration tests passing, 0 failing, 0 skipped
 
 ### Language Features -- Complete
 - [x] Map[K,V] with full method support (insert, get, contains, remove, len, keys, values, indexing)
