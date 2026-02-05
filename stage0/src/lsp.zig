@@ -14,8 +14,10 @@ const Lexer = @import("lexer.zig").Lexer;
 const TokenType = @import("lexer.zig").TokenType;
 const parser_mod = @import("parser.zig");
 const Parser = parser_mod.Parser;
+const ast = @import("ast.zig");
 const checker_mod = @import("checker.zig");
 const TypeChecker = checker_mod.TypeChecker;
+const Symbol = checker_mod.Symbol;
 
 // ============================================================================
 // JSON Helpers (minimal subset for LSP)
@@ -274,6 +276,14 @@ const LspServer = struct {
             try self.handleCompletion(id, msg);
         } else if (std.mem.eql(u8, method, "textDocument/hover")) {
             try self.handleHover(id, msg);
+        } else if (std.mem.eql(u8, method, "textDocument/definition")) {
+            try self.handleDefinition(id, msg);
+        } else if (std.mem.eql(u8, method, "textDocument/references")) {
+            try self.handleReferences(id, msg);
+        } else if (std.mem.eql(u8, method, "textDocument/documentSymbol")) {
+            try self.handleDocumentSymbol(id, msg);
+        } else if (std.mem.eql(u8, method, "textDocument/signatureHelp")) {
+            try self.handleSignatureHelp(id, msg);
         } else {
             // Unknown method - send null result for requests with id
             if (id != null) {
@@ -290,7 +300,11 @@ const LspServer = struct {
         result.raw("\"capabilities\":{");
         result.raw("\"textDocumentSync\":1,"); // Full sync
         result.raw("\"completionProvider\":{\"triggerCharacters\":[\".\",\":\"]},");
-        result.raw("\"hoverProvider\":true");
+        result.raw("\"hoverProvider\":true,");
+        result.raw("\"definitionProvider\":true,");
+        result.raw("\"referencesProvider\":true,");
+        result.raw("\"documentSymbolProvider\":true,");
+        result.raw("\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}");
         result.raw("},");
         result.raw("\"serverInfo\":{\"name\":\"daimond-lsp\",\"version\":\"0.1.0\"}");
         result.raw("}");
@@ -506,6 +520,344 @@ const LspServer = struct {
     }
 
     // ========================================================================
+    // Go-to-Definition
+    // ========================================================================
+
+    fn handleDefinition(self: *LspServer, id: ?i64, msg: []const u8) !void {
+        const params = jsonGetObject(msg, "params") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const text_doc = jsonGetObject(params, "textDocument") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const uri = jsonGetString(text_doc, "uri") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const position = jsonGetObject(params, "position") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const line = jsonGetInt(position, "line") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const character = jsonGetInt(position, "character") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        const source = self.documents.get(uri) orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        // Find the word at the cursor
+        const word = getWordAtPosition(source, @intCast(line), @intCast(character)) orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        // Run the type checker to get symbol information
+        const symbol = self.lookupSymbol(source, word) orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        const def_loc = symbol.def_location orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        // Build Location response
+        var result = JsonWriter.init(self.allocator);
+        defer result.deinit();
+        result.raw("{\"uri\":");
+        result.string(uri);
+        result.raw(",\"range\":{\"start\":{\"line\":");
+        result.int(@intCast(if (def_loc.start.line > 0) def_loc.start.line - 1 else 0));
+        result.raw(",\"character\":");
+        result.int(@intCast(if (def_loc.start.column > 0) def_loc.start.column - 1 else 0));
+        result.raw("},\"end\":{\"line\":");
+        result.int(@intCast(if (def_loc.end.line > 0) def_loc.end.line - 1 else 0));
+        result.raw(",\"character\":");
+        result.int(@intCast(def_loc.end.column));
+        result.raw("}}}");
+        self.sendResponse(id, null, result.toSlice());
+    }
+
+    // ========================================================================
+    // Find References
+    // ========================================================================
+
+    fn handleReferences(self: *LspServer, id: ?i64, msg: []const u8) !void {
+        const params = jsonGetObject(msg, "params") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        const text_doc = jsonGetObject(params, "textDocument") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        const uri = jsonGetString(text_doc, "uri") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        const position = jsonGetObject(params, "position") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        const line_num = jsonGetInt(position, "line") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        const character = jsonGetInt(position, "character") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+
+        const source = self.documents.get(uri) orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+
+        const word = getWordAtPosition(source, @intCast(line_num), @intCast(character)) orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+
+        // Find all occurrences of the word in source (simple text-based search)
+        var result = JsonWriter.init(self.allocator);
+        defer result.deinit();
+        result.raw("[");
+
+        var first = true;
+        var current_line: usize = 0;
+        var line_start: usize = 0;
+        var i: usize = 0;
+
+        while (i < source.len) {
+            if (source[i] == '\n') {
+                current_line += 1;
+                line_start = i + 1;
+                i += 1;
+                continue;
+            }
+
+            // Check if this position starts the word
+            if (i + word.len <= source.len and std.mem.eql(u8, source[i .. i + word.len], word)) {
+                // Verify it's a whole word (not part of a larger identifier)
+                const before_ok = i == 0 or !isWordChar(source[i - 1]);
+                const after_ok = i + word.len >= source.len or !isWordChar(source[i + word.len]);
+
+                if (before_ok and after_ok) {
+                    if (!first) result.raw(",");
+                    first = false;
+                    result.raw("{\"uri\":");
+                    result.string(uri);
+                    result.raw(",\"range\":{\"start\":{\"line\":");
+                    result.int(@intCast(current_line));
+                    result.raw(",\"character\":");
+                    result.int(@intCast(i - line_start));
+                    result.raw("},\"end\":{\"line\":");
+                    result.int(@intCast(current_line));
+                    result.raw(",\"character\":");
+                    result.int(@intCast(i - line_start + word.len));
+                    result.raw("}}}");
+                }
+            }
+
+            i += 1;
+        }
+
+        result.raw("]");
+        self.sendResponse(id, null, result.toSlice());
+    }
+
+    // ========================================================================
+    // Document Symbols
+    // ========================================================================
+
+    fn handleDocumentSymbol(self: *LspServer, id: ?i64, msg: []const u8) !void {
+        const params = jsonGetObject(msg, "params") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        const text_doc = jsonGetObject(params, "textDocument") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        const uri = jsonGetString(text_doc, "uri") orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+
+        const source = self.documents.get(uri) orelse {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+
+        // Parse source to get declarations
+        var lexer = Lexer.init(source, self.allocator);
+        defer lexer.deinit();
+        const tokens = lexer.scanAll() catch {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+        defer self.allocator.free(tokens);
+
+        if (lexer.hasErrors()) {
+            self.sendResponse(id, null, "[]");
+            return;
+        }
+
+        var parser = Parser.init(tokens, self.allocator);
+        defer parser.deinit();
+        const ast_result = parser.parse() catch {
+            self.sendResponse(id, null, "[]");
+            return;
+        };
+
+        var result = JsonWriter.init(self.allocator);
+        defer result.deinit();
+        result.raw("[");
+
+        var first = true;
+        for (ast_result.declarations) |decl| {
+            const name_and_kind = getDeclNameAndKind(decl) orelse continue;
+            const span = decl.span;
+
+            if (!first) result.raw(",");
+            first = false;
+
+            // SymbolInformation format
+            result.raw("{\"name\":");
+            result.string(name_and_kind.name);
+            result.raw(",\"kind\":");
+            result.int(name_and_kind.kind);
+            result.raw(",\"range\":{\"start\":{\"line\":");
+            result.int(@intCast(if (span.start.line > 0) span.start.line - 1 else 0));
+            result.raw(",\"character\":");
+            result.int(@intCast(if (span.start.column > 0) span.start.column - 1 else 0));
+            result.raw("},\"end\":{\"line\":");
+            result.int(@intCast(if (span.end.line > 0) span.end.line - 1 else 0));
+            result.raw(",\"character\":");
+            result.int(@intCast(span.end.column));
+            result.raw("}},\"selectionRange\":{\"start\":{\"line\":");
+            result.int(@intCast(if (span.start.line > 0) span.start.line - 1 else 0));
+            result.raw(",\"character\":");
+            result.int(@intCast(if (span.start.column > 0) span.start.column - 1 else 0));
+            result.raw("},\"end\":{\"line\":");
+            result.int(@intCast(if (span.start.line > 0) span.start.line - 1 else 0));
+            result.raw(",\"character\":");
+            result.int(@intCast(span.start.column + name_and_kind.name.len));
+            result.raw("}}}");
+        }
+
+        result.raw("]");
+        self.sendResponse(id, null, result.toSlice());
+    }
+
+    // ========================================================================
+    // Signature Help
+    // ========================================================================
+
+    fn handleSignatureHelp(self: *LspServer, id: ?i64, msg: []const u8) !void {
+        const params = jsonGetObject(msg, "params") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const text_doc = jsonGetObject(params, "textDocument") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const uri = jsonGetString(text_doc, "uri") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const position = jsonGetObject(params, "position") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const line_num = jsonGetInt(position, "line") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+        const character = jsonGetInt(position, "character") orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        const source = self.documents.get(uri) orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        // Find the function name before the opening paren
+        const func_name = getFunctionNameAtCall(source, @intCast(line_num), @intCast(character)) orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        // Look up signature info for known functions
+        const sig_info = getSignatureInfo(func_name) orelse {
+            self.sendResponse(id, null, "null");
+            return;
+        };
+
+        // Count commas to determine active parameter
+        const active_param = countActiveParam(source, @intCast(line_num), @intCast(character));
+
+        var result = JsonWriter.init(self.allocator);
+        defer result.deinit();
+        result.raw("{\"signatures\":[{\"label\":");
+        result.string(sig_info.label);
+        result.raw(",\"parameters\":[");
+        var first_p = true;
+        for (sig_info.params) |param| {
+            if (!first_p) result.raw(",");
+            first_p = false;
+            result.raw("{\"label\":");
+            result.string(param);
+            result.raw("}");
+        }
+        result.raw("]}],\"activeSignature\":0,\"activeParameter\":");
+        result.int(@intCast(active_param));
+        result.raw("}");
+        self.sendResponse(id, null, result.toSlice());
+    }
+
+    // ========================================================================
+    // Helper: Look up a symbol from source via type checker
+    // ========================================================================
+
+    fn lookupSymbol(self: *LspServer, source: []const u8, name: []const u8) ?Symbol {
+        // Lex
+        var lexer = Lexer.init(source, self.allocator);
+        defer lexer.deinit();
+        const tokens = lexer.scanAll() catch return null;
+        defer self.allocator.free(tokens);
+        if (lexer.hasErrors()) return null;
+
+        // Parse
+        var parser = Parser.init(tokens, self.allocator);
+        defer parser.deinit();
+        const ast_result = parser.parse() catch return null;
+        if (parser.hasErrors()) return null;
+
+        // Type check
+        var type_checker = TypeChecker.init(self.allocator) catch return null;
+        defer type_checker.deinit();
+        type_checker.setSource(source);
+        type_checker.checkSourceFile(ast_result) catch {};
+
+        // Look up the symbol
+        return type_checker.env.lookup(name);
+    }
+
+    // ========================================================================
     // Diagnostics
     // ========================================================================
 
@@ -651,6 +1003,157 @@ fn getWordAtPosition(source: []const u8, line_num: usize, col: usize) ?[]const u
 
 fn isWordChar(ch: u8) bool {
     return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or (ch >= '0' and ch <= '9') or ch == '_';
+}
+
+const DeclInfo = struct {
+    name: []const u8,
+    kind: i64, // LSP SymbolKind
+};
+
+fn getDeclNameAndKind(decl: *ast.Declaration) ?DeclInfo {
+    return switch (decl.kind) {
+        .function => |func| .{ .name = func.name.name, .kind = 12 }, // Function
+        .struct_def => |s| .{ .name = s.name.name, .kind = 23 }, // Struct
+        .enum_def => |e| .{ .name = e.name.name, .kind = 10 }, // Enum
+        .trait_def => |t| .{ .name = t.name.name, .kind = 11 }, // Interface
+        .impl_block => |i| blk: {
+            // Extract type name from the target_type TypeExpr
+            if (i.target_type.kind == .named) {
+                const path = i.target_type.kind.named.path;
+                if (path.segments.len > 0) {
+                    break :blk DeclInfo{ .name = path.segments[path.segments.len - 1].name, .kind = 6 };
+                }
+            }
+            break :blk null;
+        },
+        .constant => |c| .{ .name = c.name.name, .kind = 14 }, // Constant
+    };
+}
+
+fn getFunctionNameAtCall(source: []const u8, line_num: usize, col: usize) ?[]const u8 {
+    // Find the position in source
+    var current_line: usize = 0;
+    var line_start: usize = 0;
+    for (source, 0..) |ch, i| {
+        if (current_line == line_num) {
+            line_start = i;
+            break;
+        }
+        if (ch == '\n') current_line += 1;
+    }
+
+    const pos = line_start + col;
+    if (pos == 0 or pos > source.len) return null;
+
+    // Walk backwards from cursor to find the opening paren
+    var p = pos - 1;
+    var depth: usize = 0;
+    while (true) {
+        if (source[p] == ')') {
+            depth += 1;
+        } else if (source[p] == '(') {
+            if (depth == 0) {
+                // Found the matching open paren; extract function name before it
+                if (p == 0) return null;
+                const end = p;
+                var start = end;
+                while (start > 0 and isWordChar(source[start - 1])) : (start -= 1) {}
+                if (start == end) return null;
+                return source[start..end];
+            }
+            depth -= 1;
+        }
+        if (p == 0) break;
+        p -= 1;
+    }
+
+    return null;
+}
+
+const SignatureInfo = struct {
+    label: []const u8,
+    params: []const []const u8,
+};
+
+fn getSignatureInfo(func_name: []const u8) ?SignatureInfo {
+    const sigs = .{
+        .{ "print", "fn print(s: string) -> void", &[_][]const u8{"s: string"} },
+        .{ "println", "fn println(s: string) -> void", &[_][]const u8{"s: string"} },
+        .{ "eprint", "fn eprint(s: string) -> void", &[_][]const u8{"s: string"} },
+        .{ "eprintln", "fn eprintln(s: string) -> void", &[_][]const u8{"s: string"} },
+        .{ "panic", "fn panic(msg: string) -> void", &[_][]const u8{"msg: string"} },
+        .{ "exit", "fn exit(code: int) -> void", &[_][]const u8{"code: int"} },
+        .{ "len", "fn len(s: string) -> int", &[_][]const u8{"s: string"} },
+        .{ "char_at", "fn char_at(s: string, i: int) -> string", &[_][]const u8{ "s: string", "i: int" } },
+        .{ "substr", "fn substr(s: string, start: int, length: int) -> string", &[_][]const u8{ "s: string", "start: int", "length: int" } },
+        .{ "int_to_string", "fn int_to_string(n: int) -> string", &[_][]const u8{"n: int"} },
+        .{ "float_to_string", "fn float_to_string(f: float) -> string", &[_][]const u8{"f: float"} },
+        .{ "bool_to_string", "fn bool_to_string(b: bool) -> string", &[_][]const u8{"b: bool"} },
+        .{ "parse_int", "fn parse_int(s: string) -> int", &[_][]const u8{"s: string"} },
+        .{ "parse_float", "fn parse_float(s: string) -> float", &[_][]const u8{"s: string"} },
+        .{ "string_contains", "fn string_contains(s: string, sub: string) -> bool", &[_][]const u8{ "s: string", "sub: string" } },
+        .{ "string_find", "fn string_find(s: string, sub: string) -> int", &[_][]const u8{ "s: string", "sub: string" } },
+        .{ "starts_with", "fn starts_with(s: string, prefix: string) -> bool", &[_][]const u8{ "s: string", "prefix: string" } },
+        .{ "ends_with", "fn ends_with(s: string, suffix: string) -> bool", &[_][]const u8{ "s: string", "suffix: string" } },
+        .{ "string_trim", "fn string_trim(s: string) -> string", &[_][]const u8{"s: string"} },
+        .{ "string_replace", "fn string_replace(s: string, old: string, new: string) -> string", &[_][]const u8{ "s: string", "old: string", "new: string" } },
+        .{ "string_to_upper", "fn string_to_upper(s: string) -> string", &[_][]const u8{"s: string"} },
+        .{ "string_to_lower", "fn string_to_lower(s: string) -> string", &[_][]const u8{"s: string"} },
+        .{ "string_split", "fn string_split(s: string, delim: string) -> List[string]", &[_][]const u8{ "s: string", "delim: string" } },
+        .{ "file_read", "fn file_read(path: string) -> string", &[_][]const u8{"path: string"} },
+        .{ "file_write", "fn file_write(path: string, content: string) -> void", &[_][]const u8{ "path: string", "content: string" } },
+        .{ "file_append", "fn file_append(path: string, content: string) -> void", &[_][]const u8{ "path: string", "content: string" } },
+        .{ "file_exists", "fn file_exists(path: string) -> bool", &[_][]const u8{"path: string"} },
+        .{ "args_get", "fn args_get(i: int) -> string", &[_][]const u8{"i: int"} },
+        .{ "system", "fn system(cmd: string) -> int", &[_][]const u8{"cmd: string"} },
+        .{ "assert", "fn assert(cond: bool) -> void", &[_][]const u8{"cond: bool"} },
+        .{ "assert_eq", "fn assert_eq(actual: T, expected: T) -> void", &[_][]const u8{ "actual: T", "expected: T" } },
+        .{ "Box_new", "fn Box_new(value: T) -> Box[T]", &[_][]const u8{"value: T"} },
+    };
+
+    inline for (sigs) |sig| {
+        if (std.mem.eql(u8, func_name, sig[0])) {
+            return .{ .label = sig[1], .params = sig[2] };
+        }
+    }
+
+    return null;
+}
+
+fn countActiveParam(source: []const u8, line_num: usize, col: usize) usize {
+    // Find position in source
+    var current_line: usize = 0;
+    var line_start: usize = 0;
+    for (source, 0..) |ch, i| {
+        if (current_line == line_num) {
+            line_start = i;
+            break;
+        }
+        if (ch == '\n') current_line += 1;
+    }
+
+    const pos = line_start + col;
+    if (pos == 0 or pos > source.len) return 0;
+
+    // Walk backwards from cursor to the opening paren, counting commas at depth 0
+    var p = pos - 1;
+    var depth: usize = 0;
+    var commas: usize = 0;
+
+    while (true) {
+        if (source[p] == ')') {
+            depth += 1;
+        } else if (source[p] == '(') {
+            if (depth == 0) return commas;
+            depth -= 1;
+        } else if (source[p] == ',' and depth == 0) {
+            commas += 1;
+        }
+        if (p == 0) break;
+        p -= 1;
+    }
+
+    return commas;
 }
 
 fn getHoverInfo(word: []const u8) ?[]const u8 {

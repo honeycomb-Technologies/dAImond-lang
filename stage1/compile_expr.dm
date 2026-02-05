@@ -318,10 +318,43 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 } else if field == "contains" {
                     result.code = "DM_LIST_CONTAINS(" + result.code + ", " + args_code + ")"
                 } else {
-                    result.code = dm_mangle(field) + "(" + result.code + ", " + args_code + ")"
+                    -- Check for impl method: look up the receiver's type and try TypeName_method
+                    let receiver_type = infer_type_from_code(result.code, result.c)
+                    let mut found_impl = false
+                    if starts_with(receiver_type, "dm_") {
+                        let type_name = substr(receiver_type, 3, len(receiver_type) - 3)
+                        -- Strip trailing * for pointer types
+                        let mut clean_type = type_name
+                        if ends_with(clean_type, "*") {
+                            clean_type = substr(clean_type, 0, len(clean_type) - 1)
+                        }
+                        let impl_method = lookup_impl_method(result.c, clean_type, field)
+                        if impl_method != "" {
+                            found_impl = true
+                            -- Pass receiver as pointer (self is always a pointer in impl methods)
+                            if args_code != "" {
+                                result.code = impl_method + "(&" + result.code + ", " + args_code + ")"
+                            } else {
+                                result.code = impl_method + "(&" + result.code + ")"
+                            }
+                        }
+                    }
+                    if found_impl == false {
+                        if args_code != "" {
+                            result.code = dm_mangle(field) + "(" + result.code + ", " + args_code + ")"
+                        } else {
+                            result.code = dm_mangle(field) + "(" + result.code + ")"
+                        }
+                    }
                 }
             } else {
-                result.code = result.code + "." + field
+                -- Field access: check if receiver is a pointer (self in impl methods)
+                let recv_type = infer_type_from_code(result.code, result.c)
+                if ends_with(recv_type, "*") {
+                    result.code = result.code + "->" + field
+                } else {
+                    result.code = result.code + "." + field
+                }
             }
         } else if k == TK_QUESTION() {
             -- Error propagation: expr? unwraps Ok/Some or early-returns Err/None
@@ -935,6 +968,10 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = inner.c
         cc = c_expect(cc, TK_RPAREN())
         return ExprOut { c: cc, code: "(" + inner.code + ")" }
+    }
+    if k == TK_SELF() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: "dm_self" }
     }
     if k == TK_MATCH() {
         return compile_match_expr(cc)

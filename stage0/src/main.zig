@@ -25,6 +25,8 @@ const TypeChecker = checker_mod.TypeChecker;
 const codegen = @import("codegen.zig");
 const CodeGenerator = codegen.CodeGenerator;
 const package = @import("package.zig");
+const cache_mod = @import("cache.zig");
+const Cache = cache_mod.Cache;
 
 const version = "0.1.0";
 
@@ -58,6 +60,7 @@ const Command = enum {
     fmt, // daimond fmt <file.dm> - Format code
     test_run, // daimond test <file.dm> - Run test functions
     pkg, // daimond pkg <subcommand> - Package management
+    clean, // daimond clean - Remove compilation cache
 };
 
 const CompilerOptions = struct {
@@ -69,6 +72,9 @@ const CompilerOptions = struct {
     no_color: bool = false,
     opt_level: OptLevel = .O0,
     verbose: bool = false,
+    debug: bool = false, // --debug flag (emit #line directives, pass -g to cc)
+    cache_dir: ?[]const u8 = null, // --cache-dir (default .daimond-cache/)
+    no_cache: bool = false, // --no-cache flag
     show_help: bool = false,
     show_version: bool = false,
 
@@ -150,8 +156,8 @@ pub fn main() !void {
         return;
     }
 
-    // Need an input file for most commands (but not pkg)
-    if (opts.input_file == null and opts.command != .pkg) {
+    // Need an input file for most commands (but not pkg or clean)
+    if (opts.input_file == null and opts.command != .pkg and opts.command != .clean) {
         try printUsage();
         return;
     }
@@ -161,6 +167,19 @@ pub fn main() !void {
         const exit_code = executePkgCommand(args, allocator) catch |err| {
             const stderr = std.io.getStdErr().writer();
             try stderr.print("Package error: {}\n", .{err});
+            std.process.exit(@intFromEnum(ExitCode.error_compile));
+        };
+        if (exit_code != .success) {
+            std.process.exit(@intFromEnum(exit_code));
+        }
+        return;
+    }
+
+    // Clean command removes the cache directory
+    if (opts.command == .clean) {
+        const exit_code = executeClean(opts) catch |err| {
+            const stderr = std.io.getStdErr().writer();
+            try stderr.print("Clean error: {}\n", .{err});
             std.process.exit(@intFromEnum(ExitCode.error_compile));
         };
         if (exit_code != .success) {
@@ -264,6 +283,11 @@ fn parseArgs(args: []const []const u8) !CompilerOptions {
             return opts;
         }
 
+        if (std.mem.eql(u8, arg, "clean")) {
+            opts.command = .clean;
+            continue;
+        }
+
         // Options with arguments
         if (std.mem.eql(u8, arg, "-o")) {
             i += 1;
@@ -292,6 +316,25 @@ fn parseArgs(args: []const []const u8) !CompilerOptions {
 
         if (std.mem.eql(u8, arg, "--verbose")) {
             opts.verbose = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--debug")) {
+            opts.debug = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--cache-dir")) {
+            i += 1;
+            if (i >= args.len) {
+                return error.MissingOutputArg;
+            }
+            opts.cache_dir = args[i];
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--no-cache")) {
+            opts.no_cache = true;
             continue;
         }
 
@@ -377,6 +420,7 @@ fn executeCommand(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         .fmt => try formatFile(opts, allocator),
         .test_run => try testFile(opts, allocator),
         .pkg => unreachable, // handled in main() before executeCommand
+        .clean => unreachable, // handled in main() before executeCommand
     };
 }
 
@@ -1017,7 +1061,8 @@ fn testFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     };
 
     {
-        var child = std.process.Child.init(&[_][]const u8{ cc, "-o", bin_path, c_path, "-lm", "-lpthread" }, allocator);
+        const platform_lib = if (@import("builtin").os.tag == .windows) "-lws2_32" else "-lpthread";
+        var child = std.process.Child.init(&[_][]const u8{ cc, "-o", bin_path, c_path, "-lm", platform_lib }, allocator);
         child.stderr_behavior = .Pipe;
         child.stdout_behavior = .Pipe;
         child.spawn() catch |err| {
@@ -1084,6 +1129,30 @@ fn testFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
 // PKG Command
 // ============================================================================
 
+// ============================================================================
+// CLEAN Command
+// ============================================================================
+
+fn executeClean(opts: CompilerOptions) !ExitCode {
+    const stdout = std.io.getStdOut().writer();
+    const cache_dir = opts.cache_dir orelse cache_mod.default_cache_dir;
+
+    // Check if cache directory exists
+    std.fs.cwd().access(cache_dir, .{}) catch {
+        try stdout.print("Cache directory '{s}' does not exist. Nothing to clean.\n", .{cache_dir});
+        return .success;
+    };
+
+    // Remove the cache directory
+    std.fs.cwd().deleteTree(cache_dir) catch |err| {
+        try stdout.print("Error removing cache directory '{s}': {}\n", .{ cache_dir, err });
+        return .error_compile;
+    };
+
+    try stdout.print("Removed cache directory '{s}'\n", .{cache_dir});
+    return .success;
+}
+
 fn executePkgCommand(args: []const []const u8, allocator: Allocator) !ExitCode {
     // Find "pkg" in args, subcommand args follow it
     var pkg_args_start: usize = 0;
@@ -1113,6 +1182,12 @@ fn executePkgCommand(args: []const []const u8, allocator: Allocator) !ExitCode {
         },
         .list => {
             try package.executePkgList(allocator);
+        },
+        .install => {
+            try package.executePkgInstall(allocator);
+        },
+        .update => {
+            try package.executePkgUpdate(allocator);
         },
         .help => {
             try package.printPkgHelp();
@@ -1509,6 +1584,18 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     };
     defer allocator.free(source);
 
+    // Check compilation cache
+    var cache = Cache.init(allocator, opts.cache_dir);
+    const use_cache = !opts.no_cache;
+    var source_hash: [64]u8 = undefined;
+    var cached_c: ?[]const u8 = null;
+    defer if (cached_c) |cc| allocator.free(cc);
+
+    if (use_cache) {
+        source_hash = cache.hashSource(source) catch [_]u8{0} ** 64;
+        cached_c = cache.lookup(&source_hash);
+    }
+
     // Create arena for compilation data (AST, types, codegen)
     var compile_arena = std.heap.ArenaAllocator.init(allocator);
     defer compile_arena.deinit();
@@ -1516,152 +1603,182 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
 
     var total_timer = Timer.init(opts.verbose);
 
-    try stdout.print("{s}Compiling '{s}'...{s}\n", .{ colors.bold(), path, colors.reset() });
-
-    // Phase 1: Lexing
-    var lex_timer = Timer.init(opts.verbose);
-    try stdout.print("  [1/5] Lexing...", .{});
-
-    var lexer = Lexer.init(source, allocator);
-    defer lexer.deinit();
-
-    const tokens = try lexer.scanAll();
-    defer allocator.free(tokens);
-
-    if (opts.verbose) {
-        try stdout.print(" {d} tokens", .{tokens.len});
-    }
-    try lex_timer.report(stdout, "lex");
-    if (!opts.verbose) try stdout.print("\n", .{});
-
-    if (lexer.hasErrors()) {
-        try displayLexerErrors(&lexer, source, path, colors, stdout);
-        return .error_compile;
+    if (cached_c != null) {
+        try stdout.print("{s}Compiling '{s}'...{s} (cached)\n", .{ colors.bold(), path, colors.reset() });
+    } else {
+        try stdout.print("{s}Compiling '{s}'...{s}\n", .{ colors.bold(), path, colors.reset() });
     }
 
-    // Phase 2: Parsing
-    var parse_timer = Timer.init(opts.verbose);
-    try stdout.print("  [2/5] Parsing...", .{});
+    const c_output_path = opts.c_output_path.?;
 
-    var parser = Parser.init(tokens, compile_allocator);
-    defer parser.deinit();
+    if (cached_c) |cached_code| {
+        // Cache hit: write cached C code directly to output
+        std.fs.cwd().writeFile(.{
+            .sub_path = c_output_path,
+            .data = cached_code,
+        }) catch |err| {
+            try stdout.print("{s}Error writing cached C file:{s} {}\n", .{
+                colors.error_style(), colors.reset(), err,
+            });
+            return .error_compile;
+        };
+    } else {
+        // Cache miss: run full compilation pipeline
 
-    const ast_result = parser.parse() catch |err| {
-        try stdout.print("\n{s}Parse error:{s} {}\n", .{ colors.error_style(), colors.reset(), err });
-        return .error_compile;
-    };
+        // Phase 1: Lexing
+        var lex_timer = Timer.init(opts.verbose);
+        try stdout.print("  [1/5] Lexing...", .{});
 
-    if (opts.verbose) {
-        try stdout.print(" {d} declarations", .{ast_result.declarations.len});
-    }
-    try parse_timer.report(stdout, "parse");
-    if (!opts.verbose) try stdout.print("\n", .{});
+        var lexer = Lexer.init(source, allocator);
+        defer lexer.deinit();
 
-    if (parser.hasErrors()) {
-        try displayParseErrors(&parser, source, path, colors, stdout);
-        return .error_compile;
-    }
-
-    // Phase 2.5: Module Loading (resolve imports)
-    var final_ast = ast_result;
-    var module_loader: ?ModuleLoader = null;
-    defer if (module_loader) |*ml| ml.deinit();
-
-    if (ast_result.imports.len > 0) {
-        const input_dir = std.fs.path.dirname(path) orelse ".";
-        var loader = ModuleLoader.init(compile_allocator, opts.verbose);
-        try loader.processImports(ast_result, input_dir);
-        final_ast = try loader.getMergedSourceFile(ast_result);
-        module_loader = loader;
+        const tokens = try lexer.scanAll();
+        defer allocator.free(tokens);
 
         if (opts.verbose) {
-            try stdout.print("        Resolved {d} import(s), {d} total declarations\n", .{
-                ast_result.imports.len,
-                final_ast.declarations.len,
-            });
+            try stdout.print(" {d} tokens", .{tokens.len});
         }
+        try lex_timer.report(stdout, "lex");
+        if (!opts.verbose) try stdout.print("\n", .{});
+
+        if (lexer.hasErrors()) {
+            try displayLexerErrors(&lexer, source, path, colors, stdout);
+            return .error_compile;
+        }
+
+        // Phase 2: Parsing
+        var parse_timer = Timer.init(opts.verbose);
+        try stdout.print("  [2/5] Parsing...", .{});
+
+        var parser = Parser.init(tokens, compile_allocator);
+        defer parser.deinit();
+
+        const ast_result = parser.parse() catch |err| {
+            try stdout.print("\n{s}Parse error:{s} {}\n", .{ colors.error_style(), colors.reset(), err });
+            return .error_compile;
+        };
+
+        if (opts.verbose) {
+            try stdout.print(" {d} declarations", .{ast_result.declarations.len});
+        }
+        try parse_timer.report(stdout, "parse");
+        if (!opts.verbose) try stdout.print("\n", .{});
+
+        if (parser.hasErrors()) {
+            try displayParseErrors(&parser, source, path, colors, stdout);
+            return .error_compile;
+        }
+
+        // Phase 2.5: Module Loading (resolve imports)
+        var final_ast = ast_result;
+        var module_loader: ?ModuleLoader = null;
+        defer if (module_loader) |*ml| ml.deinit();
+
+        if (ast_result.imports.len > 0) {
+            const input_dir = std.fs.path.dirname(path) orelse ".";
+            var loader = ModuleLoader.init(compile_allocator, opts.verbose);
+            try loader.processImports(ast_result, input_dir);
+            final_ast = try loader.getMergedSourceFile(ast_result);
+            module_loader = loader;
+
+            if (opts.verbose) {
+                try stdout.print("        Resolved {d} import(s), {d} total declarations\n", .{
+                    ast_result.imports.len,
+                    final_ast.declarations.len,
+                });
+            }
+        }
+
+        // Phase 3: Type Checking
+        var check_timer = Timer.init(opts.verbose);
+        try stdout.print("  [3/5] Type checking...", .{});
+
+        var type_checker = TypeChecker.init(compile_allocator) catch |err| {
+            try stdout.print("\n{s}Error initializing type checker:{s} {}\n", .{
+                colors.error_style(),
+                colors.reset(),
+                err,
+            });
+            return .error_compile;
+        };
+        defer type_checker.deinit();
+
+        // Set source for error messages
+        type_checker.setSource(source);
+        type_checker.setSourceFile(path);
+
+        // Run type checking on the merged AST
+        type_checker.checkSourceFile(final_ast) catch |err| {
+            try stdout.print("\n{s}Type check error:{s} {}\n", .{
+                colors.error_style(),
+                colors.reset(),
+                err,
+            });
+            return .error_compile;
+        };
+
+        if (opts.verbose) {
+            try stdout.print(" ok", .{});
+        }
+        try check_timer.report(stdout, "check");
+        if (!opts.verbose) try stdout.print("\n", .{});
+
+        // Check for type errors
+        if (type_checker.hasErrors()) {
+            try displayTypeErrors(&type_checker, colors, stdout);
+            return .error_compile;
+        }
+
+        // Phase 4: Code Generation
+        var codegen_timer = Timer.init(opts.verbose);
+        try stdout.print("  [4/5] Generating C code...", .{});
+
+        var code_generator = CodeGenerator.init(compile_allocator);
+        defer code_generator.deinit();
+
+        // Wire type context from type checker to code generator
+        if (type_checker.getTypeContext()) |ctx| {
+            code_generator.setTypeContext(ctx);
+        }
+
+        // Wire debug info for #line directive emission
+        if (opts.debug) {
+            code_generator.setDebugInfo(true, path);
+        }
+
+        const c_code = code_generator.generate(final_ast) catch |err| {
+            try stdout.print("\n{s}Code generation error:{s} {}\n", .{
+                colors.error_style(),
+                colors.reset(),
+                err,
+            });
+            return .error_compile;
+        };
+
+        // Write C code to output file
+        std.fs.cwd().writeFile(.{
+            .sub_path = c_output_path,
+            .data = c_code,
+        }) catch |err| {
+            try stdout.print("\n{s}Error writing C file:{s} {}\n", .{
+                colors.error_style(),
+                colors.reset(),
+                err,
+            });
+            return .error_compile;
+        };
+
+        // Store in cache for next time
+        if (use_cache) {
+            cache.store(&source_hash, c_code) catch {}; // Ignore cache store errors
+        }
+
+        if (opts.verbose) {
+            try stdout.print(" -> {s}", .{c_output_path});
+        }
+        try codegen_timer.report(stdout, "codegen");
+        if (!opts.verbose) try stdout.print("\n", .{});
     }
-
-    // Phase 3: Type Checking
-    var check_timer = Timer.init(opts.verbose);
-    try stdout.print("  [3/5] Type checking...", .{});
-
-    var type_checker = TypeChecker.init(compile_allocator) catch |err| {
-        try stdout.print("\n{s}Error initializing type checker:{s} {}\n", .{
-            colors.error_style(),
-            colors.reset(),
-            err,
-        });
-        return .error_compile;
-    };
-    defer type_checker.deinit();
-
-    // Set source for error messages
-    type_checker.setSource(source);
-    type_checker.setSourceFile(path);
-
-    // Run type checking on the merged AST
-    type_checker.checkSourceFile(final_ast) catch |err| {
-        try stdout.print("\n{s}Type check error:{s} {}\n", .{
-            colors.error_style(),
-            colors.reset(),
-            err,
-        });
-        return .error_compile;
-    };
-
-    if (opts.verbose) {
-        try stdout.print(" ok", .{});
-    }
-    try check_timer.report(stdout, "check");
-    if (!opts.verbose) try stdout.print("\n", .{});
-
-    // Check for type errors
-    if (type_checker.hasErrors()) {
-        try displayTypeErrors(&type_checker, colors, stdout);
-        return .error_compile;
-    }
-
-    // Phase 4: Code Generation
-    var codegen_timer = Timer.init(opts.verbose);
-    try stdout.print("  [4/5] Generating C code...", .{});
-
-    var code_generator = CodeGenerator.init(compile_allocator);
-    defer code_generator.deinit();
-
-    // Wire type context from type checker to code generator
-    if (type_checker.getTypeContext()) |ctx| {
-        code_generator.setTypeContext(ctx);
-    }
-
-    const c_code = code_generator.generate(final_ast) catch |err| {
-        try stdout.print("\n{s}Code generation error:{s} {}\n", .{
-            colors.error_style(),
-            colors.reset(),
-            err,
-        });
-        return .error_compile;
-    };
-
-    // Write C code to output file
-    const c_output_path = opts.c_output_path.?;
-    std.fs.cwd().writeFile(.{
-        .sub_path = c_output_path,
-        .data = c_code,
-    }) catch |err| {
-        try stdout.print("\n{s}Error writing C file:{s} {}\n", .{
-            colors.error_style(),
-            colors.reset(),
-            err,
-        });
-        return .error_compile;
-    };
-
-    if (opts.verbose) {
-        try stdout.print(" -> {s}", .{c_output_path});
-    }
-    try codegen_timer.report(stdout, "codegen");
-    if (!opts.verbose) try stdout.print("\n", .{});
 
     // If only compiling to C, stop here
     if (opts.compile_to_c_only) {
@@ -1729,6 +1846,11 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
     // Add optimization level
     try cc_args.append(opts.opt_level.toCcFlag());
 
+    // Add debug flag (-g) for debugger integration
+    if (opts.debug) {
+        try cc_args.append("-g");
+    }
+
     // Add standard flags
     try cc_args.append("-std=c11");
     try cc_args.append("-Wall");
@@ -1737,8 +1859,12 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
 
     // Link math library (needed for extern fn wrapping math.h)
     try cc_args.append("-lm");
-    // Link pthread library (needed for threading primitives)
-    try cc_args.append("-lpthread");
+    // Link platform-specific libraries for threading and networking
+    if (@import("builtin").os.tag == .windows) {
+        try cc_args.append("-lws2_32"); // Winsock2 for networking
+    } else {
+        try cc_args.append("-lpthread"); // POSIX threads
+    }
 
     if (opts.verbose) {
         try stdout.print("\n        Running: ", .{});
@@ -2056,6 +2182,7 @@ fn printUsage() !void {
         \\  parse <file.dm>     Parse and display AST structure (debugging)
         \\  check <file.dm>     Type check only, don't generate code
         \\  fmt <file.dm>       Format source code (not yet implemented)
+        \\  clean               Remove compilation cache
         \\
         \\{s}Options:{s}
         \\  -o <output>         Specify output file name
@@ -2064,6 +2191,9 @@ fn printUsage() !void {
         \\  --no-color          Disable colored output
         \\  -O0/-O1/-O2/-O3     Optimization level (default: -O0)
         \\  --verbose           Show detailed compilation progress
+        \\  --debug             Emit #line directives and pass -g to C compiler
+        \\  --cache-dir <dir>   Set cache directory (default: .daimond-cache/)
+        \\  --no-cache          Disable compilation caching
         \\  -h, --help          Show this help message
         \\  -v, --version       Show version information
         \\

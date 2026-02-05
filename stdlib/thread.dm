@@ -2,20 +2,51 @@ module thread
 
 -- Standard Threading Module
 -- Provides threading primitives backed by POSIX pthreads.
--- Note: Thread functions spawned must be top-level functions (not closures)
--- because the spawn API uses C function pointers.
+-- Thread handles and mutex handles are represented as integers.
+--
+-- Example:
+--   import std.thread
+--
+--   fn worker() {
+--       println("Hello from thread!")
+--   }
+--
+--   fn main() {
+--       let t = thread_spawn(worker)
+--       thread_join(t)
+--
+--       let m = mutex_new()
+--       mutex_lock(m)
+--       -- critical section
+--       mutex_unlock(m)
+--       mutex_destroy(m)
+--   }
+--
+-- Note: thread_spawn takes a function reference. The function must take
+-- no arguments and return void. It is spawned in a new OS thread.
 
--- Thread spawn: run a function in a new thread
--- The function must take no arguments and return void.
--- extern fn dm_thread_spawn(func: fn() -> void) -> Thread
--- extern fn dm_thread_join(thread: Thread) -> void
+-- Create a new mutex
+-- Returns a mutex handle (integer)
+fn thread_mutex_new() -> int {
+    return mutex_new()
+}
 
--- Mutex operations
--- extern fn dm_mutex_new() -> Mutex
--- extern fn dm_mutex_lock(mutex: &Mutex) -> void
--- extern fn dm_mutex_unlock(mutex: &Mutex) -> void
--- extern fn dm_mutex_destroy(mutex: &Mutex) -> void
+-- Lock a mutex (blocks until acquired)
+fn thread_mutex_lock(m: int) {
+    mutex_lock(m)
+}
 
--- Note: Direct use of the runtime threading API requires extern fn declarations.
--- The threading primitives (dm_thread_spawn, dm_thread_join, dm_mutex_*) are
--- available in the C runtime and can be called via extern fn from dAImond code.
+-- Unlock a mutex
+fn thread_mutex_unlock(m: int) {
+    mutex_unlock(m)
+}
+
+-- Destroy a mutex and free its resources
+fn thread_mutex_destroy(m: int) {
+    mutex_destroy(m)
+}
+
+-- Wait for a thread to finish
+fn thread_wait(t: int) {
+    thread_join(t)
+}

@@ -87,7 +87,7 @@ dAImond-lang/
 │   │   ├── daimond_runtime.c  # Runtime implementation
 │   │   └── test_runtime.c     # Runtime unit tests
 │   └── tests/
-│       └── runner.zig         # Integration test harness (186 tests)
+│       └── runner.zig         # Integration test harness (196 tests)
 ├── stage1/                    # Stage 1 self-hosting compiler (written in dAImond)
 │   ├── main.dm                # Monolithic bootstrap file (generated)
 │   ├── main_split.dm          # Entry point with imports (for self-compilation)
@@ -355,7 +355,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Error diagnostics with colored output
 - [x] C runtime library (strings, arenas, option/result, I/O, networking, threading)
 - [x] CLI: compile, run, lex, parse, check, fmt, test, pkg
-- [x] 186 integration tests passing, 0 failing, 0 skipped
+- [x] 196 integration tests passing, 0 failing, 0 skipped
 
 ### Language Features -- Complete
 - [x] Map[K,V] with full method support (insert, get, contains, remove, len, keys, values, indexing)
@@ -374,6 +374,8 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Comptime evaluation (arithmetic and boolean expressions)
 - [x] Effect system enforcement (opt-in via `with [IO, Console, FileSystem]`)
 - [x] Concurrency primitives (thread spawn/join, mutex)
+- [x] SIMD intrinsics (f32x4, f32x8, f64x2, f64x4, i32x4, i32x8, i64x2, i64x4)
+- [x] Async/await with Future[T] (Phase A: synchronous semantics)
 
 ### Stage 1 Self-Hosting Compiler -- Complete
 - [x] Compiler rewritten in dAImond (~10 modules)
@@ -402,6 +404,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] `daimond-lsp` -- Language Server Protocol (diagnostics, completion, hover)
 
 ### Upcoming
+- [ ] Async/await Phase B (true stackless coroutines with state machine transformation)
 - [ ] LLVM backend (Stage 3)
 
 ## Design Principles

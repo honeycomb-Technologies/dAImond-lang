@@ -541,6 +541,16 @@ pub const TypeChecker = struct {
         try self.env.defineGlobal(Symbol.init("byte", .type_def, try self.type_ctx.intern(.{ .int = .u8 })));
         try self.env.defineGlobal(Symbol.init("char", .type_def, try self.type_ctx.intern(.char)));
 
+        // Register SIMD vector types
+        try self.env.defineGlobal(Symbol.init("f32x4", .type_def, try self.type_ctx.intern(.{ .simd = .f32x4 })));
+        try self.env.defineGlobal(Symbol.init("f32x8", .type_def, try self.type_ctx.intern(.{ .simd = .f32x8 })));
+        try self.env.defineGlobal(Symbol.init("f64x2", .type_def, try self.type_ctx.intern(.{ .simd = .f64x2 })));
+        try self.env.defineGlobal(Symbol.init("f64x4", .type_def, try self.type_ctx.intern(.{ .simd = .f64x4 })));
+        try self.env.defineGlobal(Symbol.init("i32x4", .type_def, try self.type_ctx.intern(.{ .simd = .i32x4 })));
+        try self.env.defineGlobal(Symbol.init("i32x8", .type_def, try self.type_ctx.intern(.{ .simd = .i32x8 })));
+        try self.env.defineGlobal(Symbol.init("i64x2", .type_def, try self.type_ctx.intern(.{ .simd = .i64x2 })));
+        try self.env.defineGlobal(Symbol.init("i64x4", .type_def, try self.type_ctx.intern(.{ .simd = .i64x4 })));
+
         // Register generic container types (List, Vec, Box, Map)
         // These are mapped to monomorphized C types by codegen
         try self.env.defineGlobal(Symbol.init("List", .type_def, try self.freshTypeVar()));
@@ -550,9 +560,10 @@ pub const TypeChecker = struct {
         try self.env.defineGlobal(Symbol.init("HashMap", .type_def, try self.freshTypeVar()));
         try self.env.defineGlobal(Symbol.init("String", .type_def, str_id));
 
-        // Register Option and Result generic types
+        // Register Option, Result, and Future generic types
         try self.env.defineGlobal(Symbol.init("Option", .type_def, try self.freshTypeVar()));
         try self.env.defineGlobal(Symbol.init("Result", .type_def, try self.freshTypeVar()));
+        try self.env.defineGlobal(Symbol.init("Future", .type_def, try self.freshTypeVar()));
 
         // Register Option/Result constructors as builtins
         // Some(x) - creates an Option with a value
@@ -940,6 +951,7 @@ pub const TypeChecker = struct {
             .string_interpolation => |si| self.inferStringInterpolation(si),
             .grouped => |inner| self.inferExpr(inner),
             .comptime_expr => |ce| self.inferExpr(ce.expr),
+            .await_expr => |aw| self.inferAwaitExpr(aw),
         };
     }
 
@@ -1200,7 +1212,12 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "panic") or
                 std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln") or
                 std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "file_write") or
-                std.mem.eql(u8, name, "file_append"))
+                std.mem.eql(u8, name, "file_append") or
+                std.mem.eql(u8, name, "fs_write") or std.mem.eql(u8, name, "fs_append") or
+                std.mem.eql(u8, name, "tcp_close") or
+                std.mem.eql(u8, name, "thread_join") or
+                std.mem.eql(u8, name, "mutex_lock") or std.mem.eql(u8, name, "mutex_unlock") or
+                std.mem.eql(u8, name, "mutex_destroy"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
@@ -1214,7 +1231,9 @@ pub const TypeChecker = struct {
                 } else if (std.mem.eql(u8, name, "panic") or std.mem.eql(u8, name, "exit")) {
                     self.current_effects.addBuiltin(.io);
                     self.current_effects.addBuiltin(.diverge);
-                } else if (std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_append")) {
+                } else if (std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_append") or
+                    std.mem.eql(u8, name, "fs_write") or std.mem.eql(u8, name, "fs_append"))
+                {
                     self.current_effects.addBuiltin(.file_system);
                 }
                 return try self.type_ctx.intern(.unit);
@@ -1223,7 +1242,12 @@ pub const TypeChecker = struct {
             if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "parse_int") or
                 std.mem.eql(u8, name, "string_to_int") or
                 std.mem.eql(u8, name, "string_find") or std.mem.eql(u8, name, "args_len") or
-                std.mem.eql(u8, name, "system"))
+                std.mem.eql(u8, name, "system") or
+                std.mem.eql(u8, name, "fs_mkdir") or std.mem.eql(u8, name, "fs_remove") or
+                std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir") or
+                std.mem.eql(u8, name, "tcp_listen") or std.mem.eql(u8, name, "tcp_accept") or
+                std.mem.eql(u8, name, "tcp_connect") or std.mem.eql(u8, name, "tcp_write") or
+                std.mem.eql(u8, name, "thread_spawn") or std.mem.eql(u8, name, "mutex_new"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
@@ -1233,6 +1257,10 @@ pub const TypeChecker = struct {
                     self.current_effects.addBuiltin(.io);
                 } else if (std.mem.eql(u8, name, "args_len")) {
                     self.current_effects.addBuiltin(.io);
+                } else if (std.mem.eql(u8, name, "fs_mkdir") or std.mem.eql(u8, name, "fs_remove") or
+                    std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir"))
+                {
+                    self.current_effects.addBuiltin(.file_system);
                 }
                 return try self.type_ctx.intern(.{ .int = .i64 });
             }
@@ -1254,14 +1282,21 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, name, "string_to_upper") or std.mem.eql(u8, name, "string_to_lower") or
                 std.mem.eql(u8, name, "path_dirname") or std.mem.eql(u8, name, "path_basename") or
                 std.mem.eql(u8, name, "path_extension") or std.mem.eql(u8, name, "path_stem") or
-                std.mem.eql(u8, name, "path_join") or std.mem.eql(u8, name, "read_line"))
+                std.mem.eql(u8, name, "path_join") or std.mem.eql(u8, name, "read_line") or
+                std.mem.eql(u8, name, "fs_readdir") or std.mem.eql(u8, name, "fs_getcwd") or
+                std.mem.eql(u8, name, "env_get") or
+                std.mem.eql(u8, name, "tcp_read"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
                 }
                 // Effect tracking
-                if (std.mem.eql(u8, name, "file_read")) {
+                if (std.mem.eql(u8, name, "file_read") or std.mem.eql(u8, name, "fs_readdir") or
+                    std.mem.eql(u8, name, "fs_getcwd"))
+                {
                     self.current_effects.addBuiltin(.file_system);
+                } else if (std.mem.eql(u8, name, "env_get")) {
+                    self.current_effects.addBuiltin(.io);
                 } else if (std.mem.eql(u8, name, "read_line")) {
                     self.current_effects.addBuiltin(.io);
                     self.current_effects.addBuiltin(.console);
@@ -1282,13 +1317,14 @@ pub const TypeChecker = struct {
             if (std.mem.eql(u8, name, "is_alpha") or std.mem.eql(u8, name, "is_digit") or
                 std.mem.eql(u8, name, "is_alnum") or std.mem.eql(u8, name, "is_whitespace") or
                 std.mem.eql(u8, name, "string_contains") or std.mem.eql(u8, name, "starts_with") or
-                std.mem.eql(u8, name, "ends_with") or std.mem.eql(u8, name, "file_exists"))
+                std.mem.eql(u8, name, "ends_with") or std.mem.eql(u8, name, "file_exists") or
+                std.mem.eql(u8, name, "fs_exists"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
                 }
                 // Effect tracking
-                if (std.mem.eql(u8, name, "file_exists")) {
+                if (std.mem.eql(u8, name, "file_exists") or std.mem.eql(u8, name, "fs_exists")) {
                     self.current_effects.addBuiltin(.file_system);
                 }
                 return try self.type_ctx.intern(.bool);
@@ -1323,6 +1359,42 @@ pub const TypeChecker = struct {
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
+                }
+                return try self.freshTypeVar();
+            }
+            // SIMD arithmetic builtins: return same type as first argument
+            if (std.mem.eql(u8, name, "simd_add") or std.mem.eql(u8, name, "simd_sub") or
+                std.mem.eql(u8, name, "simd_mul") or std.mem.eql(u8, name, "simd_div"))
+            {
+                var first_type: ?TypeId = null;
+                for (fc.args, 0..) |arg, i| {
+                    const t = try self.inferExpr(arg.value);
+                    if (i == 0) first_type = t;
+                }
+                return first_type orelse try self.freshTypeVar();
+            }
+            // SIMD extract: returns scalar (use fresh type var, C handles the actual type)
+            if (std.mem.eql(u8, name, "simd_extract"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                return try self.freshTypeVar();
+            }
+            // SIMD splat/set builtins: simd_splat_f32x4(val) -> f32x4, etc.
+            if (std.mem.startsWith(u8, name, "simd_splat_") or std.mem.startsWith(u8, name, "simd_set_"))
+            {
+                for (fc.args) |arg| {
+                    _ = try self.inferExpr(arg.value);
+                }
+                // Extract the SIMD type suffix (e.g., "f32x4" from "simd_splat_f32x4")
+                const suffix = if (std.mem.startsWith(u8, name, "simd_splat_"))
+                    name[11..]
+                else
+                    name[9..];
+                // Look up the SIMD type by name
+                if (self.type_ctx.type_names.get(suffix)) |simd_type_id| {
+                    return simd_type_id;
                 }
                 return try self.freshTypeVar();
             }
@@ -1674,6 +1746,22 @@ pub const TypeChecker = struct {
         }
 
         try self.reportError(.expected_result_type, "? operator requires Result or Option type", ep.span);
+        return try self.type_ctx.intern(.error_type);
+    }
+
+    fn inferAwaitExpr(self: *Self, aw: *const ast.AwaitExpr) anyerror!TypeId {
+        const operand_type = try self.inferExpr(aw.operand);
+        const resolved = self.resolveType(operand_type);
+        const typ = self.type_ctx.get(resolved) orelse {
+            try self.reportError(.expected_result_type, "await requires Future type", aw.span);
+            return try self.type_ctx.intern(.error_type);
+        };
+
+        if (typ == .future) {
+            return typ.future;
+        }
+
+        try self.reportError(.expected_result_type, "await requires Future type", aw.span);
         return try self.type_ctx.intern(.error_type);
     }
 
@@ -2274,16 +2362,26 @@ pub const TypeChecker = struct {
             try param_types.append(param_type);
         }
 
-        const return_type = if (func.return_type) |rt|
+        const inner_return_type = if (func.return_type) |rt|
             try self.resolveTypeExpr(rt)
         else
             try self.type_ctx.intern(.unit);
+
+        // For async functions, external return type is Future[T]
+        const return_type = if (func.is_async)
+            try self.type_ctx.makeFuture(inner_return_type)
+        else
+            inner_return_type;
 
         var effects = EffectSet.pure;
         if (func.effects) |effs| {
             for (effs) |eff| {
                 try self.addEffectFromTypeExpr(eff, &effects);
             }
+        }
+
+        if (func.is_async) {
+            effects.addBuiltin(.async_effect);
         }
 
         if (has_generics) {
@@ -2317,10 +2415,17 @@ pub const TypeChecker = struct {
         }
 
         // Process return type
-        const return_type = if (func.return_type) |rt|
+        const inner_return_type = if (func.return_type) |rt|
             try self.resolveTypeExpr(rt)
         else
             try self.type_ctx.intern(.unit);
+
+        // For async functions, the external return type is Future[T],
+        // but the body type-checks against the inner T
+        const return_type = if (func.is_async)
+            try self.type_ctx.makeFuture(inner_return_type)
+        else
+            inner_return_type;
 
         // Process effects
         var effects = EffectSet.pure;
@@ -2328,6 +2433,11 @@ pub const TypeChecker = struct {
             for (effs) |eff| {
                 try self.addEffectFromTypeExpr(eff, &effects);
             }
+        }
+
+        // Auto-add async effect for async functions
+        if (func.is_async) {
+            effects.addBuiltin(.async_effect);
         }
 
         if (has_generics) {
@@ -2368,7 +2478,9 @@ pub const TypeChecker = struct {
             try self.env.define(Symbol.init(param.name.name, .variable, param_type).withMutable(param.is_mut));
         }
 
-        self.env.current.return_type = return_type;
+        // For async functions, the body checks against inner_return_type (T, not Future[T])
+        const body_return_type = if (func.is_async) inner_return_type else return_type;
+        self.env.current.return_type = body_return_type;
         self.env.current.allowed_effects = effects;
 
         // Check contracts
@@ -2394,12 +2506,12 @@ pub const TypeChecker = struct {
                     // result expression (tail expression). Blocks with explicit
                     // return statements already check return types in checkReturn.
                     if (blk.result != null) {
-                        try self.unify(body_type, return_type, func.span);
+                        try self.unify(body_type, body_return_type, func.span);
                     }
                 },
                 .expression => |expr| {
                     const body_type = try self.inferExpr(expr);
-                    try self.unify(body_type, return_type, func.span);
+                    try self.unify(body_type, body_return_type, func.span);
                 },
             }
 
@@ -2693,6 +2805,16 @@ pub const TypeChecker = struct {
                         if (args.len > 0) {
                             const inner = try self.resolveTypeExpr(args[0]);
                             return try self.type_ctx.makeOption(inner);
+                        }
+                    }
+                    return try self.freshTypeVar();
+                }
+                // Special handling for Future[T] -> creates a proper .future type
+                if (std.mem.eql(u8, name, "Future")) {
+                    if (named.generic_args) |args| {
+                        if (args.len > 0) {
+                            const inner = try self.resolveTypeExpr(args[0]);
+                            return try self.type_ctx.makeFuture(inner);
                         }
                     }
                     return try self.freshTypeVar();

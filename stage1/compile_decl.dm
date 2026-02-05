@@ -70,6 +70,16 @@ fn compile_fn_decl(c: Compiler) -> Compiler {
         ret_type = rt.code
     }
 
+    -- Skip optional effect annotation: with [IO, Console, ...]
+    if c_peek(cc) == TK_WITH() {
+        cc = c_advance(cc)
+        cc = c_expect(cc, TK_LBRACKET())
+        while c_peek(cc) != TK_RBRACKET() and c_peek(cc) != TK_EOF() {
+            cc = c_advance(cc)
+        }
+        cc = c_expect(cc, TK_RBRACKET())
+    }
+
     -- Generate function signature
     let mut final_sig = ret_type + " " + dm_mangle(fn_name) + "(" + params_c + ")"
     if params_c == "" {
@@ -302,11 +312,140 @@ fn compile_enum_decl(c: Compiler) -> Compiler {
     return cc
 }
 
+fn compile_trait_decl(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'trait'
+    let name_tok = c_cur(cc)
+    let trait_name = name_tok.value
+    cc = c_advance(cc)
+    cc.trait_names.push(trait_name)
+
+    -- Skip optional trait inheritance: trait Ord: Eq { ... }
+    if c_peek(cc) == TK_COLON() {
+        cc = c_advance(cc)
+        -- Skip parent trait name(s)
+        while c_peek(cc) == TK_IDENT() or c_peek(cc) == TK_COMMA() {
+            cc = c_advance(cc)
+        }
+    }
+
+    cc = c_skip_nl(cc)
+    cc = c_expect(cc, TK_LBRACE())
+    cc = c_skip_nl(cc)
+
+    -- Parse method signatures inside trait block
+    while c_peek(cc) != TK_RBRACE() and c_peek(cc) != TK_EOF() {
+        if c_peek(cc) == TK_FN() {
+            cc = c_advance(cc)  -- skip 'fn'
+            let method_tok = c_cur(cc)
+            let method_name = method_tok.value
+            cc = c_advance(cc)
+
+            -- Parse parameters (skip the method signature, just collect types)
+            cc = c_expect(cc, TK_LPAREN())
+            let mut param_types = ""
+            let mut first = true
+            while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+                if first == false {
+                    cc = c_expect(cc, TK_COMMA())
+                }
+                first = false
+                let ptok = c_cur(cc)
+                -- Handle 'self' and 'mut self' parameter
+                if ptok.kind == TK_SELF() {
+                    cc = c_advance(cc)
+                    -- self parameter: skip for param_types (receiver is implicit)
+                } else if ptok.kind == TK_MUT() {
+                    cc = c_advance(cc)
+                    if c_peek(cc) == TK_SELF() {
+                        cc = c_advance(cc)
+                        -- mut self: skip
+                    } else {
+                        -- regular mut param: name: type
+                        cc = c_advance(cc)
+                        cc = c_expect(cc, TK_COLON())
+                        let pt = parse_type_for_c(cc)
+                        cc = pt.c
+                        if param_types != "" {
+                            param_types = param_types + ","
+                        }
+                        param_types = param_types + pt.code
+                    }
+                } else {
+                    -- Regular param: name: type
+                    cc = c_advance(cc)
+                    cc = c_expect(cc, TK_COLON())
+                    -- Handle 'Self' type as placeholder
+                    let pt = parse_type_for_c(cc)
+                    cc = pt.c
+                    if param_types != "" {
+                        param_types = param_types + ","
+                    }
+                    param_types = param_types + pt.code
+                }
+            }
+            cc = c_expect(cc, TK_RPAREN())
+
+            -- Return type
+            let mut ret_type = "void"
+            if c_peek(cc) == TK_ARROW() {
+                cc = c_advance(cc)
+                let rt = parse_type_for_c(cc)
+                cc = rt.c
+                ret_type = rt.code
+            }
+
+            -- Skip optional effect annotation: with [IO, Console, ...]
+            if c_peek(cc) == TK_WITH() {
+                cc = c_advance(cc)
+                cc = c_expect(cc, TK_LBRACKET())
+                while c_peek(cc) != TK_RBRACKET() and c_peek(cc) != TK_EOF() {
+                    cc = c_advance(cc)
+                }
+                cc = c_expect(cc, TK_RBRACKET())
+            }
+
+            -- Store trait method signature: "|TraitName.method=ret_type:param_types|"
+            cc.trait_methods = cc.trait_methods + "|" + trait_name + "." + method_name + "=" + ret_type + ":" + param_types + "|"
+
+            -- Skip optional method body (default impl) or just continue
+            cc = c_skip_nl(cc)
+            if c_peek(cc) == TK_LBRACE() {
+                -- Skip default implementation body
+                let mut depth = 1
+                cc = c_advance(cc)
+                while depth > 0 and c_peek(cc) != TK_EOF() {
+                    if c_peek(cc) == TK_LBRACE() {
+                        depth = depth + 1
+                    }
+                    if c_peek(cc) == TK_RBRACE() {
+                        depth = depth - 1
+                    }
+                    if depth > 0 {
+                        cc = c_advance(cc)
+                    }
+                }
+                cc = c_advance(cc)  -- skip final '}'
+            }
+        } else {
+            cc = c_advance(cc)
+        }
+        cc = c_skip_nl(cc)
+    }
+    cc = c_expect(cc, TK_RBRACE())
+    return cc
+}
+
 fn compile_impl_decl(c: Compiler) -> Compiler {
     let mut cc = c_advance(c)  -- skip 'impl'
-    let type_tok = c_cur(cc)
+    let first_tok = c_cur(cc)
+    let first_name = first_tok.value
     cc = c_advance(cc)
-    -- Skip generic params if any
+
+    -- Determine if this is 'impl Type { ... }' or 'impl Trait for Type { ... }'
+    let mut impl_type_name = first_name
+    let mut trait_name = ""
+
+    -- Skip generic params on first name if any
     if c_peek(cc) == TK_LBRACKET() {
         let mut depth = 1
         cc = c_advance(cc)
@@ -320,19 +459,189 @@ fn compile_impl_decl(c: Compiler) -> Compiler {
             cc = c_advance(cc)
         }
     }
+
+    -- Check for 'for' keyword -> impl Trait for Type
+    cc = c_skip_nl(cc)
+    if c_peek(cc) == TK_FOR() {
+        cc = c_advance(cc)  -- skip 'for'
+        trait_name = first_name
+        let type_tok = c_cur(cc)
+        impl_type_name = type_tok.value
+        cc = c_advance(cc)
+        -- Skip generic params on type if any
+        if c_peek(cc) == TK_LBRACKET() {
+            let mut depth2 = 1
+            cc = c_advance(cc)
+            while depth2 > 0 and c_peek(cc) != TK_EOF() {
+                if c_peek(cc) == TK_LBRACKET() {
+                    depth2 = depth2 + 1
+                }
+                if c_peek(cc) == TK_RBRACKET() {
+                    depth2 = depth2 - 1
+                }
+                cc = c_advance(cc)
+            }
+        }
+        -- Record the impl-for mapping
+        cc.impl_for_map = cc.impl_for_map + "|" + impl_type_name + "=" + trait_name + "|"
+    }
+
+    -- Set the current impl type for method name mangling
+    let saved_impl_type = cc.current_impl_type
+    cc.current_impl_type = impl_type_name
+
     cc = c_skip_nl(cc)
     cc = c_expect(cc, TK_LBRACE())
     cc = c_skip_nl(cc)
     -- Parse methods inside impl block
     while c_peek(cc) != TK_RBRACE() and c_peek(cc) != TK_EOF() {
         if c_peek(cc) == TK_FN() {
-            cc = compile_fn_decl(cc)
+            cc = compile_impl_method(cc, impl_type_name)
         } else {
             cc = c_advance(cc)
         }
         cc = c_skip_nl(cc)
     }
     cc = c_expect(cc, TK_RBRACE())
+
+    -- Restore impl type
+    cc.current_impl_type = saved_impl_type
+    return cc
+}
+
+-- Compile a method inside an impl block with proper name mangling
+fn compile_impl_method(c: Compiler, type_name: string) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'fn'
+    let name_tok = c_cur(cc)
+    let method_name = name_tok.value
+    cc = c_advance(cc)
+
+    -- Mangled name: TypeName_method
+    let mangled_name = type_name + "_" + method_name
+
+    -- Check for generic function: fn name[T](...) — skip it
+    if c_peek(cc) == TK_LBRACKET() {
+        let mut depth = 0
+        let mut found_end = false
+        while found_end == false and c_peek(cc) != TK_EOF() {
+            if c_peek(cc) == TK_LBRACE() {
+                depth = depth + 1
+            }
+            if c_peek(cc) == TK_RBRACE() {
+                depth = depth - 1
+                if depth == 0 {
+                    cc = c_advance(cc)
+                    found_end = true
+                }
+            }
+            if found_end == false {
+                cc = c_advance(cc)
+            }
+        }
+        return cc
+    }
+
+    -- Parameters
+    cc = c_expect(cc, TK_LPAREN())
+    let mut params_c = ""
+    let mut first = true
+    while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+        if first == false {
+            cc = c_expect(cc, TK_COMMA())
+            params_c = params_c + ", "
+        }
+        first = false
+        let pname_tok = c_cur(cc)
+        let pname = pname_tok.value
+
+        -- Handle 'self' and 'mut self' parameters
+        if pname_tok.kind == TK_SELF() {
+            cc = c_advance(cc)
+            let self_type = dm_mangle(type_name)
+            params_c = params_c + self_type + "* dm_self"
+            cc = track_str_var(cc, "dm_self", false)
+            cc = track_var_type(cc, "dm_self", self_type + "*")
+        } else if pname_tok.kind == TK_MUT() {
+            cc = c_advance(cc)
+            if c_peek(cc) == TK_SELF() {
+                cc = c_advance(cc)
+                let self_type = dm_mangle(type_name)
+                params_c = params_c + self_type + "* dm_self"
+                cc = track_str_var(cc, "dm_self", false)
+                cc = track_var_type(cc, "dm_self", self_type + "*")
+            } else {
+                -- Regular mut param
+                let mpname_tok = c_cur(cc)
+                let mpname = mpname_tok.value
+                cc = c_advance(cc)
+                cc = c_expect(cc, TK_COLON())
+                let pt = parse_type_for_c(cc)
+                cc = pt.c
+                params_c = params_c + pt.code + " " + dm_mangle(mpname)
+                cc = track_str_var(cc, dm_mangle(mpname), pt.code == "dm_string")
+                cc = track_list_elem_type(cc, pt.code, mpname)
+                cc = track_var_type(cc, dm_mangle(mpname), pt.code)
+            }
+        } else {
+            cc = c_advance(cc)
+            cc = c_expect(cc, TK_COLON())
+            let pt = parse_type_for_c(cc)
+            cc = pt.c
+            params_c = params_c + pt.code + " " + dm_mangle(pname)
+            cc = track_str_var(cc, dm_mangle(pname), pt.code == "dm_string")
+            cc = track_list_elem_type(cc, pt.code, pname)
+            cc = track_var_type(cc, dm_mangle(pname), pt.code)
+        }
+    }
+    cc = c_expect(cc, TK_RPAREN())
+
+    -- Return type
+    let mut ret_type = "void"
+    if c_peek(cc) == TK_ARROW() {
+        cc = c_advance(cc)
+        let rt = parse_type_for_c(cc)
+        cc = rt.c
+        ret_type = rt.code
+    }
+
+    -- Skip optional effect annotation: with [IO, Console, ...]
+    if c_peek(cc) == TK_WITH() {
+        cc = c_advance(cc)
+        cc = c_expect(cc, TK_LBRACKET())
+        while c_peek(cc) != TK_RBRACKET() and c_peek(cc) != TK_EOF() {
+            cc = c_advance(cc)
+        }
+        cc = c_expect(cc, TK_RBRACKET())
+    }
+
+    -- Generate function signature with mangled name
+    let mut final_sig = ret_type + " " + dm_mangle(mangled_name) + "(" + params_c + ")"
+    if params_c == "" {
+        final_sig = ret_type + " " + dm_mangle(mangled_name) + "(void)"
+    }
+    cc.fn_sigs.push(final_sig + ";")
+    cc.fn_names.push(mangled_name)
+    cc.fn_ret_types.push(ret_type)
+
+    -- Function body
+    cc = c_skip_nl(cc)
+    cc = c_expect(cc, TK_LBRACE())
+    let mut body_out = final_sig + " {\n"
+
+    -- Save and reset output for body
+    let saved_output = cc.output
+    let saved_fn_ret = cc.current_fn_ret_type
+    cc.output = ""
+    cc.indent = 1
+    cc.current_fn_ret_type = ret_type
+    cc = compile_block_body(cc)
+    cc = c_expect(cc, TK_RBRACE())
+    body_out = body_out + cc.output + "}\n\n"
+    cc.output = saved_output
+    cc.indent = 0
+    cc.current_fn_ret_type = saved_fn_ret
+    cc.fn_defs.push(body_out)
+
     return cc
 }
 
@@ -472,6 +781,17 @@ fn prescan_declarations(c: Compiler) -> Compiler {
                         }
                     }
                 }
+                -- Skip optional effect annotation: with [IO, Console, ...]
+                if j < cc.tokens.len() and cc.tokens[j].kind == TK_WITH() {
+                    j = j + 1
+                    if j < cc.tokens.len() and cc.tokens[j].kind == TK_LBRACKET() {
+                        j = j + 1
+                        while j < cc.tokens.len() and cc.tokens[j].kind != TK_RBRACKET() {
+                            j = j + 1
+                        }
+                        if j < cc.tokens.len() { j = j + 1 }
+                    }
+                }
                 cc.fn_names.push(fn_name)
                 cc.fn_ret_types.push(ret_type)
             }
@@ -486,6 +806,120 @@ fn prescan_declarations(c: Compiler) -> Compiler {
             let name_tok = cc.tokens[i + 1]
             if name_tok.kind == TK_IDENT() {
                 cc.enum_names.push(name_tok.value)
+            }
+        }
+        if tok.kind == TK_TRAIT() and i + 1 < cc.tokens.len() {
+            let name_tok = cc.tokens[i + 1]
+            if name_tok.kind == TK_IDENT() {
+                cc.trait_names.push(name_tok.value)
+            }
+        }
+        -- Prescan impl blocks to register mangled method names
+        if tok.kind == TK_IMPL() and i + 1 < cc.tokens.len() {
+            let impl_first_tok = cc.tokens[i + 1]
+            if impl_first_tok.kind == TK_IDENT() {
+                let first_name = impl_first_tok.value
+                -- Scan forward to check for 'for' keyword
+                let mut scan_j = i + 2
+                -- Skip generic params if any
+                if scan_j < cc.tokens.len() and cc.tokens[scan_j].kind == TK_LBRACKET() {
+                    let mut gdepth = 1
+                    scan_j = scan_j + 1
+                    while gdepth > 0 and scan_j < cc.tokens.len() {
+                        if cc.tokens[scan_j].kind == TK_LBRACKET() {
+                            gdepth = gdepth + 1
+                        }
+                        if cc.tokens[scan_j].kind == TK_RBRACKET() {
+                            gdepth = gdepth - 1
+                        }
+                        scan_j = scan_j + 1
+                    }
+                }
+                -- Skip newlines
+                while scan_j < cc.tokens.len() and cc.tokens[scan_j].kind == TK_NEWLINE() {
+                    scan_j = scan_j + 1
+                }
+                let mut impl_type = first_name
+                if scan_j < cc.tokens.len() and cc.tokens[scan_j].kind == TK_FOR() {
+                    -- impl Trait for Type: the type is after 'for'
+                    scan_j = scan_j + 1
+                    if scan_j < cc.tokens.len() and cc.tokens[scan_j].kind == TK_IDENT() {
+                        let impl_type_tok = cc.tokens[scan_j]
+                        impl_type = impl_type_tok.value
+                    }
+                }
+                -- Now scan methods inside { } and register with mangled names
+                -- Find the opening brace
+                while scan_j < cc.tokens.len() and cc.tokens[scan_j].kind != TK_LBRACE() {
+                    scan_j = scan_j + 1
+                }
+                if scan_j < cc.tokens.len() {
+                    scan_j = scan_j + 1  -- skip '{'
+                    let mut impl_brace_depth = 1
+                    while impl_brace_depth > 0 and scan_j < cc.tokens.len() {
+                        if cc.tokens[scan_j].kind == TK_LBRACE() {
+                            impl_brace_depth = impl_brace_depth + 1
+                        }
+                        if cc.tokens[scan_j].kind == TK_RBRACE() {
+                            impl_brace_depth = impl_brace_depth - 1
+                            if impl_brace_depth == 0 { break }
+                        }
+                        if cc.tokens[scan_j].kind == TK_FN() and impl_brace_depth == 1 {
+                            -- Found a method at the impl level
+                            if scan_j + 1 < cc.tokens.len() and cc.tokens[scan_j + 1].kind == TK_IDENT() {
+                                let method_tok = cc.tokens[scan_j + 1]
+                                let method_name = method_tok.value
+                                let mangled = impl_type + "_" + method_name
+                                -- Find return type of this method
+                                let mut mj = scan_j + 2
+                                -- Skip generic params
+                                if mj < cc.tokens.len() and cc.tokens[mj].kind == TK_LBRACKET() {
+                                    while mj < cc.tokens.len() and cc.tokens[mj].kind != TK_RBRACKET() {
+                                        mj = mj + 1
+                                    }
+                                    mj = mj + 1
+                                }
+                                -- Skip past parameter list
+                                let mut pdepth = 0
+                                while mj < cc.tokens.len() {
+                                    let pt = cc.tokens[mj]
+                                    if pt.kind == TK_LPAREN() { pdepth = pdepth + 1 }
+                                    if pt.kind == TK_RPAREN() {
+                                        pdepth = pdepth - 1
+                                        if pdepth == 0 {
+                                            mj = mj + 1
+                                            break
+                                        }
+                                    }
+                                    mj = mj + 1
+                                }
+                                -- Check for -> RetType
+                                let mut mret_type = "void"
+                                if mj < cc.tokens.len() and cc.tokens[mj].kind == TK_ARROW() {
+                                    mj = mj + 1
+                                    if mj < cc.tokens.len() and cc.tokens[mj].kind == TK_IDENT() {
+                                        let ret_tok = cc.tokens[mj]
+                                        mret_type = map_dm_type(ret_tok.value)
+                                    }
+                                }
+                                -- Skip optional effect annotation: with [...]
+                                if mj < cc.tokens.len() and cc.tokens[mj].kind == TK_WITH() {
+                                    mj = mj + 1
+                                    if mj < cc.tokens.len() and cc.tokens[mj].kind == TK_LBRACKET() {
+                                        mj = mj + 1
+                                        while mj < cc.tokens.len() and cc.tokens[mj].kind != TK_RBRACKET() {
+                                            mj = mj + 1
+                                        }
+                                        if mj < cc.tokens.len() { mj = mj + 1 }
+                                    }
+                                }
+                                cc.fn_names.push(mangled)
+                                cc.fn_ret_types.push(mret_type)
+                            }
+                        }
+                        scan_j = scan_j + 1
+                    }
+                }
             }
         }
         i = i + 1
@@ -524,6 +958,8 @@ fn compile_source(c: Compiler) -> Compiler {
             cc = compile_struct_decl(cc)
         } else if k == TK_ENUM() {
             cc = compile_enum_decl(cc)
+        } else if k == TK_TRAIT() {
+            cc = compile_trait_decl(cc)
         } else if k == TK_IMPL() {
             cc = compile_impl_decl(cc)
         } else if k == TK_IMPORT() {

@@ -195,7 +195,17 @@ struct Compiler {
     -- Counter for unique for-loop iterator variables
     for_counter: int,
     -- Counter for unique try-operator temporaries
-    try_counter: int
+    try_counter: int,
+    -- Track trait method signatures: "|TraitName.method=ret_type:param_types|"
+    trait_methods: string,
+    -- Track trait names
+    trait_names: List[string],
+    -- Track impl-for mappings: "|TypeName=TraitName|" (which type implements which trait)
+    impl_for_map: string,
+    -- Track current impl type prefix for method name mangling
+    current_impl_type: string,
+    -- Counter for unique region arena variables
+    region_counter: int
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -208,6 +218,7 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
     let fdefs: List[string] = []
     let sv: List[string] = []
     let en: List[string] = []
+    let tn: List[string] = []
     return Compiler {
         tokens: tokens, pos: 0, output: "", indent: 0,
         errors: errs, struct_names: sn, fn_names: fnames,
@@ -228,7 +239,12 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         generic_fn_tokens: "",
         monomorphized_fns: "",
         for_counter: 0,
-        try_counter: 0
+        try_counter: 0,
+        trait_methods: "",
+        trait_names: tn,
+        impl_for_map: "",
+        current_impl_type: "",
+        region_counter: 0
     }
 }
 
@@ -370,6 +386,56 @@ fn indent_str(level: int) -> string {
 
 fn dm_mangle(name: string) -> string {
     return "dm_" + name
+}
+
+-- Check if a name is a known trait
+fn is_trait_name(c: Compiler, name: string) -> bool {
+    let mut i = 0
+    while i < c.trait_names.len() {
+        let cur = "" + c.trait_names[i]
+        if cur == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+-- Look up trait method signature: returns "ret_type:param_types" or ""
+fn lookup_trait_method(c: Compiler, trait_name: string, method_name: string) -> string {
+    let marker = "|" + trait_name + "." + method_name + "="
+    let pos = string_find(c.trait_methods, marker)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let rest = substr(c.trait_methods, start, len(c.trait_methods) - start)
+    let end_pos = string_find(rest, "|")
+    if end_pos < 0 { return "" }
+    return substr(rest, 0, end_pos)
+}
+
+-- Look up which trait a type implements: returns trait name or ""
+fn lookup_impl_trait(c: Compiler, type_name: string) -> string {
+    let marker = "|" + type_name + "="
+    let pos = string_find(c.impl_for_map, marker)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let rest = substr(c.impl_for_map, start, len(c.impl_for_map) - start)
+    let end_pos = string_find(rest, "|")
+    if end_pos < 0 { return "" }
+    return substr(rest, 0, end_pos)
+}
+
+-- Look up impl method: checks if a method is defined for a type via impl block
+-- Returns the mangled impl method name or ""
+fn lookup_impl_method(c: Compiler, type_name: string, method_name: string) -> string {
+    -- Look for direct impl method: "|TypeName.method=" in struct_fields or a specific marker
+    -- We track impl methods via fn_names with mangled format: TypeName_method
+    let mangled = type_name + "_" + method_name
+    let mut i = 0
+    while i < c.fn_names.len() {
+        let cur = "" + c.fn_names[i]
+        if cur == mangled { return "dm_" + mangled }
+        i = i + 1
+    }
+    return ""
 }
 
 fn map_dm_type(name: string) -> string {

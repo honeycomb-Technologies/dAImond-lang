@@ -582,27 +582,44 @@ void dm_runtime_init(void);
 void dm_runtime_cleanup(void);
 
 /* ============================================================================
- * Threading Primitives (POSIX pthreads)
+ * Threading Primitives
  * ============================================================================ */
 
 #ifdef _WIN32
-/* TODO: Windows threading support */
-#else
+#include <windows.h>
+
+/**
+ * Thread handle type (Windows).
+ */
+typedef struct dm_thread {
+    HANDLE handle;
+} dm_thread;
+
+/**
+ * Mutex type (Windows).
+ */
+typedef struct dm_mutex {
+    HANDLE handle;
+} dm_mutex;
+
+#else /* POSIX */
 #include <pthread.h>
 
 /**
- * Thread handle type.
+ * Thread handle type (POSIX).
  */
 typedef struct dm_thread {
     pthread_t handle;
 } dm_thread;
 
 /**
- * Mutex type.
+ * Mutex type (POSIX).
  */
 typedef struct dm_mutex {
     pthread_mutex_t handle;
 } dm_mutex;
+
+#endif /* _WIN32 */
 
 /**
  * Spawn a new thread running a function.
@@ -635,13 +652,39 @@ void dm_mutex_unlock(dm_mutex* mutex);
  */
 void dm_mutex_destroy(dm_mutex* mutex);
 
-#endif /* _WIN32 */
-
 /* ============================================================================
- * Networking Primitives (BSD Sockets)
+ * Networking Primitives
  * ============================================================================ */
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+/**
+ * Initialize Winsock (call once at startup).
+ */
+void dm_winsock_init(void);
+
+/**
+ * Cleanup Winsock (call once at shutdown).
+ */
+void dm_winsock_cleanup(void);
+
+/**
+ * TCP listener - listens for incoming connections (Windows: SOCKET).
+ */
+typedef struct dm_tcp_listener {
+    SOCKET fd;
+} dm_tcp_listener;
+
+/**
+ * TCP stream - a connected socket (Windows: SOCKET).
+ */
+typedef struct dm_tcp_stream {
+    SOCKET fd;
+} dm_tcp_stream;
+
+#else /* POSIX */
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -649,18 +692,20 @@ void dm_mutex_destroy(dm_mutex* mutex);
 #include <netdb.h>
 
 /**
- * TCP listener - listens for incoming connections.
+ * TCP listener - listens for incoming connections (POSIX: int fd).
  */
 typedef struct dm_tcp_listener {
     int fd;
 } dm_tcp_listener;
 
 /**
- * TCP stream - a connected socket.
+ * TCP stream - a connected socket (POSIX: int fd).
  */
 typedef struct dm_tcp_stream {
     int fd;
 } dm_tcp_stream;
+
+#endif /* _WIN32 */
 
 /**
  * Bind a TCP listener to an address (e.g., "0.0.0.0:8080").
@@ -700,7 +745,225 @@ void dm_tcp_close(dm_tcp_stream* stream);
  */
 void dm_tcp_listener_close(dm_tcp_listener* listener);
 
-#endif /* _WIN32 */
+/* ============================================================================
+ * Filesystem Operations
+ * ============================================================================ */
+
+#ifdef _WIN32
+#include <direct.h>   /* _mkdir, _getcwd, _rmdir */
+#include <io.h>       /* _access */
+#else
+#include <sys/stat.h>
+#include <dirent.h>
+#endif
+
+/**
+ * Create a directory (and parents if needed).
+ * @param path Directory path
+ * @return 0 on success, -1 on error
+ */
+int dm_mkdir(dm_string path);
+
+/**
+ * Read directory entries.
+ * Returns a newline-separated string of entry names.
+ * @param path Directory path
+ * @return Entry names separated by newlines, or empty string on error
+ */
+dm_string dm_readdir(dm_string path);
+
+/**
+ * Remove a file or empty directory.
+ * @param path Path to remove
+ * @return 0 on success, -1 on error
+ */
+int dm_remove(dm_string path);
+
+/**
+ * Rename/move a file or directory.
+ * @param old_path Current path
+ * @param new_path New path
+ * @return 0 on success, -1 on error
+ */
+int dm_rename(dm_string old_path, dm_string new_path);
+
+/**
+ * Get the current working directory.
+ * @return Current directory path (must be freed)
+ */
+dm_string dm_getcwd(void);
+
+/* ============================================================================
+ * OS Functions
+ * ============================================================================ */
+
+/**
+ * Get an environment variable.
+ * @param name Variable name
+ * @return Variable value, or empty string if not set
+ */
+dm_string dm_getenv(dm_string name);
+
+/* ============================================================================
+ * SIMD Vector Types
+ * ============================================================================ */
+
+/* GCC/Clang vector extensions for SIMD types */
+#if defined(__GNUC__) || defined(__clang__)
+
+typedef float    dm_f32x4 __attribute__((vector_size(16)));
+typedef float    dm_f32x8 __attribute__((vector_size(32)));
+typedef double   dm_f64x2 __attribute__((vector_size(16)));
+typedef double   dm_f64x4 __attribute__((vector_size(32)));
+typedef int32_t  dm_i32x4 __attribute__((vector_size(16)));
+typedef int32_t  dm_i32x8 __attribute__((vector_size(32)));
+typedef int64_t  dm_i64x2 __attribute__((vector_size(16)));
+typedef int64_t  dm_i64x4 __attribute__((vector_size(32)));
+
+#else
+/* Scalar fallback for compilers without vector extensions */
+
+typedef struct { float    v[4]; } dm_f32x4;
+typedef struct { float    v[8]; } dm_f32x8;
+typedef struct { double   v[2]; } dm_f64x2;
+typedef struct { double   v[4]; } dm_f64x4;
+typedef struct { int32_t  v[4]; } dm_i32x4;
+typedef struct { int32_t  v[8]; } dm_i32x8;
+typedef struct { int64_t  v[2]; } dm_i64x2;
+typedef struct { int64_t  v[4]; } dm_i64x4;
+
+#endif /* __GNUC__ || __clang__ */
+
+/* SIMD constructors - splat a scalar to all lanes */
+static inline dm_f32x4 dm_simd_splat_f32x4(float v) {
+    return (dm_f32x4){v, v, v, v};
+}
+static inline dm_f32x8 dm_simd_splat_f32x8(float v) {
+    return (dm_f32x8){v, v, v, v, v, v, v, v};
+}
+static inline dm_f64x2 dm_simd_splat_f64x2(double v) {
+    return (dm_f64x2){v, v};
+}
+static inline dm_f64x4 dm_simd_splat_f64x4(double v) {
+    return (dm_f64x4){v, v, v, v};
+}
+static inline dm_i32x4 dm_simd_splat_i32x4(int32_t v) {
+    return (dm_i32x4){v, v, v, v};
+}
+static inline dm_i32x8 dm_simd_splat_i32x8(int32_t v) {
+    return (dm_i32x8){v, v, v, v, v, v, v, v};
+}
+static inline dm_i64x2 dm_simd_splat_i64x2(int64_t v) {
+    return (dm_i64x2){v, v};
+}
+static inline dm_i64x4 dm_simd_splat_i64x4(int64_t v) {
+    return (dm_i64x4){v, v, v, v};
+}
+
+/* SIMD set - construct from individual elements */
+static inline dm_f32x4 dm_simd_set_f32x4(float a, float b, float c, float d) {
+    return (dm_f32x4){a, b, c, d};
+}
+static inline dm_f64x2 dm_simd_set_f64x2(double a, double b) {
+    return (dm_f64x2){a, b};
+}
+static inline dm_i32x4 dm_simd_set_i32x4(int32_t a, int32_t b, int32_t c, int32_t d) {
+    return (dm_i32x4){a, b, c, d};
+}
+static inline dm_i64x2 dm_simd_set_i64x2(int64_t a, int64_t b) {
+    return (dm_i64x2){a, b};
+}
+
+/* SIMD extract - get element at index (compile-time constant index) */
+#if defined(__GNUC__) || defined(__clang__)
+#define dm_simd_extract(vec, idx) ((vec)[(idx)])
+#else
+#define dm_simd_extract(vec, idx) ((vec).v[(idx)])
+#endif
+
+/* SIMD arithmetic - with vector extensions, +, -, *, / work directly */
+#if defined(__GNUC__) || defined(__clang__)
+
+#define dm_simd_add(a, b) ((a) + (b))
+#define dm_simd_sub(a, b) ((a) - (b))
+#define dm_simd_mul(a, b) ((a) * (b))
+#define dm_simd_div(a, b) ((a) / (b))
+
+#else
+/* Scalar fallback - only f32x4 shown for brevity, others follow same pattern */
+
+static inline dm_f32x4 dm_simd_add_f32x4(dm_f32x4 a, dm_f32x4 b) {
+    dm_f32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] + b.v[i]; return r;
+}
+static inline dm_f32x4 dm_simd_sub_f32x4(dm_f32x4 a, dm_f32x4 b) {
+    dm_f32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] - b.v[i]; return r;
+}
+static inline dm_f32x4 dm_simd_mul_f32x4(dm_f32x4 a, dm_f32x4 b) {
+    dm_f32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] * b.v[i]; return r;
+}
+static inline dm_f32x4 dm_simd_div_f32x4(dm_f32x4 a, dm_f32x4 b) {
+    dm_f32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] / b.v[i]; return r;
+}
+static inline dm_f64x2 dm_simd_add_f64x2(dm_f64x2 a, dm_f64x2 b) {
+    dm_f64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] + b.v[i]; return r;
+}
+static inline dm_f64x2 dm_simd_sub_f64x2(dm_f64x2 a, dm_f64x2 b) {
+    dm_f64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] - b.v[i]; return r;
+}
+static inline dm_f64x2 dm_simd_mul_f64x2(dm_f64x2 a, dm_f64x2 b) {
+    dm_f64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] * b.v[i]; return r;
+}
+static inline dm_f64x2 dm_simd_div_f64x2(dm_f64x2 a, dm_f64x2 b) {
+    dm_f64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] / b.v[i]; return r;
+}
+static inline dm_i32x4 dm_simd_add_i32x4(dm_i32x4 a, dm_i32x4 b) {
+    dm_i32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] + b.v[i]; return r;
+}
+static inline dm_i32x4 dm_simd_sub_i32x4(dm_i32x4 a, dm_i32x4 b) {
+    dm_i32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] - b.v[i]; return r;
+}
+static inline dm_i32x4 dm_simd_mul_i32x4(dm_i32x4 a, dm_i32x4 b) {
+    dm_i32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] * b.v[i]; return r;
+}
+static inline dm_i32x4 dm_simd_div_i32x4(dm_i32x4 a, dm_i32x4 b) {
+    dm_i32x4 r; for (int i = 0; i < 4; i++) r.v[i] = a.v[i] / b.v[i]; return r;
+}
+static inline dm_i64x2 dm_simd_add_i64x2(dm_i64x2 a, dm_i64x2 b) {
+    dm_i64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] + b.v[i]; return r;
+}
+static inline dm_i64x2 dm_simd_sub_i64x2(dm_i64x2 a, dm_i64x2 b) {
+    dm_i64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] - b.v[i]; return r;
+}
+static inline dm_i64x2 dm_simd_mul_i64x2(dm_i64x2 a, dm_i64x2 b) {
+    dm_i64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] * b.v[i]; return r;
+}
+static inline dm_i64x2 dm_simd_div_i64x2(dm_i64x2 a, dm_i64x2 b) {
+    dm_i64x2 r; for (int i = 0; i < 2; i++) r.v[i] = a.v[i] / b.v[i]; return r;
+}
+
+/* Fallback generic macros via _Generic (C11) */
+#define dm_simd_add(a, b) _Generic((a), \
+    dm_f32x4: dm_simd_add_f32x4, \
+    dm_f64x2: dm_simd_add_f64x2, \
+    dm_i32x4: dm_simd_add_i32x4, \
+    dm_i64x2: dm_simd_add_i64x2)(a, b)
+#define dm_simd_sub(a, b) _Generic((a), \
+    dm_f32x4: dm_simd_sub_f32x4, \
+    dm_f64x2: dm_simd_sub_f64x2, \
+    dm_i32x4: dm_simd_sub_i32x4, \
+    dm_i64x2: dm_simd_sub_i64x2)(a, b)
+#define dm_simd_mul(a, b) _Generic((a), \
+    dm_f32x4: dm_simd_mul_f32x4, \
+    dm_f64x2: dm_simd_mul_f64x2, \
+    dm_i32x4: dm_simd_mul_i32x4, \
+    dm_i64x2: dm_simd_mul_i64x2)(a, b)
+#define dm_simd_div(a, b) _Generic((a), \
+    dm_f32x4: dm_simd_div_f32x4, \
+    dm_f64x2: dm_simd_div_f64x2, \
+    dm_i32x4: dm_simd_div_i32x4, \
+    dm_i64x2: dm_simd_div_i64x2)(a, b)
+
+#endif /* __GNUC__ || __clang__ */
 
 #ifdef __cplusplus
 }

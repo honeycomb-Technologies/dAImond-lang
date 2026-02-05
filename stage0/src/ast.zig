@@ -130,6 +130,7 @@ pub const FunctionDecl = struct {
     body: ?FunctionBody,
     is_comptime: bool,
     is_extern: bool,
+    is_async: bool,
     span: Span,
 
     pub const FunctionBody = union(enum) {
@@ -435,6 +436,7 @@ pub const Expr = struct {
         // Special
         grouped: *Expr, // parenthesized expression
         comptime_expr: *ComptimeExpr,
+        await_expr: *AwaitExpr,
     };
 };
 
@@ -685,6 +687,12 @@ pub const PipelineExpr = struct {
 
 /// Error propagation: `expr?`
 pub const ErrorPropagateExpr = struct {
+    operand: *Expr,
+    span: Span,
+};
+
+/// Await expression: `await expr`
+pub const AwaitExpr = struct {
     operand: *Expr,
     span: Span,
 };

@@ -3580,6 +3580,190 @@ pub const bare_self_tests = [_]TestCase{
     },
 };
 
+pub const simd_tests = [_]TestCase{
+    .{
+        .name = "simd_f32x4_splat_add",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a: f32x4 = simd_splat_f32x4(1.0)
+            \\    let b: f32x4 = simd_set_f32x4(1.0, 2.0, 3.0, 4.0)
+            \\    let c: f32x4 = simd_add(a, b)
+            \\    let v0 = simd_extract(c, 0)
+            \\    let v1 = simd_extract(c, 1)
+            \\    let v2 = simd_extract(c, 2)
+            \\    let v3 = simd_extract(c, 3)
+            \\    println(float_to_string(v0))
+            \\    println(float_to_string(v1))
+            \\    println(float_to_string(v2))
+            \\    println(float_to_string(v3))
+            \\}
+        ,
+        .expected_output = "2\n3\n4\n5\n",
+    },
+    .{
+        .name = "simd_f32x4_mul",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a: f32x4 = simd_set_f32x4(1.0, 2.0, 3.0, 4.0)
+            \\    let b: f32x4 = simd_set_f32x4(2.0, 3.0, 4.0, 5.0)
+            \\    let c: f32x4 = simd_mul(a, b)
+            \\    let v0 = simd_extract(c, 0)
+            \\    let v1 = simd_extract(c, 1)
+            \\    let v2 = simd_extract(c, 2)
+            \\    let v3 = simd_extract(c, 3)
+            \\    println(float_to_string(v0))
+            \\    println(float_to_string(v1))
+            \\    println(float_to_string(v2))
+            \\    println(float_to_string(v3))
+            \\}
+        ,
+        .expected_output = "2\n6\n12\n20\n",
+    },
+    .{
+        .name = "simd_i32x4_arithmetic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a: i32x4 = simd_set_i32x4(10, 20, 30, 40)
+            \\    let b: i32x4 = simd_splat_i32x4(2)
+            \\    let c: i32x4 = simd_mul(a, b)
+            \\    let d: i32x4 = simd_sub(a, b)
+            \\    println(int_to_string(simd_extract(c, 0)))
+            \\    println(int_to_string(simd_extract(c, 1)))
+            \\    println(int_to_string(simd_extract(c, 2)))
+            \\    println(int_to_string(simd_extract(c, 3)))
+            \\    println(int_to_string(simd_extract(d, 0)))
+            \\    println(int_to_string(simd_extract(d, 3)))
+            \\}
+        ,
+        .expected_output = "20\n40\n60\n80\n8\n38\n",
+    },
+    .{
+        .name = "simd_f64x2_operations",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let a: f64x2 = simd_set_f64x2(3.14, 2.71)
+            \\    let b: f64x2 = simd_splat_f64x2(2.0)
+            \\    let c: f64x2 = simd_div(a, b)
+            \\    println(float_to_string(simd_extract(c, 0)))
+            \\    println(float_to_string(simd_extract(c, 1)))
+            \\}
+        ,
+        .expected_output = "1.57\n1.355\n",
+    },
+};
+
+pub const async_await_tests = [_]TestCase{
+    .{
+        .name = "async_basic_int",
+        .source =
+            \\module test
+            \\
+            \\async fn compute() -> int {
+            \\    return 42
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = await compute()
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "async_with_params",
+        .source =
+            \\module test
+            \\
+            \\async fn add(a: int, b: int) -> int {
+            \\    return a + b
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = await add(10, 20)
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "30\n",
+    },
+    .{
+        .name = "async_string",
+        .source =
+            \\module test
+            \\
+            \\async fn greet() -> string {
+            \\    return "Hello, world!"
+            \\}
+            \\
+            \\fn main() {
+            \\    let msg = await greet()
+            \\    println(msg)
+            \\}
+        ,
+        .expected_output = "Hello, world!\n",
+    },
+    .{
+        .name = "async_chain",
+        .source =
+            \\module test
+            \\
+            \\async fn add(a: int, b: int) -> int {
+            \\    return a + b
+            \\}
+            \\
+            \\async fn chain(x: int) -> int {
+            \\    let a = await add(x, 5)
+            \\    let b = await add(a, 6)
+            \\    return b
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = await chain(0)
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "11\n",
+    },
+    .{
+        .name = "async_inline_await",
+        .source =
+            \\module test
+            \\
+            \\async fn add(a: int, b: int) -> int {
+            \\    return a + b
+            \\}
+            \\
+            \\fn main() {
+            \\    let sum = await add(3, 4)
+            \\    println(int_to_string(sum))
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+    .{
+        .name = "async_void",
+        .source =
+            \\module test
+            \\
+            \\async fn do_work() {
+            \\    println("working")
+            \\}
+            \\
+            \\fn main() {
+            \\    await do_work()
+            \\}
+        ,
+        .expected_output = "working\n",
+    },
+};
+
 pub const comprehensive_test = [_]TestCase{
     .{
         .name = "stage1_comprehensive",
@@ -3706,6 +3890,8 @@ pub fn main() !void {
         .{ .name = "Effects", .tests = &effect_tests },
         .{ .name = "Dyn Trait", .tests = &dyn_trait_tests },
         .{ .name = "Bare Self", .tests = &bare_self_tests },
+        .{ .name = "SIMD", .tests = &simd_tests },
+        .{ .name = "Async/Await", .tests = &async_await_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
     };
 

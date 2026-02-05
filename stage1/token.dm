@@ -36,6 +36,7 @@ fn TK_IN() -> int { return 33 }
 fn TK_CONST() -> int { return 34 }
 fn TK_WITH() -> int { return 35 }
 fn TK_SELF() -> int { return 36 }
+fn TK_REGION() -> int { return 37 }
 fn TK_PLUS() -> int { return 50 }
 fn TK_MINUS() -> int { return 51 }
 fn TK_STAR() -> int { return 52 }
@@ -115,6 +116,7 @@ fn keyword_lookup(name: string) -> int {
     if name == "const" { return TK_CONST() }
     if name == "with" { return TK_WITH() }
     if name == "self" { return TK_SELF() }
+    if name == "region" { return TK_REGION() }
     return TK_IDENT()
 }
 
@@ -164,5 +166,6 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_DOT() { return "'.'" }
     if kind == TK_COLON() { return "':'" }
     if kind == TK_COMMA() { return "','" }
+    if kind == TK_REGION() { return "'region'" }
     return "token(" + int_to_string(kind) + ")"
 }

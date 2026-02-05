@@ -2,8 +2,6 @@ module fs
 
 -- Standard Filesystem Module
 -- File system operations via builtins.
--- Note: mkdir/rmdir/remove/rename use system() calls since
--- extern fn with string types conflicts with C stdlib declarations.
 
 -- Read entire file contents
 fn fs_read(path: string) -> string {
@@ -25,22 +23,30 @@ fn fs_exists(path: string) -> bool {
     return file_exists(path)
 }
 
--- Create a directory (uses shell command)
+-- Create a directory (and parents if needed)
+-- Returns 0 on success, -1 on error
 fn fs_mkdir(path: string) -> int {
-    return system("mkdir -p " + path)
+    return fs_mkdir(path)
 }
 
--- Remove a directory (uses shell command)
-fn fs_rmdir(path: string) -> int {
-    return system("rmdir " + path)
+-- Read directory entries as newline-separated string
+fn fs_readdir(path: string) -> string {
+    return fs_readdir(path)
 }
 
--- Remove a file (uses shell command)
+-- Remove a file or empty directory
+-- Returns 0 on success, -1 on error
 fn fs_remove(path: string) -> int {
-    return system("rm -f " + path)
+    return fs_remove(path)
 }
 
--- Rename/move a file (uses shell command)
+-- Rename/move a file or directory
+-- Returns 0 on success, -1 on error
 fn fs_rename(old_path: string, new_path: string) -> int {
-    return system("mv " + old_path + " " + new_path)
+    return fs_rename(old_path, new_path)
+}
+
+-- Get the current working directory
+fn fs_getcwd() -> string {
+    return fs_getcwd()
 }

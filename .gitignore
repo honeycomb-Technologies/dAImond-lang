@@ -5,6 +5,9 @@
 # Generated C files at root
 /main.c
 
+# Compilation cache
+.daimond-cache/
+
 # Editor/IDE
 *.swp
 *.swo

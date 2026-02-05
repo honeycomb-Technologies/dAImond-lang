@@ -908,6 +908,8 @@ pub fn tokenTypeName(token_type: TokenType) []const u8 {
         .kw_ensures => "`ensures`",
         .kw_discard => "`discard`",
         .kw_expect => "`expect`",
+        .kw_async => "`async`",
+        .kw_await => "`await`",
         .plus => "`+`",
         .minus => "`-`",
         .star => "`*`",

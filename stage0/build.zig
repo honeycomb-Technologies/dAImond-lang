@@ -116,6 +116,15 @@ pub fn build(b: *std.Build) void {
 
     const run_lsp_tests = b.addRunArtifact(lsp_tests);
 
+    // Unit tests for cache
+    const cache_tests = b.addTest(.{
+        .root_source_file = b.path("src/cache.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const run_cache_tests = b.addRunArtifact(cache_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lexer_tests.step);
     test_step.dependOn(&run_errors_tests.step);
@@ -126,6 +135,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_checker_tests.step);
     test_step.dependOn(&run_package_tests.step);
     test_step.dependOn(&run_lsp_tests.step);
+    test_step.dependOn(&run_cache_tests.step);
 
     // Integration test runner executable
     const integration_exe = b.addExecutable(.{

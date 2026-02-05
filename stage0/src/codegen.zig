@@ -57,6 +57,7 @@ const BlockExpr = ast.BlockExpr;
 const LambdaExpr = ast.LambdaExpr;
 const PipelineExpr = ast.PipelineExpr;
 const ErrorPropagateExpr = ast.ErrorPropagateExpr;
+const AwaitExpr = ast.AwaitExpr;
 const CoalesceExpr = ast.CoalesceExpr;
 const RangeExpr = ast.RangeExpr;
 const CastExpr = ast.CastExpr;
@@ -292,6 +293,11 @@ pub const CodeGenerator = struct {
     // Deferred buffer for result type definitions
     result_type_writer: CWriter,
 
+    // Track generated future types: maps future type name -> inner C type
+    generated_future_types: std.StringHashMap([]const u8),
+    // Deferred buffer for future type definitions
+    future_type_writer: CWriter,
+
     // Track enum variant payload types: maps "dm_EnumName.VariantName" -> C type
     enum_variant_types: std.StringHashMap([]const u8),
 
@@ -324,6 +330,11 @@ pub const CodeGenerator = struct {
     // Current function's return C type (for ? operator early-return construction)
     current_function_return_type: ?[]const u8,
 
+    // Whether current function is async (needs _ready() wrapping on returns)
+    current_function_is_async: bool,
+    // The future type name for async function returns (e.g., "dm_future_int64_t")
+    current_function_future_type: ?[]const u8,
+
     // Track which parameters in the current function are mut (pass-by-reference)
     current_mut_params: std.StringHashMap(void),
 
@@ -355,6 +366,11 @@ pub const CodeGenerator = struct {
     dyn_trait_writer: CWriter,
     // Track variable types for dyn dispatch: maps var name -> trait name if dyn
     dyn_var_traits: std.StringHashMap([]const u8),
+
+    // Debug info: emit #line directives for debugger integration
+    emit_debug_info: bool,
+    source_file_path: ?[]const u8,
+    last_debug_line: usize, // track last emitted #line to avoid duplicates
 
     const Self = @This();
 
@@ -430,6 +446,8 @@ pub const CodeGenerator = struct {
             .option_type_writer = CWriter.init(allocator),
             .generated_result_types = std.StringHashMap(ResultTypeInfo).init(allocator),
             .result_type_writer = CWriter.init(allocator),
+            .generated_future_types = std.StringHashMap([]const u8).init(allocator),
+            .future_type_writer = CWriter.init(allocator),
             .enum_variant_types = std.StringHashMap([]const u8).init(allocator),
             .generic_functions = std.StringHashMap(*FunctionDecl).init(allocator),
             .pending_monomorphizations = std.StringHashMap(MonoRequest).init(allocator),
@@ -444,6 +462,8 @@ pub const CodeGenerator = struct {
             .current_function_is_void = false,
             .expected_type = null,
             .current_function_return_type = null,
+            .current_function_is_async = false,
+            .current_function_future_type = null,
             .current_mut_params = std.StringHashMap(void).init(allocator),
             .function_mut_info = std.StringHashMap([]const bool).init(allocator),
             .region_stack = std.ArrayList([]const u8).init(allocator),
@@ -455,7 +475,29 @@ pub const CodeGenerator = struct {
             .generated_dyn_traits = std.StringHashMap(void).init(allocator),
             .dyn_trait_writer = CWriter.init(allocator),
             .dyn_var_traits = std.StringHashMap([]const u8).init(allocator),
+            .emit_debug_info = false,
+            .source_file_path = null,
+            .last_debug_line = 0,
         };
+    }
+
+    /// Set debug info generation (emit #line directives)
+    pub fn setDebugInfo(self: *Self, debug: bool, source_path: ?[]const u8) void {
+        self.emit_debug_info = debug;
+        self.source_file_path = source_path;
+    }
+
+    /// Emit a #line directive for source-level debugging
+    fn emitLineDirective(self: *Self, span: Span) !void {
+        if (!self.emit_debug_info) return;
+        const line = span.start.line;
+        if (line == 0 or line == self.last_debug_line) return;
+        self.last_debug_line = line;
+        if (self.source_file_path) |path| {
+            try self.writer.printLine("#line {d} \"{s}\"", .{ line, path });
+        } else {
+            try self.writer.printLine("#line {d}", .{line});
+        }
     }
 
     /// Clean up resources - arena frees all temporary strings
@@ -481,6 +523,8 @@ pub const CodeGenerator = struct {
         self.option_type_writer.deinit();
         self.generated_result_types.deinit();
         self.result_type_writer.deinit();
+        self.generated_future_types.deinit();
+        self.future_type_writer.deinit();
         self.enum_variant_types.deinit();
         self.generic_functions.deinit();
         self.pending_monomorphizations.deinit();
@@ -574,6 +618,19 @@ pub const CodeGenerator = struct {
             try self.scanForListTypes(decl);
         }
 
+        // Pre-scan async functions to trigger Future type generation
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .function => |f| {
+                    if (f.is_async) {
+                        const inner_ret = if (f.return_type) |rt| try self.mapType(rt) else "void";
+                        _ = try self.generateFutureTypeByName(inner_ret);
+                    }
+                },
+                else => {},
+            }
+        }
+
         // Insert monomorphized list type STRUCT definitions BEFORE user structs.
         // List structs only contain T* pointers so they only need forward declarations.
         // User structs may contain List[T] fields by value so they need these typedefs.
@@ -595,6 +652,13 @@ pub const CodeGenerator = struct {
             try self.writer.blankLine();
             try self.writer.writeLineComment("Monomorphized Result Types");
             try self.writer.write(self.result_type_writer.getOutput());
+        }
+
+        // Insert generated future type definitions (before user structs that may use them)
+        if (self.future_type_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Future Types");
+            try self.writer.write(self.future_type_writer.getOutput());
         }
 
         // Generate user type definitions (structs and enums)
@@ -675,7 +739,9 @@ pub const CodeGenerator = struct {
                     // Skip generic functions - their return types depend on type parameters
                     // and are tracked per-monomorphization in emitMonomorphizedPrototypes
                     if (f.generic_params != null and f.generic_params.?.len > 0) continue;
-                    const ret_type = if (f.return_type) |rt| try self.mapType(rt) else "void";
+                    const inner_ret = if (f.return_type) |rt| try self.mapType(rt) else "void";
+                    // For async functions, the actual return type is Future[T]
+                    const ret_type = if (f.is_async) try self.generateFutureTypeByName(inner_ret) else inner_ret;
                     self.trackFunctionReturnType(f.name.name, ret_type);
                     if (f.is_extern) {
                         // Check if extern fn has string types — if so, a wrapper
@@ -1452,6 +1518,461 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
+        // Helper: convert dm_string to null-terminated C string
+        try self.writer.writeLine("static inline char* dm_to_cstr(dm_string s) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cstr = (char*)malloc(s.len + 1);");
+        try self.writer.writeLine("if (!cstr) return NULL;");
+        try self.writer.writeLine("memcpy(cstr, s.data, s.len);");
+        try self.writer.writeLine("cstr[s.len] = '\\0';");
+        try self.writer.writeLine("return cstr;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Filesystem: platform includes
+        try self.writer.writeLine("#include <errno.h>");
+        try self.writer.writeLine("#ifdef _WIN32");
+        try self.writer.writeLine("#include <direct.h>");
+        try self.writer.writeLine("#include <io.h>");
+        try self.writer.writeLine("#include <windows.h>");
+        try self.writer.writeLine("#else");
+        try self.writer.writeLine("#include <sys/stat.h>");
+        try self.writer.writeLine("#include <dirent.h>");
+        try self.writer.writeLine("#include <unistd.h>");
+        try self.writer.writeLine("#endif");
+        try self.writer.blankLine();
+
+        // Filesystem: mkdir
+        try self.writer.writeLine("static inline int64_t dm_fs_mkdir(dm_string path) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cpath = dm_to_cstr(path);");
+        try self.writer.writeLine("if (!cpath) return -1;");
+        try self.writer.writeLine("char* p = cpath;");
+        try self.writer.writeLine("#ifdef _WIN32");
+        try self.writer.writeLine("while (*p) { if ((*p == '/' || *p == '\\\\') && p != cpath) { char sv = *p; *p = '\\0'; _mkdir(cpath); *p = sv; } p++; }");
+        try self.writer.writeLine("int result = _mkdir(cpath);");
+        try self.writer.writeLine("#else");
+        try self.writer.writeLine("while (*p) { if (*p == '/' && p != cpath) { *p = '\\0'; mkdir(cpath, 0755); *p = '/'; } p++; }");
+        try self.writer.writeLine("int result = mkdir(cpath, 0755);");
+        try self.writer.writeLine("#endif");
+        try self.writer.writeLine("if (result != 0 && errno == EEXIST) result = 0;");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("return (int64_t)result;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Filesystem: readdir
+        try self.writer.writeLine("static inline dm_string dm_fs_readdir(dm_string path) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cpath = dm_to_cstr(path);");
+        try self.writer.writeLine("if (!cpath) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("#ifdef _WIN32");
+        try self.writer.writeLine("size_t plen = strlen(cpath);");
+        try self.writer.writeLine("char* pattern = (char*)malloc(plen + 3);");
+        try self.writer.writeLine("if (!pattern) { free(cpath); return (dm_string){ .data = \"\", .len = 0, .capacity = 0 }; }");
+        try self.writer.writeLine("memcpy(pattern, cpath, plen);");
+        try self.writer.writeLine("if (plen > 0 && cpath[plen-1] != '\\\\' && cpath[plen-1] != '/') { pattern[plen] = '\\\\'; pattern[plen+1] = '*'; pattern[plen+2] = '\\0'; }");
+        try self.writer.writeLine("else { pattern[plen] = '*'; pattern[plen+1] = '\\0'; }");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("WIN32_FIND_DATAA fd; HANDLE hFind = FindFirstFileA(pattern, &fd); free(pattern);");
+        try self.writer.writeLine("if (hFind == INVALID_HANDLE_VALUE) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("size_t buf_cap = 1024; char* buf = (char*)malloc(buf_cap); size_t buf_len = 0;");
+        try self.writer.writeLine("do {");
+        self.writer.indent();
+        try self.writer.writeLine("if (strcmp(fd.cFileName, \".\") == 0 || strcmp(fd.cFileName, \"..\") == 0) continue;");
+        try self.writer.writeLine("size_t name_len = strlen(fd.cFileName);");
+        try self.writer.writeLine("while (buf_len + name_len + 1 >= buf_cap) { buf_cap *= 2; buf = (char*)realloc(buf, buf_cap); }");
+        try self.writer.writeLine("if (buf_len > 0) buf[buf_len++] = '\\n';");
+        try self.writer.writeLine("memcpy(buf + buf_len, fd.cFileName, name_len); buf_len += name_len;");
+        self.writer.dedent();
+        try self.writer.writeLine("} while (FindNextFileA(hFind, &fd));");
+        try self.writer.writeLine("FindClose(hFind);");
+        try self.writer.writeLine("#else");
+        try self.writer.writeLine("DIR* dir = opendir(cpath);");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("if (!dir) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("size_t buf_cap = 1024;");
+        try self.writer.writeLine("char* buf = (char*)malloc(buf_cap);");
+        try self.writer.writeLine("size_t buf_len = 0;");
+        try self.writer.writeLine("struct dirent* entry;");
+        try self.writer.writeLine("while ((entry = readdir(dir)) != NULL) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (strcmp(entry->d_name, \".\") == 0 || strcmp(entry->d_name, \"..\") == 0) continue;");
+        try self.writer.writeLine("size_t name_len = strlen(entry->d_name);");
+        try self.writer.writeLine("while (buf_len + name_len + 1 >= buf_cap) { buf_cap *= 2; buf = (char*)realloc(buf, buf_cap); }");
+        try self.writer.writeLine("if (buf_len > 0) buf[buf_len++] = '\\n';");
+        try self.writer.writeLine("memcpy(buf + buf_len, entry->d_name, name_len);");
+        try self.writer.writeLine("buf_len += name_len;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.writeLine("closedir(dir);");
+        try self.writer.writeLine("#endif");
+        try self.writer.writeLine("if (buf_len == 0) { free(buf); return (dm_string){ .data = \"\", .len = 0, .capacity = 0 }; }");
+        try self.writer.writeLine("buf[buf_len] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = buf, .len = buf_len, .capacity = buf_cap };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Filesystem: remove
+        try self.writer.writeLine("static inline int64_t dm_fs_remove(dm_string path) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cpath = dm_to_cstr(path);");
+        try self.writer.writeLine("if (!cpath) return -1;");
+        try self.writer.writeLine("#ifdef _WIN32");
+        try self.writer.writeLine("int result = remove(cpath); if (result != 0) result = _rmdir(cpath);");
+        try self.writer.writeLine("#else");
+        try self.writer.writeLine("int result = remove(cpath);");
+        try self.writer.writeLine("#endif");
+        try self.writer.writeLine("free(cpath);");
+        try self.writer.writeLine("return (int64_t)result;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Filesystem: rename
+        try self.writer.writeLine("static inline int64_t dm_fs_rename(dm_string old_path, dm_string new_path) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cold = dm_to_cstr(old_path);");
+        try self.writer.writeLine("char* cnew = dm_to_cstr(new_path);");
+        try self.writer.writeLine("if (!cold || !cnew) { free(cold); free(cnew); return -1; }");
+        try self.writer.writeLine("int result = rename(cold, cnew);");
+        try self.writer.writeLine("free(cold); free(cnew);");
+        try self.writer.writeLine("return (int64_t)result;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Filesystem: getcwd
+        try self.writer.writeLine("static inline dm_string dm_fs_getcwd(void) {");
+        self.writer.indent();
+        try self.writer.writeLine("char buf[4096];");
+        try self.writer.writeLine("#ifdef _WIN32");
+        try self.writer.writeLine("if (_getcwd(buf, sizeof(buf)) == NULL) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("#else");
+        try self.writer.writeLine("if (getcwd(buf, sizeof(buf)) == NULL) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("#endif");
+        try self.writer.writeLine("size_t len = strlen(buf);");
+        try self.writer.writeLine("char* result = (char*)malloc(len + 1);");
+        try self.writer.writeLine("memcpy(result, buf, len + 1);");
+        try self.writer.writeLine("return (dm_string){ .data = result, .len = len, .capacity = len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // OS: getenv
+        try self.writer.writeLine("static inline dm_string dm_os_getenv(dm_string name) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* cname = dm_to_cstr(name);");
+        try self.writer.writeLine("if (!cname) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("const char* val = getenv(cname);");
+        try self.writer.writeLine("free(cname);");
+        try self.writer.writeLine("if (!val) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };");
+        try self.writer.writeLine("size_t len = strlen(val);");
+        try self.writer.writeLine("char* result = (char*)malloc(len + 1);");
+        try self.writer.writeLine("memcpy(result, val, len + 1);");
+        try self.writer.writeLine("return (dm_string){ .data = result, .len = len, .capacity = len };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Networking: integer-based wrappers around struct-based TCP API
+        try self.writer.writeLine("#ifdef _WIN32");
+        try self.writer.writeLine("#include <winsock2.h>");
+        try self.writer.writeLine("#include <ws2tcpip.h>");
+        try self.writer.writeLine("#pragma comment(lib, \"ws2_32.lib\")");
+        try self.writer.blankLine();
+        try self.writer.writeLine("static int dm__winsock_inited = 0;");
+        try self.writer.writeLine("static inline void dm__ensure_winsock(void) { if (!dm__winsock_inited) { WSADATA w; WSAStartup(MAKEWORD(2,2), &w); dm__winsock_inited = 1; } }");
+        try self.writer.blankLine();
+
+        // Windows: tcp_listen
+        try self.writer.writeLine("static inline int64_t dm_tcp_listen_fd(dm_string addr) {");
+        self.writer.indent();
+        try self.writer.writeLine("dm__ensure_winsock();");
+        try self.writer.writeLine("char* caddr = dm_to_cstr(addr); if (!caddr) return -1;");
+        try self.writer.writeLine("char* colon = strrchr(caddr, ':'); if (!colon) { free(caddr); return -1; }");
+        try self.writer.writeLine("*colon = '\\0'; int port = atoi(colon+1);");
+        try self.writer.writeLine("SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);");
+        try self.writer.writeLine("if (fd == INVALID_SOCKET) { free(caddr); return -1; }");
+        try self.writer.writeLine("int opt = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));");
+        try self.writer.writeLine("struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));");
+        try self.writer.writeLine("sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);");
+        try self.writer.writeLine("if (strlen(caddr) == 0 || strcmp(caddr, \"0.0.0.0\") == 0) sa.sin_addr.s_addr = INADDR_ANY;");
+        try self.writer.writeLine("else inet_pton(AF_INET, caddr, &sa.sin_addr);");
+        try self.writer.writeLine("free(caddr);");
+        try self.writer.writeLine("if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) { closesocket(fd); return -1; }");
+        try self.writer.writeLine("if (listen(fd, 128) == SOCKET_ERROR) { closesocket(fd); return -1; }");
+        try self.writer.writeLine("return (int64_t)fd;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Windows: tcp_accept
+        try self.writer.writeLine("static inline int64_t dm_tcp_accept_fd(int64_t listener_fd) {");
+        self.writer.indent();
+        try self.writer.writeLine("struct sockaddr_in ca; int al = sizeof(ca);");
+        try self.writer.writeLine("SOCKET cfd = accept((SOCKET)listener_fd, (struct sockaddr*)&ca, &al);");
+        try self.writer.writeLine("return (cfd == INVALID_SOCKET) ? -1 : (int64_t)cfd;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Windows: tcp_connect
+        try self.writer.writeLine("static inline int64_t dm_tcp_connect_fd(dm_string addr) {");
+        self.writer.indent();
+        try self.writer.writeLine("dm__ensure_winsock();");
+        try self.writer.writeLine("char* caddr = dm_to_cstr(addr); if (!caddr) return -1;");
+        try self.writer.writeLine("char* colon = strrchr(caddr, ':'); if (!colon) { free(caddr); return -1; }");
+        try self.writer.writeLine("*colon = '\\0'; int port = atoi(colon+1);");
+        try self.writer.writeLine("SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);");
+        try self.writer.writeLine("if (fd == INVALID_SOCKET) { free(caddr); return -1; }");
+        try self.writer.writeLine("struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));");
+        try self.writer.writeLine("sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);");
+        try self.writer.writeLine("inet_pton(AF_INET, caddr, &sa.sin_addr);");
+        try self.writer.writeLine("free(caddr);");
+        try self.writer.writeLine("if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) { closesocket(fd); return -1; }");
+        try self.writer.writeLine("return (int64_t)fd;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Windows: tcp_read
+        try self.writer.writeLine("static inline dm_string dm_tcp_read_fd(int64_t fd, int64_t max_bytes) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (max_bytes <= 0) max_bytes = 4096;");
+        try self.writer.writeLine("char* buf = (char*)malloc((size_t)max_bytes + 1);");
+        try self.writer.writeLine("int n = recv((SOCKET)fd, buf, (int)max_bytes, 0);");
+        try self.writer.writeLine("if (n <= 0) { free(buf); return (dm_string){ .data = \"\", .len = 0, .capacity = 0 }; }");
+        try self.writer.writeLine("buf[n] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = buf, .len = (size_t)n, .capacity = (size_t)max_bytes };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Windows: tcp_write
+        try self.writer.writeLine("static inline int64_t dm_tcp_write_fd(int64_t fd, dm_string data) {");
+        self.writer.indent();
+        try self.writer.writeLine("int n = send((SOCKET)fd, data.data, (int)data.len, 0);");
+        try self.writer.writeLine("return (int64_t)(n < 0 ? 0 : n);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Windows: tcp_close
+        try self.writer.writeLine("static inline void dm_tcp_close_fd(int64_t fd) { if (fd >= 0) closesocket((SOCKET)fd); }");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("#else /* POSIX */");
+        try self.writer.writeLine("#include <sys/socket.h>");
+        try self.writer.writeLine("#include <netinet/in.h>");
+        try self.writer.writeLine("#include <arpa/inet.h>");
+        try self.writer.blankLine();
+
+        // POSIX: tcp_listen(addr) -> fd
+        try self.writer.writeLine("static inline int64_t dm_tcp_listen_fd(dm_string addr) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* caddr = dm_to_cstr(addr); if (!caddr) return -1;");
+        try self.writer.writeLine("char* colon = strrchr(caddr, ':'); if (!colon) { free(caddr); return -1; }");
+        try self.writer.writeLine("*colon = '\\0'; int port = atoi(colon+1);");
+        try self.writer.writeLine("int fd = socket(AF_INET, SOCK_STREAM, 0);");
+        try self.writer.writeLine("if (fd < 0) { free(caddr); return -1; }");
+        try self.writer.writeLine("int opt = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));");
+        try self.writer.writeLine("struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));");
+        try self.writer.writeLine("sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);");
+        try self.writer.writeLine("if (strlen(caddr) == 0 || strcmp(caddr, \"0.0.0.0\") == 0) sa.sin_addr.s_addr = INADDR_ANY;");
+        try self.writer.writeLine("else inet_pton(AF_INET, caddr, &sa.sin_addr);");
+        try self.writer.writeLine("free(caddr);");
+        try self.writer.writeLine("if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) { close(fd); return -1; }");
+        try self.writer.writeLine("if (listen(fd, 128) < 0) { close(fd); return -1; }");
+        try self.writer.writeLine("return (int64_t)fd;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // POSIX: tcp_accept(listener_fd) -> client_fd
+        try self.writer.writeLine("static inline int64_t dm_tcp_accept_fd(int64_t listener_fd) {");
+        self.writer.indent();
+        try self.writer.writeLine("struct sockaddr_in ca; socklen_t al = sizeof(ca);");
+        try self.writer.writeLine("int cfd = accept((int)listener_fd, (struct sockaddr*)&ca, &al);");
+        try self.writer.writeLine("return (int64_t)cfd;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // POSIX: tcp_connect(addr) -> fd
+        try self.writer.writeLine("static inline int64_t dm_tcp_connect_fd(dm_string addr) {");
+        self.writer.indent();
+        try self.writer.writeLine("char* caddr = dm_to_cstr(addr); if (!caddr) return -1;");
+        try self.writer.writeLine("char* colon = strrchr(caddr, ':'); if (!colon) { free(caddr); return -1; }");
+        try self.writer.writeLine("*colon = '\\0'; int port = atoi(colon+1);");
+        try self.writer.writeLine("int fd = socket(AF_INET, SOCK_STREAM, 0);");
+        try self.writer.writeLine("if (fd < 0) { free(caddr); return -1; }");
+        try self.writer.writeLine("struct sockaddr_in sa; memset(&sa, 0, sizeof(sa));");
+        try self.writer.writeLine("sa.sin_family = AF_INET; sa.sin_port = htons((uint16_t)port);");
+        try self.writer.writeLine("inet_pton(AF_INET, caddr, &sa.sin_addr);");
+        try self.writer.writeLine("free(caddr);");
+        try self.writer.writeLine("if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) { close(fd); return -1; }");
+        try self.writer.writeLine("return (int64_t)fd;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // POSIX: tcp_read(fd, max_bytes) -> string
+        try self.writer.writeLine("static inline dm_string dm_tcp_read_fd(int64_t fd, int64_t max_bytes) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (max_bytes <= 0) max_bytes = 4096;");
+        try self.writer.writeLine("char* buf = (char*)malloc((size_t)max_bytes + 1);");
+        try self.writer.writeLine("ssize_t n = read((int)fd, buf, (size_t)max_bytes);");
+        try self.writer.writeLine("if (n <= 0) { free(buf); return (dm_string){ .data = \"\", .len = 0, .capacity = 0 }; }");
+        try self.writer.writeLine("buf[n] = '\\0';");
+        try self.writer.writeLine("return (dm_string){ .data = buf, .len = (size_t)n, .capacity = (size_t)max_bytes };");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // POSIX: tcp_write(fd, data) -> bytes_written
+        try self.writer.writeLine("static inline int64_t dm_tcp_write_fd(int64_t fd, dm_string data) {");
+        self.writer.indent();
+        try self.writer.writeLine("ssize_t n = write((int)fd, data.data, data.len);");
+        try self.writer.writeLine("return (int64_t)(n < 0 ? 0 : n);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // POSIX: tcp_close(fd)
+        try self.writer.writeLine("static inline void dm_tcp_close_fd(int64_t fd) { if (fd >= 0) close((int)fd); }");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("#endif /* _WIN32 */");
+        try self.writer.blankLine();
+
+        // Threading: integer-based wrappers
+        try self.writer.writeLine("#ifdef _WIN32");
+        try self.writer.writeLine("#ifndef DM_WINDOWS_H_INCLUDED");
+        try self.writer.writeLine("#define DM_WINDOWS_H_INCLUDED");
+        try self.writer.writeLine("#include <windows.h>");
+        try self.writer.writeLine("#endif");
+        try self.writer.blankLine();
+
+        // Windows: thread_spawn(fn) -> thread_id (encoded as int)
+        try self.writer.writeLine("typedef struct { void (*func)(void); } dm_thread_tramp_arg;");
+        try self.writer.writeLine("static DWORD WINAPI dm_thread_tramp(LPVOID arg) { dm_thread_tramp_arg* ta = (dm_thread_tramp_arg*)arg; void (*f)(void) = ta->func; free(ta); f(); return 0; }");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm_thread_spawn_fn(void (*func)(void)) {");
+        self.writer.indent();
+        try self.writer.writeLine("dm_thread_tramp_arg* arg = (dm_thread_tramp_arg*)malloc(sizeof(dm_thread_tramp_arg));");
+        try self.writer.writeLine("arg->func = func;");
+        try self.writer.writeLine("HANDLE h = CreateThread(NULL, 0, dm_thread_tramp, arg, 0, NULL);");
+        try self.writer.writeLine("return (int64_t)(intptr_t)h;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Windows: thread_join(thread_id)
+        try self.writer.writeLine("static inline void dm_thread_join_id(int64_t tid) { HANDLE h = (HANDLE)(intptr_t)tid; WaitForSingleObject(h, INFINITE); CloseHandle(h); }");
+        try self.writer.blankLine();
+
+        // Windows: mutex_new() -> mutex_ptr (encoded as int)
+        try self.writer.writeLine("static inline int64_t dm_mutex_new_ptr(void) {");
+        self.writer.indent();
+        try self.writer.writeLine("HANDLE m = CreateMutex(NULL, FALSE, NULL);");
+        try self.writer.writeLine("return (int64_t)(intptr_t)m;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline void dm_mutex_lock_ptr(int64_t mp) { WaitForSingleObject((HANDLE)(intptr_t)mp, INFINITE); }");
+        try self.writer.writeLine("static inline void dm_mutex_unlock_ptr(int64_t mp) { ReleaseMutex((HANDLE)(intptr_t)mp); }");
+        try self.writer.writeLine("static inline void dm_mutex_destroy_ptr(int64_t mp) { CloseHandle((HANDLE)(intptr_t)mp); }");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("#else /* POSIX */");
+        try self.writer.writeLine("#include <pthread.h>");
+        try self.writer.blankLine();
+
+        // POSIX: thread_spawn(fn) -> thread_id (encoded as int)
+        try self.writer.writeLine("typedef struct { void (*func)(void); } dm_thread_tramp_arg;");
+        try self.writer.writeLine("static void* dm_thread_tramp(void* arg) { dm_thread_tramp_arg* ta = (dm_thread_tramp_arg*)arg; void (*f)(void) = ta->func; free(ta); f(); return NULL; }");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm_thread_spawn_fn(void (*func)(void)) {");
+        self.writer.indent();
+        try self.writer.writeLine("pthread_t t;");
+        try self.writer.writeLine("dm_thread_tramp_arg* arg = (dm_thread_tramp_arg*)malloc(sizeof(dm_thread_tramp_arg));");
+        try self.writer.writeLine("arg->func = func;");
+        try self.writer.writeLine("pthread_create(&t, NULL, dm_thread_tramp, arg);");
+        try self.writer.writeLine("return (int64_t)t;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // POSIX: thread_join(thread_id)
+        try self.writer.writeLine("static inline void dm_thread_join_id(int64_t tid) { pthread_join((pthread_t)tid, NULL); }");
+        try self.writer.blankLine();
+
+        // POSIX: mutex_new() -> mutex_ptr (encoded as int)
+        try self.writer.writeLine("static inline int64_t dm_mutex_new_ptr(void) {");
+        self.writer.indent();
+        try self.writer.writeLine("pthread_mutex_t* m = (pthread_mutex_t*)malloc(sizeof(pthread_mutex_t));");
+        try self.writer.writeLine("pthread_mutex_init(m, NULL);");
+        try self.writer.writeLine("return (int64_t)(intptr_t)m;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline void dm_mutex_lock_ptr(int64_t mp) { pthread_mutex_lock((pthread_mutex_t*)(intptr_t)mp); }");
+        try self.writer.writeLine("static inline void dm_mutex_unlock_ptr(int64_t mp) { pthread_mutex_unlock((pthread_mutex_t*)(intptr_t)mp); }");
+        try self.writer.writeLine("static inline void dm_mutex_destroy_ptr(int64_t mp) { pthread_mutex_t* m = (pthread_mutex_t*)(intptr_t)mp; pthread_mutex_destroy(m); free(m); }");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("#endif /* _WIN32 */");
+        try self.writer.blankLine();
+
+        // SIMD vector types and operations
+        try self.writer.writeLineComment("SIMD Vector Types");
+        try self.writer.writeLine("#if defined(__GNUC__) || defined(__clang__)");
+        try self.writer.writeLine("typedef float    dm_f32x4 __attribute__((vector_size(16)));");
+        try self.writer.writeLine("typedef float    dm_f32x8 __attribute__((vector_size(32)));");
+        try self.writer.writeLine("typedef double   dm_f64x2 __attribute__((vector_size(16)));");
+        try self.writer.writeLine("typedef double   dm_f64x4 __attribute__((vector_size(32)));");
+        try self.writer.writeLine("typedef int32_t  dm_i32x4 __attribute__((vector_size(16)));");
+        try self.writer.writeLine("typedef int32_t  dm_i32x8 __attribute__((vector_size(32)));");
+        try self.writer.writeLine("typedef int64_t  dm_i64x2 __attribute__((vector_size(16)));");
+        try self.writer.writeLine("typedef int64_t  dm_i64x4 __attribute__((vector_size(32)));");
+        try self.writer.blankLine();
+        // Splat constructors
+        try self.writer.writeLine("static inline dm_f32x4 dm_simd_splat_f32x4(float v) { return (dm_f32x4){v,v,v,v}; }");
+        try self.writer.writeLine("static inline dm_f32x8 dm_simd_splat_f32x8(float v) { return (dm_f32x8){v,v,v,v,v,v,v,v}; }");
+        try self.writer.writeLine("static inline dm_f64x2 dm_simd_splat_f64x2(double v) { return (dm_f64x2){v,v}; }");
+        try self.writer.writeLine("static inline dm_f64x4 dm_simd_splat_f64x4(double v) { return (dm_f64x4){v,v,v,v}; }");
+        try self.writer.writeLine("static inline dm_i32x4 dm_simd_splat_i32x4(int32_t v) { return (dm_i32x4){v,v,v,v}; }");
+        try self.writer.writeLine("static inline dm_i32x8 dm_simd_splat_i32x8(int32_t v) { return (dm_i32x8){v,v,v,v,v,v,v,v}; }");
+        try self.writer.writeLine("static inline dm_i64x2 dm_simd_splat_i64x2(int64_t v) { return (dm_i64x2){v,v}; }");
+        try self.writer.writeLine("static inline dm_i64x4 dm_simd_splat_i64x4(int64_t v) { return (dm_i64x4){v,v,v,v}; }");
+        try self.writer.blankLine();
+        // Set constructors
+        try self.writer.writeLine("static inline dm_f32x4 dm_simd_set_f32x4(float a, float b, float c, float d) { return (dm_f32x4){a,b,c,d}; }");
+        try self.writer.writeLine("static inline dm_f32x8 dm_simd_set_f32x8(float a, float b, float c, float d, float e, float f, float g, float h) { return (dm_f32x8){a,b,c,d,e,f,g,h}; }");
+        try self.writer.writeLine("static inline dm_f64x2 dm_simd_set_f64x2(double a, double b) { return (dm_f64x2){a,b}; }");
+        try self.writer.writeLine("static inline dm_f64x4 dm_simd_set_f64x4(double a, double b, double c, double d) { return (dm_f64x4){a,b,c,d}; }");
+        try self.writer.writeLine("static inline dm_i32x4 dm_simd_set_i32x4(int32_t a, int32_t b, int32_t c, int32_t d) { return (dm_i32x4){a,b,c,d}; }");
+        try self.writer.writeLine("static inline dm_i32x8 dm_simd_set_i32x8(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f, int32_t g, int32_t h) { return (dm_i32x8){a,b,c,d,e,f,g,h}; }");
+        try self.writer.writeLine("static inline dm_i64x2 dm_simd_set_i64x2(int64_t a, int64_t b) { return (dm_i64x2){a,b}; }");
+        try self.writer.writeLine("static inline dm_i64x4 dm_simd_set_i64x4(int64_t a, int64_t b, int64_t c, int64_t d) { return (dm_i64x4){a,b,c,d}; }");
+        try self.writer.blankLine();
+        // Extract and arithmetic (vector extension operators)
+        try self.writer.writeLine("#define dm_simd_extract(vec, idx) ((vec)[(idx)])");
+        try self.writer.writeLine("#define dm_simd_add(a, b) ((a) + (b))");
+        try self.writer.writeLine("#define dm_simd_sub(a, b) ((a) - (b))");
+        try self.writer.writeLine("#define dm_simd_mul(a, b) ((a) * (b))");
+        try self.writer.writeLine("#define dm_simd_div(a, b) ((a) / (b))");
+        try self.writer.writeLine("#endif /* __GNUC__ || __clang__ */");
+        try self.writer.blankLine();
+
         try self.writer.writeLineComment("End of Runtime");
         try self.writer.blankLine();
     }
@@ -1608,6 +2129,14 @@ pub const CodeGenerator = struct {
                 }
             }
             return "void*";
+        } else if (std.mem.eql(u8, type_name, "Future")) {
+            // Future type (async result wrapper)
+            if (named.generic_args) |args| {
+                if (args.len > 0) {
+                    return self.generateFutureType(args[0]);
+                }
+            }
+            return "dm_future_void";
         } else if (std.mem.eql(u8, type_name, "Map") or std.mem.eql(u8, type_name, "HashMap")) {
             const mangled = try self.mangleTypeName(type_name);
             if (self.generated_enums.contains(mangled) or self.generated_structs.contains(mangled))
@@ -1616,6 +2145,22 @@ pub const CodeGenerator = struct {
                 if (args.len >= 2) return self.generateMapType(args[0], args[1]);
             }
             return "dm_map_void";
+        } else if (std.mem.eql(u8, type_name, "f32x4")) {
+            return "dm_f32x4";
+        } else if (std.mem.eql(u8, type_name, "f32x8")) {
+            return "dm_f32x8";
+        } else if (std.mem.eql(u8, type_name, "f64x2")) {
+            return "dm_f64x2";
+        } else if (std.mem.eql(u8, type_name, "f64x4")) {
+            return "dm_f64x4";
+        } else if (std.mem.eql(u8, type_name, "i32x4")) {
+            return "dm_i32x4";
+        } else if (std.mem.eql(u8, type_name, "i32x8")) {
+            return "dm_i32x8";
+        } else if (std.mem.eql(u8, type_name, "i64x2")) {
+            return "dm_i64x2";
+        } else if (std.mem.eql(u8, type_name, "i64x4")) {
+            return "dm_i64x4";
         }
 
         // Check active type substitutions for generic monomorphization
@@ -1887,6 +2432,75 @@ pub const CodeGenerator = struct {
         try w.writeLine("return r.err;");
         w.dedent();
         try w.writeLine("}");
+        try w.blankLine();
+    }
+
+    /// Generate Future type name and emit monomorphized struct + helpers if not already done
+    fn generateFutureType(self: *Self, inner: *TypeExpr) CodeGenError![]const u8 {
+        const inner_name = try self.mapType(inner);
+        return self.generateFutureTypeByName(inner_name);
+    }
+
+    /// Generate Future type from a C type name string
+    fn generateFutureTypeByName(self: *Self, inner_name: []const u8) ![]const u8 {
+        const safe_name = try self.sanitizeTypeName(inner_name);
+        const future_type_name = try std.fmt.allocPrint(self.stringAllocator(), "dm_future_{s}", .{safe_name});
+
+        if (!self.generated_future_types.contains(future_type_name)) {
+            try self.generated_future_types.put(future_type_name, inner_name);
+            try self.emitFutureTypeDefinition(future_type_name, inner_name);
+        }
+
+        return future_type_name;
+    }
+
+    /// Emit a monomorphized future type struct and helper functions
+    fn emitFutureTypeDefinition(self: *Self, future_type_name: []const u8, inner_type: []const u8) !void {
+        var w = &self.future_type_writer;
+        const is_void = std.mem.eql(u8, inner_type, "void");
+
+        // Struct definition
+        try w.printLine("typedef struct {s} {{", .{future_type_name});
+        w.indent();
+        try w.writeLine("bool ready;");
+        if (!is_void) {
+            try w.printLine("{s} value;", .{inner_type});
+        }
+        w.dedent();
+        try w.printLine("}} {s};", .{future_type_name});
+        try w.blankLine();
+
+        // Ready constructor
+        if (is_void) {
+            try w.printLine("static inline {s} {s}_ready(void) {{", .{ future_type_name, future_type_name });
+            w.indent();
+            try w.printLine("return ({s}){{ .ready = true }};", .{future_type_name});
+            w.dedent();
+            try w.writeLine("}");
+        } else {
+            try w.printLine("static inline {s} {s}_ready({s} v) {{", .{ future_type_name, future_type_name, inner_type });
+            w.indent();
+            try w.printLine("return ({s}){{ .ready = true, .value = v }};", .{future_type_name});
+            w.dedent();
+            try w.writeLine("}");
+        }
+        try w.blankLine();
+
+        // Await helper
+        if (is_void) {
+            try w.printLine("static inline void {s}_await({s} fut) {{", .{ future_type_name, future_type_name });
+            w.indent();
+            try w.writeLine("if (!fut.ready) dm_panic(\"await on pending future\");");
+            w.dedent();
+            try w.writeLine("}");
+        } else {
+            try w.printLine("static inline {s} {s}_await({s} fut) {{", .{ inner_type, future_type_name, future_type_name });
+            w.indent();
+            try w.writeLine("if (!fut.ready) dm_panic(\"await on pending future\");");
+            try w.writeLine("return fut.value;");
+            w.dedent();
+            try w.writeLine("}");
+        }
         try w.blankLine();
     }
 
@@ -2544,6 +3158,13 @@ pub const CodeGenerator = struct {
                             }
                         }
                     }
+                    if (std.mem.eql(u8, type_name, "Future")) {
+                        if (named.generic_args) |args| {
+                            if (args.len > 0) {
+                                _ = try self.generateFutureType(args[0]);
+                            }
+                        }
+                    }
                 }
                 // Recursively scan generic args
                 if (named.generic_args) |args| {
@@ -2869,7 +3490,17 @@ pub const CodeGenerator = struct {
                         std.mem.eql(u8, name, "string_to_int") or
                         std.mem.eql(u8, name, "string_find") or
                         std.mem.eql(u8, name, "args_len") or
-                        std.mem.eql(u8, name, "system")) break :blk "int64_t";
+                        std.mem.eql(u8, name, "system") or
+                        std.mem.eql(u8, name, "fs_mkdir") or
+                        std.mem.eql(u8, name, "fs_remove") or
+                        std.mem.eql(u8, name, "fs_rename") or
+                        std.mem.eql(u8, name, "fs_rmdir") or
+                        std.mem.eql(u8, name, "tcp_listen") or
+                        std.mem.eql(u8, name, "tcp_accept") or
+                        std.mem.eql(u8, name, "tcp_connect") or
+                        std.mem.eql(u8, name, "tcp_write") or
+                        std.mem.eql(u8, name, "thread_spawn") or
+                        std.mem.eql(u8, name, "mutex_new")) break :blk "int64_t";
                     if (std.mem.eql(u8, name, "parse_float")) break :blk "double";
                     if (std.mem.eql(u8, name, "to_string") or
                         std.mem.eql(u8, name, "int_to_string") or
@@ -2889,7 +3520,11 @@ pub const CodeGenerator = struct {
                         std.mem.eql(u8, name, "path_extension") or
                         std.mem.eql(u8, name, "path_stem") or
                         std.mem.eql(u8, name, "path_join") or
-                        std.mem.eql(u8, name, "read_line")) break :blk "dm_string";
+                        std.mem.eql(u8, name, "read_line") or
+                        std.mem.eql(u8, name, "fs_readdir") or
+                        std.mem.eql(u8, name, "fs_getcwd") or
+                        std.mem.eql(u8, name, "env_get") or
+                        std.mem.eql(u8, name, "tcp_read")) break :blk "dm_string";
                     if (std.mem.eql(u8, name, "string_split")) break :blk "dm_list_dm_string";
                     if (std.mem.eql(u8, name, "is_alpha") or
                         std.mem.eql(u8, name, "is_digit") or
@@ -2898,7 +3533,8 @@ pub const CodeGenerator = struct {
                         std.mem.eql(u8, name, "string_contains") or
                         std.mem.eql(u8, name, "starts_with") or
                         std.mem.eql(u8, name, "ends_with") or
-                        std.mem.eql(u8, name, "file_exists")) break :blk "bool";
+                        std.mem.eql(u8, name, "file_exists") or
+                        std.mem.eql(u8, name, "fs_exists")) break :blk "bool";
                     if (std.mem.eql(u8, name, "char")) break :blk "char";
                     // Look up in function declarations tracked during generation
                     if (self.lookupFunctionReturnType(name)) |ret_type| break :blk ret_type;
@@ -3065,6 +3701,17 @@ pub const CodeGenerator = struct {
             .type_check => "bool",
             .string_interpolation => "dm_string",
             .range => "void*",
+            .await_expr => |aw| blk: {
+                const operand_type = self.inferCTypeFromExpr(aw.operand);
+                if (std.mem.startsWith(u8, operand_type, "dm_future_")) {
+                    // Strip "dm_future_" prefix to get inner type
+                    if (self.generated_future_types.get(operand_type)) |inner| {
+                        break :blk inner;
+                    }
+                    break :blk operand_type["dm_future_".len..];
+                }
+                break :blk "int64_t";
+            },
             else => "int64_t", // Default to int64_t rather than void*
         };
     }
@@ -3541,7 +4188,8 @@ pub const CodeGenerator = struct {
     /// Emit a function prototype with optional name override (for monomorphized functions)
     fn emitFunctionPrototype(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8, name_override: ?[]const u8) !void {
         const func_name = name_override orelse try self.mangleFunctionName(func.name.name, type_prefix);
-        const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+        const inner_ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+        const ret_type = if (func.is_async) try self.generateFutureTypeByName(inner_ret_type) else inner_ret_type;
         const has_self = type_prefix != null and methodHasSelf(func);
 
         try self.writer.print("{s} {s}(", .{ ret_type, func_name });
@@ -3704,16 +4352,36 @@ pub const CodeGenerator = struct {
 
     /// Emit a full function definition with optional name override (for monomorphized functions)
     fn emitFunctionDefinition(self: *Self, func: *FunctionDecl, type_prefix: ?[]const u8, name_override: ?[]const u8) !void {
+        try self.emitLineDirective(func.span);
         self.current_function = func.name.name;
         defer self.current_function = null;
 
-        const is_void = func.return_type == null;
+        const is_void = func.return_type == null and !func.is_async;
         self.current_function_is_void = is_void;
         defer self.current_function_is_void = false;
 
+        // Handle async functions: wrap return type in Future
+        const prev_is_async = self.current_function_is_async;
+        const prev_future_type = self.current_function_future_type;
+        defer {
+            self.current_function_is_async = prev_is_async;
+            self.current_function_future_type = prev_future_type;
+        }
+
         const has_self = type_prefix != null and methodHasSelf(func);
         const func_name = name_override orelse try self.mangleFunctionName(func.name.name, type_prefix);
-        const ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+        const inner_ret_type = if (func.return_type) |rt| try self.mapType(rt) else "void";
+
+        var ret_type: []const u8 = inner_ret_type;
+        if (func.is_async) {
+            const future_type_name = try self.generateFutureTypeByName(inner_ret_type);
+            self.current_function_is_async = true;
+            self.current_function_future_type = future_type_name;
+            ret_type = future_type_name;
+        } else {
+            self.current_function_is_async = false;
+            self.current_function_future_type = null;
+        }
 
         // Track current function return type for ? operator and Option/Result constructors
         const prev_return_type = self.current_function_return_type;
@@ -3788,9 +4456,16 @@ pub const CodeGenerator = struct {
                 },
                 .expression => |expr| {
                     try self.writer.beginBlock();
-                    try self.writer.write("return ");
-                    try self.generateExpr(expr);
-                    try self.writer.writeLine(";");
+                    if (self.current_function_is_async) {
+                        const future_type = self.current_function_future_type.?;
+                        try self.writer.print("return {s}_ready(", .{future_type});
+                        try self.generateExpr(expr);
+                        try self.writer.writeLine(");");
+                    } else {
+                        try self.writer.write("return ");
+                        try self.generateExpr(expr);
+                        try self.writer.writeLine(";");
+                    }
                     try self.writer.endBlock();
                 },
             }
@@ -4065,8 +4740,24 @@ pub const CodeGenerator = struct {
             try self.generateStatement(stmt);
         }
 
+        // For async void functions, if the block has no result and doesn't end
+        // with a return statement, emit an implicit return dm_future_void_ready()
+        if (block.result == null and self.current_function_is_async) {
+            // Check if the last statement is already a return
+            const has_trailing_return = if (block.statements.len > 0)
+                block.statements[block.statements.len - 1].kind == .return_stmt
+            else
+                false;
+            if (!has_trailing_return) {
+                const future_type = self.current_function_future_type.?;
+                try self.writer.print("return {s}_ready()", .{future_type});
+                try self.writer.writeLine(";");
+            }
+        }
+
         // Handle block result expression
         if (block.result) |result| {
+            try self.emitLineDirective(result.span);
             if (self.current_function_is_void) {
                 // For void functions, just execute the expression (don't return it)
                 // Use statement form for if/match to avoid ternary expressions
@@ -4077,6 +4768,20 @@ pub const CodeGenerator = struct {
                 } else {
                     try self.generateExpr(result);
                     try self.writer.writeLine(";");
+                }
+            } else if (self.current_function_is_async) {
+                // For async functions, wrap the result in _ready()
+                const future_type = self.current_function_future_type.?;
+                if (std.mem.eql(u8, future_type, "dm_future_void")) {
+                    // Void future: execute expression, then return _ready()
+                    try self.generateExpr(result);
+                    try self.writer.writeLine(";");
+                    try self.writer.print("return {s}_ready()", .{future_type});
+                    try self.writer.writeLine(";");
+                } else {
+                    try self.writer.print("return {s}_ready(", .{future_type});
+                    try self.generateExpr(result);
+                    try self.writer.writeLine(");");
                 }
             } else {
                 // For if/match expressions in return position, use statement form
@@ -4099,6 +4804,7 @@ pub const CodeGenerator = struct {
 
     /// Generate a statement
     fn generateStatement(self: *Self, stmt: *Statement) anyerror!void {
+        try self.emitLineDirective(stmt.span);
         switch (stmt.kind) {
             .let_binding => |let| try self.generateLetBinding(let),
             .return_stmt => |ret| try self.generateReturn(ret),
@@ -4306,7 +5012,18 @@ pub const CodeGenerator = struct {
 
     /// Generate return statement
     fn generateReturn(self: *Self, ret: *ReturnStmt) anyerror!void {
-        if (ret.value) |val| {
+        if (self.current_function_is_async) {
+            if (ret.value) |val| {
+                const future_type = self.current_function_future_type.?;
+                try self.writer.print("return {s}_ready(", .{future_type});
+                try self.generateExpr(val);
+                try self.writer.writeLine(");");
+            } else {
+                const future_type = self.current_function_future_type.?;
+                try self.writer.print("return {s}_ready()", .{future_type});
+                try self.writer.writeLine(";");
+            }
+        } else if (ret.value) |val| {
             // Set expected type from function return type for Option/Result constructors
             const prev_expected = self.expected_type;
             self.expected_type = self.current_function_return_type;
@@ -4971,6 +5688,7 @@ pub const CodeGenerator = struct {
                     try self.generateExpr(comp.expr);
                 }
             },
+            .await_expr => |aw| try self.generateAwaitExpr(aw),
         }
     }
 
@@ -5786,6 +6504,137 @@ pub const CodeGenerator = struct {
                 try self.writer.write(")");
             }
             return true;
+        } else if (std.mem.eql(u8, name, "fs_mkdir")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_fs_mkdir(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "fs_readdir")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_fs_readdir(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "fs_remove")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_fs_remove(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "fs_rename")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_fs_rename(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "fs_rmdir")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_fs_remove(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "fs_getcwd")) {
+            try self.writer.write("dm_fs_getcwd()");
+            return true;
+        } else if (std.mem.eql(u8, name, "fs_exists")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_file_exists(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "env_get")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_os_getenv(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "tcp_listen")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_tcp_listen_fd(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "tcp_accept")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_tcp_accept_fd(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "tcp_connect")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_tcp_connect_fd(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "tcp_read")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_tcp_read_fd(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "tcp_write")) {
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_tcp_write_fd(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "tcp_close")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_tcp_close_fd(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "thread_join")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_thread_join_id(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "mutex_new")) {
+            try self.writer.write("dm_mutex_new_ptr()");
+            return true;
+        } else if (std.mem.eql(u8, name, "mutex_lock")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_mutex_lock_ptr(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "mutex_unlock")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_mutex_unlock_ptr(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "mutex_destroy")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_mutex_destroy_ptr(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
         } else if (std.mem.eql(u8, name, "Some")) {
             // Some(value) -> dm_option_T_Some(value)
             if (call.args.len > 0) {
@@ -5870,6 +6719,53 @@ pub const CodeGenerator = struct {
             if (call.args.len > 0) {
                 try self.writer.write("dm_parse_float(");
                 try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "simd_add") or std.mem.eql(u8, name, "simd_sub") or
+            std.mem.eql(u8, name, "simd_mul") or std.mem.eql(u8, name, "simd_div"))
+        {
+            // simd_add(a, b) -> dm_simd_add(a, b), etc.
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_");
+                try self.writer.write(name);
+                try self.writer.write("(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.eql(u8, name, "simd_extract")) {
+            // simd_extract(vec, idx) -> dm_simd_extract(vec, idx)
+            if (call.args.len >= 2) {
+                try self.writer.write("dm_simd_extract(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(", ");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.startsWith(u8, name, "simd_splat_")) {
+            // simd_splat_f32x4(val) -> dm_simd_splat_f32x4(val)
+            if (call.args.len >= 1) {
+                try self.writer.write("dm_");
+                try self.writer.write(name);
+                try self.writer.write("(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
+        } else if (std.mem.startsWith(u8, name, "simd_set_")) {
+            // simd_set_f32x4(a, b, c, d) -> dm_simd_set_f32x4(a, b, c, d)
+            if (call.args.len >= 1) {
+                try self.writer.write("dm_");
+                try self.writer.write(name);
+                try self.writer.write("(");
+                for (call.args, 0..) |arg, i| {
+                    if (i > 0) try self.writer.write(", ");
+                    try self.generateExpr(arg.value);
+                }
                 try self.writer.write(")");
             }
             return true;
@@ -6604,6 +7500,20 @@ pub const CodeGenerator = struct {
                 try self.generateExpr(pipe.left);
                 try self.writer.write(")");
             },
+        }
+    }
+
+    /// Generate await expression: `await expr` -> `dm_future_T_await(expr)`
+    fn generateAwaitExpr(self: *Self, aw: *AwaitExpr) anyerror!void {
+        const operand_type = self.inferCTypeFromExpr(aw.operand);
+        if (std.mem.startsWith(u8, operand_type, "dm_future_")) {
+            try self.writer.print("{s}_await(", .{operand_type});
+            try self.generateExpr(aw.operand);
+            try self.writer.write(")");
+        } else {
+            // Fallback: just access .value
+            try self.generateExpr(aw.operand);
+            try self.writer.write(".value");
         }
     }
 

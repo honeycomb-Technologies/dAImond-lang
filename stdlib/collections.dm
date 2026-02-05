@@ -1,40 +1,115 @@
 module collections
 
 -- Standard Collections Module
--- Provides guidance on using built-in collection types.
---
--- List[T] - Dynamic array (built-in)
---   let mut items: List[int] = []
---   items.push(1)      -- append element
---   items.push(2)
---   items.pop()        -- remove and return last element (returns 2)
---   items.len()        -- get length
---   items[0]           -- index access
---   for item in items { ... }  -- iteration
---
--- Stack (LIFO) - Use List[T] directly:
---   let mut stack: List[int] = []
---   stack.push(1)      -- push
---   stack.pop()        -- pop
---
--- Queue (FIFO) - Use List[T] with index access:
---   let mut queue: List[int] = []
---   queue.push(1)      -- enqueue (push to back)
---   let front = queue[0]  -- peek front
---
--- Map[K,V] - Hash map (built-in)
---   let mut m: Map[string, int] = Map_new()
---   m.insert("key", 42)
---   m.get("key")       -- returns value (panics if missing)
---   m.contains("key")  -- check existence
---   m.remove("key")    -- remove entry
---   m.len()            -- number of entries
---   m.keys()           -- List[K] of keys
---   m.values()         -- List[V] of values
---   m["key"]           -- index access (alias for get)
---   m["key"] = 42      -- index assignment (alias for insert)
+-- Provides collection types built on top of List[T] and Map[K,V].
 
--- Helper: check if a collection count is zero
+-- ============================================================================
+-- Set[T] - Unique element collection (backed by Map[T, bool])
+-- ============================================================================
+-- Usage:
+--   let mut s: Map[string, bool] = Map_new()
+--   s = set_add(s, "hello")
+--   s = set_add(s, "world")
+--   set_has(s, "hello")    -- true
+--   set_size(s)            -- 2
+--   s = set_remove(s, "hello")
+
+-- Add an element to a set (Map[T, bool])
+fn set_add_str(mut s: Map[string, bool], item: string) -> Map[string, bool] {
+    s.insert(item, true)
+    return s
+}
+
+-- Check if set contains an element
+fn set_has_str(s: Map[string, bool], item: string) -> bool {
+    return s.contains(item)
+}
+
+-- Remove an element from a set
+fn set_remove_str(mut s: Map[string, bool], item: string) -> Map[string, bool] {
+    s.remove(item)
+    return s
+}
+
+-- Get the number of elements in a set
+fn set_size_str(s: Map[string, bool]) -> int {
+    return s.len()
+}
+
+-- Get all elements as a list
+fn set_items_str(s: Map[string, bool]) -> List[string] {
+    return s.keys()
+}
+
+-- ============================================================================
+-- Queue[T] - FIFO queue (backed by List[T] with front index)
+-- ============================================================================
+-- Usage:
+--   let mut q: List[string] = []
+--   q.push("first")
+--   q.push("second")
+--   let front = q[0]       -- peek front
+--   queue_size(q)           -- 2
+
+-- Get the size of a queue
+fn queue_size_int(q: List[int]) -> int {
+    return q.len()
+}
+
+-- Check if queue is empty
+fn queue_empty_int(q: List[int]) -> bool {
+    return q.len() == 0
+}
+
+-- ============================================================================
+-- Stack[T] - LIFO stack (List[T] with push/pop)
+-- ============================================================================
+-- Usage:
+--   let mut stack: List[int] = []
+--   stack.push(1)
+--   stack.push(2)
+--   let top = stack[stack.len() - 1]   -- peek top
+--   stack.pop()                         -- pop
+
+-- Peek at the top of a stack without removing it
+fn stack_peek_int(stack: List[int]) -> int {
+    return stack[stack.len() - 1]
+}
+
+-- Check if stack is empty
+fn stack_empty_int(stack: List[int]) -> bool {
+    return stack.len() == 0
+}
+
+-- Get the size of a stack
+fn stack_size_int(stack: List[int]) -> int {
+    return stack.len()
+}
+
+-- ============================================================================
+-- Utility functions
+-- ============================================================================
+
+-- Check if a collection count is zero
 fn is_empty_count(count: int) -> bool {
     return count == 0
+}
+
+-- Return the minimum of two integers
+fn min_int(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+-- Return the maximum of two integers
+fn max_int(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
+}
+
+-- Clamp an integer between bounds
+fn clamp_int(x: int, lo: int, hi: int) -> int {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
 }

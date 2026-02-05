@@ -57,6 +57,9 @@ fn compile_stmt(c: Compiler) -> Compiler {
     if k == TK_MATCH() {
         return compile_match_stmt(cc)
     }
+    if k == TK_REGION() {
+        return compile_region_stmt(cc)
+    }
     -- Expression statement (possibly assignment)
     let lhs = compile_expr(cc)
     cc = lhs.c
@@ -632,6 +635,28 @@ fn compile_loop_stmt(c: Compiler) -> Compiler {
     cc = c_expect(cc, TK_RBRACE())
     cc.indent = cc.indent - 1
     cc.output = cc.output + ind + "}\n"
+    return cc
+}
+
+fn compile_region_stmt(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'region'
+    let ind = indent_str(cc.indent)
+    -- Parse region name (optional, just skip it)
+    if c_peek(cc) == TK_IDENT() {
+        cc = c_advance(cc)
+    }
+    -- Generate unique arena variable name
+    let arena_name = "_region_arena" + int_to_string(cc.region_counter)
+    cc.region_counter = cc.region_counter + 1
+    -- Emit arena create
+    cc.output = cc.output + ind + "dm_arena* " + arena_name + " = dm_arena_create(4096);\n"
+    cc = c_expect(cc, TK_LBRACE())
+    cc.indent = cc.indent + 1
+    cc = compile_block_body(cc)
+    cc = c_expect(cc, TK_RBRACE())
+    cc.indent = cc.indent - 1
+    -- Emit arena destroy
+    cc.output = cc.output + ind + "dm_arena_destroy(" + arena_name + ");\n"
     return cc
 }
 

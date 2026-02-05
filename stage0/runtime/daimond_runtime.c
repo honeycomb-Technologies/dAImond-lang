@@ -698,7 +698,11 @@ bool dm_string_to_float(dm_string s, double* out) {
  * ============================================================================ */
 
 void dm_runtime_init(void) {
-    /* Currently a no-op, but can be extended for:
+#ifdef _WIN32
+    /* Initialize Winsock for networking support */
+    dm_winsock_init();
+#endif
+    /* Can be extended for:
      * - Global allocator initialization
      * - Signal handlers
      * - Thread-local storage
@@ -707,7 +711,11 @@ void dm_runtime_init(void) {
 }
 
 void dm_runtime_cleanup(void) {
-    /* Currently a no-op, but can be extended for:
+#ifdef _WIN32
+    /* Clean up Winsock */
+    dm_winsock_cleanup();
+#endif
+    /* Can be extended for:
      * - Final cleanup of global resources
      * - Memory leak detection in debug mode
      */
@@ -717,7 +725,59 @@ void dm_runtime_cleanup(void) {
  * Threading Primitives
  * ============================================================================ */
 
-#ifndef _WIN32
+#ifdef _WIN32
+
+/* Trampoline for thread spawn: Windows CreateThread expects
+ * DWORD WINAPI (*)(LPVOID) but dAImond spawns void (*)(void) functions. */
+typedef struct {
+    void (*func)(void);
+} dm_thread_trampoline_arg;
+
+static DWORD WINAPI dm_thread_trampoline(LPVOID arg) {
+    dm_thread_trampoline_arg* ta = (dm_thread_trampoline_arg*)arg;
+    void (*func)(void) = ta->func;
+    free(ta);
+    func();
+    return 0;
+}
+
+dm_thread dm_thread_spawn(void (*func)(void)) {
+    dm_thread t;
+    dm_thread_trampoline_arg* arg = (dm_thread_trampoline_arg*)malloc(sizeof(dm_thread_trampoline_arg));
+    arg->func = func;
+    t.handle = CreateThread(NULL, 0, dm_thread_trampoline, arg, 0, NULL);
+    return t;
+}
+
+void dm_thread_join(dm_thread thread) {
+    if (thread.handle) {
+        WaitForSingleObject(thread.handle, INFINITE);
+        CloseHandle(thread.handle);
+    }
+}
+
+dm_mutex dm_mutex_new(void) {
+    dm_mutex m;
+    m.handle = CreateMutex(NULL, FALSE, NULL);
+    return m;
+}
+
+void dm_mutex_lock(dm_mutex* mutex) {
+    WaitForSingleObject(mutex->handle, INFINITE);
+}
+
+void dm_mutex_unlock(dm_mutex* mutex) {
+    ReleaseMutex(mutex->handle);
+}
+
+void dm_mutex_destroy(dm_mutex* mutex) {
+    if (mutex->handle) {
+        CloseHandle(mutex->handle);
+        mutex->handle = NULL;
+    }
+}
+
+#else /* POSIX */
 
 /* Trampoline for thread spawn: pthreads expects void* (*)(void*) but
  * dAImond spawns void (*)(void) functions. */
@@ -763,8 +823,10 @@ void dm_mutex_destroy(dm_mutex* mutex) {
     pthread_mutex_destroy(&mutex->handle);
 }
 
+#endif /* _WIN32 */
+
 /* ============================================================================
- * Networking Primitives (BSD Sockets)
+ * Networking Primitives
  * ============================================================================ */
 
 /**
@@ -794,6 +856,157 @@ static int dm_parse_addr(dm_string addr, char* host_buf, size_t host_size, int* 
     *port = atoi(port_buf);
     return 0;
 }
+
+#ifdef _WIN32
+
+static int dm_winsock_initialized = 0;
+
+void dm_winsock_init(void) {
+    if (!dm_winsock_initialized) {
+        WSADATA wsa;
+        WSAStartup(MAKEWORD(2, 2), &wsa);
+        dm_winsock_initialized = 1;
+    }
+}
+
+void dm_winsock_cleanup(void) {
+    if (dm_winsock_initialized) {
+        WSACleanup();
+        dm_winsock_initialized = 0;
+    }
+}
+
+dm_tcp_listener dm_tcp_listen(dm_string addr) {
+    dm_tcp_listener listener;
+    listener.fd = INVALID_SOCKET;
+    char host[256];
+    int port = 0;
+
+    dm_winsock_init();
+
+    if (dm_parse_addr(addr, host, sizeof(host), &port) < 0) {
+        fprintf(stderr, "dm_tcp_listen: invalid address format\n");
+        return listener;
+    }
+
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == INVALID_SOCKET) {
+        fprintf(stderr, "dm_tcp_listen: socket failed (%d)\n", WSAGetLastError());
+        return listener;
+    }
+
+    int opt = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    if (strlen(host) == 0 || strcmp(host, "0.0.0.0") == 0) {
+        sa.sin_addr.s_addr = INADDR_ANY;
+    } else {
+        inet_pton(AF_INET, host, &sa.sin_addr);
+    }
+
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        fprintf(stderr, "dm_tcp_listen: bind failed (%d)\n", WSAGetLastError());
+        closesocket(fd);
+        return listener;
+    }
+
+    if (listen(fd, 128) == SOCKET_ERROR) {
+        fprintf(stderr, "dm_tcp_listen: listen failed (%d)\n", WSAGetLastError());
+        closesocket(fd);
+        return listener;
+    }
+
+    listener.fd = fd;
+    return listener;
+}
+
+dm_tcp_stream dm_tcp_accept(dm_tcp_listener* listener) {
+    dm_tcp_stream stream;
+    stream.fd = INVALID_SOCKET;
+    struct sockaddr_in client_addr;
+    int addr_len = sizeof(client_addr);
+
+    SOCKET client_fd = accept(listener->fd, (struct sockaddr*)&client_addr, &addr_len);
+    if (client_fd == INVALID_SOCKET) {
+        fprintf(stderr, "dm_tcp_accept: accept failed (%d)\n", WSAGetLastError());
+        return stream;
+    }
+
+    stream.fd = client_fd;
+    return stream;
+}
+
+dm_tcp_stream dm_tcp_connect(dm_string addr) {
+    dm_tcp_stream stream;
+    stream.fd = INVALID_SOCKET;
+    char host[256];
+    int port = 0;
+
+    dm_winsock_init();
+
+    if (dm_parse_addr(addr, host, sizeof(host), &port) < 0) {
+        fprintf(stderr, "dm_tcp_connect: invalid address format\n");
+        return stream;
+    }
+
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == INVALID_SOCKET) {
+        fprintf(stderr, "dm_tcp_connect: socket failed (%d)\n", WSAGetLastError());
+        return stream;
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    inet_pton(AF_INET, host, &sa.sin_addr);
+
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        fprintf(stderr, "dm_tcp_connect: connect failed (%d)\n", WSAGetLastError());
+        closesocket(fd);
+        return stream;
+    }
+
+    stream.fd = fd;
+    return stream;
+}
+
+dm_string dm_tcp_read(dm_tcp_stream* stream, int64_t max_bytes) {
+    if (max_bytes <= 0) max_bytes = 4096;
+    char* buf = (char*)malloc((size_t)max_bytes + 1);
+    int n = recv(stream->fd, buf, (int)max_bytes, 0);
+    if (n <= 0) {
+        free(buf);
+        return (dm_string){ .data = "", .len = 0, .cap = 0 };
+    }
+    buf[n] = '\0';
+    return (dm_string){ .data = buf, .len = (size_t)n, .cap = (size_t)max_bytes };
+}
+
+int64_t dm_tcp_write(dm_tcp_stream* stream, dm_string data) {
+    int n = send(stream->fd, data.data, (int)data.len, 0);
+    return (int64_t)(n < 0 ? 0 : n);
+}
+
+void dm_tcp_close(dm_tcp_stream* stream) {
+    if (stream->fd != INVALID_SOCKET) {
+        closesocket(stream->fd);
+        stream->fd = INVALID_SOCKET;
+    }
+}
+
+void dm_tcp_listener_close(dm_tcp_listener* listener) {
+    if (listener->fd != INVALID_SOCKET) {
+        closesocket(listener->fd);
+        listener->fd = INVALID_SOCKET;
+    }
+}
+
+#else /* POSIX */
 
 dm_tcp_listener dm_tcp_listen(dm_string addr) {
     dm_tcp_listener listener = { .fd = -1 };
@@ -919,3 +1132,210 @@ void dm_tcp_listener_close(dm_tcp_listener* listener) {
 }
 
 #endif /* _WIN32 */
+
+/* ============================================================================
+ * Filesystem Operations Implementation
+ * ============================================================================ */
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#else
+#include <sys/stat.h>
+#include <dirent.h>
+#include <unistd.h>
+#endif
+
+static char* dm_to_cstr(dm_string s) {
+    char* cstr = (char*)malloc(s.len + 1);
+    if (!cstr) return NULL;
+    memcpy(cstr, s.data, s.len);
+    cstr[s.len] = '\0';
+    return cstr;
+}
+
+int dm_mkdir(dm_string path) {
+    char* cpath = dm_to_cstr(path);
+    if (!cpath) return -1;
+
+    /* Simple mkdir -p: create each component */
+    char* p = cpath;
+    while (*p) {
+        if ((*p == '/' || *p == '\\') && p != cpath) {
+            char saved = *p;
+            *p = '\0';
+#ifdef _WIN32
+            _mkdir(cpath);
+#else
+            mkdir(cpath, 0755);
+#endif
+            *p = saved;
+        }
+        p++;
+    }
+#ifdef _WIN32
+    int result = _mkdir(cpath);
+    /* Ignore EEXIST - directory already exists is not an error */
+    if (result != 0 && errno == EEXIST) result = 0;
+#else
+    int result = mkdir(cpath, 0755);
+    /* Ignore EEXIST - directory already exists is not an error */
+    if (result != 0 && errno == EEXIST) result = 0;
+#endif
+    free(cpath);
+    return result;
+}
+
+dm_string dm_readdir(dm_string path) {
+    char* cpath = dm_to_cstr(path);
+    if (!cpath) return DM_STRING_EMPTY;
+
+#ifdef _WIN32
+    /* Build search pattern: path\* */
+    size_t plen = strlen(cpath);
+    char* pattern = (char*)malloc(plen + 3);
+    if (!pattern) { free(cpath); return DM_STRING_EMPTY; }
+    memcpy(pattern, cpath, plen);
+    /* Ensure trailing backslash */
+    if (plen > 0 && cpath[plen - 1] != '\\' && cpath[plen - 1] != '/') {
+        pattern[plen] = '\\';
+        pattern[plen + 1] = '*';
+        pattern[plen + 2] = '\0';
+    } else {
+        pattern[plen] = '*';
+        pattern[plen + 1] = '\0';
+    }
+    free(cpath);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(pattern, &fd);
+    free(pattern);
+    if (hFind == INVALID_HANDLE_VALUE) return DM_STRING_EMPTY;
+
+    /* Build newline-separated list of entries */
+    size_t buf_cap = 1024;
+    char* buf = (char*)malloc(buf_cap);
+    size_t buf_len = 0;
+
+    do {
+        /* Skip . and .. */
+        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) {
+            continue;
+        }
+        size_t name_len = strlen(fd.cFileName);
+        /* Ensure capacity: name + newline */
+        while (buf_len + name_len + 1 >= buf_cap) {
+            buf_cap *= 2;
+            buf = (char*)realloc(buf, buf_cap);
+        }
+        if (buf_len > 0) {
+            buf[buf_len++] = '\n';
+        }
+        memcpy(buf + buf_len, fd.cFileName, name_len);
+        buf_len += name_len;
+    } while (FindNextFileA(hFind, &fd));
+    FindClose(hFind);
+
+    if (buf_len == 0) {
+        free(buf);
+        return DM_STRING_EMPTY;
+    }
+    buf[buf_len] = '\0';
+    return (dm_string){ .data = buf, .len = buf_len, .cap = buf_cap };
+#else
+    DIR* dir = opendir(cpath);
+    free(cpath);
+    if (!dir) return DM_STRING_EMPTY;
+
+    /* Build newline-separated list of entries */
+    size_t buf_cap = 1024;
+    char* buf = (char*)malloc(buf_cap);
+    size_t buf_len = 0;
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        /* Skip . and .. */
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        size_t name_len = strlen(entry->d_name);
+        /* Ensure capacity: name + newline */
+        while (buf_len + name_len + 1 >= buf_cap) {
+            buf_cap *= 2;
+            buf = (char*)realloc(buf, buf_cap);
+        }
+        if (buf_len > 0) {
+            buf[buf_len++] = '\n';
+        }
+        memcpy(buf + buf_len, entry->d_name, name_len);
+        buf_len += name_len;
+    }
+    closedir(dir);
+
+    if (buf_len == 0) {
+        free(buf);
+        return DM_STRING_EMPTY;
+    }
+    buf[buf_len] = '\0';
+    return (dm_string){ .data = buf, .len = buf_len, .cap = buf_cap };
+#endif
+}
+
+int dm_remove(dm_string path) {
+    char* cpath = dm_to_cstr(path);
+    if (!cpath) return -1;
+#ifdef _WIN32
+    /* Try file removal first; if it fails, try _rmdir for directories */
+    int result = remove(cpath);
+    if (result != 0) {
+        result = _rmdir(cpath);
+    }
+#else
+    int result = remove(cpath);
+#endif
+    free(cpath);
+    return result;
+}
+
+int dm_rename(dm_string old_path, dm_string new_path) {
+    char* cold = dm_to_cstr(old_path);
+    char* cnew = dm_to_cstr(new_path);
+    if (!cold || !cnew) {
+        free(cold);
+        free(cnew);
+        return -1;
+    }
+    int result = rename(cold, cnew);
+    free(cold);
+    free(cnew);
+    return result;
+}
+
+dm_string dm_getcwd(void) {
+    char buf[4096];
+#ifdef _WIN32
+    if (_getcwd(buf, sizeof(buf)) == NULL) return DM_STRING_EMPTY;
+#else
+    if (getcwd(buf, sizeof(buf)) == NULL) return DM_STRING_EMPTY;
+#endif
+    size_t len = strlen(buf);
+    char* result = (char*)malloc(len + 1);
+    memcpy(result, buf, len + 1);
+    return (dm_string){ .data = result, .len = len, .cap = len + 1 };
+}
+
+/* ============================================================================
+ * OS Functions Implementation
+ * ============================================================================ */
+
+dm_string dm_getenv(dm_string name) {
+    char* cname = dm_to_cstr(name);
+    if (!cname) return DM_STRING_EMPTY;
+    const char* val = getenv(cname);
+    free(cname);
+    if (!val) return DM_STRING_EMPTY;
+    size_t len = strlen(val);
+    char* result = (char*)malloc(len + 1);
+    memcpy(result, val, len + 1);
+    return (dm_string){ .data = result, .len = len, .cap = len + 1 };
+}

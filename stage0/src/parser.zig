@@ -60,6 +60,7 @@ pub const LambdaExpr = ast.LambdaExpr;
 pub const LambdaParam = ast.LambdaParam;
 pub const PipelineExpr = ast.PipelineExpr;
 pub const ErrorPropagateExpr = ast.ErrorPropagateExpr;
+pub const AwaitExpr = ast.AwaitExpr;
 pub const CoalesceExpr = ast.CoalesceExpr;
 pub const RangeExpr = ast.RangeExpr;
 pub const CastExpr = ast.CastExpr;
@@ -440,7 +441,19 @@ pub const Parser = struct {
 
         const decl = try self.astAllocator().create(Declaration);
 
-        if (self.match(.kw_extern)) {
+        if (self.match(.kw_async)) {
+            // async fn Name(params) -> RetType { body }
+            if (!self.match(.kw_fn)) {
+                return self.errorAtCurrent("expected 'fn' after 'async'");
+            }
+            const func = try self.parseFunction();
+            func.is_async = true;
+            decl.* = .{
+                .kind = .{ .function = func },
+                .visibility = visibility,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+        } else if (self.match(.kw_extern)) {
             // extern fn Name(params) -> RetType
             if (!self.match(.kw_fn)) {
                 return self.errorAtCurrent("expected 'fn' after 'extern'");
@@ -572,6 +585,7 @@ pub const Parser = struct {
             .body = body,
             .is_comptime = is_comptime,
             .is_extern = false,
+            .is_async = false,
             .span = makeSpan(start_loc, self.previousLocation()),
         };
         return func;
@@ -1712,6 +1726,22 @@ pub const Parser = struct {
             expr.* = .{
                 .kind = .{ .unary = unary },
                 .span = unary.span,
+            };
+            return expr;
+        }
+        if (self.match(.kw_await)) {
+            const operand = try self.parseUnaryImpl(allow_struct_lit);
+
+            const await_node = try self.astAllocator().create(AwaitExpr);
+            await_node.* = .{
+                .operand = operand,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const expr = try self.astAllocator().create(Expr);
+            expr.* = .{
+                .kind = .{ .await_expr = await_node },
+                .span = await_node.span,
             };
             return expr;
         }

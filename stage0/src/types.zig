@@ -94,6 +94,58 @@ pub const FloatType = enum {
     }
 };
 
+/// SIMD vector type variants
+pub const SimdType = enum {
+    f32x4, // 4 x f32 = 128 bits
+    f32x8, // 8 x f32 = 256 bits
+    f64x2, // 2 x f64 = 128 bits
+    f64x4, // 4 x f64 = 256 bits
+    i32x4, // 4 x i32 = 128 bits
+    i32x8, // 8 x i32 = 256 bits
+    i64x2, // 2 x i64 = 128 bits
+    i64x4, // 4 x i64 = 256 bits
+
+    /// Get the total bit width of this SIMD vector
+    pub fn bitWidth(self: SimdType) u16 {
+        return switch (self) {
+            .f32x4, .i32x4, .f64x2, .i64x2 => 128,
+            .f32x8, .i32x8, .f64x4, .i64x4 => 256,
+        };
+    }
+
+    /// Get the number of lanes (elements)
+    pub fn lanes(self: SimdType) u8 {
+        return switch (self) {
+            .f64x2, .i64x2 => 2,
+            .f32x4, .i32x4, .f64x4, .i64x4 => 4,
+            .f32x8, .i32x8 => 8,
+        };
+    }
+
+    /// Get the element type as a string for C codegen
+    pub fn elementCType(self: SimdType) []const u8 {
+        return switch (self) {
+            .f32x4, .f32x8 => "float",
+            .f64x2, .f64x4 => "double",
+            .i32x4, .i32x8 => "int32_t",
+            .i64x2, .i64x4 => "int64_t",
+        };
+    }
+
+    /// Check if element type is floating-point
+    pub fn isFloat(self: SimdType) bool {
+        return switch (self) {
+            .f32x4, .f32x8, .f64x2, .f64x4 => true,
+            .i32x4, .i32x8, .i64x2, .i64x4 => false,
+        };
+    }
+
+    /// Get a string representation of the type
+    pub fn name(self: SimdType) []const u8 {
+        return @tagName(self);
+    }
+};
+
 // ============================================================================
 // EFFECT TYPES
 // ============================================================================
@@ -472,10 +524,14 @@ pub const Type = union(enum) {
     ref: RefType,
     region: RegionType,
 
+    // SIMD vector types
+    simd: SimdType,
+
     // Special built-in types
     option: TypeId, // Option[T] - wraps the inner type
     result: struct { ok_type: TypeId, err_type: TypeId }, // Result[T, E]
     box: TypeId, // Box[T] - heap allocated
+    future: TypeId, // Future[T] - async result wrapper
 
     // Trait types
     trait_def: TraitDef,
@@ -513,7 +569,7 @@ pub const Type = union(enum) {
     /// Check if this is a primitive type
     pub fn isPrimitive(self: Self) bool {
         return switch (self) {
-            .int, .float, .bool, .char, .str, .unit => true,
+            .int, .float, .bool, .char, .str, .unit, .simd => true,
             else => false,
         };
     }
@@ -534,7 +590,7 @@ pub const Type = union(enum) {
     /// Check if this type can be copied implicitly (Copy semantics)
     pub fn isCopy(self: Self) bool {
         return switch (self) {
-            .int, .float, .bool, .char, .unit => true,
+            .int, .float, .bool, .char, .unit, .simd => true,
             .array => false, // Would need to check element type
             .tuple => false, // Would need to check element types
             else => false,
@@ -546,6 +602,7 @@ pub const Type = union(enum) {
         return switch (self) {
             .int => |i| @as(usize, i.bitWidth()) / 8,
             .float => |f| @as(usize, f.bitWidth()) / 8,
+            .simd => |s| @as(usize, s.bitWidth()) / 8,
             .bool => 1,
             .char => 4, // Unicode scalar
             .unit => 0,
@@ -563,6 +620,7 @@ pub const Type = union(enum) {
         return switch (self) {
             .int => |i| @as(usize, i.bitWidth()) / 8,
             .float => |f| @as(usize, f.bitWidth()) / 8,
+            .simd => |s| @as(usize, s.bitWidth()) / 8,
             .bool => 1,
             .char => 4,
             .unit => 1,
@@ -634,9 +692,11 @@ pub const Type = union(enum) {
                 }
             },
             .region => |reg| try writer.print("region '{s}", .{reg.name}),
+            .simd => |s| try writer.writeAll(s.name()),
             .option => try writer.writeAll("Option[T]"),
             .result => try writer.writeAll("Result[T, E]"),
             .box => try writer.writeAll("Box[T]"),
+            .future => try writer.writeAll("Future[T]"),
             .trait_def => |t| try writer.print("trait {s}", .{t.name}),
             .trait_object => try writer.writeAll("dyn Trait"),
             .type_var => |v| {
@@ -733,11 +793,31 @@ pub const TypeContext = struct {
         _ = try self.intern(.unit);
         _ = try self.intern(.never);
 
+        // SIMD vector types
+        _ = try self.intern(.{ .simd = .f32x4 });
+        _ = try self.intern(.{ .simd = .f32x8 });
+        _ = try self.intern(.{ .simd = .f64x2 });
+        _ = try self.intern(.{ .simd = .f64x4 });
+        _ = try self.intern(.{ .simd = .i32x4 });
+        _ = try self.intern(.{ .simd = .i32x8 });
+        _ = try self.intern(.{ .simd = .i64x2 });
+        _ = try self.intern(.{ .simd = .i64x4 });
+
         // Register type aliases
         try self.type_names.put("int", try self.intern(.{ .int = .i64 }));
         try self.type_names.put("uint", try self.intern(.{ .int = .u64 }));
         try self.type_names.put("byte", try self.intern(.{ .int = .u8 }));
         try self.type_names.put("float", try self.intern(.{ .float = .f64 }));
+
+        // SIMD type name aliases
+        try self.type_names.put("f32x4", try self.intern(.{ .simd = .f32x4 }));
+        try self.type_names.put("f32x8", try self.intern(.{ .simd = .f32x8 }));
+        try self.type_names.put("f64x2", try self.intern(.{ .simd = .f64x2 }));
+        try self.type_names.put("f64x4", try self.intern(.{ .simd = .f64x4 }));
+        try self.type_names.put("i32x4", try self.intern(.{ .simd = .i32x4 }));
+        try self.type_names.put("i32x8", try self.intern(.{ .simd = .i32x8 }));
+        try self.type_names.put("i64x2", try self.intern(.{ .simd = .i64x2 }));
+        try self.type_names.put("i64x4", try self.intern(.{ .simd = .i64x4 }));
     }
 
     /// Intern a type and return its ID
@@ -801,6 +881,11 @@ pub const TypeContext = struct {
         return try self.intern(.{ .box = inner });
     }
 
+    /// Create a Future[T] type
+    pub fn makeFuture(self: *Self, inner: TypeId) !TypeId {
+        return try self.intern(.{ .future = inner });
+    }
+
     /// Create an array type [T; N]
     pub fn makeArray(self: *Self, element: TypeId, size: usize) !TypeId {
         return try self.intern(.{ .array = .{ .element_type = element, .size = size } });
@@ -862,6 +947,7 @@ pub const TypeContext = struct {
                 try self.substitute(r.err_type, subs),
             ),
             .box => |inner| try self.makeBox(try self.substitute(inner, subs)),
+            .future => |inner| try self.makeFuture(try self.substitute(inner, subs)),
             .array => |a| try self.makeArray(try self.substitute(a.element_type, subs), a.size),
             .slice => |s| try self.makeSlice(try self.substitute(s.element_type, subs), s.is_mutable),
             .tuple => |t| {
@@ -932,10 +1018,12 @@ fn typeEqlSimple(a: Type, b: Type) bool {
     return switch (a) {
         .int => |i| b.int == i,
         .float => |f| b.float == f,
+        .simd => |s| b.simd == s,
         .bool, .char, .str, .unit, .never, .any, .unknown, .error_type => true,
         .option => |o| b.option == o,
         .result => |r| b.result.ok_type == r.ok_type and b.result.err_type == r.err_type,
         .box => |bx| b.box == bx,
+        .future => |f| b.future == f,
         .array => |arr| b.array.element_type == arr.element_type and b.array.size == arr.size,
         .slice => |s| b.slice.element_type == s.element_type and b.slice.is_mutable == s.is_mutable,
         else => false, // Complex types need deeper comparison
