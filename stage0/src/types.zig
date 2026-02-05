@@ -243,11 +243,36 @@ pub const EffectSet = struct {
 
     /// Union of two effect sets
     pub fn unionWith(self: Self, other: Self) Self {
-        // Note: This doesn't merge custom effects properly, would need allocator
+        const alloc = self.allocator orelse other.allocator;
+        // Merge custom effects
+        var merged_custom = self.custom_effects;
+        if (alloc) |a| {
+            if (other.custom_effects.len > 0) {
+                var list = std.ArrayList([]const u8).init(a);
+                // Add all from self
+                for (self.custom_effects) |c| {
+                    list.append(c) catch {};
+                }
+                // Add unique from other
+                for (other.custom_effects) |oc| {
+                    var found = false;
+                    for (self.custom_effects) |sc| {
+                        if (std.mem.eql(u8, oc, sc)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        list.append(oc) catch {};
+                    }
+                }
+                merged_custom = list.toOwnedSlice() catch self.custom_effects;
+            }
+        }
         return .{
             .builtin_effects = self.builtin_effects | other.builtin_effects,
-            .custom_effects = if (self.custom_effects.len > 0) self.custom_effects else other.custom_effects,
-            .allocator = self.allocator orelse other.allocator,
+            .custom_effects = merged_custom,
+            .allocator = alloc,
         };
     }
 
@@ -257,14 +282,35 @@ pub const EffectSet = struct {
         if ((self.builtin_effects & ~other.builtin_effects) != 0) {
             return false;
         }
-        // TODO: Check custom effects
+        // Check custom effects
+        for (self.custom_effects) |custom| {
+            var found = false;
+            for (other.custom_effects) |other_custom| {
+                if (std.mem.eql(u8, custom, other_custom)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
         return true;
     }
 
     /// Check if two effect sets are equal
     pub fn eql(self: Self, other: Self) bool {
-        return self.builtin_effects == other.builtin_effects;
-        // TODO: Compare custom effects
+        if (self.builtin_effects != other.builtin_effects) return false;
+        if (self.custom_effects.len != other.custom_effects.len) return false;
+        for (self.custom_effects) |custom| {
+            var found = false;
+            for (other.custom_effects) |other_custom| {
+                if (std.mem.eql(u8, custom, other_custom)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
     }
 
     /// Format effect set for display
@@ -291,6 +337,11 @@ pub const EffectSet = struct {
                 try writer.writeAll(effect.name());
                 first = false;
             }
+        }
+        for (self.custom_effects) |custom| {
+            if (!first) try writer.writeAll(", ");
+            try writer.writeAll(custom);
+            first = false;
         }
         try writer.writeAll("]");
     }

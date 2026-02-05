@@ -2831,6 +2831,41 @@ pub const map_iteration_tests = [_]TestCase{
         ,
         .expected_output = "1\n",
     },
+    .{
+        .name = "map_for_in_keys",
+        .skip = false,
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("a", 1)
+            \\    m.insert("b", 2)
+            \\    let mut count = 0
+            \\    for k in m {
+            \\        count = count + 1
+            \\    }
+            \\    println(int_to_string(count))
+            \\}
+        ,
+        .expected_output = "2\n",
+    },
+    .{
+        .name = "map_for_in_empty",
+        .skip = false,
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    for k in m {
+            \\        println("should not print")
+            \\    }
+            \\    println("done")
+            \\}
+        ,
+        .expected_output = "done\n",
+    },
 };
 
 pub const lambda_tests = [_]TestCase{
@@ -3449,6 +3484,37 @@ pub const effect_tests = [_]TestCase{
         ,
         .expected_output = "7\n",
     },
+    .{
+        .name = "custom_effect_declared",
+        .source =
+            \\module test
+            \\fn greet() with [MyEffect, IO, Console] {
+            \\    println("hello from custom effect")
+            \\}
+            \\fn main() with [MyEffect, IO, Console] {
+            \\    greet()
+            \\}
+        ,
+        .expected_output = "hello from custom effect\n",
+    },
+    .{
+        .name = "custom_effect_violation",
+        .source =
+            \\module test
+            \\fn impure() with [CustomSideEffect, IO, Console] {
+            \\    println("side effect")
+            \\}
+            \\fn pure_fn() with [IO, Console] -> int {
+            \\    impure()
+            \\    return 42
+            \\}
+            \\fn main() with [IO, Console] {
+            \\    println(int_to_string(pure_fn()))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
 };
 
 pub const dyn_trait_tests = [_]TestCase{
@@ -3749,6 +3815,148 @@ pub const async_await_tests = [_]TestCase{
     },
 };
 
+pub const async_phase_b_tests = [_]TestCase{
+    .{
+        .name = "async_phase_b_linear",
+        .source =
+            \\module test
+            \\
+            \\async fn get_value() -> int {
+            \\    return 10
+            \\}
+            \\
+            \\async fn add_five(x: int) -> int {
+            \\    return x + 5
+            \\}
+            \\
+            \\async fn compute() -> int {
+            \\    let a = await get_value()
+            \\    let b = await add_five(a)
+            \\    return a + b
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = await compute()
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "25\n",
+    },
+    .{
+        .name = "async_phase_b_three_awaits",
+        .source =
+            \\module test
+            \\
+            \\async fn step1() -> int {
+            \\    return 3
+            \\}
+            \\
+            \\async fn step2(x: int) -> int {
+            \\    return x * 2
+            \\}
+            \\
+            \\async fn step3(x: int) -> int {
+            \\    return x + 10
+            \\}
+            \\
+            \\async fn pipeline() -> int {
+            \\    let a = await step1()
+            \\    let b = await step2(a)
+            \\    let c = await step3(b)
+            \\    return c
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = await pipeline()
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "16\n",
+    },
+    .{
+        .name = "async_phase_b_reject_loop",
+        .source =
+            \\module test
+            \\
+            \\async fn get_value() -> int {
+            \\    return 1
+            \\}
+            \\
+            \\async fn bad_loop() -> int {
+            \\    let mut sum = 0
+            \\    while sum < 10 {
+            \\        sum = sum + await get_value()
+            \\    }
+            \\    return sum
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = await bad_loop()
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+    .{
+        .name = "async_phase_b_reject_branch",
+        .source =
+            \\module test
+            \\
+            \\async fn get_a() -> int {
+            \\    return 1
+            \\}
+            \\
+            \\async fn get_b() -> int {
+            \\    return 2
+            \\}
+            \\
+            \\async fn bad_branch(flag: bool) -> int {
+            \\    if flag {
+            \\        return await get_a()
+            \\    } else {
+            \\        return await get_b()
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let result = await bad_branch(true)
+            \\    println(int_to_string(result))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+};
+
+pub const array_size_tests = [_]TestCase{
+    .{
+        .name = "array_fixed_size",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let arr: [int; 3] = [1, 2, 3]
+            \\    println(int_to_string(arr[0]))
+            \\    println(int_to_string(arr[1]))
+            \\    println(int_to_string(arr[2]))
+            \\}
+        ,
+        .expected_output = "1\n2\n3\n",
+    },
+    .{
+        .name = "array_repeat_size",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let arr = [0; 5]
+            \\    println(int_to_string(arr[0]))
+            \\    println(int_to_string(arr[4]))
+            \\}
+        ,
+        .expected_output = "0\n0\n",
+    },
+};
+
 pub const comprehensive_test = [_]TestCase{
     .{
         .name = "stage1_comprehensive",
@@ -3877,6 +4085,8 @@ pub fn main() !void {
         .{ .name = "Bare Self", .tests = &bare_self_tests },
         .{ .name = "SIMD", .tests = &simd_tests },
         .{ .name = "Async/Await", .tests = &async_await_tests },
+        .{ .name = "Async Phase B", .tests = &async_phase_b_tests },
+        .{ .name = "Array Sizes", .tests = &array_size_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
     };
 

@@ -2202,16 +2202,48 @@ pub const CodeGenerator = struct {
             const before_star = type_str[0 .. star_pos + 2]; // "ret_type (*"
             const after_star = type_str[star_pos + 2 ..]; // ")(params...)"
             try self.writer.print("{s}{s}{s}", .{ before_star, var_name, after_star });
+        } else if (std.mem.indexOf(u8, type_str, "[")) |bracket_pos| {
+            // Fixed-size array type: "elem_type[N]"
+            // Emit as: "elem_type var_name[N]"
+            const elem_type = type_str[0..bracket_pos];
+            const size_part = type_str[bracket_pos..]; // "[N]"
+            try self.writer.print("{s} {s}{s}", .{ elem_type, var_name, size_part });
         } else {
             // Normal type: "type var_name"
             try self.writer.print("{s} {s}", .{ type_str, var_name });
         }
     }
 
+    /// Evaluate an AST expression to a usize (for array sizes in codegen).
+    fn evalExprUsize(expr: *const ast.Expr) ?usize {
+        switch (expr.kind) {
+            .literal => |lit| {
+                switch (lit.kind) {
+                    .int => |int_lit| {
+                        const val = std.fmt.parseInt(i64, int_lit.value, 10) catch return null;
+                        if (val >= 0) return @intCast(@as(u64, @intCast(val)));
+                        return null;
+                    },
+                    else => return null,
+                }
+            },
+            .comptime_expr => |ce| return evalExprUsize(ce.expr),
+            else => return null,
+        }
+    }
+
     /// Map array type to C
+    /// For fixed-size arrays, returns "elem_type[N]" which emitVarDecl handles specially.
+    /// For unknown-size arrays, falls back to pointer representation.
     fn mapArrayType(self: *Self, arr: *ArrayType) CodeGenError![]const u8 {
         const elem_type = try self.mapType(arr.element_type);
-        // C arrays are tricky in function signatures, use pointer
+        const size = evalExprUsize(arr.size);
+        if (size) |n| {
+            if (n > 0) {
+                return try std.fmt.allocPrint(self.stringAllocator(), "{s}[{d}]", .{ elem_type, n });
+            }
+        }
+        // Fallback: use pointer for unknown-size or zero-size arrays
         return try std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{elem_type});
     }
 
@@ -3618,6 +3650,12 @@ pub const CodeGenerator = struct {
                     // Strip "dm_list_" prefix to get element type
                     break :blk obj_type["dm_list_".len..];
                 }
+                // Indexing a fixed-size array type "elem[N]" returns the element type
+                if (std.mem.endsWith(u8, obj_type, "]")) {
+                    if (std.mem.indexOf(u8, obj_type, "[")) |bracket_pos| {
+                        break :blk obj_type[0..bracket_pos];
+                    }
+                }
                 // Indexing a pointer type returns the pointed-to element
                 if (std.mem.endsWith(u8, obj_type, "*")) {
                     break :blk obj_type[0 .. obj_type.len - 1];
@@ -3695,7 +3733,25 @@ pub const CodeGenerator = struct {
                 }
                 break :blk "int64_t";
             },
-            .array_literal => "void*",
+            .array_literal => |al| blk: {
+                switch (al.kind) {
+                    .elements => |elems| {
+                        if (elems.len > 0) {
+                            const elem_type = self.inferCTypeFromExpr(elems[0]);
+                            break :blk std.fmt.allocPrint(self.stringAllocator(), "{s}[{d}]", .{ elem_type, elems.len }) catch "void*";
+                        }
+                        break :blk "void*";
+                    },
+                    .repeat => |rep| {
+                        const elem_type = self.inferCTypeFromExpr(rep.value);
+                        const count = evalExprUsize(rep.count) orelse 0;
+                        if (count > 0) {
+                            break :blk std.fmt.allocPrint(self.stringAllocator(), "{s}[{d}]", .{ elem_type, count }) catch "void*";
+                        }
+                        break :blk "void*";
+                    },
+                }
+            },
             .tuple_literal => "void*",
             .lambda => "void*",
             .type_check => "bool",
@@ -4398,6 +4454,56 @@ pub const CodeGenerator = struct {
             self.trackFunctionReturnType(full_name, ret_type);
         }
 
+        // Detect Phase B async (body has await points) and emit frame struct before function
+        const is_phase_b = func.is_async and if (func.body) |b| switch (b) {
+            .block => |blk| blockHasAwait(blk),
+            .expression => |expr| exprHasAwait(expr),
+        } else false;
+
+        var phase_b_frame_name: ?[]const u8 = null;
+        var phase_b_poll_name: ?[]const u8 = null;
+        var phase_b_param_decls: ?[]const u8 = null; // e.g. ", int64_t x, int64_t y"
+        var phase_b_forward_args: ?[]const u8 = null; // e.g. ", x, y"
+        if (is_phase_b) {
+            phase_b_frame_name = try std.fmt.allocPrint(self.stringAllocator(), "{s}_frame", .{func_name});
+            phase_b_poll_name = try std.fmt.allocPrint(self.stringAllocator(), "{s}_poll", .{func_name});
+
+            // Build parameter declaration and forwarding strings
+            var decl_buf = std.ArrayList(u8).init(self.allocator);
+            var args_buf = std.ArrayList(u8).init(self.allocator);
+            const p_start: usize = if (has_self) 1 else 0;
+            for (func.params[p_start..]) |param| {
+                const param_type = try self.mapType(param.type_expr);
+                if (param.is_mut) {
+                    try decl_buf.appendSlice(", ");
+                    try decl_buf.appendSlice(param_type);
+                    try decl_buf.appendSlice("* ");
+                    try decl_buf.appendSlice(param.name.name);
+                } else {
+                    try decl_buf.appendSlice(", ");
+                    try decl_buf.appendSlice(param_type);
+                    try decl_buf.append(' ');
+                    try decl_buf.appendSlice(param.name.name);
+                }
+                try args_buf.appendSlice(", ");
+                try args_buf.appendSlice(param.name.name);
+            }
+            phase_b_param_decls = try decl_buf.toOwnedSlice();
+            phase_b_forward_args = try args_buf.toOwnedSlice();
+
+            // Emit frame struct before function
+            try self.writer.printLine("typedef struct {{", .{});
+            self.writer.indent();
+            try self.writer.writeLine("int state;");
+            self.writer.dedent();
+            try self.writer.printLine("}} {s};", .{phase_b_frame_name.?});
+            try self.writer.blankLine();
+
+            // Forward declare poll function (with parameter pass-through)
+            try self.writer.printLine("static {s} {s}({s}* frame{s});", .{ ret_type, phase_b_poll_name.?, phase_b_frame_name.?, phase_b_param_decls.? });
+            try self.writer.blankLine();
+        }
+
         try self.writer.print("{s} {s}(", .{ ret_type, func_name });
 
         // If this is a method with self, add typed self pointer parameter
@@ -4448,26 +4554,71 @@ pub const CodeGenerator = struct {
                 self.trackVariableType(param.name.name, param_type);
             }
 
-            switch (body) {
-                .block => |block| {
-                    try self.writer.beginBlock();
-                    try self.generateBlock(block);
-                    try self.writer.endBlock();
-                },
-                .expression => |expr| {
-                    try self.writer.beginBlock();
-                    if (self.current_function_is_async) {
+            if (is_phase_b) {
+                // Phase B Lite: wrapper body + poll function
+                const frame_name = phase_b_frame_name.?;
+                const poll_name = phase_b_poll_name.?;
+
+                // Wrapper body (the current function becomes the wrapper)
+                const fwd_args = phase_b_forward_args.?;
+                const param_decls = phase_b_param_decls.?;
+                try self.writer.beginBlock();
+                try self.writer.printLine("{s} frame = {{.state = 0}};", .{frame_name});
+                try self.writer.printLine("return {s}(&frame{s});", .{ poll_name, fwd_args });
+                try self.writer.endBlock();
+                try self.writer.blankLine();
+
+                // Poll function definition (frame + original params passed through)
+                try self.writer.printLine("static {s} {s}({s}* frame{s}) {{", .{ ret_type, poll_name, frame_name, param_decls });
+                self.writer.indent();
+                try self.writer.writeLine("switch(frame->state) {");
+                self.writer.indent();
+                try self.writer.writeLine("case 0: {");
+                self.writer.indent();
+
+                // Generate body (same code as Phase A — _ready() wrapping etc. still works)
+                switch (body) {
+                    .block => |block| {
+                        try self.generateBlock(block);
+                    },
+                    .expression => |expr| {
                         const future_type = self.current_function_future_type.?;
                         try self.writer.print("return {s}_ready(", .{future_type});
                         try self.generateExpr(expr);
                         try self.writer.writeLine(");");
-                    } else {
-                        try self.writer.write("return ");
-                        try self.generateExpr(expr);
-                        try self.writer.writeLine(";");
-                    }
-                    try self.writer.endBlock();
-                },
+                    },
+                }
+
+                self.writer.dedent();
+                try self.writer.writeLine("}"); // close case 0
+                self.writer.dedent();
+                try self.writer.writeLine("}"); // close switch
+                try self.writer.printLine("return ({s}){{.ready = false}};", .{ret_type});
+                self.writer.dedent();
+                try self.writer.writeLine("}"); // close poll function
+            } else {
+                // Phase A or non-async: generate body normally
+                switch (body) {
+                    .block => |block| {
+                        try self.writer.beginBlock();
+                        try self.generateBlock(block);
+                        try self.writer.endBlock();
+                    },
+                    .expression => |expr| {
+                        try self.writer.beginBlock();
+                        if (self.current_function_is_async) {
+                            const future_type = self.current_function_future_type.?;
+                            try self.writer.print("return {s}_ready(", .{future_type});
+                            try self.generateExpr(expr);
+                            try self.writer.writeLine(");");
+                        } else {
+                            try self.writer.write("return ");
+                            try self.generateExpr(expr);
+                            try self.writer.writeLine(";");
+                        }
+                        try self.writer.endBlock();
+                    },
+                }
             }
         } else {
             try self.writer.writeLine(";");
@@ -5523,12 +5674,39 @@ pub const CodeGenerator = struct {
 
                 try self.generateBlock(for_stmt.body);
                 try self.writer.endBlock();
+            } else if (std.mem.startsWith(u8, iter_type, "dm_map_")) {
+                // Map iteration: for k in map { ... }
+                // Look up the key type from generated map type info
+                var key_type: []const u8 = "int64_t";
+                if (self.generated_map_types.get(iter_type)) |map_info| {
+                    key_type = map_info.key_type;
+                }
+
+                try self.writer.print("{s} {s} = ", .{ iter_type, iter_temp });
+                try self.generateExpr(for_stmt.iterator);
+                try self.writer.writeLine(";");
+                try self.writer.print("for (size_t {s} = 0; {s} < {s}.capacity; {s}++)", .{ idx_temp, idx_temp, iter_temp, idx_temp });
+                try self.writer.beginBlock();
+
+                // Skip empty/deleted slots
+                try self.writer.printLine("if ({s}.entries[{s}].state != 1) continue;", .{ iter_temp, idx_temp });
+
+                // Bind pattern variable to key
+                switch (for_stmt.pattern.kind) {
+                    .identifier => |ident| {
+                        try self.writer.printLine("{s} {s} = {s}.entries[{s}].key;", .{ key_type, ident.name.name, iter_temp, idx_temp });
+                        self.trackVariableType(ident.name.name, key_type);
+                    },
+                    else => {},
+                }
+
+                try self.generateBlock(for_stmt.body);
+                try self.writer.endBlock();
             } else {
-                // Fallback: generic iterator (unsupported, emit placeholder)
-                try self.writer.writeLineComment("unsupported iterator type");
-                try self.writer.write("/* for-each on ");
-                try self.writer.write(iter_type);
-                try self.writer.writeLine(" not supported */");
+                // Fallback: unsupported iterator type - emit valid but empty C block
+                try self.writer.beginBlock();
+                try self.writer.writeLineComment(try std.fmt.allocPrint(self.stringAllocator(), "unsupported iterator type: {s}", .{iter_type}));
+                try self.writer.endBlock();
             }
         }
     }
@@ -6943,10 +7121,14 @@ pub const CodeGenerator = struct {
                 try self.writer.write(" }");
             },
             .repeat => |repeat| {
-                // [value; count] syntax - generate as inline compound literal
+                // [value; count] syntax - expand to { val, val, ... val }
+                const count = evalExprUsize(repeat.count) orelse 1;
                 try self.writer.write("{ ");
-                try self.generateExpr(repeat.value);
-                try self.writer.write(" /* repeated */ }");
+                for (0..count) |i| {
+                    if (i > 0) try self.writer.write(", ");
+                    try self.generateExpr(repeat.value);
+                }
+                try self.writer.write(" }");
             },
         }
     }
@@ -7515,6 +7697,147 @@ pub const CodeGenerator = struct {
             try self.generateExpr(aw.operand);
             try self.writer.write(".value");
         }
+    }
+
+    // ========================================================================
+    // ASYNC PHASE B — Await point detection
+    // ========================================================================
+
+    fn blockHasAwait(block: *const BlockExpr) bool {
+        for (block.statements) |stmt| {
+            if (stmtHasAwait(stmt)) return true;
+        }
+        if (block.result) |result| {
+            if (exprHasAwait(result)) return true;
+        }
+        return false;
+    }
+
+    fn stmtHasAwait(stmt: *const Statement) bool {
+        return switch (stmt.kind) {
+            .let_binding => |lb| if (lb.value) |v| exprHasAwait(v) else false,
+            .return_stmt => |rs| if (rs.value) |v| exprHasAwait(v) else false,
+            .expression => |e| exprHasAwait(e),
+            .assignment => |a| exprHasAwait(a.value) or exprHasAwait(a.target),
+            .if_stmt => |ie| exprHasAwait(ie.condition) or blockHasAwait(ie.then_branch) or
+                (if (ie.else_branch) |eb| switch (eb) {
+                .else_block => |b| blockHasAwait(b),
+                .else_if => |ei| exprHasAwait(ei.condition) or blockHasAwait(ei.then_branch),
+            } else false),
+            .while_loop => |wl| exprHasAwait(wl.condition) or blockHasAwait(wl.body),
+            .for_loop => |fl| exprHasAwait(fl.iterator) or blockHasAwait(fl.body),
+            .loop_stmt => |ls| blockHasAwait(ls.body),
+            .match_stmt => |me| blk: {
+                if (exprHasAwait(me.scrutinee)) break :blk true;
+                for (me.arms) |arm| {
+                    switch (arm.body) {
+                        .block => |b| if (blockHasAwait(b)) break :blk true,
+                        .expression => |e| if (exprHasAwait(e)) break :blk true,
+                    }
+                }
+                break :blk false;
+            },
+            .region_block => |rb| blockHasAwait(rb.body),
+            .discard => |d| exprHasAwait(d.value),
+            .break_stmt => |bs| if (bs.value) |v| exprHasAwait(v) else false,
+            .continue_stmt => false,
+        };
+    }
+
+    fn exprHasAwait(expr: *const Expr) bool {
+        return switch (expr.kind) {
+            .await_expr => true,
+            .binary => |b| exprHasAwait(b.left) or exprHasAwait(b.right),
+            .unary => |u| exprHasAwait(u.operand),
+            .function_call => |fc| blk: {
+                if (exprHasAwait(fc.function)) break :blk true;
+                for (fc.args) |arg| {
+                    if (exprHasAwait(arg.value)) break :blk true;
+                }
+                break :blk false;
+            },
+            .method_call => |mc| blk: {
+                if (exprHasAwait(mc.object)) break :blk true;
+                for (mc.args) |arg| {
+                    if (exprHasAwait(arg)) break :blk true;
+                }
+                break :blk false;
+            },
+            .field_access => |fa| exprHasAwait(fa.object),
+            .index_access => |ia| exprHasAwait(ia.object) or exprHasAwait(ia.index),
+            .if_expr => |ie| exprHasAwait(ie.condition) or blockHasAwait(ie.then_branch) or
+                (if (ie.else_branch) |eb| switch (eb) {
+                .else_block => |b| blockHasAwait(b),
+                .else_if => |ei| exprHasAwait(ei.condition) or blockHasAwait(ei.then_branch),
+            } else false),
+            .match_expr => |me| blk: {
+                if (exprHasAwait(me.scrutinee)) break :blk true;
+                for (me.arms) |arm| {
+                    switch (arm.body) {
+                        .block => |b| if (blockHasAwait(b)) break :blk true,
+                        .expression => |e| if (exprHasAwait(e)) break :blk true,
+                    }
+                }
+                break :blk false;
+            },
+            .block => |b| blockHasAwait(b),
+            .pipeline => |p| exprHasAwait(p.left) or exprHasAwait(p.right),
+            .error_propagate => |e| exprHasAwait(e.operand),
+            .coalesce => |c| exprHasAwait(c.left) or exprHasAwait(c.right),
+            .cast => |c| exprHasAwait(c.expr),
+            .type_check => |tc| exprHasAwait(tc.expr),
+            .grouped => |g| exprHasAwait(g),
+            .comptime_expr => |c| exprHasAwait(c.expr),
+            .string_interpolation => |si| blk: {
+                for (si.parts) |part| {
+                    switch (part) {
+                        .expr => |e| if (exprHasAwait(e)) break :blk true,
+                        .literal => {},
+                    }
+                }
+                break :blk false;
+            },
+            .struct_literal => |sl| blk: {
+                for (sl.fields) |f| {
+                    if (exprHasAwait(f.value)) break :blk true;
+                }
+                if (sl.spread) |s| if (exprHasAwait(s)) break :blk true;
+                break :blk false;
+            },
+            .array_literal => |al| switch (al.kind) {
+                .elements => |elems| blk: {
+                    for (elems) |e| {
+                        if (exprHasAwait(e)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .repeat => |rep| exprHasAwait(rep.value) or exprHasAwait(rep.count),
+            },
+            .enum_literal => |el| switch (el.payload) {
+                .none => false,
+                .tuple => |t| blk: {
+                    for (t) |e| {
+                        if (exprHasAwait(e)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .struct_fields => |sfs| blk: {
+                    for (sfs) |f| {
+                        if (exprHasAwait(f.value)) break :blk true;
+                    }
+                    break :blk false;
+                },
+            },
+            .tuple_literal => |tl| blk: {
+                for (tl.elements) |e| {
+                    if (exprHasAwait(e)) break :blk true;
+                }
+                break :blk false;
+            },
+            .range => |r| (if (r.start) |s| exprHasAwait(s) else false) or
+                (if (r.end) |e| exprHasAwait(e) else false),
+            .lambda, .literal, .identifier, .path => false,
+        };
     }
 
     /// Generate error propagation expression (standalone, when not in let/return context)

@@ -1556,10 +1556,9 @@ pub const TypeChecker = struct {
             },
             .repeat => |rep| {
                 const val_type = try self.inferExpr(rep.value);
-                // Count should be comptime int
                 _ = try self.inferExpr(rep.count);
-                // For now, use placeholder size
-                return try self.type_ctx.makeArray(val_type, 0);
+                const size = evalComptimeUsize(rep.count) orelse 0;
+                return try self.type_ctx.makeArray(val_type, size);
             },
         }
     }
@@ -2515,6 +2514,14 @@ pub const TypeChecker = struct {
                 },
             }
 
+            // Validate linear async: reject await in loops/branches
+            if (func.is_async) {
+                switch (body) {
+                    .block => |blk| try self.validateLinearAsync(blk, func.span),
+                    .expression => {},
+                }
+            }
+
             // Effect enforcement: if the function declares effects (with [...]),
             // verify the observed effects don't exceed the declared set.
             if (func.effects) |_| {
@@ -2536,6 +2543,219 @@ pub const TypeChecker = struct {
                 }
             }
         }
+    }
+
+    // ========================================================================
+    // LINEAR ASYNC VALIDATION
+    // ========================================================================
+
+    /// Validate that an async function body only uses await in linear positions
+    /// (not inside if/while/for/loop/match branches).
+    fn validateLinearAsync(self: *Self, body: *const ast.BlockExpr, span: ast.Span) !void {
+        for (body.statements) |stmt| {
+            switch (stmt.kind) {
+                .if_stmt => |if_expr| {
+                    if (ifExprContainsAwait(if_expr)) {
+                        try self.reportError(.type_mismatch, "await is not allowed inside if/else branches (linear async only)", span);
+                        return;
+                    }
+                },
+                .while_loop => |wl| {
+                    if (blockContainsAwait(wl.body)) {
+                        try self.reportError(.type_mismatch, "await is not allowed inside while loops (linear async only)", span);
+                        return;
+                    }
+                },
+                .for_loop => |fl| {
+                    if (blockContainsAwait(fl.body)) {
+                        try self.reportError(.type_mismatch, "await is not allowed inside for loops (linear async only)", span);
+                        return;
+                    }
+                },
+                .loop_stmt => |ls| {
+                    if (blockContainsAwait(ls.body)) {
+                        try self.reportError(.type_mismatch, "await is not allowed inside loop blocks (linear async only)", span);
+                        return;
+                    }
+                },
+                .match_stmt => |me| {
+                    if (matchContainsAwait(me)) {
+                        try self.reportError(.type_mismatch, "await is not allowed inside match arms (linear async only)", span);
+                        return;
+                    }
+                },
+                else => {},
+            }
+        }
+        // Also check result expression for control flow containing await
+        if (body.result) |result| {
+            switch (result.kind) {
+                .if_expr => |ie| {
+                    if (ifExprContainsAwait(ie)) {
+                        try self.reportError(.type_mismatch, "await is not allowed inside if/else branches (linear async only)", span);
+                    }
+                },
+                .match_expr => |me| {
+                    if (matchContainsAwait(me)) {
+                        try self.reportError(.type_mismatch, "await is not allowed inside match arms (linear async only)", span);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn ifExprContainsAwait(ie: *const ast.IfExpr) bool {
+        if (blockContainsAwait(ie.then_branch)) return true;
+        if (ie.else_branch) |eb| {
+            switch (eb) {
+                .else_block => |b| {
+                    if (blockContainsAwait(b)) return true;
+                },
+                .else_if => |ei| {
+                    if (ifExprContainsAwait(ei)) return true;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn matchContainsAwait(me: *const ast.MatchExpr) bool {
+        for (me.arms) |arm| {
+            switch (arm.body) {
+                .block => |b| {
+                    if (blockContainsAwait(b)) return true;
+                },
+                .expression => |e| {
+                    if (exprContainsAwait(e)) return true;
+                },
+            }
+        }
+        return false;
+    }
+
+    fn blockContainsAwait(block: *const ast.BlockExpr) bool {
+        for (block.statements) |stmt| {
+            if (stmtContainsAwait(stmt)) return true;
+        }
+        if (block.result) |result| {
+            if (exprContainsAwait(result)) return true;
+        }
+        return false;
+    }
+
+    fn stmtContainsAwait(stmt: *const ast.Statement) bool {
+        return switch (stmt.kind) {
+            .let_binding => |lb| if (lb.value) |v| exprContainsAwait(v) else false,
+            .return_stmt => |rs| if (rs.value) |v| exprContainsAwait(v) else false,
+            .expression => |e| exprContainsAwait(e),
+            .assignment => |a| exprContainsAwait(a.value) or exprContainsAwait(a.target),
+            .if_stmt => |ie| exprContainsAwait(ie.condition) or blockContainsAwait(ie.then_branch) or
+                (if (ie.else_branch) |eb| switch (eb) {
+                .else_block => |b| blockContainsAwait(b),
+                .else_if => |ei| ifExprContainsAwait(ei),
+            } else false),
+            .while_loop => |wl| exprContainsAwait(wl.condition) or blockContainsAwait(wl.body),
+            .for_loop => |fl| exprContainsAwait(fl.iterator) or blockContainsAwait(fl.body),
+            .loop_stmt => |ls| blockContainsAwait(ls.body),
+            .match_stmt => |me| exprContainsAwait(me.scrutinee) or matchContainsAwait(me),
+            .region_block => |rb| blockContainsAwait(rb.body),
+            .discard => |d| exprContainsAwait(d.value),
+            .break_stmt => |bs| if (bs.value) |v| exprContainsAwait(v) else false,
+            .continue_stmt => false,
+        };
+    }
+
+    fn exprContainsAwait(expr: *const ast.Expr) bool {
+        return switch (expr.kind) {
+            .await_expr => true,
+            .binary => |b| exprContainsAwait(b.left) or exprContainsAwait(b.right),
+            .unary => |u| exprContainsAwait(u.operand),
+            .function_call => |fc| blk: {
+                if (exprContainsAwait(fc.function)) break :blk true;
+                for (fc.args) |arg| {
+                    if (exprContainsAwait(arg.value)) break :blk true;
+                }
+                break :blk false;
+            },
+            .method_call => |mc| blk: {
+                if (exprContainsAwait(mc.object)) break :blk true;
+                for (mc.args) |arg| {
+                    if (exprContainsAwait(arg)) break :blk true;
+                }
+                break :blk false;
+            },
+            .field_access => |fa| exprContainsAwait(fa.object),
+            .index_access => |ia| exprContainsAwait(ia.object) or exprContainsAwait(ia.index),
+            .if_expr => |ie| exprContainsAwait(ie.condition) or blockContainsAwait(ie.then_branch) or
+                (if (ie.else_branch) |eb| switch (eb) {
+                .else_block => |b| blockContainsAwait(b),
+                .else_if => |ei| ifExprContainsAwait(ei),
+            } else false),
+            .match_expr => |me| exprContainsAwait(me.scrutinee) or matchContainsAwait(me),
+            .block => |b| blockContainsAwait(b),
+            .pipeline => |p| exprContainsAwait(p.left) or exprContainsAwait(p.right),
+            .error_propagate => |e| exprContainsAwait(e.operand),
+            .coalesce => |c| exprContainsAwait(c.left) or exprContainsAwait(c.right),
+            .cast => |c| exprContainsAwait(c.expr),
+            .type_check => |tc| exprContainsAwait(tc.expr),
+            .grouped => |g| exprContainsAwait(g),
+            .comptime_expr => |c| exprContainsAwait(c.expr),
+            .string_interpolation => |si| blk: {
+                for (si.parts) |part| {
+                    switch (part) {
+                        .expr => |e| {
+                            if (exprContainsAwait(e)) break :blk true;
+                        },
+                        .literal => {},
+                    }
+                }
+                break :blk false;
+            },
+            .struct_literal => |sl| blk: {
+                for (sl.fields) |f| {
+                    if (exprContainsAwait(f.value)) break :blk true;
+                }
+                if (sl.spread) |s| {
+                    if (exprContainsAwait(s)) break :blk true;
+                }
+                break :blk false;
+            },
+            .array_literal => |al| switch (al.kind) {
+                .elements => |elems| blk: {
+                    for (elems) |e| {
+                        if (exprContainsAwait(e)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .repeat => |rep| exprContainsAwait(rep.value) or exprContainsAwait(rep.count),
+            },
+            .enum_literal => |el| switch (el.payload) {
+                .none => false,
+                .tuple => |t| blk: {
+                    for (t) |e| {
+                        if (exprContainsAwait(e)) break :blk true;
+                    }
+                    break :blk false;
+                },
+                .struct_fields => |sfs| blk: {
+                    for (sfs) |f| {
+                        if (exprContainsAwait(f.value)) break :blk true;
+                    }
+                    break :blk false;
+                },
+            },
+            .tuple_literal => |tl| blk: {
+                for (tl.elements) |e| {
+                    if (exprContainsAwait(e)) break :blk true;
+                }
+                break :blk false;
+            },
+            .range => |r| (if (r.start) |s| exprContainsAwait(s) else false) or
+                (if (r.end) |e| exprContainsAwait(e) else false),
+            .lambda => false,
+            .literal, .identifier, .path => false,
+        };
     }
 
     fn checkStruct(self: *Self, sd: *const ast.StructDecl, is_public: bool) !void {
@@ -2785,6 +3005,25 @@ pub const TypeChecker = struct {
     // TYPE RESOLUTION
     // ========================================================================
 
+    /// Evaluate a comptime expression to a usize (for array sizes).
+    /// Returns null if the expression cannot be statically evaluated.
+    fn evalComptimeUsize(expr: *const ast.Expr) ?usize {
+        switch (expr.kind) {
+            .literal => |lit| {
+                switch (lit.kind) {
+                    .int => |int_lit| {
+                        const val = std.fmt.parseInt(i64, int_lit.value, 10) catch return null;
+                        if (val >= 0) return @intCast(@as(u64, @intCast(val)));
+                        return null;
+                    },
+                    else => return null,
+                }
+            },
+            .comptime_expr => |ce| return evalComptimeUsize(ce.expr),
+            else => return null,
+        }
+    }
+
     pub fn resolveTypeExpr(self: *Self, te: *const ast.TypeExpr) !TypeId {
         return switch (te.kind) {
             .named => |named| {
@@ -2863,8 +3102,8 @@ pub const TypeChecker = struct {
             },
             .array => |arr| {
                 const elem_type = try self.resolveTypeExpr(arr.element_type);
-                // For now, use placeholder size
-                return try self.type_ctx.makeArray(elem_type, 0);
+                const size = evalComptimeUsize(arr.size) orelse 0;
+                return try self.type_ctx.makeArray(elem_type, size);
             },
             .slice => |s| {
                 const elem_type = try self.resolveTypeExpr(s.element_type);
@@ -2937,7 +3176,7 @@ pub const TypeChecker = struct {
         return types.instantiateGeneric(self.type_ctx, base_type, type_args.items) catch base_type;
     }
 
-    fn addEffectFromTypeExpr(_: *Self, te: *const ast.TypeExpr, effects: *EffectSet) !void {
+    fn addEffectFromTypeExpr(self: *Self, te: *const ast.TypeExpr, effects: *EffectSet) !void {
         if (te.kind == .named) {
             const name = te.kind.named.path.segments[0].name;
             if (std.mem.eql(u8, name, "IO")) {
@@ -2960,6 +3199,27 @@ pub const TypeChecker = struct {
                 effects.addBuiltin(.exception);
             } else if (std.mem.eql(u8, name, "State")) {
                 effects.addBuiltin(.state);
+            } else {
+                // Custom effect — track it
+                if (effects.allocator == null) {
+                    effects.allocator = self.allocator;
+                }
+                var list = std.ArrayList([]const u8).init(effects.allocator.?);
+                for (effects.custom_effects) |c| {
+                    list.append(c) catch {};
+                }
+                // Don't add duplicates
+                var already = false;
+                for (effects.custom_effects) |c| {
+                    if (std.mem.eql(u8, c, name)) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    list.append(name) catch {};
+                }
+                effects.custom_effects = list.toOwnedSlice() catch effects.custom_effects;
             }
         }
     }

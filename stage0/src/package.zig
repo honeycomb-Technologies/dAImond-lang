@@ -15,6 +15,7 @@ pub const Manifest = struct {
     description: []const u8 = "",
     author: []const u8 = "",
     license: []const u8 = "",
+    registry_url: ?[]const u8 = null,
     dependencies: std.ArrayList(Dependency),
     allocator: Allocator,
 
@@ -535,10 +536,26 @@ pub fn parseLockFile(source: []const u8, allocator: Allocator) !std.ArrayList(Lo
 // Package Download
 // ============================================================================
 
+/// Build the registry URL for a versioned package.
+/// Default: https://github.com/daimond-lang/packages/releases/download/{name}-{version}/{name}-{version}.tar.gz
+/// Override with DAIMOND_REGISTRY_URL environment variable.
+fn buildRegistryUrl(name: []const u8, version: []const u8, allocator: Allocator) ![]const u8 {
+    // Check for env override
+    const base_url = std.process.getEnvVarOwned(allocator, "DAIMOND_REGISTRY_URL") catch |err| blk: {
+        if (err == error.EnvironmentVariableNotFound) {
+            break :blk try allocator.dupe(u8, "https://github.com/daimond-lang/packages/releases/download");
+        }
+        return err;
+    };
+    defer allocator.free(base_url);
+
+    return try std.fmt.allocPrint(allocator, "{s}/{s}-{s}/{s}-{s}.tar.gz", .{ base_url, name, version, name, version });
+}
+
 /// Download/install a single resolved dependency into the deps/ directory.
 /// - Git deps: `git clone --depth 1` into deps/<name>/
 /// - Path deps: create a symlink from deps/<name>/ to the path
-/// - Version deps: print a warning (no registry yet)
+/// - Version deps: download from registry (curl + tar)
 fn downloadDep(dep: ResolvedDep, deps_dir: std.fs.Dir, allocator: Allocator) !void {
     const stdout = std.io.getStdOut().writer();
 
@@ -600,7 +617,101 @@ fn downloadDep(dep: ResolvedDep, deps_dir: std.fs.Dir, allocator: Allocator) !vo
             try stdout.print("  Installed {s} (path)\n", .{dep.name});
         },
         .version => |v| {
-            try stdout.print("  Warning: registry not yet available. Skipping {s} ({s})\n", .{ dep.name, v });
+            // Build download URL
+            const url = buildRegistryUrl(dep.name, v, allocator) catch |err| {
+                try stdout.print("  Error: could not build registry URL for {s}: {}\n", .{ dep.name, err });
+                return;
+            };
+            defer allocator.free(url);
+
+            const tarball_path = try std.fmt.allocPrint(allocator, "/tmp/daimond_pkg_{s}_{s}.tar.gz", .{ dep.name, v });
+            defer allocator.free(tarball_path);
+
+            try stdout.print("  Downloading {s} ({s})...\n", .{ dep.name, v });
+
+            // Download with curl
+            var curl_argv = std.ArrayList([]const u8).init(allocator);
+            defer curl_argv.deinit();
+
+            try curl_argv.append("curl");
+            try curl_argv.append("-fsSL");
+            try curl_argv.append("-o");
+            try curl_argv.append(tarball_path);
+            try curl_argv.append(url);
+
+            var curl_child = std.process.Child.init(curl_argv.items, allocator);
+            curl_child.stdout_behavior = .Ignore;
+            curl_child.stderr_behavior = .Pipe;
+
+            curl_child.spawn() catch |err| {
+                if (err == error.FileNotFound) {
+                    try stdout.print("  Error: 'curl' not found. Install curl or use --path/--git dependency instead.\n", .{});
+                    return;
+                }
+                try stdout.print("  Error: could not start curl for {s}: {}\n", .{ dep.name, err });
+                return;
+            };
+            const curl_result = try curl_child.wait();
+
+            const curl_exit: u32 = switch (curl_result) {
+                .Exited => |code| code,
+                else => 255,
+            };
+
+            if (curl_exit != 0) {
+                try stdout.print("  Error: download failed for {s} ({s}). URL: {s}\n", .{ dep.name, v, url });
+                return;
+            }
+
+            // Remove existing entry if present
+            deps_dir.deleteTree(dep.name) catch {};
+
+            // Create directory
+            deps_dir.makeDir(dep.name) catch |err| {
+                if (err != error.PathAlreadyExists) {
+                    try stdout.print("  Error: could not create directory for {s}: {}\n", .{ dep.name, err });
+                    return;
+                }
+            };
+
+            // Extract tarball
+            const dep_path = try std.fmt.allocPrint(allocator, "deps/{s}/", .{dep.name});
+            defer allocator.free(dep_path);
+
+            var tar_argv = std.ArrayList([]const u8).init(allocator);
+            defer tar_argv.deinit();
+
+            try tar_argv.append("tar");
+            try tar_argv.append("xzf");
+            try tar_argv.append(tarball_path);
+            try tar_argv.append("-C");
+            try tar_argv.append(dep_path);
+            try tar_argv.append("--strip-components=1");
+
+            var tar_child = std.process.Child.init(tar_argv.items, allocator);
+            tar_child.stdout_behavior = .Ignore;
+            tar_child.stderr_behavior = .Pipe;
+
+            tar_child.spawn() catch |err| {
+                try stdout.print("  Error: could not start tar for {s}: {}\n", .{ dep.name, err });
+                return;
+            };
+            const tar_result = try tar_child.wait();
+
+            const tar_exit: u32 = switch (tar_result) {
+                .Exited => |code| code,
+                else => 255,
+            };
+
+            if (tar_exit != 0) {
+                try stdout.print("  Error: extraction failed for {s}\n", .{dep.name});
+                return;
+            }
+
+            // Clean up tarball
+            std.fs.cwd().deleteFile(tarball_path) catch {};
+
+            try stdout.print("  Installed {s} ({s})\n", .{ dep.name, v });
         },
     }
 }
@@ -642,7 +753,7 @@ pub fn parseManifest(source: []const u8, allocator: Allocator) !Manifest {
     var manifest = Manifest.init(allocator);
     errdefer manifest.deinit();
 
-    var current_section: enum { none, package, dependencies } = .none;
+    var current_section: enum { none, package, dependencies, registry } = .none;
     var lines = std.mem.splitScalar(u8, source, '\n');
 
     while (lines.next()) |raw_line| {
@@ -658,6 +769,8 @@ pub fn parseManifest(source: []const u8, allocator: Allocator) !Manifest {
                 current_section = .package;
             } else if (std.mem.eql(u8, line, "[dependencies]")) {
                 current_section = .dependencies;
+            } else if (std.mem.eql(u8, line, "[registry]")) {
+                current_section = .registry;
             } else {
                 current_section = .none;
             }
@@ -696,6 +809,12 @@ pub fn parseManifest(source: []const u8, allocator: Allocator) !Manifest {
                         // Inline table
                         const dep = parseInlineDep(key, raw_val);
                         try manifest.dependencies.append(dep);
+                    }
+                },
+                .registry => {
+                    const val = stripQuotes(raw_val);
+                    if (std.mem.eql(u8, key, "url")) {
+                        manifest.registry_url = val;
                     }
                 },
                 .none => {},
@@ -1576,6 +1695,27 @@ test "resolve absolute path passthrough" {
     const result = try resolveRelativePath("/home/user/project", "/opt/libs/mylib", std.testing.allocator);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("/opt/libs/mylib", result);
+}
+
+test "buildRegistryUrl format" {
+    const allocator = std.testing.allocator;
+    const url = try buildRegistryUrl("mylib", "1.2.3", allocator);
+    defer allocator.free(url);
+    try std.testing.expectEqualStrings(
+        "https://github.com/daimond-lang/packages/releases/download/mylib-1.2.3/mylib-1.2.3.tar.gz",
+        url,
+    );
+}
+
+test "parse manifest with registry section" {
+    const source = "[package]\nname = \"myapp\"\nversion = \"0.1.0\"\n\n[registry]\nurl = \"https://custom-registry.example.com/packages\"\n\n[dependencies]\nmath = \"1.2.3\"\n";
+    var manifest = try parseManifest(source, std.testing.allocator);
+    defer manifest.deinit();
+
+    try std.testing.expectEqualStrings("myapp", manifest.name);
+    try std.testing.expect(manifest.registry_url != null);
+    try std.testing.expectEqualStrings("https://custom-registry.example.com/packages", manifest.registry_url.?);
+    try std.testing.expectEqual(@as(usize, 1), manifest.dependencies.items.len);
 }
 
 test "git source without branch in lock file" {

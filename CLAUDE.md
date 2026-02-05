@@ -136,7 +136,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 195 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 205 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -269,8 +269,9 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Error diagnostics with colored output
 - C runtime library (strings, arenas, option/result, I/O, networking sockets, threading)
 - CLI with commands: compile, run, lex, parse, check, fmt, test, pkg
-- Integration test harness (196 pass, 0 fail, 0 skipped)
+- Integration test harness (205 pass, 0 fail, 0 skipped)
 - Map[K,V] type with full method support (insert, get, contains, remove, len, keys, values, set, indexing)
+- Map iteration via for-in loops (iterates over map keys using runtime entry scanning)
 - String split returning List[string]
 - Multi-file imports in Stage 0 (import resolution, stdlib path resolution, diamond import deduplication)
 - String interpolation (f"Hello {name}")
@@ -286,20 +287,24 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Region memory allocation redirection (arena allocator for allocations within region blocks)
 - Comptime evaluation (arithmetic and boolean expressions evaluated at compile time)
 - Effect system enforcement (opt-in via `with [IO, Console, FileSystem, ...]` declarations)
+- Custom user-defined effects (tracked in EffectSet alongside builtins, enforced via subset checking in with [...] declarations)
 - Dynamic trait dispatch (`dyn Trait` with vtable-based fat pointers)
 - Concurrency primitives (thread spawn/join, mutex lock/unlock via pthreads)
 - SIMD intrinsics (f32x4, f32x8, f64x2, f64x4, i32x4, i32x8, i64x2, i64x4 types with simd_add/sub/mul/div/splat/set/extract builtins via GCC/Clang vector extensions)
+- Compile-time array size evaluation (array types [T; N] where N is a comptime expression)
 - Async/await with `Future[T]` type (`async fn` declarations, `await` expressions, synchronous Phase A semantics with monomorphized future struct generation)
+- Async Phase B Lite (state machine frame/poll/wrapper for linear async functions with await points; checker rejects await in loops/branches)
 - Standard library (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
 - `daimond fmt` code formatter (indent normalization, brace-counting)
 - `daimond test` testing framework (test_* function discovery, setjmp-based panic catching, assert/assert_eq)
 - `daimond pkg` package manager (init, add, list; TOML manifest; version/path/git dependencies)
+- Package registry support (version dependencies resolved via HTTP download from configurable registry URL)
 - LSP server (`daimond-lsp`) for IDE integration (diagnostics, completion, hover)
 - Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete with verified fixed-point. Split into ~10 modules. Full feature parity with Stage 0 subset: enum payloads, Option/Result, match expressions (including bare Ok/Err/Some/None patterns), multi-file imports, lambdas, generic monomorphization, pipeline operator `|>`, error propagation `?`, Box[T] support, compound assignment operators (`+=`, `-=`, `*=`, `/=`), modulo `%`, all builtins (including `eprint`, `parse_float`, `string_to_upper`, `string_to_lower`), CLI flag parity (`-o`, `-c`, `--emit-c`, `-v`, `--version`, `-h`), nested for-loop support, for-loop element type inference, traits (static dispatch via mangled names, `trait`/`impl` blocks), effects (`with [IO, Console, ...]` annotations parsed and skipped), regions (`region name { ... }` blocks with arena allocation/cleanup). Hardened: monomorphization propagates all counters/state, type inference covers all builtin return types, runtime uses safe `strtoll` parsing with overflow protection, pipeline operator uses balanced-paren matching.
 
 ### Not Yet Implemented
 - LLVM backend (Stage 3)
-- True stackless coroutines for async/await (Phase B — current implementation is synchronous Phase A)
+- True stackless coroutines for async/await (Phase B Full — Phase B Lite with linear state machines is implemented)
 
 ## Documentation Maintenance
 
