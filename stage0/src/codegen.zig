@@ -1074,6 +1074,52 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
+        // Safe division/modulo helpers (runtime division-by-zero protection)
+        try self.writer.writeLine("static inline int64_t dm__safe_div(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (b == 0) dm_panic(\"division by zero\");");
+        try self.writer.writeLine("return a / b;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm__safe_mod(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (b == 0) dm_panic(\"modulo by zero\");");
+        try self.writer.writeLine("return a % b;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline double dm__safe_divf(double a, double b) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (b == 0.0) dm_panic(\"division by zero\");");
+        try self.writer.writeLine("return a / b;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline float dm__safe_divf32(float a, float b) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (b == 0.0f) dm_panic(\"division by zero\");");
+        try self.writer.writeLine("return a / b;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Bounds checking helper (runtime index-out-of-bounds protection)
+        try self.writer.writeLine("static inline void dm_bounds_check(int64_t index, int64_t len, const char* context) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (index < 0 || index >= len) {");
+        self.writer.indent();
+        try self.writer.writeLine("fprintf(stderr, \"PANIC: index out of bounds: index %lld, length %lld (%s)\\n\", (long long)index, (long long)len, context);");
+        try self.writer.writeLine("exit(1);");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
         // Print functions
         try self.writer.writeLine("static inline void dm_print_str(dm_string s) {");
         self.writer.indent();
@@ -5155,8 +5201,7 @@ pub const CodeGenerator = struct {
                 }
             },
             else => {
-                // Fallback for other patterns
-                try self.writer.writeLineComment("Unsupported pattern type");
+                return error.CodegenFailed;
             },
         }
     }
@@ -5777,6 +5822,33 @@ pub const CodeGenerator = struct {
 
     /// Generate assignment statement
     fn generateAssignment(self: *Self, assign: *Assignment) anyerror!void {
+        // Safe division/modulo for compound assignment: x /= y -> x = dm__safe_div(x, y)
+        if (assign.op == .div_assign or assign.op == .mod_assign) {
+            const target_type = self.inferCTypeFromExpr(assign.target);
+            const is_float = std.mem.eql(u8, target_type, "double");
+            const is_f32 = std.mem.eql(u8, target_type, "float");
+
+            try self.generateExpr(assign.target);
+            try self.writer.write(" = ");
+
+            if (assign.op == .div_assign) {
+                if (is_float) {
+                    try self.writer.write("dm__safe_divf(");
+                } else if (is_f32) {
+                    try self.writer.write("dm__safe_divf32(");
+                } else {
+                    try self.writer.write("dm__safe_div(");
+                }
+            } else {
+                try self.writer.write("dm__safe_mod(");
+            }
+            try self.generateExpr(assign.target);
+            try self.writer.write(", ");
+            try self.generateExpr(assign.value);
+            try self.writer.writeLine(");");
+            return;
+        }
+
         try self.generateExpr(assign.target);
 
         const op_str: []const u8 = switch (assign.op) {
@@ -5784,8 +5856,8 @@ pub const CodeGenerator = struct {
             .add_assign => " += ",
             .sub_assign => " -= ",
             .mul_assign => " *= ",
-            .div_assign => " /= ",
-            .mod_assign => " %= ",
+            .div_assign => unreachable, // Handled above
+            .mod_assign => unreachable, // Handled above
             .bit_and_assign => " &= ",
             .bit_or_assign => " |= ",
             .bit_xor_assign => " ^= ",
@@ -6046,6 +6118,28 @@ pub const CodeGenerator = struct {
             }
         }
 
+        // Safe division/modulo: emit runtime-checked helper calls instead of raw / and %
+        if (bin.op == .div or bin.op == .mod) {
+            const is_float = std.mem.eql(u8, left_type, "double");
+            const is_f32 = std.mem.eql(u8, left_type, "float");
+            if (bin.op == .div) {
+                if (is_float) {
+                    try self.writer.write("dm__safe_divf(");
+                } else if (is_f32) {
+                    try self.writer.write("dm__safe_divf32(");
+                } else {
+                    try self.writer.write("dm__safe_div(");
+                }
+            } else {
+                try self.writer.write("dm__safe_mod(");
+            }
+            try self.generateExpr(bin.left);
+            try self.writer.write(", ");
+            try self.generateExpr(bin.right);
+            try self.writer.write(")");
+            return;
+        }
+
         try self.writer.write("(");
         try self.generateExpr(bin.left);
 
@@ -6053,8 +6147,8 @@ pub const CodeGenerator = struct {
             .add => " + ",
             .sub => " - ",
             .mul => " * ",
-            .div => " / ",
-            .mod => " % ",
+            .div => unreachable, // Handled above
+            .mod => unreachable, // Handled above
             .eq => " == ",
             .ne => " != ",
             .lt => " < ",
@@ -6172,12 +6266,16 @@ pub const CodeGenerator = struct {
             try self.generateExpr(idx.index);
             try self.writer.write("])");
         } else if (std.mem.startsWith(u8, obj_type, "dm_list_")) {
-            // dm_list_X is a struct: list[i] -> (list).data[i]
-            try self.writer.write("(");
+            // dm_list_X is a struct: list[i] -> bounds-checked (list).data[i]
+            try self.writer.write("(dm_bounds_check((int64_t)(");
+            try self.generateExpr(idx.index);
+            try self.writer.write("), (int64_t)(");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").len, \"list\"), (");
             try self.generateExpr(idx.object);
             try self.writer.write(").data[");
             try self.generateExpr(idx.index);
-            try self.writer.write("]");
+            try self.writer.write("])");
         } else {
             try self.generateExpr(idx.object);
             try self.writer.write("[");

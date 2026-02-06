@@ -1,0 +1,32 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Build dAImond Program (debug)",
+            "type": "shell",
+            "command": "${workspaceFolder}/stage0/zig-out/bin/daimond",
+            "args": [
+                "--debug",
+                "${input:sourceFile}",
+                "-o",
+                "${workspaceFolder}/${input:programName}"
+            ],
+            "group": "build",
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "sourceFile",
+            "type": "promptString",
+            "description": "Path to the .dm source file",
+            "default": "examples/hello.dm"
+        },
+        {
+            "id": "programName",
+            "type": "promptString",
+            "description": "Name of the output executable",
+            "default": "program"
+        }
+    ]
+}

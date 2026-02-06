@@ -2256,7 +2256,8 @@ pub const TypeChecker = struct {
 
                     for (e.variants) |variant| {
                         if (!covered.contains(variant.name)) {
-                            try self.reportError(.missing_match_arm, "non-exhaustive pattern: missing variant", span);
+                            const msg = try std.fmt.allocPrint(self.allocator, "non-exhaustive pattern: missing variant '{s}'", .{variant.name});
+                            try self.reportError(.missing_match_arm, msg, span);
                             return;
                         }
                     }

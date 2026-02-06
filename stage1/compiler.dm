@@ -205,7 +205,31 @@ struct Compiler {
     -- Track current impl type prefix for method name mangling
     current_impl_type: string,
     -- Counter for unique region arena variables
-    region_counter: int
+    region_counter: int,
+    -- Accumulated map type definitions (built during parsing)
+    map_type_defs: string,
+    -- Track map key/value types: "|dm_map_K_V=key_type:val_type|..."
+    map_kv_types: string,
+    -- Accumulated Future type definitions (built during async fn parsing)
+    future_type_defs: string,
+    -- Track whether current function is async (for return wrapping)
+    current_fn_is_async: bool,
+    -- Track the inner type for current async function (e.g. "int64_t" for Future[int])
+    current_fn_async_inner_type: string,
+    -- Accumulated dyn trait definitions (vtable struct, fat pointer, dispatch functions)
+    dyn_trait_defs: string,
+    -- Track which dyn trait types have been generated: "|TraitName|..."
+    dyn_traits_generated: string,
+    -- Accumulated array type definitions: typedef T dm_array_T_N[N];
+    array_type_defs: string,
+    -- Track generic function trait bounds: "|fn_name:T=TraitName|..."
+    generic_bounds: string,
+    -- Effect enforcement: pipe-delimited effect names like "|Console|IO|" or ""
+    current_fn_effects: string,
+    -- Whether current function has a with [...] clause (distinguishes "no clause" from "empty clause")
+    current_fn_has_effects: bool,
+    -- Current region arena variable name (empty when not in a region, e.g. "_region_arena0" when inside)
+    current_region_arena: string
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -244,7 +268,19 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         trait_names: tn,
         impl_for_map: "",
         current_impl_type: "",
-        region_counter: 0
+        region_counter: 0,
+        map_type_defs: "",
+        map_kv_types: "",
+        future_type_defs: "",
+        current_fn_is_async: false,
+        current_fn_async_inner_type: "",
+        dyn_trait_defs: "",
+        dyn_traits_generated: "",
+        array_type_defs: "",
+        generic_bounds: "",
+        current_fn_effects: "",
+        current_fn_has_effects: false,
+        current_region_arena: ""
     }
 }
 
@@ -309,6 +345,7 @@ fn str_list_contains(list: List[string], val: string) -> bool {
 fn code_is_string(code: string, c: Compiler) -> bool {
     if starts_with(code, "dm_string_from_cstr(") { return true }
     if starts_with(code, "dm_string_concat(") { return true }
+    if starts_with(code, "dm_string_concat_arena(") { return true }
     if starts_with(code, "dm_int_to_string(") { return true }
     if starts_with(code, "dm_bool_to_string(") { return true }
     if starts_with(code, "dm_float_to_string(") { return true }
@@ -444,5 +481,24 @@ fn map_dm_type(name: string) -> string {
     if name == "bool" { return "bool" }
     if name == "string" { return "dm_string" }
     if name == "void" { return "void" }
+    if name == "i8" { return "int8_t" }
+    if name == "i16" { return "int16_t" }
+    if name == "i32" { return "int32_t" }
+    if name == "u8" { return "uint8_t" }
+    if name == "u16" { return "uint16_t" }
+    if name == "u32" { return "uint32_t" }
+    if name == "i64" { return "int64_t" }
+    if name == "u64" { return "uint64_t" }
+    if name == "f32" { return "float" }
+    if name == "f64" { return "double" }
+    -- SIMD vector types
+    if name == "f32x4" { return "dm_f32x4" }
+    if name == "f32x8" { return "dm_f32x8" }
+    if name == "f64x2" { return "dm_f64x2" }
+    if name == "f64x4" { return "dm_f64x4" }
+    if name == "i32x4" { return "dm_i32x4" }
+    if name == "i32x8" { return "dm_i32x8" }
+    if name == "i64x2" { return "dm_i64x2" }
+    if name == "i64x4" { return "dm_i64x4" }
     return "dm_" + name
 }

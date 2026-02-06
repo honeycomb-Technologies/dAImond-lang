@@ -508,6 +508,42 @@ _Noreturn void dm_panic(const char* msg, const char* file, int line);
 #define DM_UNREACHABLE() DM_PANIC("unreachable code reached")
 
 /* ============================================================================
+ * Safe Division / Modulo (runtime division-by-zero protection)
+ * ============================================================================ */
+
+/**
+ * Safe integer division - panics on division by zero.
+ */
+static inline int64_t dm_safe_div(int64_t a, int64_t b) {
+    if (b == 0) dm_panic("division by zero", __FILE__, __LINE__);
+    return a / b;
+}
+
+/**
+ * Safe integer modulo - panics on modulo by zero.
+ */
+static inline int64_t dm_safe_mod(int64_t a, int64_t b) {
+    if (b == 0) dm_panic("modulo by zero", __FILE__, __LINE__);
+    return a % b;
+}
+
+/**
+ * Safe double division - panics on division by zero.
+ */
+static inline double dm_safe_divf(double a, double b) {
+    if (b == 0.0) dm_panic("division by zero", __FILE__, __LINE__);
+    return a / b;
+}
+
+/**
+ * Safe float division - panics on division by zero.
+ */
+static inline float dm_safe_divf32(float a, float b) {
+    if (b == 0.0f) dm_panic("division by zero", __FILE__, __LINE__);
+    return a / b;
+}
+
+/* ============================================================================
  * Numeric Conversions
  * ============================================================================ */
 

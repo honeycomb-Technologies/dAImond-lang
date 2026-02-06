@@ -86,7 +86,7 @@ void* dm_arena_alloc_aligned(dm_arena* arena, size_t size, size_t alignment) {
 
     dm_arena* new_arena = dm_arena_create(new_size);
     if (!new_arena) {
-        return NULL;
+        dm_panic("out of memory: arena allocation failed", __FILE__, __LINE__);
     }
 
     current->next = new_arena;

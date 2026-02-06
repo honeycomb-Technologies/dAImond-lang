@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
   echo "-- Compiles a subset of dAImond to C11"
   echo "-- ============================================================"
   echo ""
-  for mod in token lexer compiler compile_expr compile_stmt compile_match compile_decl runtime imports; do
+  for mod in token lexer compiler compile_expr compile_stmt compile_match compile_decl runtime imports package; do
     echo "-- [module: $mod]"
     # Strip module and import lines, output the rest
     sed '/^module /d; /^import /d' "$mod.dm"

@@ -47,6 +47,7 @@ dAImond-lang/
 │   ├── compile_decl.dm    # Function/struct/enum/impl declarations, prescan
 │   ├── runtime.dm         # C runtime emission, output assembly
 │   ├── imports.dm         # Multi-file import resolver
+│   ├── package.dm         # Package manager (TOML manifest, pkg init/add/list)
 │   ├── gen_bootstrap.sh   # Concatenates modules into main.dm
 │   └── test_lexer.dm      # Lexer standalone test
 ├── stdlib/                # Standard library modules
@@ -64,6 +65,11 @@ dAImond-lang/
 │   ├── arithmetic.dm      # Basic math operations
 │   ├── fibonacci.dm       # Recursive functions
 │   └── calculator.dm      # Full scientific calculator demo
+├── docs/                  # Design documents
+│   ├── ir-spec.md         # dAImond IR specification (SSA-based, typed)
+│   └── llvm-backend.md    # Stage 3 LLVM backend architecture
+├── stage3/                # Stage 3 LLVM backend (planned)
+│   └── src/               # Placeholder for LLVM backend source
 └── tests/                 # Integration test programs (.dm files)
     ├── arithmetic.dm      # Arithmetic validation
     ├── structs.dm         # Struct/enum/pattern matching tests
@@ -136,7 +142,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 205 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 233 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -269,7 +275,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Error diagnostics with colored output
 - C runtime library (strings, arenas, option/result, I/O, networking sockets, threading)
 - CLI with commands: compile, run, lex, parse, check, fmt, test, pkg
-- Integration test harness (205 pass, 0 fail, 0 skipped)
+- Integration test harness (233 pass, 0 fail, 0 skipped)
 - Map[K,V] type with full method support (insert, get, contains, remove, len, keys, values, set, indexing)
 - Map iteration via for-in loops (iterates over map keys using runtime entry scanning)
 - String split returning List[string]
@@ -300,11 +306,16 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - `daimond pkg` package manager (init, add, list; TOML manifest; version/path/git dependencies)
 - Package registry support (version dependencies resolved via HTTP download from configurable registry URL)
 - LSP server (`daimond-lsp`) for IDE integration (diagnostics, completion, hover)
-- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete with verified fixed-point. Split into ~10 modules. Full feature parity with Stage 0 subset: enum payloads, Option/Result, match expressions (including bare Ok/Err/Some/None patterns), multi-file imports, lambdas, generic monomorphization, pipeline operator `|>`, error propagation `?`, Box[T] support, compound assignment operators (`+=`, `-=`, `*=`, `/=`), modulo `%`, all builtins (including `eprint`, `parse_float`, `string_to_upper`, `string_to_lower`), CLI flag parity (`-o`, `-c`, `--emit-c`, `-v`, `--version`, `-h`), nested for-loop support, for-loop element type inference, traits (static dispatch via mangled names, `trait`/`impl` blocks), effects (`with [IO, Console, ...]` annotations parsed and skipped), regions (`region name { ... }` blocks with arena allocation/cleanup). Hardened: monomorphization propagates all counters/state, type inference covers all builtin return types, runtime uses safe `strtoll` parsing with overflow protection, pipeline operator uses balanced-paren matching.
+- Division-by-zero runtime protection (all `/` and `%` operations emit safe helpers that panic on zero divisor)
+- List bounds checking (index access emits `dm_bounds_check()` that panics with informative message on out-of-bounds)
+- Arena OOM panic (`dm_arena_alloc_aligned()` panics instead of returning NULL on allocation failure)
+- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete with verified fixed-point. Split into ~11 modules. Full feature parity with Stage 0 subset: enum payloads, Option/Result, match expressions (including bare Ok/Err/Some/None patterns), multi-file imports, lambdas, generic monomorphization, pipeline operator `|>`, error propagation `?`, Box[T] support, compound assignment operators (`+=`, `-=`, `*=`, `/=`), modulo `%`, all builtins (including `eprint`, `parse_float`, `string_to_upper`, `string_to_lower`), full CLI commands (lex, parse, check, fmt, test, compile, run, pkg init/add/list, clean), nested for-loop support, for-loop element type inference, traits (static dispatch via mangled names, `trait`/`impl` blocks), effect enforcement (builtin-to-effect mapping with subset checking in `with [...]` declarations), regions with allocation redirection (`region name { ... }` blocks with arena allocation/cleanup and string concat redirected to arena), package management (TOML manifest parsing, pkg init/add/list). Hardened: monomorphization propagates all counters/state, type inference covers all builtin return types, runtime uses safe `strtoll` parsing with overflow protection, pipeline operator uses balanced-paren matching.
+- Stage 3 LLVM backend — IR specification and architecture documents complete (`docs/ir-spec.md`, `docs/llvm-backend.md`), directory structure created
 
 ### Not Yet Implemented
-- LLVM backend (Stage 3)
+- LLVM backend implementation (Stage 3) — IR spec and architecture documented in `docs/ir-spec.md` and `docs/llvm-backend.md`
 - True stackless coroutines for async/await (Phase B Full — Phase B Lite with linear state machines is implemented)
+- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0)
 
 ## Documentation Maintenance
 
@@ -457,6 +468,10 @@ The following issues from earlier versions are now resolved:
 - **Stdlib name collisions** — `import std.os`, `import std.fs`, `import std.collections` no longer produce C compilation errors from conflicting `extern fn` declarations
 - **Extern string wrapper** — `extern fn getenv(name: string) -> string` now generates a static wrapper that converts between `dm_string` and `const char*`, avoiding C type conflicts with system headers
 - **Monomorphization forward declarations** — nested generic calls (e.g., `apply_double[T]` calling `double[T]`) now emit forward declarations before implementations via writer splicing, preventing implicit function declaration errors in C
+- **fs.dm infinite recursion** — stdlib filesystem wrapper functions renamed to avoid shadowing builtins (e.g., `fs_mkdir` -> `mkdir`, `fs_readdir` -> `readdir`, `fs_remove` -> `remove_file`)
+- **Division/modulo undefined behavior on zero divisor** — all `/` and `%` operations now emit safe helpers (`dm_safe_div`, `dm_safe_mod`, etc.) that runtime-check for zero and panic with clear error message
+- **Arena allocation silent NULL on OOM** — `dm_arena_alloc_aligned()` now panics instead of silently returning NULL when out of memory
+- **Unsupported pattern type silent comment in codegen** — unsupported pattern types in let bindings now return `error.CodegenFailed` instead of silently emitting a comment
 
 ## Stage 1 Compiler Architecture
 
@@ -480,6 +495,7 @@ compile_match.dm   → compiler          — Match expressions and statements
 compile_decl.dm    → compiler          — Function/struct/enum/impl declarations, prescan
 runtime.dm         → compiler          — C runtime emission, output assembly
 imports.dm         (no imports)        — Multi-file import resolver
+package.dm         (no imports)        — Package manager (TOML manifest, pkg commands)
 main_split.dm      → all of the above  — Entry point with main()
 ```
 
@@ -505,9 +521,11 @@ Cross-module function calls (e.g., compile_stmt calls compile_expr) work because
 - **All builtins**: `print`, `println`, `eprint`, `eprintln`, `panic`, `exit`, `len`, `char_at`, `substr`, `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_replace`, `string_trim`, `string_to_upper`, `string_to_lower`, `file_read`, `file_write`, `args_get`, `args_len`, `system`, `Box_new`, `Box_null`
 - **CLI flags**: `-o`, `-c`, `--emit-c`, `-v`/`--verbose`, `--version`, `-h`/`--help`, `run`, `compile` commands
 - **Traits**: `trait Name { fn method(self) -> Type }` and `impl TraitName for TypeName { ... }` with static dispatch via mangled C function names (e.g., `dm_TypeName_method`)
-- **Effects**: `with [IO, Console, ...]` annotations on function signatures are parsed and silently skipped (no enforcement in Stage 1; enforcement is in Stage 0's checker)
-- **Regions**: `region name { ... }` blocks generate `dm_arena_create(4096)` / `dm_arena_destroy()` calls. Arena struct and functions emitted inline in Stage 1's runtime. Nested regions supported with unique arena names.
-- **Not yet supported in Stage 1**: dynamic dispatch (`dyn Trait`), effect enforcement, region allocation redirection (deferred to Stage 2)
+- **Effects**: `with [IO, Console, FileSystem, Process]` annotations on function signatures are enforced — builtins are mapped to required effects (`println`→Console, `file_read`→FileSystem, `exit`→Process, etc.) and callers without the required effect in their `with [...]` clause get a compile error
+- **Regions**: `region name { ... }` blocks generate `dm_arena_create(4096)` / `dm_arena_destroy()` calls with allocation redirection — string concatenation within a region uses `dm_string_concat_arena` to allocate from the arena. Arena struct and functions emitted inline in Stage 1's runtime. Nested regions supported with unique arena names.
+- **Package management**: `pkg init` (create daimond.toml), `pkg add <name>` (add dependency), `pkg list` (list dependencies). TOML manifest parsing with version/path/git dependency support.
+- **CLI commands**: `lex`, `parse`, `check`, `fmt`, `test`, `compile`, `run`, `pkg init/add/list`, `clean` — full command parity with Stage 0
+- **Not yet supported in Stage 1**: dynamic dispatch (`dyn Trait`)
 
 ### Building Stage 1
 ```bash

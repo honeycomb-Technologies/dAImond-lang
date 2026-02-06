@@ -46,6 +46,12 @@ fn thread_mutex_destroy(m: int) {
     mutex_destroy(m)
 }
 
+-- Spawn a new thread running a function
+-- Returns a thread handle (integer)
+fn thread_run(func: fn() -> void) -> int {
+    return thread_spawn(func)
+}
+
 -- Wait for a thread to finish
 fn thread_wait(t: int) {
     thread_join(t)

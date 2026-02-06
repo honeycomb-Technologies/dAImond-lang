@@ -2391,14 +2391,14 @@ pub const option_result_tests = [_]TestCase{
             \\
             \\fn main() {
             \\    let r1 = safe_div(10, 2)
-            \\    if r1.is_ok {
-            \\        println(int_to_string(r1.ok))
+            \\    match r1 {
+            \\        Ok(v) => println(int_to_string(v))
+            \\        _ => println("error")
             \\    }
             \\    let r2 = safe_div(10, 0)
-            \\    if r2.is_ok {
-            \\        println("should not print")
-            \\    } else {
-            \\        println(r2.err)
+            \\    match r2 {
+            \\        Err(e) => println(e)
+            \\        _ => println("should not print")
             \\    }
             \\}
         ,
@@ -3957,6 +3957,392 @@ pub const array_size_tests = [_]TestCase{
     },
 };
 
+// Filesystem Builtin Tests
+pub const fs_builtin_tests = [_]TestCase{
+    .{
+        .name = "fs_getcwd",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let cwd = fs_getcwd()
+            \\    if len(cwd) > 0 {
+            \\        println("got cwd")
+            \\    }
+            \\}
+        ,
+        .expected_output = "got cwd\n",
+    },
+    .{
+        .name = "fs_mkdir_and_remove",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let r1 = fs_mkdir("/tmp/dm_test_fs_mkdir")
+            \\    println(int_to_string(r1))
+            \\    let r2 = fs_remove("/tmp/dm_test_fs_mkdir")
+            \\    println(int_to_string(r2))
+            \\}
+        ,
+        .expected_output = "0\n0\n",
+    },
+    .{
+        .name = "fs_readdir",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let r1 = fs_mkdir("/tmp/dm_test_fs_readdir")
+            \\    file_write("/tmp/dm_test_fs_readdir/a.txt", "aaa")
+            \\    let entries = fs_readdir("/tmp/dm_test_fs_readdir")
+            \\    println(entries)
+            \\    let r2 = fs_remove("/tmp/dm_test_fs_readdir/a.txt")
+            \\    let r3 = fs_remove("/tmp/dm_test_fs_readdir")
+            \\}
+        ,
+        .expected_output = "a.txt\n",
+    },
+    .{
+        .name = "fs_rename",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let r0 = fs_mkdir("/tmp/dm_test_fs_rename")
+            \\    file_write("/tmp/dm_test_fs_rename/old.txt", "data")
+            \\    let r = fs_rename("/tmp/dm_test_fs_rename/old.txt", "/tmp/dm_test_fs_rename/new.txt")
+            \\    println(int_to_string(r))
+            \\    let exists = file_exists("/tmp/dm_test_fs_rename/new.txt")
+            \\    println(bool_to_string(exists))
+            \\    let r2 = fs_remove("/tmp/dm_test_fs_rename/new.txt")
+            \\    let r3 = fs_remove("/tmp/dm_test_fs_rename")
+            \\}
+        ,
+        .expected_output = "0\ntrue\n",
+    },
+};
+
+pub const div_safety_tests = [_]TestCase{
+    .{
+        .name = "normal_int_division",
+        .source =
+            \\fn main() {
+            \\    let x = 10 / 3
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "3\n",
+    },
+    .{
+        .name = "normal_int_modulo",
+        .source =
+            \\fn main() {
+            \\    let x = 10 % 3
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "1\n",
+    },
+    .{
+        .name = "normal_float_division",
+        .source =
+            \\fn main() {
+            \\    let x = 10.0 / 4.0
+            \\    println(float_to_string(x))
+            \\}
+        ,
+        .expected_output = "2.5\n",
+    },
+    .{
+        .name = "int_division_by_zero_panics",
+        .source =
+            \\fn main() {
+            \\    let x = 10 / 0
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "int_modulo_by_zero_panics",
+        .source =
+            \\fn main() {
+            \\    let x = 10 % 0
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "float_division_by_zero_panics",
+        .source =
+            \\fn main() {
+            \\    let x = 10.0 / 0.0
+            \\    println(float_to_string(x))
+            \\}
+        ,
+        .expected_output = "",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "division_by_variable_zero_panics",
+        .source =
+            \\fn main() {
+            \\    let y = 0
+            \\    let x = 42 / y
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "division_in_expression",
+        .source =
+            \\fn main() {
+            \\    let a = 100
+            \\    let b = 5
+            \\    let c = a / b + 3
+            \\    println(int_to_string(c))
+            \\}
+        ,
+        .expected_output = "23\n",
+    },
+};
+
+pub const bounds_check_tests = [_]TestCase{
+    .{
+        .name = "list_normal_access",
+        .source =
+            \\fn main() {
+            \\    let mut l: List[int] = []
+            \\    l.push(10)
+            \\    l.push(20)
+            \\    l.push(30)
+            \\    println(int_to_string(l[0]))
+            \\    println(int_to_string(l[2]))
+            \\}
+        ,
+        .expected_output = "10\n30\n",
+    },
+    .{
+        .name = "list_out_of_bounds_panics",
+        .source =
+            \\fn main() {
+            \\    let mut l: List[int] = []
+            \\    l.push(10)
+            \\    let x = l[5]
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "list_negative_index_panics",
+        .source =
+            \\fn main() {
+            \\    let mut l: List[int] = []
+            \\    l.push(10)
+            \\    let x = l[-1]
+            \\    println(int_to_string(x))
+            \\}
+        ,
+        .expected_output = "",
+        .expected_exit_code = 1,
+    },
+};
+
+pub const numeric_cast_tests = [_]TestCase{
+    .{
+        .name = "cast_int_to_i32",
+        .source =
+            \\fn main() {
+            \\    let x: int = 42
+            \\    let y = x as i32
+            \\    println(int_to_string(y as int))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "cast_int_to_f64",
+        .source =
+            \\fn main() {
+            \\    let x: int = 10
+            \\    let y = x as f64
+            \\    let z = y + 0.5
+            \\    println(float_to_string(z))
+            \\}
+        ,
+        .expected_output = "10.5\n",
+    },
+    .{
+        .name = "cast_f64_to_int",
+        .source =
+            \\fn main() {
+            \\    let x: float = 3.7
+            \\    let y = x as int
+            \\    println(int_to_string(y))
+            \\}
+        ,
+        .expected_output = "3\n",
+    },
+    .{
+        .name = "cast_u8_to_int",
+        .source =
+            \\fn main() {
+            \\    let x: u8 = 255
+            \\    let y = x as int
+            \\    println(int_to_string(y))
+            \\}
+        ,
+        .expected_output = "255\n",
+    },
+};
+
+pub const string_edge_tests = [_]TestCase{
+    .{
+        .name = "empty_string_length",
+        .source =
+            \\fn main() {
+            \\    let s = ""
+            \\    println(int_to_string(len(s)))
+            \\}
+        ,
+        .expected_output = "0\n",
+    },
+    .{
+        .name = "empty_string_concat",
+        .source =
+            \\fn main() {
+            \\    let s = "" + "hello" + ""
+            \\    println(s)
+            \\}
+        ,
+        .expected_output = "hello\n",
+    },
+    .{
+        .name = "string_equality_empty",
+        .source =
+            \\fn main() {
+            \\    let a = ""
+            \\    let b = ""
+            \\    println(bool_to_string(a == b))
+            \\}
+        ,
+        .expected_output = "true\n",
+    },
+    .{
+        .name = "string_comparison",
+        .source =
+            \\fn main() {
+            \\    println(bool_to_string("abc" < "abd"))
+            \\    println(bool_to_string("xyz" > "abc"))
+            \\}
+        ,
+        .expected_output = "true\ntrue\n",
+    },
+};
+
+pub const nested_generic_tests = [_]TestCase{
+    .{
+        .name = "list_of_lists",
+        .source =
+            \\fn main() {
+            \\    let mut outer: List[List[int]] = []
+            \\    let mut inner1: List[int] = []
+            \\    inner1.push(1)
+            \\    inner1.push(2)
+            \\    let mut inner2: List[int] = []
+            \\    inner2.push(3)
+            \\    inner2.push(4)
+            \\    outer.push(inner1)
+            \\    outer.push(inner2)
+            \\    println(int_to_string(outer[0][0]))
+            \\    println(int_to_string(outer[1][1]))
+            \\}
+        ,
+        .expected_output = "1\n4\n",
+    },
+    .{
+        .name = "option_of_int",
+        .source =
+            \\fn main() {
+            \\    let x: Option[int] = Some(42)
+            \\    match x {
+            \\        Some(v) => println(int_to_string(v)),
+            \\        None => println("none")
+            \\    }
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+};
+
+pub const region_extended_tests = [_]TestCase{
+    .{
+        .name = "nested_regions",
+        .source =
+            \\fn main() {
+            \\    region outer {
+            \\        println("outer start")
+            \\        region inner {
+            \\            println("inner")
+            \\        }
+            \\        println("outer end")
+            \\    }
+            \\    println("done")
+            \\}
+        ,
+        .expected_output = "outer start\ninner\nouter end\ndone\n",
+    },
+};
+
+pub const closure_extended_tests = [_]TestCase{
+    .{
+        .name = "closure_captures_int_and_string",
+        .source =
+            \\fn main() {
+            \\    let prefix = "num: "
+            \\    let offset = 100
+            \\    let f = |x: int| -> string { return prefix + int_to_string(x + offset) }
+            \\    println(f(5))
+            \\    println(f(10))
+            \\}
+        ,
+        .expected_output = "num: 105\nnum: 110\n",
+    },
+};
+
+pub const op_overload_extended_tests = [_]TestCase{
+    .{
+        .name = "overload_sub_mul",
+        .source =
+            \\struct Vec2 {
+            \\    x: float,
+            \\    y: float
+            \\}
+            \\impl Vec2 {
+            \\    fn sub(self, other: Vec2) -> Vec2 {
+            \\        return Vec2 { x: self.x - other.x, y: self.y - other.y }
+            \\    }
+            \\}
+            \\fn main() {
+            \\    let a = Vec2 { x: 5.0, y: 3.0 }
+            \\    let b = Vec2 { x: 2.0, y: 1.0 }
+            \\    let c = a - b
+            \\    println(float_to_string(c.x))
+            \\    println(float_to_string(c.y))
+            \\}
+        ,
+        .expected_output = "3\n2\n",
+    },
+};
+
 pub const comprehensive_test = [_]TestCase{
     .{
         .name = "stage1_comprehensive",
@@ -3997,7 +4383,7 @@ pub const comprehensive_test = [_]TestCase{
             \\    }
             \\
             \\    -- List method calls
-            \\    let mut items: List[int] = List_new()
+            \\    let mut items: List[int] = []
             \\    items.push(10)
             \\    items.push(20)
             \\    println(int_to_string(items.len()))
@@ -4006,7 +4392,7 @@ pub const comprehensive_test = [_]TestCase{
             \\    println(int_to_string(apply(double, 21)))
             \\
             \\    -- String utils
-            \\    let n = string_to_int("42")
+            \\    let n = parse_int("42")
             \\    println(int_to_string(n))
             \\
             \\    let trimmed = string_trim("  hello  ")
@@ -4087,6 +4473,15 @@ pub fn main() !void {
         .{ .name = "Async/Await", .tests = &async_await_tests },
         .{ .name = "Async Phase B", .tests = &async_phase_b_tests },
         .{ .name = "Array Sizes", .tests = &array_size_tests },
+        .{ .name = "FS Builtins", .tests = &fs_builtin_tests },
+        .{ .name = "Division Safety", .tests = &div_safety_tests },
+        .{ .name = "Bounds Checking", .tests = &bounds_check_tests },
+        .{ .name = "Numeric Casts Extended", .tests = &numeric_cast_tests },
+        .{ .name = "String Edge Cases", .tests = &string_edge_tests },
+        .{ .name = "Nested Generics", .tests = &nested_generic_tests },
+        .{ .name = "Regions Extended", .tests = &region_extended_tests },
+        .{ .name = "Closures Extended", .tests = &closure_extended_tests },
+        .{ .name = "Op Overload Extended", .tests = &op_overload_extended_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
     };
 

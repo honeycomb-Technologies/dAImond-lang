@@ -30,3 +30,8 @@ fn io_file_read(path: string) -> string {
 fn io_file_write(path: string, content: string) {
     file_write(path, content)
 }
+
+-- Read a line from stdin
+fn io_read_line() -> string {
+    return read_line()
+}

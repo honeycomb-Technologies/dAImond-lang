@@ -70,14 +70,26 @@ fn compile_fn_decl(c: Compiler) -> Compiler {
         ret_type = rt.code
     }
 
-    -- Skip optional effect annotation: with [IO, Console, ...]
+    -- Parse optional effect annotation: with [IO, Console, ...]
+    let mut fn_effects = ""
+    let mut fn_has_effects = false
     if c_peek(cc) == TK_WITH() {
         cc = c_advance(cc)
         cc = c_expect(cc, TK_LBRACKET())
         while c_peek(cc) != TK_RBRACKET() and c_peek(cc) != TK_EOF() {
+            let effect_tok = c_cur(cc)
+            if effect_tok.kind == TK_IDENT() {
+                fn_effects = fn_effects + "|" + effect_tok.value + "|"
+            }
             cc = c_advance(cc)
         }
         cc = c_expect(cc, TK_RBRACKET())
+        fn_has_effects = true
+    }
+
+    -- If this is an async fn, extract inner type from dm_future_T return type
+    if cc.current_fn_is_async and starts_with(ret_type, "dm_future_") {
+        cc.current_fn_async_inner_type = substr(ret_type, 10, len(ret_type) - 10)
     }
 
     -- Generate function signature
@@ -97,15 +109,21 @@ fn compile_fn_decl(c: Compiler) -> Compiler {
     -- Save and reset output for body
     let saved_output = cc.output
     let saved_fn_ret = cc.current_fn_ret_type
+    let saved_fn_effects = cc.current_fn_effects
+    let saved_fn_has_effects = cc.current_fn_has_effects
     cc.output = ""
     cc.indent = 1
     cc.current_fn_ret_type = ret_type
+    cc.current_fn_effects = fn_effects
+    cc.current_fn_has_effects = fn_has_effects
     cc = compile_block_body(cc)
     cc = c_expect(cc, TK_RBRACE())
     body_out = body_out + cc.output + "}\n\n"
     cc.output = saved_output
     cc.indent = 0
     cc.current_fn_ret_type = saved_fn_ret
+    cc.current_fn_effects = saved_fn_effects
+    cc.current_fn_has_effects = saved_fn_has_effects
     cc.fn_defs.push(body_out)
 
     return cc
@@ -604,14 +622,21 @@ fn compile_impl_method(c: Compiler, type_name: string) -> Compiler {
         ret_type = rt.code
     }
 
-    -- Skip optional effect annotation: with [IO, Console, ...]
+    -- Parse optional effect annotation: with [IO, Console, ...]
+    let mut method_effects = ""
+    let mut method_has_effects = false
     if c_peek(cc) == TK_WITH() {
         cc = c_advance(cc)
         cc = c_expect(cc, TK_LBRACKET())
         while c_peek(cc) != TK_RBRACKET() and c_peek(cc) != TK_EOF() {
+            let effect_tok = c_cur(cc)
+            if effect_tok.kind == TK_IDENT() {
+                method_effects = method_effects + "|" + effect_tok.value + "|"
+            }
             cc = c_advance(cc)
         }
         cc = c_expect(cc, TK_RBRACKET())
+        method_has_effects = true
     }
 
     -- Generate function signature with mangled name
@@ -631,16 +656,221 @@ fn compile_impl_method(c: Compiler, type_name: string) -> Compiler {
     -- Save and reset output for body
     let saved_output = cc.output
     let saved_fn_ret = cc.current_fn_ret_type
+    let saved_method_effects = cc.current_fn_effects
+    let saved_method_has_effects = cc.current_fn_has_effects
     cc.output = ""
     cc.indent = 1
     cc.current_fn_ret_type = ret_type
+    cc.current_fn_effects = method_effects
+    cc.current_fn_has_effects = method_has_effects
     cc = compile_block_body(cc)
     cc = c_expect(cc, TK_RBRACE())
     body_out = body_out + cc.output + "}\n\n"
     cc.output = saved_output
     cc.indent = 0
     cc.current_fn_ret_type = saved_fn_ret
+    cc.current_fn_effects = saved_method_effects
+    cc.current_fn_has_effects = saved_method_has_effects
     cc.fn_defs.push(body_out)
+
+    return cc
+}
+
+fn compile_extern_fn_decl(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'extern'
+    cc = c_advance(cc)  -- skip 'fn'
+    let name_tok = c_cur(cc)
+    let fn_name = name_tok.value
+    cc = c_advance(cc)
+
+    -- Parse parameters
+    cc = c_expect(cc, TK_LPAREN())
+    let mut param_names: List[string] = []
+    let mut param_types: List[string] = []
+    let mut first = true
+    while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+        if first == false {
+            cc = c_expect(cc, TK_COMMA())
+        }
+        first = false
+        let pname_tok = c_cur(cc)
+        cc = c_advance(cc)
+        cc = c_expect(cc, TK_COLON())
+        let pt = parse_type_for_c(cc)
+        cc = pt.c
+        param_names.push(pname_tok.value)
+        param_types.push(pt.code)
+    }
+    cc = c_expect(cc, TK_RPAREN())
+
+    -- Return type
+    let mut ret_type = "void"
+    if c_peek(cc) == TK_ARROW() {
+        cc = c_advance(cc)
+        let rt = parse_type_for_c(cc)
+        cc = rt.c
+        ret_type = rt.code
+    }
+
+    -- Check if any params or return type involve dm_string
+    let mut needs_string_wrapper = false
+    if ret_type == "dm_string" { needs_string_wrapper = true }
+    let mut pi = 0
+    while pi < param_types.len() {
+        let pt = "" + param_types[pi]
+        if pt == "dm_string" { needs_string_wrapper = true }
+        pi = pi + 1
+    }
+
+    if needs_string_wrapper {
+        -- String-typed extern: emit C extern with native types and wrapper with dm_string conversion
+        let mut c_params = ""
+        let mut wrapper_call_args = ""
+        let mut wrapper_params = ""
+        let mut fi = 0
+        while fi < param_types.len() {
+            if fi > 0 {
+                c_params = c_params + ", "
+                wrapper_call_args = wrapper_call_args + ", "
+                wrapper_params = wrapper_params + ", "
+            }
+            let pt = "" + param_types[fi]
+            let pn = "" + param_names[fi]
+            if pt == "dm_string" {
+                c_params = c_params + "const char*"
+                wrapper_params = wrapper_params + "dm_string " + dm_mangle(pn)
+                wrapper_call_args = wrapper_call_args + dm_mangle(pn) + ".data"
+            } else {
+                c_params = c_params + pt
+                wrapper_params = wrapper_params + pt + " " + dm_mangle(pn)
+                wrapper_call_args = wrapper_call_args + dm_mangle(pn)
+            }
+            fi = fi + 1
+        }
+
+        let mut c_ret_native = ret_type
+        if c_ret_native == "dm_string" { c_ret_native = "const char*" }
+
+        -- Build wrapper function
+        let mut wrapper = "static " + ret_type + " " + dm_mangle(fn_name) + "(" + wrapper_params + ") {\n"
+        if ret_type == "dm_string" {
+            wrapper = wrapper + "    const char* __ret = " + fn_name + "(" + wrapper_call_args + ");\n"
+            wrapper = wrapper + "    return __ret ? dm_string_from_cstr(__ret) : dm_string_from_cstr(\"\");\n"
+        } else if ret_type == "void" {
+            wrapper = wrapper + "    " + fn_name + "(" + wrapper_call_args + ");\n"
+        } else {
+            wrapper = wrapper + "    return " + fn_name + "(" + wrapper_call_args + ");\n"
+        }
+        wrapper = wrapper + "}\n\n"
+
+        -- We do NOT emit an extern declaration for string-typed externs because the
+        -- real C function may already be declared in system headers (e.g., getenv in <stdlib.h>)
+        -- and re-declaring with different types would cause C compilation errors.
+        -- The function is expected to be available at link time.
+        cc.fn_defs.push(wrapper)
+        let _x1 = 0
+    } else {
+        -- Non-string extern: generate a simple dm_ wrapper that forwards to the real C function
+        -- We do NOT emit an extern declaration because the function may already be declared
+        -- in system headers (e.g., abs in <stdlib.h>) with different parameter types
+        -- (C uses int, dAImond maps int to int64_t). The function will be resolved at link time.
+        let mut wrapper_params = ""
+        let mut call_args = ""
+        let mut fi = 0
+        while fi < param_types.len() {
+            if fi > 0 {
+                wrapper_params = wrapper_params + ", "
+                call_args = call_args + ", "
+            }
+            let pt = "" + param_types[fi]
+            let pn = "" + param_names[fi]
+            wrapper_params = wrapper_params + pt + " " + dm_mangle(pn)
+            call_args = call_args + dm_mangle(pn)
+            fi = fi + 1
+        }
+
+        -- Generate dm_ wrapper that forwards to the real C function
+        let mut wp = wrapper_params
+        if wp == "" { wp = "void" }
+        let mut wrapper = "static " + ret_type + " " + dm_mangle(fn_name) + "(" + wp + ") {\n"
+        if ret_type == "void" {
+            wrapper = wrapper + "    " + fn_name + "(" + call_args + ");\n"
+        } else {
+            wrapper = wrapper + "    return " + fn_name + "(" + call_args + ");\n"
+        }
+        wrapper = wrapper + "}\n\n"
+        cc.fn_defs.push(wrapper)
+        let _x2 = 0
+    }
+
+    -- Register function name and return type
+    cc.fn_names.push(fn_name)
+    cc.fn_ret_types.push(ret_type)
+
+    return cc
+}
+
+fn compile_async_fn_decl(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'async'
+    -- The next token should be 'fn'
+    if c_peek(cc) != TK_FN() {
+        cc = c_error(cc, "expected 'fn' after 'async'")
+        return cc
+    }
+    -- Set async flag before compiling function
+    let saved_is_async = cc.current_fn_is_async
+    let saved_async_inner = cc.current_fn_async_inner_type
+    cc.current_fn_is_async = true
+    cc.current_fn_async_inner_type = ""
+    cc = compile_fn_decl(cc)
+    -- Restore
+    cc.current_fn_is_async = saved_is_async
+    cc.current_fn_async_inner_type = saved_async_inner
+    return cc
+}
+
+fn compile_const_decl(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'const'
+    let name_tok = c_cur(cc)
+    let var_name = name_tok.value
+    cc = c_advance(cc)
+
+    -- Optional type annotation
+    let mut type_str = ""
+    if c_peek(cc) == TK_COLON() {
+        cc = c_advance(cc)
+        let tr = parse_type_for_c(cc)
+        cc = tr.c
+        type_str = tr.code
+    }
+
+    cc = c_expect(cc, TK_EQ())
+
+    if c_peek(cc) == TK_COMPTIME() {
+        cc = c_advance(cc)  -- skip 'comptime'
+        let val = eval_comptime_expr(cc)
+        cc = val.c
+        if type_str == "" {
+            if val.code == "true" or val.code == "false" {
+                type_str = "bool"
+            } else if string_contains(val.code, ".") {
+                type_str = "double"
+            } else {
+                type_str = "int64_t"
+            }
+        }
+        cc.fn_defs.push("static const " + type_str + " " + dm_mangle(var_name) + " = " + val.code + ";\n")
+        cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    } else {
+        -- Regular const (non-comptime): compile expression normally
+        let val = compile_expr(cc)
+        cc = val.c
+        if type_str == "" {
+            type_str = infer_type_from_code(val.code, cc)
+        }
+        cc.fn_defs.push("static const " + type_str + " " + dm_mangle(var_name) + " = " + val.code + ";\n")
+        cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    }
 
     return cc
 }
@@ -663,28 +893,193 @@ fn prescan_declarations(c: Compiler) -> Compiler {
     let mut i = 0
     while i < cc.tokens.len() {
         let tok = cc.tokens[i]
+        -- Prescan extern fn declarations
+        if tok.kind == TK_EXTERN() and i + 2 < cc.tokens.len() {
+            let next_tok = cc.tokens[i + 1]
+            if next_tok.kind == TK_FN() {
+                let ename_tok = cc.tokens[i + 2]
+                if ename_tok.kind == TK_IDENT() {
+                    let efn_name = ename_tok.value
+                    -- Find return type by scanning for -> after )
+                    let mut ej = i + 3
+                    let mut edepth = 0
+                    while ej < cc.tokens.len() {
+                        let et = cc.tokens[ej]
+                        if et.kind == TK_LPAREN() { edepth = edepth + 1 }
+                        if et.kind == TK_RPAREN() {
+                            edepth = edepth - 1
+                            if edepth == 0 {
+                                ej = ej + 1
+                                break
+                            }
+                        }
+                        ej = ej + 1
+                    }
+                    let mut eret_type = "void"
+                    if ej < cc.tokens.len() {
+                        let earrow_tok = cc.tokens[ej]
+                        if earrow_tok.kind == TK_ARROW() {
+                            ej = ej + 1
+                            if ej < cc.tokens.len() {
+                                let eret_tok = cc.tokens[ej]
+                                if eret_tok.kind == TK_IDENT() {
+                                    let eret_name = eret_tok.value
+                                    if ej + 2 < cc.tokens.len() {
+                                        let emaybe_bracket = cc.tokens[ej + 1]
+                                        if emaybe_bracket.kind == TK_LBRACKET() {
+                                            let einner_tok = cc.tokens[ej + 2]
+                                            if einner_tok.kind == TK_IDENT() {
+                                                let einner_c = map_dm_type(einner_tok.value)
+                                                if eret_name == "List" {
+                                                    eret_type = "dm_list_" + einner_c
+                                                } else if eret_name == "Box" {
+                                                    eret_type = einner_c + "*"
+                                                } else if eret_name == "Option" {
+                                                    eret_type = "dm_option_" + einner_c
+                                                } else if eret_name == "Result" {
+                                                    let mut esecond_c = "dm_string"
+                                                    if ej + 4 < cc.tokens.len() {
+                                                        let emaybe_comma = cc.tokens[ej + 3]
+                                                        if emaybe_comma.kind == TK_COMMA() {
+                                                            let esecond_tok = cc.tokens[ej + 4]
+                                                            if esecond_tok.kind == TK_IDENT() {
+                                                                esecond_c = map_dm_type(esecond_tok.value)
+                                                            }
+                                                        }
+                                                    }
+                                                    eret_type = "dm_result_" + einner_c + "_" + esecond_c
+                                                } else {
+                                                    eret_type = "dm_" + eret_name + "_" + einner_c
+                                                }
+                                            } else {
+                                                eret_type = map_dm_type(eret_name)
+                                            }
+                                        } else {
+                                            eret_type = map_dm_type(eret_name)
+                                        }
+                                    } else {
+                                        eret_type = map_dm_type(eret_name)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cc.fn_names.push(efn_name)
+                    cc.fn_ret_types.push(eret_type)
+                }
+            }
+        }
+        -- Prescan async fn declarations: treat 'async fn' like 'fn' with offset+1
+        if tok.kind == TK_ASYNC() and i + 2 < cc.tokens.len() {
+            let next_tok = cc.tokens[i + 1]
+            if next_tok.kind == TK_FN() {
+                let aname_tok = cc.tokens[i + 2]
+                if aname_tok.kind == TK_IDENT() {
+                    let afn_name = aname_tok.value
+                    -- Find return type by scanning for -> after )
+                    let mut aj = i + 3
+                    let mut adepth = 0
+                    while aj < cc.tokens.len() {
+                        let at = cc.tokens[aj]
+                        if at.kind == TK_LPAREN() { adepth = adepth + 1 }
+                        if at.kind == TK_RPAREN() {
+                            adepth = adepth - 1
+                            if adepth == 0 {
+                                aj = aj + 1
+                                break
+                            }
+                        }
+                        aj = aj + 1
+                    }
+                    let mut aret_type = "void"
+                    if aj < cc.tokens.len() {
+                        let aarrow_tok = cc.tokens[aj]
+                        if aarrow_tok.kind == TK_ARROW() {
+                            aj = aj + 1
+                            if aj < cc.tokens.len() {
+                                let aret_tok = cc.tokens[aj]
+                                if aret_tok.kind == TK_IDENT() {
+                                    let aret_name = aret_tok.value
+                                    if aj + 2 < cc.tokens.len() {
+                                        let amaybe_bracket = cc.tokens[aj + 1]
+                                        if amaybe_bracket.kind == TK_LBRACKET() {
+                                            let ainner_tok = cc.tokens[aj + 2]
+                                            if ainner_tok.kind == TK_IDENT() {
+                                                let ainner_c = map_dm_type(ainner_tok.value)
+                                                if aret_name == "Future" {
+                                                    aret_type = "dm_future_" + ainner_c
+                                                } else if aret_name == "List" {
+                                                    aret_type = "dm_list_" + ainner_c
+                                                } else if aret_name == "Box" {
+                                                    aret_type = ainner_c + "*"
+                                                } else if aret_name == "Option" {
+                                                    aret_type = "dm_option_" + ainner_c
+                                                } else {
+                                                    aret_type = "dm_" + aret_name + "_" + ainner_c
+                                                }
+                                            } else {
+                                                aret_type = map_dm_type(aret_name)
+                                            }
+                                        } else {
+                                            aret_type = map_dm_type(aret_name)
+                                        }
+                                    } else {
+                                        aret_type = map_dm_type(aret_name)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cc.fn_names.push(afn_name)
+                    cc.fn_ret_types.push(aret_type)
+                }
+            }
+        }
         if tok.kind == TK_FN() and i + 1 < cc.tokens.len() {
+            -- Skip if preceded by 'async' (already handled above)
+            let mut skip_fn = false
+            if i > 0 {
+                let prev_tok = cc.tokens[i - 1]
+                if prev_tok.kind == TK_ASYNC() {
+                    skip_fn = true
+                }
+            }
+            if skip_fn == false {
             let name_tok = cc.tokens[i + 1]
             if name_tok.kind == TK_IDENT() {
                 let fn_name = name_tok.value
 
-                -- Check for generic function: fn name[T](...)
+                -- Check for generic function: fn name[T](...) or fn name[T: Trait](...)
                 let mut is_generic = false
                 let mut type_params = ""
                 if i + 2 < cc.tokens.len() {
                     let maybe_bracket = cc.tokens[i + 2]
                     if maybe_bracket.kind == TK_LBRACKET() {
                         is_generic = true
-                        -- Collect type parameter names
+                        -- Collect type parameter names (skip trait bounds after colon)
                         let mut gj = i + 3
                         while gj < cc.tokens.len() and cc.tokens[gj].kind != TK_RBRACKET() {
                             if cc.tokens[gj].kind == TK_IDENT() {
+                                let tp_tok = cc.tokens[gj]
+                                let tp_name = tp_tok.value
                                 if type_params != "" {
                                     type_params = type_params + ","
                                 }
-                                type_params = type_params + cc.tokens[gj].value
+                                type_params = type_params + tp_name
+                                gj = gj + 1
+                                -- Check for trait bound: T: TraitName
+                                if gj < cc.tokens.len() and cc.tokens[gj].kind == TK_COLON() {
+                                    gj = gj + 1  -- skip ':'
+                                    if gj < cc.tokens.len() and cc.tokens[gj].kind == TK_IDENT() {
+                                        let bound_tok = cc.tokens[gj]
+                                        let bound_name = bound_tok.value
+                                        cc.generic_bounds = cc.generic_bounds + "|" + fn_name + ":" + tp_name + "=" + bound_name + "|"
+                                        gj = gj + 1  -- skip trait name
+                                    }
+                                }
+                            } else {
+                                gj = gj + 1
                             }
-                            gj = gj + 1
                         }
                         -- Find end of function body (matching closing brace)
                         let mut body_j = gj
@@ -765,6 +1160,8 @@ fn prescan_declarations(c: Compiler) -> Compiler {
                                                     }
                                                 }
                                                 ret_type = "dm_result_" + inner_c + "_" + second_c
+                                            } else if ret_name == "Future" {
+                                                ret_type = "dm_future_" + inner_c
                                             } else {
                                                 ret_type = "dm_" + ret_name + "_" + inner_c
                                             }
@@ -794,6 +1191,7 @@ fn prescan_declarations(c: Compiler) -> Compiler {
                 }
                 cc.fn_names.push(fn_name)
                 cc.fn_ret_types.push(ret_type)
+            }
             }
         }
         if tok.kind == TK_STRUCT() and i + 1 < cc.tokens.len() {
@@ -964,6 +1362,12 @@ fn compile_source(c: Compiler) -> Compiler {
             cc = compile_impl_decl(cc)
         } else if k == TK_IMPORT() {
             cc = compile_import_decl(cc)
+        } else if k == TK_EXTERN() {
+            cc = compile_extern_fn_decl(cc)
+        } else if k == TK_CONST() {
+            cc = compile_const_decl(cc)
+        } else if k == TK_ASYNC() {
+            cc = compile_async_fn_decl(cc)
         } else if k == TK_NEWLINE() {
             cc = c_advance(cc)
         } else {

@@ -1,0 +1,47 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug dAImond Program",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/${input:programName}",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Load dAImond pretty-printers",
+                    "text": "-interpreter-exec console \"source ${workspaceFolder}/tools/daimond-gdb.py\"",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "Build dAImond Program (debug)"
+        },
+        {
+            "name": "Debug dAImond Program (LLDB)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/${input:programName}",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "Build dAImond Program (debug)"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "programName",
+            "type": "promptString",
+            "description": "Name of the compiled dAImond executable (without path)",
+            "default": "program"
+        }
+    ]
+}

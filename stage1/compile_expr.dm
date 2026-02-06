@@ -15,6 +15,63 @@ fn compile_expr(c: Compiler) -> ExprOut {
     return compile_pipe_expr(c)
 }
 
+-- Returns the required effect for a builtin function name, or "" if none needed
+fn get_builtin_effect(name: string) -> string {
+    -- Console effect: stdout/stderr output
+    if name == "println" { return "Console" }
+    if name == "print" { return "Console" }
+    if name == "eprintln" { return "Console" }
+    if name == "eprint" { return "Console" }
+    -- FileSystem effect: file I/O
+    if name == "file_read" { return "FileSystem" }
+    if name == "file_write" { return "FileSystem" }
+    if name == "file_append" { return "FileSystem" }
+    if name == "file_exists" { return "FileSystem" }
+    -- IO effect: stdin input
+    if name == "read_line" { return "IO" }
+    -- Process effect: system calls and exit
+    if name == "system" { return "Process" }
+    if name == "exit" { return "Process" }
+    -- No effect needed for all other builtins
+    return ""
+}
+
+-- Check if the current function's effect set allows the given effect
+fn check_effect_allowed(c: Compiler, builtin_name: string) -> Compiler {
+    let mut cc = c
+    if cc.current_fn_has_effects == false {
+        -- No with [...] clause on this function: no enforcement (opt-in)
+        return cc
+    }
+    let required = get_builtin_effect(builtin_name)
+    if required == "" {
+        -- This builtin has no effect requirement
+        return cc
+    }
+    -- Check if the required effect is in the current_fn_effects pipe-delimited string
+    let marker = "|" + required + "|"
+    if string_contains(cc.current_fn_effects, marker) {
+        return cc
+    }
+    -- Effect not allowed: report error and abort
+    -- Extract the allowed effects from the pipe-delimited string for error message
+    let effects_str = string_replace(cc.current_fn_effects, "|", ", ")
+    let trimmed = string_trim(effects_str)
+    let mut display = trimmed
+    if starts_with(display, ", ") {
+        display = substr(display, 2, len(display) - 2)
+    }
+    if ends_with(display, ", ") {
+        display = substr(display, 0, len(display) - 2)
+    }
+    if display == "" {
+        display = "(none)"
+    }
+    eprintln("Effect error: '" + builtin_name + "' requires '" + required + "' effect but function only allows [" + display + "]")
+    panic("")
+    return cc
+}
+
 -- Find the position of the outermost function call's opening paren.
 -- Returns -1 if the expression is not a function call.
 -- Skips past nested parens in the function name position (e.g. casts).
@@ -181,7 +238,11 @@ fn compile_add_expr(c: Compiler) -> ExprOut {
             let rhs = compile_mul_expr(result.c)
             result.c = rhs.c
             if code_is_string(result.code, result.c) or code_is_string(rhs.code, result.c) {
-                result.code = "dm_string_concat(" + result.code + ", " + rhs.code + ")"
+                if result.c.current_region_arena != "" {
+                    result.code = "dm_string_concat_arena(" + result.c.current_region_arena + ", " + result.code + ", " + rhs.code + ")"
+                } else {
+                    result.code = "dm_string_concat(" + result.code + ", " + rhs.code + ")"
+                }
             } else {
                 result.code = "(" + result.code + " + " + rhs.code + ")"
             }
@@ -308,8 +369,27 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                     args_code = args_code + arg.code
                 }
                 result.c = c_expect(result.c, TK_RPAREN())
+                -- Determine receiver type for map vs list dispatch
+                let recv_method_type = infer_type_from_code(result.code, result.c)
+                let is_map_recv = starts_with(recv_method_type, "dm_map_")
                 -- Generate method call
-                if field == "push" {
+                if field == "insert" and is_map_recv {
+                    result.code = recv_method_type + "_insert(&" + result.code + ", " + args_code + ")"
+                } else if field == "get" and is_map_recv {
+                    result.code = recv_method_type + "_get(&" + result.code + ", " + args_code + ")"
+                } else if field == "contains" and is_map_recv {
+                    result.code = recv_method_type + "_contains(&" + result.code + ", " + args_code + ")"
+                } else if field == "remove" and is_map_recv {
+                    result.code = recv_method_type + "_remove(&" + result.code + ", " + args_code + ")"
+                } else if field == "len" and is_map_recv {
+                    result.code = "(int64_t)(" + result.code + ").len"
+                } else if field == "keys" and is_map_recv {
+                    result.code = recv_method_type + "_keys(&" + result.code + ")"
+                } else if field == "values" and is_map_recv {
+                    result.code = recv_method_type + "_values(&" + result.code + ")"
+                } else if field == "set" and is_map_recv {
+                    result.code = recv_method_type + "_insert(&" + result.code + ", " + args_code + ")"
+                } else if field == "push" {
                     result.code = "DM_LIST_PUSH(" + result.code + ", (" + args_code + "))"
                 } else if field == "len" {
                     result.code = "DM_LIST_LEN(" + result.code + ")"
@@ -318,10 +398,20 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 } else if field == "contains" {
                     result.code = "DM_LIST_CONTAINS(" + result.code + ", " + args_code + ")"
                 } else {
-                    -- Check for impl method: look up the receiver's type and try TypeName_method
+                    -- Check for dyn trait dispatch: receiver type starts with dm_dyn_
                     let receiver_type = infer_type_from_code(result.code, result.c)
                     let mut found_impl = false
-                    if starts_with(receiver_type, "dm_") {
+                    if starts_with(receiver_type, "dm_dyn_") {
+                        found_impl = true
+                        -- Dispatch through vtable: dm_dyn_TraitName_method(receiver, args)
+                        if args_code != "" {
+                            result.code = receiver_type + "_" + field + "(" + result.code + ", " + args_code + ")"
+                        } else {
+                            result.code = receiver_type + "_" + field + "(" + result.code + ")"
+                        }
+                    }
+                    -- Check for impl method: look up the receiver's type and try TypeName_method
+                    if found_impl == false and starts_with(receiver_type, "dm_") {
                         let type_name = substr(receiver_type, 3, len(receiver_type) - 3)
                         -- Strip trailing * for pointer types
                         let mut clean_type = type_name
@@ -385,7 +475,13 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
             let idx = compile_expr(result.c)
             result.c = idx.c
             result.c = c_expect(result.c, TK_RBRACKET())
-            result.code = "DM_LIST_GET(" + result.code + ", " + idx.code + ")"
+            -- Check if receiver is a map type for index access
+            let idx_recv_type = infer_type_from_code(result.code, result.c)
+            if starts_with(idx_recv_type, "dm_map_") {
+                result.code = idx_recv_type + "_get(&" + result.code + ", " + idx.code + ")"
+            } else {
+                result.code = "DM_LIST_GET(" + result.code + ", " + idx.code + ")"
+            }
         } else if k == TK_LPAREN() and result.code != "" {
             -- Function call (only if we have a callee)
             result.c = c_advance(result.c)
@@ -418,6 +514,85 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 }
             }
             result.code = callee_code + "(" + args_code + ")"
+        } else if k == TK_AS() {
+            -- Cast expression: expr as Type or expr as dyn TraitName
+            result.c = c_advance(result.c)
+            -- Check for "dyn" keyword for trait object cast
+            let as_tok = c_cur(result.c)
+            if as_tok.kind == TK_IDENT() and as_tok.value == "dyn" {
+                result.c = c_advance(result.c)  -- skip 'dyn'
+                let dyn_trait_tok = c_cur(result.c)
+                let dyn_trait_name = dyn_trait_tok.value
+                result.c = c_advance(result.c)  -- skip trait name
+                -- Generate dyn trait infrastructure if not already done
+                result.c = generate_dyn_trait_defs(result.c, dyn_trait_name)
+                -- Infer concrete type of expression
+                let concrete_type = infer_type_from_code(result.code, result.c)
+                -- Strip dm_ prefix and trailing * to get the clean type name
+                let mut clean_type = concrete_type
+                if starts_with(clean_type, "dm_") {
+                    clean_type = substr(clean_type, 3, len(clean_type) - 3)
+                }
+                if ends_with(clean_type, "*") {
+                    clean_type = substr(clean_type, 0, len(clean_type) - 1)
+                }
+                -- Generate the vtable instance and fat pointer inline
+                let dyn_type = "dm_dyn_" + dyn_trait_name
+                let vtable_type = "dm_" + dyn_trait_name + "_vtable"
+                let vtable_var = "_vtable_" + clean_type + "_" + dyn_trait_name
+                -- Emit the static vtable variable (once) into lambda_defs
+                let vtable_marker = "|" + vtable_var + "|"
+                if string_contains(result.c.dyn_traits_generated, vtable_marker) == false {
+                    result.c.dyn_traits_generated = result.c.dyn_traits_generated + vtable_marker
+                    let mut vtable_init = ""
+                    let search_prefix = "|" + dyn_trait_name + "."
+                    let mut sp2 = string_find(result.c.trait_methods, search_prefix)
+                    while sp2 >= 0 {
+                        let after_p2 = sp2 + len(search_prefix)
+                        let rest3 = substr(result.c.trait_methods, after_p2, len(result.c.trait_methods) - after_p2)
+                        let eq_p2 = string_find(rest3, "=")
+                        if eq_p2 >= 0 {
+                            let mname2 = substr(rest3, 0, eq_p2)
+                            let after_eq2 = substr(rest3, eq_p2 + 1, len(rest3) - eq_p2 - 1)
+                            let pipe_p2 = string_find(after_eq2, "|")
+                            let mut sig3 = after_eq2
+                            if pipe_p2 >= 0 {
+                                sig3 = substr(after_eq2, 0, pipe_p2)
+                            }
+                            let colon_p2 = string_find(sig3, ":")
+                            let mut mret2 = "void"
+                            let mut mparams2 = ""
+                            if colon_p2 >= 0 {
+                                mret2 = substr(sig3, 0, colon_p2)
+                                mparams2 = substr(sig3, colon_p2 + 1, len(sig3) - colon_p2 - 1)
+                            }
+                            let mut cast_fptr_params = "void*"
+                            if mparams2 != "" {
+                                cast_fptr_params = cast_fptr_params + ", " + mparams2
+                            }
+                            if vtable_init != "" {
+                                vtable_init = vtable_init + ", "
+                            }
+                            vtable_init = vtable_init + "." + mname2 + " = (" + mret2 + " (*)(" + cast_fptr_params + "))dm_" + clean_type + "_" + mname2
+                        }
+                        let next_s2 = sp2 + len(search_prefix)
+                        let next_rest2 = substr(result.c.trait_methods, next_s2, len(result.c.trait_methods) - next_s2)
+                        let nf2 = string_find(next_rest2, search_prefix)
+                        if nf2 < 0 {
+                            sp2 = 0 - 1
+                        } else {
+                            sp2 = next_s2 + nf2
+                        }
+                    }
+                    let vtable_def = "static " + vtable_type + " " + vtable_var + " = { " + vtable_init + " };\n"
+                    result.c.lambda_defs = result.c.lambda_defs + vtable_def
+                }
+                result.code = "(" + dyn_type + "){ .data = (void*)&" + result.code + ", .vtable = &" + vtable_var + " }"
+            } else {
+                let cast_type = parse_type_for_c(result.c)
+                result.c = cast_type.c
+                result.code = "((" + cast_type.code + ")(" + result.code + "))"
+            }
         } else {
             cont = false
         }
@@ -733,10 +908,19 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     temp_cc.var_types = cc.var_types
     temp_cc.str_vars = cc.str_vars
     temp_cc.list_type_defs = cc.list_type_defs
+    temp_cc.map_type_defs = cc.map_type_defs
+    temp_cc.map_kv_types = cc.map_kv_types
     temp_cc.option_type_defs = cc.option_type_defs
+    temp_cc.future_type_defs = cc.future_type_defs
     temp_cc.list_elem_types = cc.list_elem_types
     temp_cc.generic_fn_tokens = cc.generic_fn_tokens
     temp_cc.monomorphized_fns = cc.monomorphized_fns
+    temp_cc.trait_methods = cc.trait_methods
+    temp_cc.trait_names = cc.trait_names
+    temp_cc.impl_for_map = cc.impl_for_map
+    temp_cc.dyn_trait_defs = cc.dyn_trait_defs
+    temp_cc.dyn_traits_generated = cc.dyn_traits_generated
+    temp_cc.array_type_defs = cc.array_type_defs
     -- Propagate counters to avoid name collisions with the caller context
     temp_cc.lambda_counter = cc.lambda_counter
     temp_cc.match_counter = cc.match_counter
@@ -759,9 +943,15 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     }
     -- Copy monomorphized tracking
     cc.monomorphized_fns = temp_cc.monomorphized_fns
-    -- Copy any new list/option type defs
+    -- Copy any new list/option/map type defs
     cc.list_type_defs = temp_cc.list_type_defs
+    cc.map_type_defs = temp_cc.map_type_defs
+    cc.map_kv_types = temp_cc.map_kv_types
     cc.option_type_defs = temp_cc.option_type_defs
+    cc.future_type_defs = temp_cc.future_type_defs
+    cc.dyn_trait_defs = temp_cc.dyn_trait_defs
+    cc.dyn_traits_generated = temp_cc.dyn_traits_generated
+    cc.array_type_defs = temp_cc.array_type_defs
     -- Copy fn_names/ret_types (the monomorphized fn was added)
     cc.fn_names = temp_cc.fn_names
     cc.fn_ret_types = temp_cc.fn_ret_types
@@ -774,6 +964,281 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     cc.lambda_defs = cc.lambda_defs + temp_cc.lambda_defs
 
     return cc
+}
+
+-- Compile f-string interpolation: f"Hello {name}, x = {x + 1}"
+-- Parses the raw content between quotes, splits on {expr} placeholders,
+-- and generates dm_string_concat chains with auto-conversion for non-string types
+fn compile_fstring(c: Compiler, content: string) -> ExprOut {
+    let mut cc = c
+    let content_len = len(content)
+    let mut result_code = ""
+    let mut i = 0
+    let mut seg_start = 0
+
+    while i < content_len {
+        let ch = char_at(content, i)
+        if ch == "{" {
+            -- Emit the literal segment before this placeholder
+            if i > seg_start {
+                let literal = substr(content, seg_start, i - seg_start)
+                let lit_code = "dm_string_from_cstr(\"" + literal + "\")"
+                if result_code == "" {
+                    result_code = lit_code
+                } else {
+                    if cc.current_region_arena != "" {
+                        result_code = "dm_string_concat_arena(" + cc.current_region_arena + ", " + result_code + ", " + lit_code + ")"
+                    } else {
+                        result_code = "dm_string_concat(" + result_code + ", " + lit_code + ")"
+                    }
+                }
+            }
+            -- Find matching }
+            i = i + 1
+            let expr_start = i
+            let mut depth = 1
+            while i < content_len and depth > 0 {
+                let c2 = char_at(content, i)
+                if c2 == "{" { depth = depth + 1 }
+                if c2 == "}" { depth = depth - 1 }
+                if depth > 0 { i = i + 1 }
+            }
+            -- Extract the expression text
+            let expr_text = substr(content, expr_start, i - expr_start)
+            i = i + 1  -- skip closing }
+            seg_start = i
+
+            -- Tokenize and compile the sub-expression
+            let expr_tokens = tokenize(expr_text)
+            let mut temp_cc = compiler_new(expr_tokens)
+            -- Copy important state from the outer compiler
+            temp_cc.str_vars = cc.str_vars
+            temp_cc.var_types = cc.var_types
+            temp_cc.struct_fields = cc.struct_fields
+            temp_cc.struct_names = cc.struct_names
+            temp_cc.enum_names = cc.enum_names
+            temp_cc.fn_names = cc.fn_names
+            temp_cc.fn_ret_types = cc.fn_ret_types
+            temp_cc.list_elem_types = cc.list_elem_types
+            temp_cc.enum_variants = cc.enum_variants
+            temp_cc.trait_methods = cc.trait_methods
+            temp_cc.trait_names = cc.trait_names
+            temp_cc.impl_for_map = cc.impl_for_map
+            temp_cc.generic_fn_tokens = cc.generic_fn_tokens
+            temp_cc.monomorphized_fns = cc.monomorphized_fns
+            temp_cc.current_region_arena = cc.current_region_arena
+            let expr_result = compile_expr(temp_cc)
+            let expr_code = expr_result.code
+
+            -- Auto-convert to string if needed
+            let mut str_expr = expr_code
+            if code_is_string(expr_code, cc) == false {
+                let etype = infer_type_from_code(expr_code, cc)
+                if etype == "int64_t" {
+                    str_expr = "dm_int_to_string(" + expr_code + ")"
+                } else if etype == "double" {
+                    str_expr = "dm_float_to_string(" + expr_code + ")"
+                } else if etype == "bool" {
+                    str_expr = "dm_bool_to_string(" + expr_code + ")"
+                } else {
+                    -- Fallback: try int_to_string
+                    str_expr = "dm_int_to_string(" + expr_code + ")"
+                }
+            }
+
+            if result_code == "" {
+                result_code = str_expr
+            } else {
+                if cc.current_region_arena != "" {
+                    result_code = "dm_string_concat_arena(" + cc.current_region_arena + ", " + result_code + ", " + str_expr + ")"
+                } else {
+                    result_code = "dm_string_concat(" + result_code + ", " + str_expr + ")"
+                }
+            }
+        } else {
+            i = i + 1
+        }
+    }
+
+    -- Emit any remaining literal tail
+    if seg_start < content_len {
+        let literal = substr(content, seg_start, content_len - seg_start)
+        let lit_code = "dm_string_from_cstr(\"" + literal + "\")"
+        if result_code == "" {
+            result_code = lit_code
+        } else {
+            if cc.current_region_arena != "" {
+                result_code = "dm_string_concat_arena(" + cc.current_region_arena + ", " + result_code + ", " + lit_code + ")"
+            } else {
+                result_code = "dm_string_concat(" + result_code + ", " + lit_code + ")"
+            }
+        }
+    }
+
+    if result_code == "" {
+        result_code = "dm_string_from_cstr(\"\")"
+    }
+
+    return ExprOut { c: cc, code: result_code }
+}
+
+-- ============================================================
+-- COMPTIME EXPRESSION EVALUATOR
+-- Evaluates constant expressions at compile time
+-- ============================================================
+
+fn eval_comptime_expr(c: Compiler) -> ExprOut {
+    return eval_comptime_or(c)
+}
+
+fn eval_comptime_or(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_and(c)
+    while c_peek(result.c) == TK_OR() {
+        result.c = c_advance(result.c)
+        let rhs = eval_comptime_and(result.c)
+        result.c = rhs.c
+        let l = result.code == "true" or result.code == "1"
+        let r = rhs.code == "true" or rhs.code == "1"
+        if l or r {
+            result.code = "true"
+        } else {
+            result.code = "false"
+        }
+    }
+    return result
+}
+
+fn eval_comptime_and(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_add(c)
+    while c_peek(result.c) == TK_AND() {
+        result.c = c_advance(result.c)
+        let rhs = eval_comptime_add(result.c)
+        result.c = rhs.c
+        let l = result.code == "true" or result.code == "1"
+        let r = rhs.code == "true" or rhs.code == "1"
+        if l and r {
+            result.code = "true"
+        } else {
+            result.code = "false"
+        }
+    }
+    return result
+}
+
+fn eval_comptime_add(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_mul(c)
+    let mut cont = true
+    while cont {
+        let k = c_peek(result.c)
+        if k == TK_PLUS() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_mul(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            result.code = int_to_string(lv + rv)
+        } else if k == TK_MINUS() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_mul(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            result.code = int_to_string(lv - rv)
+        } else {
+            cont = false
+        }
+    }
+    return result
+}
+
+fn eval_comptime_mul(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_primary(c)
+    let mut cont = true
+    while cont {
+        let k = c_peek(result.c)
+        if k == TK_STAR() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_primary(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            result.code = int_to_string(lv * rv)
+        } else if k == TK_SLASH() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_primary(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            if rv != 0 {
+                result.code = int_to_string(lv / rv)
+            } else {
+                result.code = "0"
+            }
+        } else if k == TK_PERCENT() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_primary(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            if rv != 0 {
+                result.code = int_to_string(lv % rv)
+            } else {
+                result.code = "0"
+            }
+        } else {
+            cont = false
+        }
+    }
+    return result
+}
+
+fn eval_comptime_primary(c: Compiler) -> ExprOut {
+    let mut cc = c_skip_nl(c)
+    let tok = c_cur(cc)
+    let k = tok.kind
+    if k == TK_INTEGER() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: tok.value }
+    }
+    if k == TK_FLOAT() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: tok.value }
+    }
+    if k == TK_TRUE() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: "true" }
+    }
+    if k == TK_FALSE() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: "false" }
+    }
+    if k == TK_NOT() {
+        cc = c_advance(cc)
+        let operand = eval_comptime_primary(cc)
+        cc = operand.c
+        if operand.code == "true" or operand.code == "1" {
+            return ExprOut { c: cc, code: "false" }
+        } else {
+            return ExprOut { c: cc, code: "true" }
+        }
+    }
+    if k == TK_MINUS() {
+        cc = c_advance(cc)
+        let operand = eval_comptime_primary(cc)
+        cc = operand.c
+        let v = parse_int(operand.code)
+        return ExprOut { c: cc, code: int_to_string(0 - v) }
+    }
+    if k == TK_LPAREN() {
+        cc = c_advance(cc)
+        let inner = eval_comptime_expr(cc)
+        cc = inner.c
+        cc = c_expect(cc, TK_RPAREN())
+        return ExprOut { c: cc, code: inner.code }
+    }
+    -- Unknown token - just return 0
+    cc = c_advance(cc)
+    return ExprOut { c: cc, code: "0" }
 }
 
 fn compile_primary_expr(c: Compiler) -> ExprOut {
@@ -793,6 +1258,10 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = c_advance(cc)
         return ExprOut { c: cc, code: "dm_string_from_cstr(\"" + tok.value + "\")" }
     }
+    if k == TK_FSTRING() {
+        cc = c_advance(cc)
+        return compile_fstring(cc, tok.value)
+    }
     if k == TK_TRUE() {
         cc = c_advance(cc)
         return ExprOut { c: cc, code: "true" }
@@ -806,15 +1275,19 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = c_advance(cc)
         -- Check for builtin function mapping
         if name == "println" {
+            cc = check_effect_allowed(cc, "println")
             return ExprOut { c: cc, code: "dm_println_str" }
         }
         if name == "print" {
+            cc = check_effect_allowed(cc, "print")
             return ExprOut { c: cc, code: "dm_print_str" }
         }
         if name == "eprintln" {
+            cc = check_effect_allowed(cc, "eprintln")
             return ExprOut { c: cc, code: "dm_eprintln_str" }
         }
         if name == "eprint" {
+            cc = check_effect_allowed(cc, "eprint")
             return ExprOut { c: cc, code: "dm_eprint_str" }
         }
         if name == "int_to_string" {
@@ -866,15 +1339,31 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
             return ExprOut { c: cc, code: "dm_string_to_lower" }
         }
         if name == "file_read" {
+            cc = check_effect_allowed(cc, "file_read")
             return ExprOut { c: cc, code: "dm_file_read" }
         }
         if name == "file_write" {
+            cc = check_effect_allowed(cc, "file_write")
             return ExprOut { c: cc, code: "dm_file_write" }
         }
+        if name == "file_append" {
+            cc = check_effect_allowed(cc, "file_append")
+            return ExprOut { c: cc, code: "dm_append_file" }
+        }
+        if name == "file_exists" {
+            cc = check_effect_allowed(cc, "file_exists")
+            return ExprOut { c: cc, code: "dm_file_exists" }
+        }
+        if name == "read_line" {
+            cc = check_effect_allowed(cc, "read_line")
+            return ExprOut { c: cc, code: "dm_read_line" }
+        }
         if name == "exit" {
+            cc = check_effect_allowed(cc, "exit")
             return ExprOut { c: cc, code: "dm_exit" }
         }
         if name == "system" {
+            cc = check_effect_allowed(cc, "system")
             return ExprOut { c: cc, code: "dm_system" }
         }
         if name == "args_get" {
@@ -885,6 +1374,71 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         }
         if name == "panic" {
             return ExprOut { c: cc, code: "dm_panic" }
+        }
+        -- assert(cond) builtin: inline expansion to check + panic
+        if name == "assert" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let assert_cond = compile_expr(cc)
+                cc = assert_cond.c
+                cc = c_expect(cc, TK_RPAREN())
+                let assert_code = "do { if (!(" + assert_cond.code + ")) { fprintf(stderr, \"PANIC: assertion failed\\n\"); exit(1); } } while(0)"
+                return ExprOut { c: cc, code: assert_code }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        -- assert_eq(a, b) builtin: inline expansion with type-aware comparison
+        if name == "assert_eq" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let aeq_a = compile_expr(cc)
+                cc = aeq_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let aeq_b = compile_expr(cc)
+                cc = aeq_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                if code_is_string(aeq_a.code, cc) or code_is_string(aeq_b.code, cc) {
+                    let aeq_code = "do { if (!dm_string_eq(" + aeq_a.code + ", " + aeq_b.code + ")) { fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1); } } while(0)"
+                    return ExprOut { c: cc, code: aeq_code }
+                } else {
+                    let aeq_code = "do { if ((" + aeq_a.code + ") != (" + aeq_b.code + ")) { fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1); } } while(0)"
+                    return ExprOut { c: cc, code: aeq_code }
+                }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        -- string_split(s, delim) builtin: register list type and emit helper
+        if name == "string_split" {
+            cc = register_list_type(cc, "dm_list_dm_string", "dm_string")
+            if string_contains(cc.lambda_defs, "dm_string_split") == false {
+                let mut split_fn = "static dm_list_dm_string dm_string_split(dm_string s, dm_string delim) {\n"
+                split_fn = split_fn + "    dm_list_dm_string result = dm_list_dm_string_new();\n"
+                split_fn = split_fn + "    if (delim.len == 0) {\n"
+                split_fn = split_fn + "        DM_LIST_PUSH(result, s);\n"
+                split_fn = split_fn + "        return result;\n"
+                split_fn = split_fn + "    }\n"
+                split_fn = split_fn + "    size_t start = 0;\n"
+                split_fn = split_fn + "    for (size_t i = 0; i + delim.len <= s.len; i++) {\n"
+                split_fn = split_fn + "        if (memcmp(s.data + i, delim.data, delim.len) == 0) {\n"
+                split_fn = split_fn + "            size_t seg_len = i - start;\n"
+                split_fn = split_fn + "            char* buf = (char*)malloc(seg_len + 1);\n"
+                split_fn = split_fn + "            memcpy(buf, s.data + start, seg_len);\n"
+                split_fn = split_fn + "            buf[seg_len] = '\\0';\n"
+                split_fn = split_fn + "            DM_LIST_PUSH(result, ((dm_string){ .data = buf, .len = seg_len, .capacity = seg_len }));\n"
+                split_fn = split_fn + "            i += delim.len - 1;\n"
+                split_fn = split_fn + "            start = i + 1;\n"
+                split_fn = split_fn + "        }\n"
+                split_fn = split_fn + "    }\n"
+                split_fn = split_fn + "    size_t last_len = s.len - start;\n"
+                split_fn = split_fn + "    char* last_buf = (char*)malloc(last_len + 1);\n"
+                split_fn = split_fn + "    memcpy(last_buf, s.data + start, last_len);\n"
+                split_fn = split_fn + "    last_buf[last_len] = '\\0';\n"
+                split_fn = split_fn + "    DM_LIST_PUSH(result, ((dm_string){ .data = last_buf, .len = last_len, .capacity = last_len }));\n"
+                split_fn = split_fn + "    return result;\n"
+                split_fn = split_fn + "}\n\n"
+                cc.lambda_defs = cc.lambda_defs + split_fn
+            }
+            return ExprOut { c: cc, code: "dm_string_split" }
         }
         -- Box_new(val) and Box_null() builtins
         if name == "Box_new" {
@@ -906,6 +1460,98 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
                 return ExprOut { c: cc, code: "NULL" }
             }
             return ExprOut { c: cc, code: "NULL" }
+        }
+        -- SIMD splat builtins: simd_splat_TYPE(val)
+        if starts_with(name, "simd_splat_") {
+            let simd_type = substr(name, 11, len(name) - 11)
+            let c_fn = "dm_simd_splat_" + simd_type
+            return ExprOut { c: cc, code: c_fn }
+        }
+        -- SIMD set builtins: simd_set_TYPE(a, b, ...)
+        if starts_with(name, "simd_set_") {
+            let simd_type = substr(name, 9, len(name) - 9)
+            let c_fn = "dm_simd_set_" + simd_type
+            return ExprOut { c: cc, code: c_fn }
+        }
+        -- SIMD arithmetic builtins: simd_add, simd_sub, simd_mul, simd_div
+        if name == "simd_add" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " + " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "simd_sub" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " - " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "simd_mul" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " * " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "simd_div" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " / " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        -- SIMD extract: simd_extract(vec, idx) -> vec[idx]
+        if name == "simd_extract" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_vec = compile_expr(cc)
+                cc = arg_vec.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_idx = compile_expr(cc)
+                cc = arg_idx.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: arg_vec.code + "[" + arg_idx.code + "]" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "Map_new" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                cc = c_expect(cc, TK_RPAREN())
+                -- Use expected_type to determine the map type
+                let map_type = cc.expected_type
+                if map_type != "" and starts_with(map_type, "dm_map_") {
+                    return ExprOut { c: cc, code: map_type + "_new()" }
+                }
+                return ExprOut { c: cc, code: "/* Map_new unknown type */" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
         }
         -- Option/Result constructors: Some, None, Ok, Err
         -- Use expected_type or current_fn_ret_type for type context
@@ -969,6 +1615,39 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = c_expect(cc, TK_RPAREN())
         return ExprOut { c: cc, code: "(" + inner.code + ")" }
     }
+    if k == TK_LBRACKET() {
+        -- Array repeat literal: [value; N]
+        cc = c_advance(cc)  -- skip '['
+        let arr_val = compile_expr(cc)
+        cc = arr_val.c
+        if c_peek(cc) == TK_SEMICOLON() {
+            cc = c_advance(cc)  -- skip ';'
+            let arr_size_tok = c_cur(cc)
+            let arr_size = arr_size_tok.value
+            cc = c_advance(cc)  -- skip N
+            cc = c_expect(cc, TK_RBRACKET())
+            -- Infer element type from value
+            let arr_elem_type = infer_type_from_code(arr_val.code, cc)
+            let arr_type = "dm_array_" + arr_elem_type + "_" + arr_size
+            cc = register_array_type(cc, arr_elem_type, arr_size)
+            -- Build compound literal: (dm_array_T_N){val, val, ..., val}
+            let arr_n = parse_int(arr_size)
+            let mut arr_init = ""
+            let mut arr_i = 0
+            while arr_i < arr_n {
+                if arr_i > 0 {
+                    arr_init = arr_init + ", "
+                }
+                arr_init = arr_init + arr_val.code
+                arr_i = arr_i + 1
+            }
+            let arr_code = "((" + arr_type + "){" + arr_init + "})"
+            return ExprOut { c: cc, code: arr_code }
+        }
+        -- Otherwise unexpected (list literals handled in compile_let_stmt)
+        cc = c_expect(cc, TK_RBRACKET())
+        return ExprOut { c: cc, code: "0 /* unexpected [ expr */" }
+    }
     if k == TK_SELF() {
         cc = c_advance(cc)
         return ExprOut { c: cc, code: "dm_self" }
@@ -978,6 +1657,19 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
     }
     if k == TK_PIPE() {
         return compile_lambda_expr(cc)
+    }
+    if k == TK_AWAIT() {
+        cc = c_advance(cc)  -- skip 'await'
+        let await_expr = compile_postfix_expr(cc)
+        cc = await_expr.c
+        -- Infer the future type from the expression
+        let expr_type = infer_type_from_code(await_expr.code, cc)
+        if starts_with(expr_type, "dm_future_") {
+            return ExprOut { c: cc, code: expr_type + "_await(" + await_expr.code + ")" }
+        }
+        -- Fallback: if type inference can't determine the future type, try from the expression code
+        -- For simple variable references, look up the variable type
+        return ExprOut { c: cc, code: await_expr.code }
     }
     -- Unknown primary
     cc = c_error(cc, "unexpected token in expression: " + token_kind_name(k))

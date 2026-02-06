@@ -116,6 +116,25 @@ fn emit_runtime() -> string {
     r = r + "    fwrite(content.data, 1, content.len, f);\n"
     r = r + "    fclose(f);\n"
     r = r + "}\n\n"
+    r = r + "static inline void dm_append_file(dm_string path, dm_string content) {\n"
+    r = r + "    char* cpath = (char*)malloc(path.len + 1);\n"
+    r = r + "    memcpy(cpath, path.data, path.len);\n"
+    r = r + "    cpath[path.len] = '\\0';\n"
+    r = r + "    FILE* f = fopen(cpath, \"ab\");\n"
+    r = r + "    free(cpath);\n"
+    r = r + "    if (!f) dm_panic_cstr(\"file_append: cannot open file\");\n"
+    r = r + "    fwrite(content.data, 1, content.len, f);\n"
+    r = r + "    fclose(f);\n"
+    r = r + "}\n\n"
+    r = r + "static inline bool dm_file_exists(dm_string path) {\n"
+    r = r + "    char* cpath = (char*)malloc(path.len + 1);\n"
+    r = r + "    memcpy(cpath, path.data, path.len);\n"
+    r = r + "    cpath[path.len] = '\\0';\n"
+    r = r + "    FILE* f = fopen(cpath, \"r\");\n"
+    r = r + "    free(cpath);\n"
+    r = r + "    if (f) { fclose(f); return true; }\n"
+    r = r + "    return false;\n"
+    r = r + "}\n\n"
     r = r + "static inline dm_string dm_string_substr(dm_string s, int64_t start, int64_t length) {\n"
     r = r + "    if (start < 0 || (size_t)start >= s.len) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };\n"
     r = r + "    size_t actual_len = (size_t)length;\n"
@@ -272,6 +291,60 @@ fn emit_runtime() -> string {
     r = r + "    }\n"
     r = r + "}\n\n"
 
+    r = r + "static void* dm_arena_alloc(dm_arena* arena, size_t size) {\n"
+    r = r + "    if (arena->used + size > arena->size) {\n"
+    r = r + "        size_t new_size = arena->size * 2;\n"
+    r = r + "        if (new_size < size) new_size = size + arena->size;\n"
+    r = r + "        dm_arena* next = dm_arena_create(new_size);\n"
+    r = r + "        next->next = arena->next;\n"
+    r = r + "        arena->next = next;\n"
+    r = r + "        void* ptr = next->data;\n"
+    r = r + "        next->used = size;\n"
+    r = r + "        return ptr;\n"
+    r = r + "    }\n"
+    r = r + "    void* ptr = arena->data + arena->used;\n"
+    r = r + "    arena->used += size;\n"
+    r = r + "    return ptr;\n"
+    r = r + "}\n\n"
+
+    r = r + "static inline dm_string dm_string_concat_arena(dm_arena* arena, dm_string a, dm_string b) {\n"
+    r = r + "    size_t new_len = a.len + b.len;\n"
+    r = r + "    char* buf = (char*)dm_arena_alloc(arena, new_len + 1);\n"
+    r = r + "    memcpy(buf, a.data, a.len);\n"
+    r = r + "    memcpy(buf + a.len, b.data, b.len);\n"
+    r = r + "    buf[new_len] = '\\0';\n"
+    r = r + "    return (dm_string){ .data = buf, .len = new_len, .capacity = new_len };\n"
+    r = r + "}\n\n"
+
+    -- SIMD vector type definitions (GCC/Clang vector extensions)
+    r = r + "// SIMD Vector Types\n\n"
+    r = r + "typedef float dm_f32x4 __attribute__((vector_size(16)));\n"
+    r = r + "typedef float dm_f32x8 __attribute__((vector_size(32)));\n"
+    r = r + "typedef double dm_f64x2 __attribute__((vector_size(16)));\n"
+    r = r + "typedef double dm_f64x4 __attribute__((vector_size(32)));\n"
+    r = r + "typedef int32_t dm_i32x4 __attribute__((vector_size(16)));\n"
+    r = r + "typedef int32_t dm_i32x8 __attribute__((vector_size(32)));\n"
+    r = r + "typedef int64_t dm_i64x2 __attribute__((vector_size(16)));\n"
+    r = r + "typedef int64_t dm_i64x4 __attribute__((vector_size(32)));\n\n"
+    -- SIMD splat helpers
+    r = r + "static inline dm_f32x4 dm_simd_splat_f32x4(float v) { return (dm_f32x4){v,v,v,v}; }\n"
+    r = r + "static inline dm_f32x8 dm_simd_splat_f32x8(float v) { return (dm_f32x8){v,v,v,v,v,v,v,v}; }\n"
+    r = r + "static inline dm_f64x2 dm_simd_splat_f64x2(double v) { return (dm_f64x2){v,v}; }\n"
+    r = r + "static inline dm_f64x4 dm_simd_splat_f64x4(double v) { return (dm_f64x4){v,v,v,v}; }\n"
+    r = r + "static inline dm_i32x4 dm_simd_splat_i32x4(int32_t v) { return (dm_i32x4){v,v,v,v}; }\n"
+    r = r + "static inline dm_i32x8 dm_simd_splat_i32x8(int32_t v) { return (dm_i32x8){v,v,v,v,v,v,v,v}; }\n"
+    r = r + "static inline dm_i64x2 dm_simd_splat_i64x2(int64_t v) { return (dm_i64x2){v,v}; }\n"
+    r = r + "static inline dm_i64x4 dm_simd_splat_i64x4(int64_t v) { return (dm_i64x4){v,v,v,v}; }\n\n"
+    -- SIMD set helpers
+    r = r + "static inline dm_f32x4 dm_simd_set_f32x4(float a, float b, float c, float d) { return (dm_f32x4){a,b,c,d}; }\n"
+    r = r + "static inline dm_f32x8 dm_simd_set_f32x8(float a, float b, float c, float d, float e, float f, float g, float h) { return (dm_f32x8){a,b,c,d,e,f,g,h}; }\n"
+    r = r + "static inline dm_f64x2 dm_simd_set_f64x2(double a, double b) { return (dm_f64x2){a,b}; }\n"
+    r = r + "static inline dm_f64x4 dm_simd_set_f64x4(double a, double b, double c, double d) { return (dm_f64x4){a,b,c,d}; }\n"
+    r = r + "static inline dm_i32x4 dm_simd_set_i32x4(int32_t a, int32_t b, int32_t c, int32_t d) { return (dm_i32x4){a,b,c,d}; }\n"
+    r = r + "static inline dm_i32x8 dm_simd_set_i32x8(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f, int32_t g, int32_t h) { return (dm_i32x8){a,b,c,d,e,f,g,h}; }\n"
+    r = r + "static inline dm_i64x2 dm_simd_set_i64x2(int64_t a, int64_t b) { return (dm_i64x2){a,b}; }\n"
+    r = r + "static inline dm_i64x4 dm_simd_set_i64x4(int64_t a, int64_t b, int64_t c, int64_t d) { return (dm_i64x4){a,b,c,d}; }\n\n"
+
     r = r + "// End of Runtime\n\n"
     return r
 }
@@ -304,8 +377,17 @@ fn assemble_output(c: Compiler) -> string {
     -- List type definitions (after forward declarations, before full struct defs)
     out = out + c.list_type_defs
 
+    -- Map type definitions (after list types, since maps may use list types for keys/values)
+    out = out + c.map_type_defs
+
+    -- Array type definitions (after list types, before option/result/struct)
+    out = out + c.array_type_defs
+
     -- Option/Result type definitions
     out = out + c.option_type_defs
+
+    -- Future type definitions (for async/await)
+    out = out + c.future_type_defs
 
     -- Struct/enum definitions
     let mut i = 0
@@ -313,6 +395,9 @@ fn assemble_output(c: Compiler) -> string {
         out = out + c.struct_defs[i]
         i = i + 1
     }
+
+    -- Dynamic trait dispatch definitions (vtable structs, fat pointers, dispatch functions)
+    out = out + c.dyn_trait_defs
 
     -- Forward declarations
     let mut j = 0

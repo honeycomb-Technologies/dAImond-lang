@@ -2,6 +2,13 @@ module collections
 
 -- Standard Collections Module
 -- Provides collection types built on top of List[T] and Map[K,V].
+--
+-- NOTE: Due to the current type system, the following collections are
+-- type-specialized rather than generic:
+--   - Set: backed by Map[string, bool] (string keys only)
+--   - Queue: backed by List[int] (int elements only)
+--   - Stack: backed by List[int] (int elements only)
+-- For other types, use List[T] and Map[K,V] directly.
 
 -- ============================================================================
 -- Set[T] - Unique element collection (backed by Map[T, bool])

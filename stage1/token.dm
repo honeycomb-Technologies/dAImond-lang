@@ -37,6 +37,8 @@ fn TK_CONST() -> int { return 34 }
 fn TK_WITH() -> int { return 35 }
 fn TK_SELF() -> int { return 36 }
 fn TK_REGION() -> int { return 37 }
+fn TK_AS() -> int { return 38 }
+fn TK_EXTERN() -> int { return 39 }
 fn TK_PLUS() -> int { return 50 }
 fn TK_MINUS() -> int { return 51 }
 fn TK_STAR() -> int { return 52 }
@@ -76,6 +78,10 @@ fn TK_UNDERSCORE() -> int { return 96 }
 fn TK_SEMICOLON() -> int { return 97 }
 fn TK_AT() -> int { return 98 }
 fn TK_HASH() -> int { return 99 }
+fn TK_FSTRING() -> int { return 100 }
+fn TK_COMPTIME() -> int { return 101 }
+fn TK_ASYNC() -> int { return 102 }
+fn TK_AWAIT() -> int { return 103 }
 
 struct Token {
     kind: int,
@@ -117,6 +123,11 @@ fn keyword_lookup(name: string) -> int {
     if name == "with" { return TK_WITH() }
     if name == "self" { return TK_SELF() }
     if name == "region" { return TK_REGION() }
+    if name == "as" { return TK_AS() }
+    if name == "extern" { return TK_EXTERN() }
+    if name == "comptime" { return TK_COMPTIME() }
+    if name == "async" { return TK_ASYNC() }
+    if name == "await" { return TK_AWAIT() }
     return TK_IDENT()
 }
 
@@ -167,5 +178,11 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_COLON() { return "':'" }
     if kind == TK_COMMA() { return "','" }
     if kind == TK_REGION() { return "'region'" }
+    if kind == TK_AS() { return "'as'" }
+    if kind == TK_EXTERN() { return "'extern'" }
+    if kind == TK_FSTRING() { return "f-string" }
+    if kind == TK_COMPTIME() { return "'comptime'" }
+    if kind == TK_ASYNC() { return "'async'" }
+    if kind == TK_AWAIT() { return "'await'" }
     return "token(" + int_to_string(kind) + ")"
 }

@@ -45,6 +45,8 @@ fn TK_CONST() -> int { return 34 }
 fn TK_WITH() -> int { return 35 }
 fn TK_SELF() -> int { return 36 }
 fn TK_REGION() -> int { return 37 }
+fn TK_AS() -> int { return 38 }
+fn TK_EXTERN() -> int { return 39 }
 fn TK_PLUS() -> int { return 50 }
 fn TK_MINUS() -> int { return 51 }
 fn TK_STAR() -> int { return 52 }
@@ -84,6 +86,10 @@ fn TK_UNDERSCORE() -> int { return 96 }
 fn TK_SEMICOLON() -> int { return 97 }
 fn TK_AT() -> int { return 98 }
 fn TK_HASH() -> int { return 99 }
+fn TK_FSTRING() -> int { return 100 }
+fn TK_COMPTIME() -> int { return 101 }
+fn TK_ASYNC() -> int { return 102 }
+fn TK_AWAIT() -> int { return 103 }
 
 struct Token {
     kind: int,
@@ -125,6 +131,11 @@ fn keyword_lookup(name: string) -> int {
     if name == "with" { return TK_WITH() }
     if name == "self" { return TK_SELF() }
     if name == "region" { return TK_REGION() }
+    if name == "as" { return TK_AS() }
+    if name == "extern" { return TK_EXTERN() }
+    if name == "comptime" { return TK_COMPTIME() }
+    if name == "async" { return TK_ASYNC() }
+    if name == "await" { return TK_AWAIT() }
     return TK_IDENT()
 }
 
@@ -175,6 +186,12 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_COLON() { return "':'" }
     if kind == TK_COMMA() { return "','" }
     if kind == TK_REGION() { return "'region'" }
+    if kind == TK_AS() { return "'as'" }
+    if kind == TK_EXTERN() { return "'extern'" }
+    if kind == TK_FSTRING() { return "f-string" }
+    if kind == TK_COMPTIME() { return "'comptime'" }
+    if kind == TK_ASYNC() { return "'async'" }
+    if kind == TK_AWAIT() { return "'await'" }
     return "token(" + int_to_string(kind) + ")"
 }
 
@@ -261,7 +278,32 @@ fn tokenize(source: string) -> List[Token] {
                     lex.col = lex.col + 1
                 }
                 let text = substr(lex.source, sp, lex.pos - sp)
-                tokens.push(token_new(keyword_lookup(text), text, sl, sc))
+                -- Check for f-string: identifier "f" immediately followed by "
+                let mut is_fstr = false
+                if text == "f" and lex.pos < lex.src_len and char_at(lex.source, lex.pos) == "\"" {
+                    is_fstr = true
+                    lex.pos = lex.pos + 1  -- skip opening "
+                    lex.col = lex.col + 1
+                    let fstart = lex.pos
+                    while lex.pos < lex.src_len and char_at(lex.source, lex.pos) != "\"" {
+                        if char_at(lex.source, lex.pos) == "\\" {
+                            lex.pos = lex.pos + 2
+                            lex.col = lex.col + 2
+                        } else {
+                            lex.pos = lex.pos + 1
+                            lex.col = lex.col + 1
+                        }
+                    }
+                    let ftext = substr(lex.source, fstart, lex.pos - fstart)
+                    if lex.pos < lex.src_len {
+                        lex.pos = lex.pos + 1  -- skip closing "
+                        lex.col = lex.col + 1
+                    }
+                    tokens.push(token_new(TK_FSTRING(), ftext, sl, sc))
+                }
+                if is_fstr == false {
+                    tokens.push(token_new(keyword_lookup(text), text, sl, sc))
+                }
             } else if is_digit_char(ch) {
                 while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
                     lex.pos = lex.pos + 1
@@ -689,7 +731,31 @@ struct Compiler {
     -- Track current impl type prefix for method name mangling
     current_impl_type: string,
     -- Counter for unique region arena variables
-    region_counter: int
+    region_counter: int,
+    -- Accumulated map type definitions (built during parsing)
+    map_type_defs: string,
+    -- Track map key/value types: "|dm_map_K_V=key_type:val_type|..."
+    map_kv_types: string,
+    -- Accumulated Future type definitions (built during async fn parsing)
+    future_type_defs: string,
+    -- Track whether current function is async (for return wrapping)
+    current_fn_is_async: bool,
+    -- Track the inner type for current async function (e.g. "int64_t" for Future[int])
+    current_fn_async_inner_type: string,
+    -- Accumulated dyn trait definitions (vtable struct, fat pointer, dispatch functions)
+    dyn_trait_defs: string,
+    -- Track which dyn trait types have been generated: "|TraitName|..."
+    dyn_traits_generated: string,
+    -- Accumulated array type definitions: typedef T dm_array_T_N[N];
+    array_type_defs: string,
+    -- Track generic function trait bounds: "|fn_name:T=TraitName|..."
+    generic_bounds: string,
+    -- Effect enforcement: pipe-delimited effect names like "|Console|IO|" or ""
+    current_fn_effects: string,
+    -- Whether current function has a with [...] clause (distinguishes "no clause" from "empty clause")
+    current_fn_has_effects: bool,
+    -- Current region arena variable name (empty when not in a region, e.g. "_region_arena0" when inside)
+    current_region_arena: string
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -728,7 +794,19 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         trait_names: tn,
         impl_for_map: "",
         current_impl_type: "",
-        region_counter: 0
+        region_counter: 0,
+        map_type_defs: "",
+        map_kv_types: "",
+        future_type_defs: "",
+        current_fn_is_async: false,
+        current_fn_async_inner_type: "",
+        dyn_trait_defs: "",
+        dyn_traits_generated: "",
+        array_type_defs: "",
+        generic_bounds: "",
+        current_fn_effects: "",
+        current_fn_has_effects: false,
+        current_region_arena: ""
     }
 }
 
@@ -793,6 +871,7 @@ fn str_list_contains(list: List[string], val: string) -> bool {
 fn code_is_string(code: string, c: Compiler) -> bool {
     if starts_with(code, "dm_string_from_cstr(") { return true }
     if starts_with(code, "dm_string_concat(") { return true }
+    if starts_with(code, "dm_string_concat_arena(") { return true }
     if starts_with(code, "dm_int_to_string(") { return true }
     if starts_with(code, "dm_bool_to_string(") { return true }
     if starts_with(code, "dm_float_to_string(") { return true }
@@ -928,6 +1007,25 @@ fn map_dm_type(name: string) -> string {
     if name == "bool" { return "bool" }
     if name == "string" { return "dm_string" }
     if name == "void" { return "void" }
+    if name == "i8" { return "int8_t" }
+    if name == "i16" { return "int16_t" }
+    if name == "i32" { return "int32_t" }
+    if name == "u8" { return "uint8_t" }
+    if name == "u16" { return "uint16_t" }
+    if name == "u32" { return "uint32_t" }
+    if name == "i64" { return "int64_t" }
+    if name == "u64" { return "uint64_t" }
+    if name == "f32" { return "float" }
+    if name == "f64" { return "double" }
+    -- SIMD vector types
+    if name == "f32x4" { return "dm_f32x4" }
+    if name == "f32x8" { return "dm_f32x8" }
+    if name == "f64x2" { return "dm_f64x2" }
+    if name == "f64x4" { return "dm_f64x4" }
+    if name == "i32x4" { return "dm_i32x4" }
+    if name == "i32x8" { return "dm_i32x8" }
+    if name == "i64x2" { return "dm_i64x2" }
+    if name == "i64x4" { return "dm_i64x4" }
     return "dm_" + name
 }
 
@@ -945,6 +1043,63 @@ struct ExprOut {
 
 fn compile_expr(c: Compiler) -> ExprOut {
     return compile_pipe_expr(c)
+}
+
+-- Returns the required effect for a builtin function name, or "" if none needed
+fn get_builtin_effect(name: string) -> string {
+    -- Console effect: stdout/stderr output
+    if name == "println" { return "Console" }
+    if name == "print" { return "Console" }
+    if name == "eprintln" { return "Console" }
+    if name == "eprint" { return "Console" }
+    -- FileSystem effect: file I/O
+    if name == "file_read" { return "FileSystem" }
+    if name == "file_write" { return "FileSystem" }
+    if name == "file_append" { return "FileSystem" }
+    if name == "file_exists" { return "FileSystem" }
+    -- IO effect: stdin input
+    if name == "read_line" { return "IO" }
+    -- Process effect: system calls and exit
+    if name == "system" { return "Process" }
+    if name == "exit" { return "Process" }
+    -- No effect needed for all other builtins
+    return ""
+}
+
+-- Check if the current function's effect set allows the given effect
+fn check_effect_allowed(c: Compiler, builtin_name: string) -> Compiler {
+    let mut cc = c
+    if cc.current_fn_has_effects == false {
+        -- No with [...] clause on this function: no enforcement (opt-in)
+        return cc
+    }
+    let required = get_builtin_effect(builtin_name)
+    if required == "" {
+        -- This builtin has no effect requirement
+        return cc
+    }
+    -- Check if the required effect is in the current_fn_effects pipe-delimited string
+    let marker = "|" + required + "|"
+    if string_contains(cc.current_fn_effects, marker) {
+        return cc
+    }
+    -- Effect not allowed: report error and abort
+    -- Extract the allowed effects from the pipe-delimited string for error message
+    let effects_str = string_replace(cc.current_fn_effects, "|", ", ")
+    let trimmed = string_trim(effects_str)
+    let mut display = trimmed
+    if starts_with(display, ", ") {
+        display = substr(display, 2, len(display) - 2)
+    }
+    if ends_with(display, ", ") {
+        display = substr(display, 0, len(display) - 2)
+    }
+    if display == "" {
+        display = "(none)"
+    }
+    eprintln("Effect error: '" + builtin_name + "' requires '" + required + "' effect but function only allows [" + display + "]")
+    panic("")
+    return cc
 }
 
 -- Find the position of the outermost function call's opening paren.
@@ -1113,7 +1268,11 @@ fn compile_add_expr(c: Compiler) -> ExprOut {
             let rhs = compile_mul_expr(result.c)
             result.c = rhs.c
             if code_is_string(result.code, result.c) or code_is_string(rhs.code, result.c) {
-                result.code = "dm_string_concat(" + result.code + ", " + rhs.code + ")"
+                if result.c.current_region_arena != "" {
+                    result.code = "dm_string_concat_arena(" + result.c.current_region_arena + ", " + result.code + ", " + rhs.code + ")"
+                } else {
+                    result.code = "dm_string_concat(" + result.code + ", " + rhs.code + ")"
+                }
             } else {
                 result.code = "(" + result.code + " + " + rhs.code + ")"
             }
@@ -1240,8 +1399,27 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                     args_code = args_code + arg.code
                 }
                 result.c = c_expect(result.c, TK_RPAREN())
+                -- Determine receiver type for map vs list dispatch
+                let recv_method_type = infer_type_from_code(result.code, result.c)
+                let is_map_recv = starts_with(recv_method_type, "dm_map_")
                 -- Generate method call
-                if field == "push" {
+                if field == "insert" and is_map_recv {
+                    result.code = recv_method_type + "_insert(&" + result.code + ", " + args_code + ")"
+                } else if field == "get" and is_map_recv {
+                    result.code = recv_method_type + "_get(&" + result.code + ", " + args_code + ")"
+                } else if field == "contains" and is_map_recv {
+                    result.code = recv_method_type + "_contains(&" + result.code + ", " + args_code + ")"
+                } else if field == "remove" and is_map_recv {
+                    result.code = recv_method_type + "_remove(&" + result.code + ", " + args_code + ")"
+                } else if field == "len" and is_map_recv {
+                    result.code = "(int64_t)(" + result.code + ").len"
+                } else if field == "keys" and is_map_recv {
+                    result.code = recv_method_type + "_keys(&" + result.code + ")"
+                } else if field == "values" and is_map_recv {
+                    result.code = recv_method_type + "_values(&" + result.code + ")"
+                } else if field == "set" and is_map_recv {
+                    result.code = recv_method_type + "_insert(&" + result.code + ", " + args_code + ")"
+                } else if field == "push" {
                     result.code = "DM_LIST_PUSH(" + result.code + ", (" + args_code + "))"
                 } else if field == "len" {
                     result.code = "DM_LIST_LEN(" + result.code + ")"
@@ -1250,10 +1428,20 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 } else if field == "contains" {
                     result.code = "DM_LIST_CONTAINS(" + result.code + ", " + args_code + ")"
                 } else {
-                    -- Check for impl method: look up the receiver's type and try TypeName_method
+                    -- Check for dyn trait dispatch: receiver type starts with dm_dyn_
                     let receiver_type = infer_type_from_code(result.code, result.c)
                     let mut found_impl = false
-                    if starts_with(receiver_type, "dm_") {
+                    if starts_with(receiver_type, "dm_dyn_") {
+                        found_impl = true
+                        -- Dispatch through vtable: dm_dyn_TraitName_method(receiver, args)
+                        if args_code != "" {
+                            result.code = receiver_type + "_" + field + "(" + result.code + ", " + args_code + ")"
+                        } else {
+                            result.code = receiver_type + "_" + field + "(" + result.code + ")"
+                        }
+                    }
+                    -- Check for impl method: look up the receiver's type and try TypeName_method
+                    if found_impl == false and starts_with(receiver_type, "dm_") {
                         let type_name = substr(receiver_type, 3, len(receiver_type) - 3)
                         -- Strip trailing * for pointer types
                         let mut clean_type = type_name
@@ -1317,7 +1505,13 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
             let idx = compile_expr(result.c)
             result.c = idx.c
             result.c = c_expect(result.c, TK_RBRACKET())
-            result.code = "DM_LIST_GET(" + result.code + ", " + idx.code + ")"
+            -- Check if receiver is a map type for index access
+            let idx_recv_type = infer_type_from_code(result.code, result.c)
+            if starts_with(idx_recv_type, "dm_map_") {
+                result.code = idx_recv_type + "_get(&" + result.code + ", " + idx.code + ")"
+            } else {
+                result.code = "DM_LIST_GET(" + result.code + ", " + idx.code + ")"
+            }
         } else if k == TK_LPAREN() and result.code != "" {
             -- Function call (only if we have a callee)
             result.c = c_advance(result.c)
@@ -1350,6 +1544,85 @@ fn compile_postfix_expr(c: Compiler) -> ExprOut {
                 }
             }
             result.code = callee_code + "(" + args_code + ")"
+        } else if k == TK_AS() {
+            -- Cast expression: expr as Type or expr as dyn TraitName
+            result.c = c_advance(result.c)
+            -- Check for "dyn" keyword for trait object cast
+            let as_tok = c_cur(result.c)
+            if as_tok.kind == TK_IDENT() and as_tok.value == "dyn" {
+                result.c = c_advance(result.c)  -- skip 'dyn'
+                let dyn_trait_tok = c_cur(result.c)
+                let dyn_trait_name = dyn_trait_tok.value
+                result.c = c_advance(result.c)  -- skip trait name
+                -- Generate dyn trait infrastructure if not already done
+                result.c = generate_dyn_trait_defs(result.c, dyn_trait_name)
+                -- Infer concrete type of expression
+                let concrete_type = infer_type_from_code(result.code, result.c)
+                -- Strip dm_ prefix and trailing * to get the clean type name
+                let mut clean_type = concrete_type
+                if starts_with(clean_type, "dm_") {
+                    clean_type = substr(clean_type, 3, len(clean_type) - 3)
+                }
+                if ends_with(clean_type, "*") {
+                    clean_type = substr(clean_type, 0, len(clean_type) - 1)
+                }
+                -- Generate the vtable instance and fat pointer inline
+                let dyn_type = "dm_dyn_" + dyn_trait_name
+                let vtable_type = "dm_" + dyn_trait_name + "_vtable"
+                let vtable_var = "_vtable_" + clean_type + "_" + dyn_trait_name
+                -- Emit the static vtable variable (once) into lambda_defs
+                let vtable_marker = "|" + vtable_var + "|"
+                if string_contains(result.c.dyn_traits_generated, vtable_marker) == false {
+                    result.c.dyn_traits_generated = result.c.dyn_traits_generated + vtable_marker
+                    let mut vtable_init = ""
+                    let search_prefix = "|" + dyn_trait_name + "."
+                    let mut sp2 = string_find(result.c.trait_methods, search_prefix)
+                    while sp2 >= 0 {
+                        let after_p2 = sp2 + len(search_prefix)
+                        let rest3 = substr(result.c.trait_methods, after_p2, len(result.c.trait_methods) - after_p2)
+                        let eq_p2 = string_find(rest3, "=")
+                        if eq_p2 >= 0 {
+                            let mname2 = substr(rest3, 0, eq_p2)
+                            let after_eq2 = substr(rest3, eq_p2 + 1, len(rest3) - eq_p2 - 1)
+                            let pipe_p2 = string_find(after_eq2, "|")
+                            let mut sig3 = after_eq2
+                            if pipe_p2 >= 0 {
+                                sig3 = substr(after_eq2, 0, pipe_p2)
+                            }
+                            let colon_p2 = string_find(sig3, ":")
+                            let mut mret2 = "void"
+                            let mut mparams2 = ""
+                            if colon_p2 >= 0 {
+                                mret2 = substr(sig3, 0, colon_p2)
+                                mparams2 = substr(sig3, colon_p2 + 1, len(sig3) - colon_p2 - 1)
+                            }
+                            let mut cast_fptr_params = "void*"
+                            if mparams2 != "" {
+                                cast_fptr_params = cast_fptr_params + ", " + mparams2
+                            }
+                            if vtable_init != "" {
+                                vtable_init = vtable_init + ", "
+                            }
+                            vtable_init = vtable_init + "." + mname2 + " = (" + mret2 + " (*)(" + cast_fptr_params + "))dm_" + clean_type + "_" + mname2
+                        }
+                        let next_s2 = sp2 + len(search_prefix)
+                        let next_rest2 = substr(result.c.trait_methods, next_s2, len(result.c.trait_methods) - next_s2)
+                        let nf2 = string_find(next_rest2, search_prefix)
+                        if nf2 < 0 {
+                            sp2 = 0 - 1
+                        } else {
+                            sp2 = next_s2 + nf2
+                        }
+                    }
+                    let vtable_def = "static " + vtable_type + " " + vtable_var + " = { " + vtable_init + " };\n"
+                    result.c.lambda_defs = result.c.lambda_defs + vtable_def
+                }
+                result.code = "(" + dyn_type + "){ .data = (void*)&" + result.code + ", .vtable = &" + vtable_var + " }"
+            } else {
+                let cast_type = parse_type_for_c(result.c)
+                result.c = cast_type.c
+                result.code = "((" + cast_type.code + ")(" + result.code + "))"
+            }
         } else {
             cont = false
         }
@@ -1665,10 +1938,19 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     temp_cc.var_types = cc.var_types
     temp_cc.str_vars = cc.str_vars
     temp_cc.list_type_defs = cc.list_type_defs
+    temp_cc.map_type_defs = cc.map_type_defs
+    temp_cc.map_kv_types = cc.map_kv_types
     temp_cc.option_type_defs = cc.option_type_defs
+    temp_cc.future_type_defs = cc.future_type_defs
     temp_cc.list_elem_types = cc.list_elem_types
     temp_cc.generic_fn_tokens = cc.generic_fn_tokens
     temp_cc.monomorphized_fns = cc.monomorphized_fns
+    temp_cc.trait_methods = cc.trait_methods
+    temp_cc.trait_names = cc.trait_names
+    temp_cc.impl_for_map = cc.impl_for_map
+    temp_cc.dyn_trait_defs = cc.dyn_trait_defs
+    temp_cc.dyn_traits_generated = cc.dyn_traits_generated
+    temp_cc.array_type_defs = cc.array_type_defs
     -- Propagate counters to avoid name collisions with the caller context
     temp_cc.lambda_counter = cc.lambda_counter
     temp_cc.match_counter = cc.match_counter
@@ -1691,9 +1973,15 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     }
     -- Copy monomorphized tracking
     cc.monomorphized_fns = temp_cc.monomorphized_fns
-    -- Copy any new list/option type defs
+    -- Copy any new list/option/map type defs
     cc.list_type_defs = temp_cc.list_type_defs
+    cc.map_type_defs = temp_cc.map_type_defs
+    cc.map_kv_types = temp_cc.map_kv_types
     cc.option_type_defs = temp_cc.option_type_defs
+    cc.future_type_defs = temp_cc.future_type_defs
+    cc.dyn_trait_defs = temp_cc.dyn_trait_defs
+    cc.dyn_traits_generated = temp_cc.dyn_traits_generated
+    cc.array_type_defs = temp_cc.array_type_defs
     -- Copy fn_names/ret_types (the monomorphized fn was added)
     cc.fn_names = temp_cc.fn_names
     cc.fn_ret_types = temp_cc.fn_ret_types
@@ -1706,6 +1994,281 @@ fn monomorphize_generic_fn(c: Compiler, fn_name: string, generic_info: string, c
     cc.lambda_defs = cc.lambda_defs + temp_cc.lambda_defs
 
     return cc
+}
+
+-- Compile f-string interpolation: f"Hello {name}, x = {x + 1}"
+-- Parses the raw content between quotes, splits on {expr} placeholders,
+-- and generates dm_string_concat chains with auto-conversion for non-string types
+fn compile_fstring(c: Compiler, content: string) -> ExprOut {
+    let mut cc = c
+    let content_len = len(content)
+    let mut result_code = ""
+    let mut i = 0
+    let mut seg_start = 0
+
+    while i < content_len {
+        let ch = char_at(content, i)
+        if ch == "{" {
+            -- Emit the literal segment before this placeholder
+            if i > seg_start {
+                let literal = substr(content, seg_start, i - seg_start)
+                let lit_code = "dm_string_from_cstr(\"" + literal + "\")"
+                if result_code == "" {
+                    result_code = lit_code
+                } else {
+                    if cc.current_region_arena != "" {
+                        result_code = "dm_string_concat_arena(" + cc.current_region_arena + ", " + result_code + ", " + lit_code + ")"
+                    } else {
+                        result_code = "dm_string_concat(" + result_code + ", " + lit_code + ")"
+                    }
+                }
+            }
+            -- Find matching }
+            i = i + 1
+            let expr_start = i
+            let mut depth = 1
+            while i < content_len and depth > 0 {
+                let c2 = char_at(content, i)
+                if c2 == "{" { depth = depth + 1 }
+                if c2 == "}" { depth = depth - 1 }
+                if depth > 0 { i = i + 1 }
+            }
+            -- Extract the expression text
+            let expr_text = substr(content, expr_start, i - expr_start)
+            i = i + 1  -- skip closing }
+            seg_start = i
+
+            -- Tokenize and compile the sub-expression
+            let expr_tokens = tokenize(expr_text)
+            let mut temp_cc = compiler_new(expr_tokens)
+            -- Copy important state from the outer compiler
+            temp_cc.str_vars = cc.str_vars
+            temp_cc.var_types = cc.var_types
+            temp_cc.struct_fields = cc.struct_fields
+            temp_cc.struct_names = cc.struct_names
+            temp_cc.enum_names = cc.enum_names
+            temp_cc.fn_names = cc.fn_names
+            temp_cc.fn_ret_types = cc.fn_ret_types
+            temp_cc.list_elem_types = cc.list_elem_types
+            temp_cc.enum_variants = cc.enum_variants
+            temp_cc.trait_methods = cc.trait_methods
+            temp_cc.trait_names = cc.trait_names
+            temp_cc.impl_for_map = cc.impl_for_map
+            temp_cc.generic_fn_tokens = cc.generic_fn_tokens
+            temp_cc.monomorphized_fns = cc.monomorphized_fns
+            temp_cc.current_region_arena = cc.current_region_arena
+            let expr_result = compile_expr(temp_cc)
+            let expr_code = expr_result.code
+
+            -- Auto-convert to string if needed
+            let mut str_expr = expr_code
+            if code_is_string(expr_code, cc) == false {
+                let etype = infer_type_from_code(expr_code, cc)
+                if etype == "int64_t" {
+                    str_expr = "dm_int_to_string(" + expr_code + ")"
+                } else if etype == "double" {
+                    str_expr = "dm_float_to_string(" + expr_code + ")"
+                } else if etype == "bool" {
+                    str_expr = "dm_bool_to_string(" + expr_code + ")"
+                } else {
+                    -- Fallback: try int_to_string
+                    str_expr = "dm_int_to_string(" + expr_code + ")"
+                }
+            }
+
+            if result_code == "" {
+                result_code = str_expr
+            } else {
+                if cc.current_region_arena != "" {
+                    result_code = "dm_string_concat_arena(" + cc.current_region_arena + ", " + result_code + ", " + str_expr + ")"
+                } else {
+                    result_code = "dm_string_concat(" + result_code + ", " + str_expr + ")"
+                }
+            }
+        } else {
+            i = i + 1
+        }
+    }
+
+    -- Emit any remaining literal tail
+    if seg_start < content_len {
+        let literal = substr(content, seg_start, content_len - seg_start)
+        let lit_code = "dm_string_from_cstr(\"" + literal + "\")"
+        if result_code == "" {
+            result_code = lit_code
+        } else {
+            if cc.current_region_arena != "" {
+                result_code = "dm_string_concat_arena(" + cc.current_region_arena + ", " + result_code + ", " + lit_code + ")"
+            } else {
+                result_code = "dm_string_concat(" + result_code + ", " + lit_code + ")"
+            }
+        }
+    }
+
+    if result_code == "" {
+        result_code = "dm_string_from_cstr(\"\")"
+    }
+
+    return ExprOut { c: cc, code: result_code }
+}
+
+-- ============================================================
+-- COMPTIME EXPRESSION EVALUATOR
+-- Evaluates constant expressions at compile time
+-- ============================================================
+
+fn eval_comptime_expr(c: Compiler) -> ExprOut {
+    return eval_comptime_or(c)
+}
+
+fn eval_comptime_or(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_and(c)
+    while c_peek(result.c) == TK_OR() {
+        result.c = c_advance(result.c)
+        let rhs = eval_comptime_and(result.c)
+        result.c = rhs.c
+        let l = result.code == "true" or result.code == "1"
+        let r = rhs.code == "true" or rhs.code == "1"
+        if l or r {
+            result.code = "true"
+        } else {
+            result.code = "false"
+        }
+    }
+    return result
+}
+
+fn eval_comptime_and(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_add(c)
+    while c_peek(result.c) == TK_AND() {
+        result.c = c_advance(result.c)
+        let rhs = eval_comptime_add(result.c)
+        result.c = rhs.c
+        let l = result.code == "true" or result.code == "1"
+        let r = rhs.code == "true" or rhs.code == "1"
+        if l and r {
+            result.code = "true"
+        } else {
+            result.code = "false"
+        }
+    }
+    return result
+}
+
+fn eval_comptime_add(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_mul(c)
+    let mut cont = true
+    while cont {
+        let k = c_peek(result.c)
+        if k == TK_PLUS() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_mul(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            result.code = int_to_string(lv + rv)
+        } else if k == TK_MINUS() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_mul(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            result.code = int_to_string(lv - rv)
+        } else {
+            cont = false
+        }
+    }
+    return result
+}
+
+fn eval_comptime_mul(c: Compiler) -> ExprOut {
+    let mut result = eval_comptime_primary(c)
+    let mut cont = true
+    while cont {
+        let k = c_peek(result.c)
+        if k == TK_STAR() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_primary(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            result.code = int_to_string(lv * rv)
+        } else if k == TK_SLASH() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_primary(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            if rv != 0 {
+                result.code = int_to_string(lv / rv)
+            } else {
+                result.code = "0"
+            }
+        } else if k == TK_PERCENT() {
+            result.c = c_advance(result.c)
+            let rhs = eval_comptime_primary(result.c)
+            result.c = rhs.c
+            let lv = parse_int(result.code)
+            let rv = parse_int(rhs.code)
+            if rv != 0 {
+                result.code = int_to_string(lv % rv)
+            } else {
+                result.code = "0"
+            }
+        } else {
+            cont = false
+        }
+    }
+    return result
+}
+
+fn eval_comptime_primary(c: Compiler) -> ExprOut {
+    let mut cc = c_skip_nl(c)
+    let tok = c_cur(cc)
+    let k = tok.kind
+    if k == TK_INTEGER() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: tok.value }
+    }
+    if k == TK_FLOAT() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: tok.value }
+    }
+    if k == TK_TRUE() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: "true" }
+    }
+    if k == TK_FALSE() {
+        cc = c_advance(cc)
+        return ExprOut { c: cc, code: "false" }
+    }
+    if k == TK_NOT() {
+        cc = c_advance(cc)
+        let operand = eval_comptime_primary(cc)
+        cc = operand.c
+        if operand.code == "true" or operand.code == "1" {
+            return ExprOut { c: cc, code: "false" }
+        } else {
+            return ExprOut { c: cc, code: "true" }
+        }
+    }
+    if k == TK_MINUS() {
+        cc = c_advance(cc)
+        let operand = eval_comptime_primary(cc)
+        cc = operand.c
+        let v = parse_int(operand.code)
+        return ExprOut { c: cc, code: int_to_string(0 - v) }
+    }
+    if k == TK_LPAREN() {
+        cc = c_advance(cc)
+        let inner = eval_comptime_expr(cc)
+        cc = inner.c
+        cc = c_expect(cc, TK_RPAREN())
+        return ExprOut { c: cc, code: inner.code }
+    }
+    -- Unknown token - just return 0
+    cc = c_advance(cc)
+    return ExprOut { c: cc, code: "0" }
 }
 
 fn compile_primary_expr(c: Compiler) -> ExprOut {
@@ -1725,6 +2288,10 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = c_advance(cc)
         return ExprOut { c: cc, code: "dm_string_from_cstr(\"" + tok.value + "\")" }
     }
+    if k == TK_FSTRING() {
+        cc = c_advance(cc)
+        return compile_fstring(cc, tok.value)
+    }
     if k == TK_TRUE() {
         cc = c_advance(cc)
         return ExprOut { c: cc, code: "true" }
@@ -1738,15 +2305,19 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = c_advance(cc)
         -- Check for builtin function mapping
         if name == "println" {
+            cc = check_effect_allowed(cc, "println")
             return ExprOut { c: cc, code: "dm_println_str" }
         }
         if name == "print" {
+            cc = check_effect_allowed(cc, "print")
             return ExprOut { c: cc, code: "dm_print_str" }
         }
         if name == "eprintln" {
+            cc = check_effect_allowed(cc, "eprintln")
             return ExprOut { c: cc, code: "dm_eprintln_str" }
         }
         if name == "eprint" {
+            cc = check_effect_allowed(cc, "eprint")
             return ExprOut { c: cc, code: "dm_eprint_str" }
         }
         if name == "int_to_string" {
@@ -1798,15 +2369,31 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
             return ExprOut { c: cc, code: "dm_string_to_lower" }
         }
         if name == "file_read" {
+            cc = check_effect_allowed(cc, "file_read")
             return ExprOut { c: cc, code: "dm_file_read" }
         }
         if name == "file_write" {
+            cc = check_effect_allowed(cc, "file_write")
             return ExprOut { c: cc, code: "dm_file_write" }
         }
+        if name == "file_append" {
+            cc = check_effect_allowed(cc, "file_append")
+            return ExprOut { c: cc, code: "dm_append_file" }
+        }
+        if name == "file_exists" {
+            cc = check_effect_allowed(cc, "file_exists")
+            return ExprOut { c: cc, code: "dm_file_exists" }
+        }
+        if name == "read_line" {
+            cc = check_effect_allowed(cc, "read_line")
+            return ExprOut { c: cc, code: "dm_read_line" }
+        }
         if name == "exit" {
+            cc = check_effect_allowed(cc, "exit")
             return ExprOut { c: cc, code: "dm_exit" }
         }
         if name == "system" {
+            cc = check_effect_allowed(cc, "system")
             return ExprOut { c: cc, code: "dm_system" }
         }
         if name == "args_get" {
@@ -1817,6 +2404,71 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         }
         if name == "panic" {
             return ExprOut { c: cc, code: "dm_panic" }
+        }
+        -- assert(cond) builtin: inline expansion to check + panic
+        if name == "assert" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let assert_cond = compile_expr(cc)
+                cc = assert_cond.c
+                cc = c_expect(cc, TK_RPAREN())
+                let assert_code = "do { if (!(" + assert_cond.code + ")) { fprintf(stderr, \"PANIC: assertion failed\\n\"); exit(1); } } while(0)"
+                return ExprOut { c: cc, code: assert_code }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        -- assert_eq(a, b) builtin: inline expansion with type-aware comparison
+        if name == "assert_eq" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let aeq_a = compile_expr(cc)
+                cc = aeq_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let aeq_b = compile_expr(cc)
+                cc = aeq_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                if code_is_string(aeq_a.code, cc) or code_is_string(aeq_b.code, cc) {
+                    let aeq_code = "do { if (!dm_string_eq(" + aeq_a.code + ", " + aeq_b.code + ")) { fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1); } } while(0)"
+                    return ExprOut { c: cc, code: aeq_code }
+                } else {
+                    let aeq_code = "do { if ((" + aeq_a.code + ") != (" + aeq_b.code + ")) { fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1); } } while(0)"
+                    return ExprOut { c: cc, code: aeq_code }
+                }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        -- string_split(s, delim) builtin: register list type and emit helper
+        if name == "string_split" {
+            cc = register_list_type(cc, "dm_list_dm_string", "dm_string")
+            if string_contains(cc.lambda_defs, "dm_string_split") == false {
+                let mut split_fn = "static dm_list_dm_string dm_string_split(dm_string s, dm_string delim) {\n"
+                split_fn = split_fn + "    dm_list_dm_string result = dm_list_dm_string_new();\n"
+                split_fn = split_fn + "    if (delim.len == 0) {\n"
+                split_fn = split_fn + "        DM_LIST_PUSH(result, s);\n"
+                split_fn = split_fn + "        return result;\n"
+                split_fn = split_fn + "    }\n"
+                split_fn = split_fn + "    size_t start = 0;\n"
+                split_fn = split_fn + "    for (size_t i = 0; i + delim.len <= s.len; i++) {\n"
+                split_fn = split_fn + "        if (memcmp(s.data + i, delim.data, delim.len) == 0) {\n"
+                split_fn = split_fn + "            size_t seg_len = i - start;\n"
+                split_fn = split_fn + "            char* buf = (char*)malloc(seg_len + 1);\n"
+                split_fn = split_fn + "            memcpy(buf, s.data + start, seg_len);\n"
+                split_fn = split_fn + "            buf[seg_len] = '\\0';\n"
+                split_fn = split_fn + "            DM_LIST_PUSH(result, ((dm_string){ .data = buf, .len = seg_len, .capacity = seg_len }));\n"
+                split_fn = split_fn + "            i += delim.len - 1;\n"
+                split_fn = split_fn + "            start = i + 1;\n"
+                split_fn = split_fn + "        }\n"
+                split_fn = split_fn + "    }\n"
+                split_fn = split_fn + "    size_t last_len = s.len - start;\n"
+                split_fn = split_fn + "    char* last_buf = (char*)malloc(last_len + 1);\n"
+                split_fn = split_fn + "    memcpy(last_buf, s.data + start, last_len);\n"
+                split_fn = split_fn + "    last_buf[last_len] = '\\0';\n"
+                split_fn = split_fn + "    DM_LIST_PUSH(result, ((dm_string){ .data = last_buf, .len = last_len, .capacity = last_len }));\n"
+                split_fn = split_fn + "    return result;\n"
+                split_fn = split_fn + "}\n\n"
+                cc.lambda_defs = cc.lambda_defs + split_fn
+            }
+            return ExprOut { c: cc, code: "dm_string_split" }
         }
         -- Box_new(val) and Box_null() builtins
         if name == "Box_new" {
@@ -1838,6 +2490,98 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
                 return ExprOut { c: cc, code: "NULL" }
             }
             return ExprOut { c: cc, code: "NULL" }
+        }
+        -- SIMD splat builtins: simd_splat_TYPE(val)
+        if starts_with(name, "simd_splat_") {
+            let simd_type = substr(name, 11, len(name) - 11)
+            let c_fn = "dm_simd_splat_" + simd_type
+            return ExprOut { c: cc, code: c_fn }
+        }
+        -- SIMD set builtins: simd_set_TYPE(a, b, ...)
+        if starts_with(name, "simd_set_") {
+            let simd_type = substr(name, 9, len(name) - 9)
+            let c_fn = "dm_simd_set_" + simd_type
+            return ExprOut { c: cc, code: c_fn }
+        }
+        -- SIMD arithmetic builtins: simd_add, simd_sub, simd_mul, simd_div
+        if name == "simd_add" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " + " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "simd_sub" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " - " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "simd_mul" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " * " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "simd_div" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_a = compile_expr(cc)
+                cc = arg_a.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_b = compile_expr(cc)
+                cc = arg_b.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: "(" + arg_a.code + " / " + arg_b.code + ")" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        -- SIMD extract: simd_extract(vec, idx) -> vec[idx]
+        if name == "simd_extract" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                let arg_vec = compile_expr(cc)
+                cc = arg_vec.c
+                cc = c_expect(cc, TK_COMMA())
+                let arg_idx = compile_expr(cc)
+                cc = arg_idx.c
+                cc = c_expect(cc, TK_RPAREN())
+                return ExprOut { c: cc, code: arg_vec.code + "[" + arg_idx.code + "]" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
+        }
+        if name == "Map_new" {
+            if c_peek(cc) == TK_LPAREN() {
+                cc = c_advance(cc)
+                cc = c_expect(cc, TK_RPAREN())
+                -- Use expected_type to determine the map type
+                let map_type = cc.expected_type
+                if map_type != "" and starts_with(map_type, "dm_map_") {
+                    return ExprOut { c: cc, code: map_type + "_new()" }
+                }
+                return ExprOut { c: cc, code: "/* Map_new unknown type */" }
+            }
+            return ExprOut { c: cc, code: dm_mangle(name) }
         }
         -- Option/Result constructors: Some, None, Ok, Err
         -- Use expected_type or current_fn_ret_type for type context
@@ -1901,6 +2645,39 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
         cc = c_expect(cc, TK_RPAREN())
         return ExprOut { c: cc, code: "(" + inner.code + ")" }
     }
+    if k == TK_LBRACKET() {
+        -- Array repeat literal: [value; N]
+        cc = c_advance(cc)  -- skip '['
+        let arr_val = compile_expr(cc)
+        cc = arr_val.c
+        if c_peek(cc) == TK_SEMICOLON() {
+            cc = c_advance(cc)  -- skip ';'
+            let arr_size_tok = c_cur(cc)
+            let arr_size = arr_size_tok.value
+            cc = c_advance(cc)  -- skip N
+            cc = c_expect(cc, TK_RBRACKET())
+            -- Infer element type from value
+            let arr_elem_type = infer_type_from_code(arr_val.code, cc)
+            let arr_type = "dm_array_" + arr_elem_type + "_" + arr_size
+            cc = register_array_type(cc, arr_elem_type, arr_size)
+            -- Build compound literal: (dm_array_T_N){val, val, ..., val}
+            let arr_n = parse_int(arr_size)
+            let mut arr_init = ""
+            let mut arr_i = 0
+            while arr_i < arr_n {
+                if arr_i > 0 {
+                    arr_init = arr_init + ", "
+                }
+                arr_init = arr_init + arr_val.code
+                arr_i = arr_i + 1
+            }
+            let arr_code = "((" + arr_type + "){" + arr_init + "})"
+            return ExprOut { c: cc, code: arr_code }
+        }
+        -- Otherwise unexpected (list literals handled in compile_let_stmt)
+        cc = c_expect(cc, TK_RBRACKET())
+        return ExprOut { c: cc, code: "0 /* unexpected [ expr */" }
+    }
     if k == TK_SELF() {
         cc = c_advance(cc)
         return ExprOut { c: cc, code: "dm_self" }
@@ -1910,6 +2687,19 @@ fn compile_primary_expr(c: Compiler) -> ExprOut {
     }
     if k == TK_PIPE() {
         return compile_lambda_expr(cc)
+    }
+    if k == TK_AWAIT() {
+        cc = c_advance(cc)  -- skip 'await'
+        let await_expr = compile_postfix_expr(cc)
+        cc = await_expr.c
+        -- Infer the future type from the expression
+        let expr_type = infer_type_from_code(await_expr.code, cc)
+        if starts_with(expr_type, "dm_future_") {
+            return ExprOut { c: cc, code: expr_type + "_await(" + await_expr.code + ")" }
+        }
+        -- Fallback: if type inference can't determine the future type, try from the expression code
+        -- For simple variable references, look up the variable type
+        return ExprOut { c: cc, code: await_expr.code }
     }
     -- Unknown primary
     cc = c_error(cc, "unexpected token in expression: " + token_kind_name(k))
@@ -1946,7 +2736,13 @@ fn compile_stmt(c: Compiler) -> Compiler {
             let val = compile_expr(cc)
             cc = val.c
             cc.expected_type = saved_expected
-            cc.output = cc.output + ind + "return " + val.code + ";\n"
+            -- If in async function, wrap return value with _ready()
+            if cc.current_fn_is_async and cc.current_fn_async_inner_type != "" {
+                let future_t = "dm_future_" + cc.current_fn_async_inner_type
+                cc.output = cc.output + ind + "return " + future_t + "_ready(" + val.code + ");\n"
+            } else {
+                cc.output = cc.output + ind + "return " + val.code + ";\n"
+            }
         }
         return cc
     }
@@ -1978,6 +2774,9 @@ fn compile_stmt(c: Compiler) -> Compiler {
     if k == TK_REGION() {
         return compile_region_stmt(cc)
     }
+    if k == TK_CONST() {
+        return compile_const_stmt(cc)
+    }
     -- Expression statement (possibly assignment)
     let lhs = compile_expr(cc)
     cc = lhs.c
@@ -1986,7 +2785,15 @@ fn compile_stmt(c: Compiler) -> Compiler {
         cc = c_advance(cc)
         let rhs = compile_expr(cc)
         cc = rhs.c
-        cc.output = cc.output + ind + lhs.code + " = " + rhs.code + ";\n"
+        -- Check for map index assignment: dm_map_K_V_get(&dm_var, key) = val -> dm_map_K_V_insert(&dm_var, key, val)
+        if starts_with(lhs.code, "dm_map_") and string_contains(lhs.code, "_get(") {
+            let get_pos = string_find(lhs.code, "_get(")
+            let map_type_name = substr(lhs.code, 0, get_pos)
+            let args_part = substr(lhs.code, get_pos + 5, len(lhs.code) - get_pos - 6)
+            cc.output = cc.output + ind + map_type_name + "_insert(" + args_part + ", " + rhs.code + ");\n"
+        } else {
+            cc.output = cc.output + ind + lhs.code + " = " + rhs.code + ";\n"
+        }
     } else if c_peek(cc) == TK_PLUSEQ() {
         cc = c_advance(cc)
         let rhs = compile_expr(cc)
@@ -2091,6 +2898,12 @@ fn lookup_var_type(c: Compiler, mangled_name: string) -> string {
 }
 
 fn infer_builtin_ret_type(fn_code: string) -> string {
+    -- Future await: dm_future_T_await(...) -> T
+    if starts_with(fn_code, "dm_future_") and string_contains(fn_code, "_await(") {
+        let await_pos = string_find(fn_code, "_await(")
+        let inner_type = substr(fn_code, 10, await_pos - 10)
+        return inner_type
+    }
     -- Builtins that return specific types
     if starts_with(fn_code, "dm_parse_int(") { return "int64_t" }
     if starts_with(fn_code, "dm_parse_float(") { return "double" }
@@ -2114,6 +2927,26 @@ fn infer_builtin_ret_type(fn_code: string) -> string {
     if starts_with(fn_code, "dm_float_to_string(") { return "dm_string" }
     if starts_with(fn_code, "dm_bool_to_string(") { return "dm_string" }
     if starts_with(fn_code, "dm_string_concat(") { return "dm_string" }
+    if starts_with(fn_code, "dm_string_concat_arena(") { return "dm_string" }
+    if starts_with(fn_code, "dm_string_split(") { return "dm_list_dm_string" }
+    -- SIMD splat builtins
+    if starts_with(fn_code, "dm_simd_splat_f32x4(") { return "dm_f32x4" }
+    if starts_with(fn_code, "dm_simd_splat_f32x8(") { return "dm_f32x8" }
+    if starts_with(fn_code, "dm_simd_splat_f64x2(") { return "dm_f64x2" }
+    if starts_with(fn_code, "dm_simd_splat_f64x4(") { return "dm_f64x4" }
+    if starts_with(fn_code, "dm_simd_splat_i32x4(") { return "dm_i32x4" }
+    if starts_with(fn_code, "dm_simd_splat_i32x8(") { return "dm_i32x8" }
+    if starts_with(fn_code, "dm_simd_splat_i64x2(") { return "dm_i64x2" }
+    if starts_with(fn_code, "dm_simd_splat_i64x4(") { return "dm_i64x4" }
+    -- SIMD set builtins
+    if starts_with(fn_code, "dm_simd_set_f32x4(") { return "dm_f32x4" }
+    if starts_with(fn_code, "dm_simd_set_f32x8(") { return "dm_f32x8" }
+    if starts_with(fn_code, "dm_simd_set_f64x2(") { return "dm_f64x2" }
+    if starts_with(fn_code, "dm_simd_set_f64x4(") { return "dm_f64x4" }
+    if starts_with(fn_code, "dm_simd_set_i32x4(") { return "dm_i32x4" }
+    if starts_with(fn_code, "dm_simd_set_i32x8(") { return "dm_i32x8" }
+    if starts_with(fn_code, "dm_simd_set_i64x2(") { return "dm_i64x2" }
+    if starts_with(fn_code, "dm_simd_set_i64x4(") { return "dm_i64x4" }
     return ""
 }
 
@@ -2176,6 +3009,105 @@ fn infer_enum_ctor_type(code: string, c: Compiler) -> string {
     return ""
 }
 
+fn infer_map_method_type(code: string, c: Compiler) -> string {
+    -- Match dm_map_*_keys(, dm_map_*_values(, dm_map_*_get(, dm_map_*_contains(, etc.
+    if starts_with(code, "dm_map_") == false { return "" }
+    if string_contains(code, "(") == false { return "" }
+    let paren_pos = string_find(code, "(")
+    let call_name = substr(code, 0, paren_pos)
+    -- Check for _keys suffix
+    if ends_with(call_name, "_keys") {
+        let map_type = substr(call_name, 0, len(call_name) - 5)
+        let key_t = lookup_map_key_type(c, map_type)
+        if key_t != "" { return "dm_list_" + key_t }
+    }
+    -- Check for _values suffix
+    if ends_with(call_name, "_values") {
+        let map_type = substr(call_name, 0, len(call_name) - 7)
+        let val_t = lookup_map_val_type(c, map_type)
+        if val_t != "" { return "dm_list_" + val_t }
+    }
+    -- Check for _get suffix
+    if ends_with(call_name, "_get") {
+        let map_type = substr(call_name, 0, len(call_name) - 4)
+        let val_t = lookup_map_val_type(c, map_type)
+        if val_t != "" { return val_t }
+    }
+    -- Check for _contains suffix
+    if ends_with(call_name, "_contains") {
+        return "bool"
+    }
+    -- Check for _remove suffix
+    if ends_with(call_name, "_remove") {
+        return "bool"
+    }
+    -- Check for _new suffix
+    if ends_with(call_name, "_new") {
+        let map_type = substr(call_name, 0, len(call_name) - 4)
+        if starts_with(map_type, "dm_map_") {
+            return map_type
+        }
+    }
+    return ""
+}
+
+fn is_simd_type(t: string) -> bool {
+    if t == "dm_f32x4" { return true }
+    if t == "dm_f32x8" { return true }
+    if t == "dm_f64x2" { return true }
+    if t == "dm_f64x4" { return true }
+    if t == "dm_i32x4" { return true }
+    if t == "dm_i32x8" { return true }
+    if t == "dm_i64x2" { return true }
+    if t == "dm_i64x4" { return true }
+    return false
+}
+
+fn simd_scalar_type(t: string) -> string {
+    if t == "dm_f32x4" { return "float" }
+    if t == "dm_f32x8" { return "float" }
+    if t == "dm_f64x2" { return "double" }
+    if t == "dm_f64x4" { return "double" }
+    if t == "dm_i32x4" { return "int32_t" }
+    if t == "dm_i32x8" { return "int32_t" }
+    if t == "dm_i64x2" { return "int64_t" }
+    if t == "dm_i64x4" { return "int64_t" }
+    return ""
+}
+
+-- Infer SIMD vector type from binary expression like (dm_a + dm_b)
+fn infer_simd_binop_type(code: string, c: Compiler) -> string {
+    let code_len = len(code)
+    if code_len < 5 { return "" }
+    if char_at(code, 0) != "(" { return "" }
+    if char_at(code, code_len - 1) != ")" { return "" }
+    -- Extract inner content between outer parens
+    let inner = substr(code, 1, code_len - 2)
+    -- Find operator: look for " + " or " - " or " * " or " / "
+    let mut op_pos = string_find(inner, " + ")
+    if op_pos < 0 { op_pos = string_find(inner, " - ") }
+    if op_pos < 0 { op_pos = string_find(inner, " * ") }
+    if op_pos < 0 { op_pos = string_find(inner, " / ") }
+    if op_pos < 0 { return "" }
+    let lhs = substr(inner, 0, op_pos)
+    let lhs_type = lookup_var_type(c, lhs)
+    if is_simd_type(lhs_type) { return lhs_type }
+    return ""
+}
+
+-- Infer scalar type from SIMD extract: dm_var[idx]
+fn infer_simd_extract_type(code: string, c: Compiler) -> string {
+    let bracket_pos = string_find(code, "[")
+    if bracket_pos < 1 { return "" }
+    if ends_with(code, "]") == false { return "" }
+    let var_name = substr(code, 0, bracket_pos)
+    let var_type = lookup_var_type(c, var_name)
+    if is_simd_type(var_type) {
+        return simd_scalar_type(var_type)
+    }
+    return ""
+}
+
 fn infer_type_from_code(code: string, c: Compiler) -> string {
     if code_is_string(code, c) { return "dm_string" }
     if code == "true" { return "bool" }
@@ -2189,12 +3121,21 @@ fn infer_type_from_code(code: string, c: Compiler) -> string {
     -- List element access: DM_LIST_GET(dm_var, idx)
     let list_elem = infer_list_get_type(code, c)
     if list_elem != "" { return list_elem }
+    -- Map method calls: dm_map_K_V_keys/values/get/contains/new
+    let map_ret = infer_map_method_type(code, c)
+    if map_ret != "" { return map_ret }
     -- Function call: dm_foo(...) - look up return type
     let fn_ret = infer_fn_call_type(code, c)
     if fn_ret != "" { return fn_ret }
     -- Variable reference: look up known variable types
     let var_type = lookup_var_type(c, code)
     if var_type != "" { return var_type }
+    -- SIMD binary operation: (dm_a + dm_b) etc.
+    let simd_binop = infer_simd_binop_type(code, c)
+    if simd_binop != "" { return simd_binop }
+    -- SIMD extract: dm_var[idx]
+    let simd_extract = infer_simd_extract_type(code, c)
+    if simd_extract != "" { return simd_extract }
     -- Ternary expression: infer from first branch
     let ternary_type = infer_ternary_type(code, c)
     if ternary_type != "" { return ternary_type }
@@ -2282,8 +3223,8 @@ fn compile_let_stmt(c: Compiler) -> Compiler {
     }
     -- = value
     cc = c_expect(cc, TK_EQ())
-    -- Handle list literals: [] or [a, b, c]
-    if c_peek(cc) == TK_LBRACKET() {
+    -- Handle list literals: [] or [a, b, c] (but not array types [T; N])
+    if c_peek(cc) == TK_LBRACKET() and starts_with(type_str, "dm_array_") == false {
         return compile_let_list_init(cc, ind, type_str, var_name)
     }
     -- Set expected type for Some/None/Ok/Err inference
@@ -2329,6 +3270,187 @@ fn register_list_type(c: Compiler, list_type: string, elem_type: string) -> Comp
     return cc
 }
 
+fn register_map_type(c: Compiler, map_type: string, key_type: string, val_type: string) -> Compiler {
+    let mut cc = c
+    -- Check if already registered
+    if string_contains(cc.map_type_defs, "} " + map_type + ";") { return cc }
+    -- Also register List types for keys() and values()
+    let key_list_t = "dm_list_" + key_type
+    cc = register_list_type(cc, key_list_t, key_type)
+    let val_list_t = "dm_list_" + val_type
+    cc = register_list_type(cc, val_list_t, val_type)
+    cc.map_type_defs = cc.map_type_defs + emit_map_type_def(map_type, key_type, val_type)
+    -- Track map key/value types for iteration and method dispatch
+    cc.map_kv_types = cc.map_kv_types + "|" + map_type + "=" + key_type + ":" + val_type + "|"
+    return cc
+}
+
+fn lookup_map_key_type(c: Compiler, map_type: string) -> string {
+    let marker = "|" + map_type + "="
+    let pos = string_find(c.map_kv_types, marker)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let rest = substr(c.map_kv_types, start, len(c.map_kv_types) - start)
+    let colon_pos = string_find(rest, ":")
+    if colon_pos < 0 { return "" }
+    return substr(rest, 0, colon_pos)
+}
+
+fn lookup_map_val_type(c: Compiler, map_type: string) -> string {
+    let marker = "|" + map_type + "="
+    let pos = string_find(c.map_kv_types, marker)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let rest = substr(c.map_kv_types, start, len(c.map_kv_types) - start)
+    let colon_pos = string_find(rest, ":")
+    if colon_pos < 0 { return "" }
+    let end_pos = string_find(rest, "|")
+    if end_pos < 0 { return "" }
+    return substr(rest, colon_pos + 1, end_pos - colon_pos - 1)
+}
+
+fn emit_map_type_def(map_type: string, key_type: string, val_type: string) -> string {
+    let is_string_key = key_type == "dm_string"
+    let key_list_t = "dm_list_" + key_type
+    let val_list_t = "dm_list_" + val_type
+    -- Entry struct
+    let mut d = "typedef struct " + map_type + "_entry {\n"
+    d = d + "    " + key_type + " key;\n"
+    d = d + "    " + val_type + " value;\n"
+    d = d + "    int state;  /* 0=empty, 1=occupied, 2=tombstone */\n"
+    d = d + "} " + map_type + "_entry;\n\n"
+    -- Map struct
+    d = d + "typedef struct " + map_type + " {\n"
+    d = d + "    " + map_type + "_entry* entries;\n"
+    d = d + "    size_t len;\n"
+    d = d + "    size_t capacity;\n"
+    d = d + "} " + map_type + ";\n\n"
+    -- Hash function
+    d = d + "static inline size_t " + map_type + "_hash(" + key_type + " key) {\n"
+    if is_string_key {
+        d = d + "    size_t h = 14695981039346656037ULL;\n"
+        d = d + "    for (size_t i = 0; i < key.len; i++) {\n"
+        d = d + "        h ^= (unsigned char)key.data[i];\n"
+        d = d + "        h *= 1099511628211ULL;\n"
+        d = d + "    }\n"
+        d = d + "    return h;\n"
+    } else {
+        d = d + "    uint64_t x = (uint64_t)key;\n"
+        d = d + "    x ^= x >> 30;\n"
+        d = d + "    x *= 0xbf58476d1ce4e5b9ULL;\n"
+        d = d + "    x ^= x >> 27;\n"
+        d = d + "    x *= 0x94d049bb133111ebULL;\n"
+        d = d + "    x ^= x >> 31;\n"
+        d = d + "    return (size_t)x;\n"
+    }
+    d = d + "}\n\n"
+    -- Key equality
+    d = d + "static inline bool " + map_type + "_key_eq(" + key_type + " a, " + key_type + " b) {\n"
+    if is_string_key {
+        d = d + "    return dm_string_eq(a, b);\n"
+    } else {
+        d = d + "    return a == b;\n"
+    }
+    d = d + "}\n\n"
+    -- _new
+    d = d + "static inline " + map_type + " " + map_type + "_new(void) {\n"
+    d = d + "    return (" + map_type + "){ .entries = NULL, .len = 0, .capacity = 0 };\n"
+    d = d + "}\n\n"
+    -- _find_slot
+    d = d + "static inline size_t " + map_type + "_find_slot(" + map_type + "* map, " + key_type + " key) {\n"
+    d = d + "    size_t idx = " + map_type + "_hash(key) & (map->capacity - 1);\n"
+    d = d + "    size_t first_tombstone = (size_t)-1;\n"
+    d = d + "    for (size_t i = 0; i < map->capacity; i++) {\n"
+    d = d + "        if (map->entries[idx].state == 0) {\n"
+    d = d + "            return (first_tombstone != (size_t)-1) ? first_tombstone : idx;\n"
+    d = d + "        }\n"
+    d = d + "        if (map->entries[idx].state == 1 && " + map_type + "_key_eq(map->entries[idx].key, key)) {\n"
+    d = d + "            return idx;\n"
+    d = d + "        }\n"
+    d = d + "        if (map->entries[idx].state == 2 && first_tombstone == (size_t)-1) {\n"
+    d = d + "            first_tombstone = idx;\n"
+    d = d + "        }\n"
+    d = d + "        idx = (idx + 1) & (map->capacity - 1);\n"
+    d = d + "    }\n"
+    d = d + "    return (first_tombstone != (size_t)-1) ? first_tombstone : idx;\n"
+    d = d + "}\n\n"
+    -- _resize
+    d = d + "static inline void " + map_type + "_resize(" + map_type + "* map) {\n"
+    d = d + "    size_t new_cap = map->capacity == 0 ? 16 : map->capacity * 2;\n"
+    d = d + "    " + map_type + "_entry* new_entries = (" + map_type + "_entry*)calloc(new_cap, sizeof(" + map_type + "_entry));\n"
+    d = d + "    if (!new_entries) dm_panic_cstr(\"map resize: out of memory\");\n"
+    d = d + "    " + map_type + " new_map = { .entries = new_entries, .len = 0, .capacity = new_cap };\n"
+    d = d + "    for (size_t i = 0; i < map->capacity; i++) {\n"
+    d = d + "        if (map->entries[i].state == 1) {\n"
+    d = d + "            size_t slot = " + map_type + "_find_slot(&new_map, map->entries[i].key);\n"
+    d = d + "            new_map.entries[slot].key = map->entries[i].key;\n"
+    d = d + "            new_map.entries[slot].value = map->entries[i].value;\n"
+    d = d + "            new_map.entries[slot].state = 1;\n"
+    d = d + "            new_map.len++;\n"
+    d = d + "        }\n"
+    d = d + "    }\n"
+    d = d + "    free(map->entries);\n"
+    d = d + "    map->entries = new_entries;\n"
+    d = d + "    map->capacity = new_cap;\n"
+    d = d + "}\n\n"
+    -- _insert
+    d = d + "static inline void " + map_type + "_insert(" + map_type + "* map, " + key_type + " key, " + val_type + " value) {\n"
+    d = d + "    if (map->capacity == 0 || (map->len + 1) * 4 > map->capacity * 3) {\n"
+    d = d + "        " + map_type + "_resize(map);\n"
+    d = d + "    }\n"
+    d = d + "    size_t slot = " + map_type + "_find_slot(map, key);\n"
+    d = d + "    if (map->entries[slot].state != 1) {\n"
+    d = d + "        map->len++;\n"
+    d = d + "    }\n"
+    d = d + "    map->entries[slot].key = key;\n"
+    d = d + "    map->entries[slot].value = value;\n"
+    d = d + "    map->entries[slot].state = 1;\n"
+    d = d + "}\n\n"
+    -- _get
+    d = d + "static inline " + val_type + " " + map_type + "_get(" + map_type + "* map, " + key_type + " key) {\n"
+    d = d + "    if (map->capacity == 0) dm_panic_cstr(\"map get: key not found\");\n"
+    d = d + "    size_t slot = " + map_type + "_find_slot(map, key);\n"
+    d = d + "    if (map->entries[slot].state != 1) dm_panic_cstr(\"map get: key not found\");\n"
+    d = d + "    return map->entries[slot].value;\n"
+    d = d + "}\n\n"
+    -- _contains
+    d = d + "static inline bool " + map_type + "_contains(" + map_type + "* map, " + key_type + " key) {\n"
+    d = d + "    if (map->capacity == 0) return false;\n"
+    d = d + "    size_t slot = " + map_type + "_find_slot(map, key);\n"
+    d = d + "    return map->entries[slot].state == 1;\n"
+    d = d + "}\n\n"
+    -- _remove
+    d = d + "static inline bool " + map_type + "_remove(" + map_type + "* map, " + key_type + " key) {\n"
+    d = d + "    if (map->capacity == 0) return false;\n"
+    d = d + "    size_t slot = " + map_type + "_find_slot(map, key);\n"
+    d = d + "    if (map->entries[slot].state != 1) return false;\n"
+    d = d + "    map->entries[slot].state = 2;\n"
+    d = d + "    map->len--;\n"
+    d = d + "    return true;\n"
+    d = d + "}\n\n"
+    -- _keys
+    d = d + "static inline " + key_list_t + " " + map_type + "_keys(" + map_type + "* map) {\n"
+    d = d + "    " + key_list_t + " result = " + key_list_t + "_new();\n"
+    d = d + "    for (size_t i = 0; i < map->capacity; i++) {\n"
+    d = d + "        if (map->entries[i].state == 1) DM_LIST_PUSH(result, map->entries[i].key);\n"
+    d = d + "    }\n"
+    d = d + "    return result;\n"
+    d = d + "}\n\n"
+    -- _values
+    d = d + "static inline " + val_list_t + " " + map_type + "_values(" + map_type + "* map) {\n"
+    d = d + "    " + val_list_t + " result = " + val_list_t + "_new();\n"
+    d = d + "    for (size_t i = 0; i < map->capacity; i++) {\n"
+    d = d + "        if (map->entries[i].state == 1) DM_LIST_PUSH(result, map->entries[i].value);\n"
+    d = d + "    }\n"
+    d = d + "    return result;\n"
+    d = d + "}\n\n"
+    -- _set (alias for _insert)
+    d = d + "static inline void " + map_type + "_set(" + map_type + "* map, " + key_type + " key, " + val_type + " value) {\n"
+    d = d + "    " + map_type + "_insert(map, key, value);\n"
+    d = d + "}\n\n"
+    return d
+}
+
 fn emit_option_type_def(opt_type: string, val_type: string) -> string {
     let mut d = "typedef enum " + opt_type + "_tag {\n"
     d = d + "    " + opt_type + "_tag_None,\n"
@@ -2368,6 +3490,27 @@ fn emit_result_type_def(res_type: string, ok_type: string, err_type: string) -> 
     return d
 }
 
+fn emit_future_type_def(future_type: string, val_type: string) -> string {
+    let mut d = "typedef struct " + future_type + " {\n"
+    d = d + "    " + val_type + " value;\n"
+    d = d + "    bool _ready;\n"
+    d = d + "} " + future_type + ";\n\n"
+    d = d + "static inline " + future_type + " " + future_type + "_ready(" + val_type + " val) {\n"
+    d = d + "    return (" + future_type + "){ .value = val, ._ready = true };\n"
+    d = d + "}\n\n"
+    d = d + "static inline " + val_type + " " + future_type + "_await(" + future_type + " f) {\n"
+    d = d + "    return f.value;\n"
+    d = d + "}\n\n"
+    return d
+}
+
+fn register_future_type(c: Compiler, future_type: string, val_type: string) -> Compiler {
+    let mut cc = c
+    if string_contains(cc.future_type_defs, "} " + future_type + ";") { return cc }
+    cc.future_type_defs = cc.future_type_defs + emit_future_type_def(future_type, val_type)
+    return cc
+}
+
 fn register_option_type(c: Compiler, opt_type: string, val_type: string) -> Compiler {
     let mut cc = c
     if string_contains(cc.option_type_defs, "} " + opt_type + ";") { return cc }
@@ -2388,14 +3531,152 @@ fn register_result_type(c: Compiler, res_type: string, ok_type: string, err_type
     return cc
 }
 
+-- Generate vtable struct, fat pointer struct, and dispatch functions for a dyn trait
+fn generate_dyn_trait_defs(c: Compiler, trait_name: string) -> Compiler {
+    let mut cc = c
+    let marker = "|" + trait_name + "|"
+    if string_contains(cc.dyn_traits_generated, marker) { return cc }
+    cc.dyn_traits_generated = cc.dyn_traits_generated + marker
+    let mangled = "dm_" + trait_name
+    let dyn_type = "dm_dyn_" + trait_name
+    -- Collect all methods for this trait from trait_methods
+    -- Format: "|TraitName.method=ret_type:param_types|"
+    -- We need to iterate over all methods for this trait
+    let mut vtable_fields = ""
+    let mut dispatch_fns = ""
+    let search_prefix = "|" + trait_name + "."
+    let mut spos = string_find(cc.trait_methods, search_prefix)
+    while spos >= 0 {
+        let after_prefix = spos + len(search_prefix)
+        let rest = substr(cc.trait_methods, after_prefix, len(cc.trait_methods) - after_prefix)
+        let eq_pos = string_find(rest, "=")
+        if eq_pos >= 0 {
+            let method_name = substr(rest, 0, eq_pos)
+            let after_eq = substr(rest, eq_pos + 1, len(rest) - eq_pos - 1)
+            let pipe_pos = string_find(after_eq, "|")
+            let mut sig_str = after_eq
+            if pipe_pos >= 0 {
+                sig_str = substr(after_eq, 0, pipe_pos)
+            }
+            -- sig_str is "ret_type:param_types" (param_types may be empty)
+            let colon_pos = string_find(sig_str, ":")
+            let mut ret_type = "void"
+            let mut param_types_str = ""
+            if colon_pos >= 0 {
+                ret_type = substr(sig_str, 0, colon_pos)
+                param_types_str = substr(sig_str, colon_pos + 1, len(sig_str) - colon_pos - 1)
+            }
+            -- Build vtable function pointer field: ret_type (*method_name)(void* self, extra_params...)
+            let mut fptr_params = "void*"
+            if param_types_str != "" {
+                fptr_params = fptr_params + ", " + param_types_str
+            }
+            vtable_fields = vtable_fields + "    " + ret_type + " (*" + method_name + ")(" + fptr_params + ");\n"
+            -- Build dispatch function
+            let mut dispatch_params = dyn_type + " self"
+            let mut call_args = "self.data"
+            if param_types_str != "" {
+                -- Parse extra param types and add named params
+                let mut pt_rest = param_types_str
+                let mut pi = 0
+                let mut pt_done = false
+                while pt_done == false {
+                    let comma = string_find(pt_rest, ",")
+                    let mut ptype = pt_rest
+                    if comma >= 0 {
+                        ptype = substr(pt_rest, 0, comma)
+                        pt_rest = substr(pt_rest, comma + 1, len(pt_rest) - comma - 1)
+                    } else {
+                        pt_done = true
+                    }
+                    dispatch_params = dispatch_params + ", " + ptype + " _p" + int_to_string(pi)
+                    call_args = call_args + ", _p" + int_to_string(pi)
+                    pi = pi + 1
+                }
+            }
+            dispatch_fns = dispatch_fns + "static " + ret_type + " " + dyn_type + "_" + method_name + "(" + dispatch_params + ") {\n"
+            if ret_type == "void" {
+                dispatch_fns = dispatch_fns + "    self.vtable->" + method_name + "(" + call_args + ");\n"
+            } else {
+                dispatch_fns = dispatch_fns + "    return self.vtable->" + method_name + "(" + call_args + ");\n"
+            }
+            dispatch_fns = dispatch_fns + "}\n\n"
+        }
+        -- Search for next method
+        let next_search_start = spos + len(search_prefix)
+        let next_rest = substr(cc.trait_methods, next_search_start, len(cc.trait_methods) - next_search_start)
+        let next_found = string_find(next_rest, search_prefix)
+        if next_found < 0 {
+            spos = 0 - 1
+        } else {
+            spos = next_search_start + next_found
+        }
+    }
+    -- Build the vtable struct
+    let mut defs = "// dyn " + trait_name + " support\n"
+    defs = defs + "typedef struct " + mangled + "_vtable {\n"
+    defs = defs + vtable_fields
+    defs = defs + "} " + mangled + "_vtable;\n\n"
+    -- Build the fat pointer struct
+    defs = defs + "typedef struct " + dyn_type + " {\n"
+    defs = defs + "    void* data;\n"
+    defs = defs + "    " + mangled + "_vtable* vtable;\n"
+    defs = defs + "} " + dyn_type + ";\n\n"
+    -- Add dispatch functions
+    defs = defs + dispatch_fns
+    cc.dyn_trait_defs = cc.dyn_trait_defs + defs
+    return cc
+}
+
+-- Look up all impl-for mappings for a given trait name, returning the concrete types
+-- (searches impl_for_map for "|TypeName=TraitName|" patterns)
+fn lookup_impl_type_for_trait(c: Compiler, type_name: string, trait_name: string) -> bool {
+    let marker = "|" + type_name + "=" + trait_name + "|"
+    return string_contains(c.impl_for_map, marker)
+}
+
+fn register_array_type(c: Compiler, elem_type: string, size_str: string) -> Compiler {
+    let mut cc = c
+    let array_type = "dm_array_" + elem_type + "_" + size_str
+    let marker = "} " + array_type + ";"
+    if string_contains(cc.array_type_defs, marker) { return cc }
+    cc.array_type_defs = cc.array_type_defs + "typedef " + elem_type + " " + array_type + "[" + size_str + "];\n"
+    return cc
+}
+
 fn parse_type_for_c(c: Compiler) -> TypeCResult {
     let mut cc = c_skip_nl(c)
     let tok = c_cur(cc)
+    -- Handle array type: [T; N]
+    if tok.kind == TK_LBRACKET() {
+        cc = c_advance(cc)
+        let inner = parse_type_for_c(cc)
+        cc = inner.c
+        cc = c_expect(cc, TK_SEMICOLON())
+        let size_tok = c_cur(cc)
+        let size_str = size_tok.value
+        cc = c_advance(cc)
+        cc = c_expect(cc, TK_RBRACKET())
+        let array_type = "dm_array_" + inner.code + "_" + size_str
+        cc = register_array_type(cc, inner.code, size_str)
+        return TypeCResult { c: cc, code: array_type }
+    }
     if tok.kind != TK_IDENT() {
         return TypeCResult { c: cc, code: "int64_t" }
     }
     let name = tok.value
     cc = c_advance(cc)
+    -- Handle dyn TraitName
+    if name == "dyn" {
+        let trait_tok = c_cur(cc)
+        if trait_tok.kind == TK_IDENT() {
+            let trait_name = trait_tok.value
+            cc = c_advance(cc)
+            cc = generate_dyn_trait_defs(cc, trait_name)
+            return TypeCResult { c: cc, code: "dm_dyn_" + trait_name }
+        }
+        return TypeCResult { c: cc, code: "int64_t" }
+    }
     -- Check for generic [T] or [T, E]
     if c_peek(cc) == TK_LBRACKET() {
         cc = c_advance(cc)
@@ -2427,6 +3708,16 @@ fn parse_type_for_c(c: Compiler) -> TypeCResult {
             let res_t = "dm_result_" + inner.code + "_" + second_type
             cc = register_result_type(cc, res_t, inner.code, second_type)
             return TypeCResult { c: cc, code: res_t }
+        }
+        if name == "Map" and second_type != "" {
+            let map_t = "dm_map_" + inner.code + "_" + second_type
+            cc = register_map_type(cc, map_t, inner.code, second_type)
+            return TypeCResult { c: cc, code: map_t }
+        }
+        if name == "Future" {
+            let future_t = "dm_future_" + inner.code
+            cc = register_future_type(cc, future_t, inner.code)
+            return TypeCResult { c: cc, code: future_t }
         }
         return TypeCResult { c: cc, code: "dm_" + name + "_" + inner.code }
     }
@@ -2519,15 +3810,35 @@ fn compile_for_stmt(c: Compiler) -> Compiler {
         cc.output = cc.output + ind + "}\n"
         return cc
     }
-    -- List iteration: for x in list { ... }
     -- Use unique iterator variable to support nested loops
     let fi_name = "_fi" + int_to_string(cc.for_counter)
     cc.for_counter = cc.for_counter + 1
-    -- Infer element type from list type
-    let list_type = infer_type_from_code(start_expr.code, cc)
+    -- Infer collection type
+    let coll_type = infer_type_from_code(start_expr.code, cc)
+    -- Map iteration: for key in map { ... } (iterates over keys)
+    if starts_with(coll_type, "dm_map_") {
+        let key_type = lookup_map_key_type(cc, coll_type)
+        let mut ktype = key_type
+        if ktype == "" { ktype = "int64_t" }
+        cc.output = cc.output + ind + "for (size_t " + fi_name + " = 0; " + fi_name + " < " + start_expr.code + ".capacity; " + fi_name + "++) {\n"
+        cc.output = cc.output + ind + "    if (" + start_expr.code + ".entries[" + fi_name + "].state == 1) {\n"
+        cc.output = cc.output + ind + "    " + ktype + " " + dm_mangle(var_name) + " = " + start_expr.code + ".entries[" + fi_name + "].key;\n"
+        -- Track the loop variable type
+        cc = track_var_type(cc, dm_mangle(var_name), ktype)
+        cc = track_str_var(cc, dm_mangle(var_name), ktype == "dm_string")
+        cc = c_expect(cc, TK_LBRACE())
+        cc.indent = cc.indent + 2
+        cc = compile_block_body(cc)
+        cc = c_expect(cc, TK_RBRACE())
+        cc.indent = cc.indent - 2
+        cc.output = cc.output + ind + "    }\n"
+        cc.output = cc.output + ind + "}\n"
+        return cc
+    }
+    -- List iteration: for x in list { ... }
     let mut elem_type = "int64_t"
-    if starts_with(list_type, "dm_list_") {
-        elem_type = substr(list_type, 8, len(list_type) - 8)
+    if starts_with(coll_type, "dm_list_") {
+        elem_type = substr(coll_type, 8, len(coll_type) - 8)
     }
     cc.output = cc.output + ind + "for (size_t " + fi_name + " = 0; " + fi_name + " < " + start_expr.code + ".len; " + fi_name + "++) {\n"
     cc.output = cc.output + ind + "    " + elem_type + " " + dm_mangle(var_name) + " = " + start_expr.code + ".data[" + fi_name + "];\n"
@@ -2568,13 +3879,66 @@ fn compile_region_stmt(c: Compiler) -> Compiler {
     cc.region_counter = cc.region_counter + 1
     -- Emit arena create
     cc.output = cc.output + ind + "dm_arena* " + arena_name + " = dm_arena_create(4096);\n"
+    -- Set current region arena for allocation redirection
+    let saved_arena = cc.current_region_arena
+    cc.current_region_arena = arena_name
     cc = c_expect(cc, TK_LBRACE())
     cc.indent = cc.indent + 1
     cc = compile_block_body(cc)
     cc = c_expect(cc, TK_RBRACE())
     cc.indent = cc.indent - 1
+    -- Restore previous region arena (supports nesting)
+    cc.current_region_arena = saved_arena
     -- Emit arena destroy
     cc.output = cc.output + ind + "dm_arena_destroy(" + arena_name + ");\n"
+    return cc
+}
+
+fn compile_const_stmt(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'const'
+    let ind = indent_str(cc.indent)
+    let name_tok = c_cur(cc)
+    let var_name = name_tok.value
+    cc = c_advance(cc)
+
+    -- Optional type annotation
+    let mut type_str = ""
+    if c_peek(cc) == TK_COLON() {
+        cc = c_advance(cc)
+        let tr = parse_type_for_c(cc)
+        cc = tr.c
+        type_str = tr.code
+    }
+
+    cc = c_expect(cc, TK_EQ())
+
+    if c_peek(cc) == TK_COMPTIME() {
+        cc = c_advance(cc)  -- skip 'comptime'
+        let val = eval_comptime_expr(cc)
+        cc = val.c
+        -- Infer type from value if no annotation
+        if type_str == "" {
+            if val.code == "true" or val.code == "false" {
+                type_str = "bool"
+            } else if string_contains(val.code, ".") {
+                type_str = "double"
+            } else {
+                type_str = "int64_t"
+            }
+        }
+        cc.output = cc.output + ind + "const " + type_str + " " + dm_mangle(var_name) + " = " + val.code + ";\n"
+        cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    } else {
+        -- Regular const (non-comptime): compile expression normally
+        let val = compile_expr(cc)
+        cc = val.c
+        if type_str == "" {
+            type_str = infer_type_from_code(val.code, cc)
+        }
+        cc.output = cc.output + ind + "const " + type_str + " " + dm_mangle(var_name) + " = " + val.code + ";\n"
+        cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    }
+
     return cc
 }
 
@@ -3050,14 +4414,26 @@ fn compile_fn_decl(c: Compiler) -> Compiler {
         ret_type = rt.code
     }
 
-    -- Skip optional effect annotation: with [IO, Console, ...]
+    -- Parse optional effect annotation: with [IO, Console, ...]
+    let mut fn_effects = ""
+    let mut fn_has_effects = false
     if c_peek(cc) == TK_WITH() {
         cc = c_advance(cc)
         cc = c_expect(cc, TK_LBRACKET())
         while c_peek(cc) != TK_RBRACKET() and c_peek(cc) != TK_EOF() {
+            let effect_tok = c_cur(cc)
+            if effect_tok.kind == TK_IDENT() {
+                fn_effects = fn_effects + "|" + effect_tok.value + "|"
+            }
             cc = c_advance(cc)
         }
         cc = c_expect(cc, TK_RBRACKET())
+        fn_has_effects = true
+    }
+
+    -- If this is an async fn, extract inner type from dm_future_T return type
+    if cc.current_fn_is_async and starts_with(ret_type, "dm_future_") {
+        cc.current_fn_async_inner_type = substr(ret_type, 10, len(ret_type) - 10)
     }
 
     -- Generate function signature
@@ -3077,15 +4453,21 @@ fn compile_fn_decl(c: Compiler) -> Compiler {
     -- Save and reset output for body
     let saved_output = cc.output
     let saved_fn_ret = cc.current_fn_ret_type
+    let saved_fn_effects = cc.current_fn_effects
+    let saved_fn_has_effects = cc.current_fn_has_effects
     cc.output = ""
     cc.indent = 1
     cc.current_fn_ret_type = ret_type
+    cc.current_fn_effects = fn_effects
+    cc.current_fn_has_effects = fn_has_effects
     cc = compile_block_body(cc)
     cc = c_expect(cc, TK_RBRACE())
     body_out = body_out + cc.output + "}\n\n"
     cc.output = saved_output
     cc.indent = 0
     cc.current_fn_ret_type = saved_fn_ret
+    cc.current_fn_effects = saved_fn_effects
+    cc.current_fn_has_effects = saved_fn_has_effects
     cc.fn_defs.push(body_out)
 
     return cc
@@ -3584,14 +4966,21 @@ fn compile_impl_method(c: Compiler, type_name: string) -> Compiler {
         ret_type = rt.code
     }
 
-    -- Skip optional effect annotation: with [IO, Console, ...]
+    -- Parse optional effect annotation: with [IO, Console, ...]
+    let mut method_effects = ""
+    let mut method_has_effects = false
     if c_peek(cc) == TK_WITH() {
         cc = c_advance(cc)
         cc = c_expect(cc, TK_LBRACKET())
         while c_peek(cc) != TK_RBRACKET() and c_peek(cc) != TK_EOF() {
+            let effect_tok = c_cur(cc)
+            if effect_tok.kind == TK_IDENT() {
+                method_effects = method_effects + "|" + effect_tok.value + "|"
+            }
             cc = c_advance(cc)
         }
         cc = c_expect(cc, TK_RBRACKET())
+        method_has_effects = true
     }
 
     -- Generate function signature with mangled name
@@ -3611,16 +5000,221 @@ fn compile_impl_method(c: Compiler, type_name: string) -> Compiler {
     -- Save and reset output for body
     let saved_output = cc.output
     let saved_fn_ret = cc.current_fn_ret_type
+    let saved_method_effects = cc.current_fn_effects
+    let saved_method_has_effects = cc.current_fn_has_effects
     cc.output = ""
     cc.indent = 1
     cc.current_fn_ret_type = ret_type
+    cc.current_fn_effects = method_effects
+    cc.current_fn_has_effects = method_has_effects
     cc = compile_block_body(cc)
     cc = c_expect(cc, TK_RBRACE())
     body_out = body_out + cc.output + "}\n\n"
     cc.output = saved_output
     cc.indent = 0
     cc.current_fn_ret_type = saved_fn_ret
+    cc.current_fn_effects = saved_method_effects
+    cc.current_fn_has_effects = saved_method_has_effects
     cc.fn_defs.push(body_out)
+
+    return cc
+}
+
+fn compile_extern_fn_decl(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'extern'
+    cc = c_advance(cc)  -- skip 'fn'
+    let name_tok = c_cur(cc)
+    let fn_name = name_tok.value
+    cc = c_advance(cc)
+
+    -- Parse parameters
+    cc = c_expect(cc, TK_LPAREN())
+    let mut param_names: List[string] = []
+    let mut param_types: List[string] = []
+    let mut first = true
+    while c_peek(cc) != TK_RPAREN() and c_peek(cc) != TK_EOF() {
+        if first == false {
+            cc = c_expect(cc, TK_COMMA())
+        }
+        first = false
+        let pname_tok = c_cur(cc)
+        cc = c_advance(cc)
+        cc = c_expect(cc, TK_COLON())
+        let pt = parse_type_for_c(cc)
+        cc = pt.c
+        param_names.push(pname_tok.value)
+        param_types.push(pt.code)
+    }
+    cc = c_expect(cc, TK_RPAREN())
+
+    -- Return type
+    let mut ret_type = "void"
+    if c_peek(cc) == TK_ARROW() {
+        cc = c_advance(cc)
+        let rt = parse_type_for_c(cc)
+        cc = rt.c
+        ret_type = rt.code
+    }
+
+    -- Check if any params or return type involve dm_string
+    let mut needs_string_wrapper = false
+    if ret_type == "dm_string" { needs_string_wrapper = true }
+    let mut pi = 0
+    while pi < param_types.len() {
+        let pt = "" + param_types[pi]
+        if pt == "dm_string" { needs_string_wrapper = true }
+        pi = pi + 1
+    }
+
+    if needs_string_wrapper {
+        -- String-typed extern: emit C extern with native types and wrapper with dm_string conversion
+        let mut c_params = ""
+        let mut wrapper_call_args = ""
+        let mut wrapper_params = ""
+        let mut fi = 0
+        while fi < param_types.len() {
+            if fi > 0 {
+                c_params = c_params + ", "
+                wrapper_call_args = wrapper_call_args + ", "
+                wrapper_params = wrapper_params + ", "
+            }
+            let pt = "" + param_types[fi]
+            let pn = "" + param_names[fi]
+            if pt == "dm_string" {
+                c_params = c_params + "const char*"
+                wrapper_params = wrapper_params + "dm_string " + dm_mangle(pn)
+                wrapper_call_args = wrapper_call_args + dm_mangle(pn) + ".data"
+            } else {
+                c_params = c_params + pt
+                wrapper_params = wrapper_params + pt + " " + dm_mangle(pn)
+                wrapper_call_args = wrapper_call_args + dm_mangle(pn)
+            }
+            fi = fi + 1
+        }
+
+        let mut c_ret_native = ret_type
+        if c_ret_native == "dm_string" { c_ret_native = "const char*" }
+
+        -- Build wrapper function
+        let mut wrapper = "static " + ret_type + " " + dm_mangle(fn_name) + "(" + wrapper_params + ") {\n"
+        if ret_type == "dm_string" {
+            wrapper = wrapper + "    const char* __ret = " + fn_name + "(" + wrapper_call_args + ");\n"
+            wrapper = wrapper + "    return __ret ? dm_string_from_cstr(__ret) : dm_string_from_cstr(\"\");\n"
+        } else if ret_type == "void" {
+            wrapper = wrapper + "    " + fn_name + "(" + wrapper_call_args + ");\n"
+        } else {
+            wrapper = wrapper + "    return " + fn_name + "(" + wrapper_call_args + ");\n"
+        }
+        wrapper = wrapper + "}\n\n"
+
+        -- We do NOT emit an extern declaration for string-typed externs because the
+        -- real C function may already be declared in system headers (e.g., getenv in <stdlib.h>)
+        -- and re-declaring with different types would cause C compilation errors.
+        -- The function is expected to be available at link time.
+        cc.fn_defs.push(wrapper)
+        let _x1 = 0
+    } else {
+        -- Non-string extern: generate a simple dm_ wrapper that forwards to the real C function
+        -- We do NOT emit an extern declaration because the function may already be declared
+        -- in system headers (e.g., abs in <stdlib.h>) with different parameter types
+        -- (C uses int, dAImond maps int to int64_t). The function will be resolved at link time.
+        let mut wrapper_params = ""
+        let mut call_args = ""
+        let mut fi = 0
+        while fi < param_types.len() {
+            if fi > 0 {
+                wrapper_params = wrapper_params + ", "
+                call_args = call_args + ", "
+            }
+            let pt = "" + param_types[fi]
+            let pn = "" + param_names[fi]
+            wrapper_params = wrapper_params + pt + " " + dm_mangle(pn)
+            call_args = call_args + dm_mangle(pn)
+            fi = fi + 1
+        }
+
+        -- Generate dm_ wrapper that forwards to the real C function
+        let mut wp = wrapper_params
+        if wp == "" { wp = "void" }
+        let mut wrapper = "static " + ret_type + " " + dm_mangle(fn_name) + "(" + wp + ") {\n"
+        if ret_type == "void" {
+            wrapper = wrapper + "    " + fn_name + "(" + call_args + ");\n"
+        } else {
+            wrapper = wrapper + "    return " + fn_name + "(" + call_args + ");\n"
+        }
+        wrapper = wrapper + "}\n\n"
+        cc.fn_defs.push(wrapper)
+        let _x2 = 0
+    }
+
+    -- Register function name and return type
+    cc.fn_names.push(fn_name)
+    cc.fn_ret_types.push(ret_type)
+
+    return cc
+}
+
+fn compile_async_fn_decl(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'async'
+    -- The next token should be 'fn'
+    if c_peek(cc) != TK_FN() {
+        cc = c_error(cc, "expected 'fn' after 'async'")
+        return cc
+    }
+    -- Set async flag before compiling function
+    let saved_is_async = cc.current_fn_is_async
+    let saved_async_inner = cc.current_fn_async_inner_type
+    cc.current_fn_is_async = true
+    cc.current_fn_async_inner_type = ""
+    cc = compile_fn_decl(cc)
+    -- Restore
+    cc.current_fn_is_async = saved_is_async
+    cc.current_fn_async_inner_type = saved_async_inner
+    return cc
+}
+
+fn compile_const_decl(c: Compiler) -> Compiler {
+    let mut cc = c_advance(c)  -- skip 'const'
+    let name_tok = c_cur(cc)
+    let var_name = name_tok.value
+    cc = c_advance(cc)
+
+    -- Optional type annotation
+    let mut type_str = ""
+    if c_peek(cc) == TK_COLON() {
+        cc = c_advance(cc)
+        let tr = parse_type_for_c(cc)
+        cc = tr.c
+        type_str = tr.code
+    }
+
+    cc = c_expect(cc, TK_EQ())
+
+    if c_peek(cc) == TK_COMPTIME() {
+        cc = c_advance(cc)  -- skip 'comptime'
+        let val = eval_comptime_expr(cc)
+        cc = val.c
+        if type_str == "" {
+            if val.code == "true" or val.code == "false" {
+                type_str = "bool"
+            } else if string_contains(val.code, ".") {
+                type_str = "double"
+            } else {
+                type_str = "int64_t"
+            }
+        }
+        cc.fn_defs.push("static const " + type_str + " " + dm_mangle(var_name) + " = " + val.code + ";\n")
+        cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    } else {
+        -- Regular const (non-comptime): compile expression normally
+        let val = compile_expr(cc)
+        cc = val.c
+        if type_str == "" {
+            type_str = infer_type_from_code(val.code, cc)
+        }
+        cc.fn_defs.push("static const " + type_str + " " + dm_mangle(var_name) + " = " + val.code + ";\n")
+        cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    }
 
     return cc
 }
@@ -3643,28 +5237,193 @@ fn prescan_declarations(c: Compiler) -> Compiler {
     let mut i = 0
     while i < cc.tokens.len() {
         let tok = cc.tokens[i]
+        -- Prescan extern fn declarations
+        if tok.kind == TK_EXTERN() and i + 2 < cc.tokens.len() {
+            let next_tok = cc.tokens[i + 1]
+            if next_tok.kind == TK_FN() {
+                let ename_tok = cc.tokens[i + 2]
+                if ename_tok.kind == TK_IDENT() {
+                    let efn_name = ename_tok.value
+                    -- Find return type by scanning for -> after )
+                    let mut ej = i + 3
+                    let mut edepth = 0
+                    while ej < cc.tokens.len() {
+                        let et = cc.tokens[ej]
+                        if et.kind == TK_LPAREN() { edepth = edepth + 1 }
+                        if et.kind == TK_RPAREN() {
+                            edepth = edepth - 1
+                            if edepth == 0 {
+                                ej = ej + 1
+                                break
+                            }
+                        }
+                        ej = ej + 1
+                    }
+                    let mut eret_type = "void"
+                    if ej < cc.tokens.len() {
+                        let earrow_tok = cc.tokens[ej]
+                        if earrow_tok.kind == TK_ARROW() {
+                            ej = ej + 1
+                            if ej < cc.tokens.len() {
+                                let eret_tok = cc.tokens[ej]
+                                if eret_tok.kind == TK_IDENT() {
+                                    let eret_name = eret_tok.value
+                                    if ej + 2 < cc.tokens.len() {
+                                        let emaybe_bracket = cc.tokens[ej + 1]
+                                        if emaybe_bracket.kind == TK_LBRACKET() {
+                                            let einner_tok = cc.tokens[ej + 2]
+                                            if einner_tok.kind == TK_IDENT() {
+                                                let einner_c = map_dm_type(einner_tok.value)
+                                                if eret_name == "List" {
+                                                    eret_type = "dm_list_" + einner_c
+                                                } else if eret_name == "Box" {
+                                                    eret_type = einner_c + "*"
+                                                } else if eret_name == "Option" {
+                                                    eret_type = "dm_option_" + einner_c
+                                                } else if eret_name == "Result" {
+                                                    let mut esecond_c = "dm_string"
+                                                    if ej + 4 < cc.tokens.len() {
+                                                        let emaybe_comma = cc.tokens[ej + 3]
+                                                        if emaybe_comma.kind == TK_COMMA() {
+                                                            let esecond_tok = cc.tokens[ej + 4]
+                                                            if esecond_tok.kind == TK_IDENT() {
+                                                                esecond_c = map_dm_type(esecond_tok.value)
+                                                            }
+                                                        }
+                                                    }
+                                                    eret_type = "dm_result_" + einner_c + "_" + esecond_c
+                                                } else {
+                                                    eret_type = "dm_" + eret_name + "_" + einner_c
+                                                }
+                                            } else {
+                                                eret_type = map_dm_type(eret_name)
+                                            }
+                                        } else {
+                                            eret_type = map_dm_type(eret_name)
+                                        }
+                                    } else {
+                                        eret_type = map_dm_type(eret_name)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cc.fn_names.push(efn_name)
+                    cc.fn_ret_types.push(eret_type)
+                }
+            }
+        }
+        -- Prescan async fn declarations: treat 'async fn' like 'fn' with offset+1
+        if tok.kind == TK_ASYNC() and i + 2 < cc.tokens.len() {
+            let next_tok = cc.tokens[i + 1]
+            if next_tok.kind == TK_FN() {
+                let aname_tok = cc.tokens[i + 2]
+                if aname_tok.kind == TK_IDENT() {
+                    let afn_name = aname_tok.value
+                    -- Find return type by scanning for -> after )
+                    let mut aj = i + 3
+                    let mut adepth = 0
+                    while aj < cc.tokens.len() {
+                        let at = cc.tokens[aj]
+                        if at.kind == TK_LPAREN() { adepth = adepth + 1 }
+                        if at.kind == TK_RPAREN() {
+                            adepth = adepth - 1
+                            if adepth == 0 {
+                                aj = aj + 1
+                                break
+                            }
+                        }
+                        aj = aj + 1
+                    }
+                    let mut aret_type = "void"
+                    if aj < cc.tokens.len() {
+                        let aarrow_tok = cc.tokens[aj]
+                        if aarrow_tok.kind == TK_ARROW() {
+                            aj = aj + 1
+                            if aj < cc.tokens.len() {
+                                let aret_tok = cc.tokens[aj]
+                                if aret_tok.kind == TK_IDENT() {
+                                    let aret_name = aret_tok.value
+                                    if aj + 2 < cc.tokens.len() {
+                                        let amaybe_bracket = cc.tokens[aj + 1]
+                                        if amaybe_bracket.kind == TK_LBRACKET() {
+                                            let ainner_tok = cc.tokens[aj + 2]
+                                            if ainner_tok.kind == TK_IDENT() {
+                                                let ainner_c = map_dm_type(ainner_tok.value)
+                                                if aret_name == "Future" {
+                                                    aret_type = "dm_future_" + ainner_c
+                                                } else if aret_name == "List" {
+                                                    aret_type = "dm_list_" + ainner_c
+                                                } else if aret_name == "Box" {
+                                                    aret_type = ainner_c + "*"
+                                                } else if aret_name == "Option" {
+                                                    aret_type = "dm_option_" + ainner_c
+                                                } else {
+                                                    aret_type = "dm_" + aret_name + "_" + ainner_c
+                                                }
+                                            } else {
+                                                aret_type = map_dm_type(aret_name)
+                                            }
+                                        } else {
+                                            aret_type = map_dm_type(aret_name)
+                                        }
+                                    } else {
+                                        aret_type = map_dm_type(aret_name)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    cc.fn_names.push(afn_name)
+                    cc.fn_ret_types.push(aret_type)
+                }
+            }
+        }
         if tok.kind == TK_FN() and i + 1 < cc.tokens.len() {
+            -- Skip if preceded by 'async' (already handled above)
+            let mut skip_fn = false
+            if i > 0 {
+                let prev_tok = cc.tokens[i - 1]
+                if prev_tok.kind == TK_ASYNC() {
+                    skip_fn = true
+                }
+            }
+            if skip_fn == false {
             let name_tok = cc.tokens[i + 1]
             if name_tok.kind == TK_IDENT() {
                 let fn_name = name_tok.value
 
-                -- Check for generic function: fn name[T](...)
+                -- Check for generic function: fn name[T](...) or fn name[T: Trait](...)
                 let mut is_generic = false
                 let mut type_params = ""
                 if i + 2 < cc.tokens.len() {
                     let maybe_bracket = cc.tokens[i + 2]
                     if maybe_bracket.kind == TK_LBRACKET() {
                         is_generic = true
-                        -- Collect type parameter names
+                        -- Collect type parameter names (skip trait bounds after colon)
                         let mut gj = i + 3
                         while gj < cc.tokens.len() and cc.tokens[gj].kind != TK_RBRACKET() {
                             if cc.tokens[gj].kind == TK_IDENT() {
+                                let tp_tok = cc.tokens[gj]
+                                let tp_name = tp_tok.value
                                 if type_params != "" {
                                     type_params = type_params + ","
                                 }
-                                type_params = type_params + cc.tokens[gj].value
+                                type_params = type_params + tp_name
+                                gj = gj + 1
+                                -- Check for trait bound: T: TraitName
+                                if gj < cc.tokens.len() and cc.tokens[gj].kind == TK_COLON() {
+                                    gj = gj + 1  -- skip ':'
+                                    if gj < cc.tokens.len() and cc.tokens[gj].kind == TK_IDENT() {
+                                        let bound_tok = cc.tokens[gj]
+                                        let bound_name = bound_tok.value
+                                        cc.generic_bounds = cc.generic_bounds + "|" + fn_name + ":" + tp_name + "=" + bound_name + "|"
+                                        gj = gj + 1  -- skip trait name
+                                    }
+                                }
+                            } else {
+                                gj = gj + 1
                             }
-                            gj = gj + 1
                         }
                         -- Find end of function body (matching closing brace)
                         let mut body_j = gj
@@ -3745,6 +5504,8 @@ fn prescan_declarations(c: Compiler) -> Compiler {
                                                     }
                                                 }
                                                 ret_type = "dm_result_" + inner_c + "_" + second_c
+                                            } else if ret_name == "Future" {
+                                                ret_type = "dm_future_" + inner_c
                                             } else {
                                                 ret_type = "dm_" + ret_name + "_" + inner_c
                                             }
@@ -3774,6 +5535,7 @@ fn prescan_declarations(c: Compiler) -> Compiler {
                 }
                 cc.fn_names.push(fn_name)
                 cc.fn_ret_types.push(ret_type)
+            }
             }
         }
         if tok.kind == TK_STRUCT() and i + 1 < cc.tokens.len() {
@@ -3944,6 +5706,12 @@ fn compile_source(c: Compiler) -> Compiler {
             cc = compile_impl_decl(cc)
         } else if k == TK_IMPORT() {
             cc = compile_import_decl(cc)
+        } else if k == TK_EXTERN() {
+            cc = compile_extern_fn_decl(cc)
+        } else if k == TK_CONST() {
+            cc = compile_const_decl(cc)
+        } else if k == TK_ASYNC() {
+            cc = compile_async_fn_decl(cc)
         } else if k == TK_NEWLINE() {
             cc = c_advance(cc)
         } else {
@@ -4071,6 +5839,25 @@ fn emit_runtime() -> string {
     r = r + "    if (!f) dm_panic_cstr(\"file_write: cannot open file\");\n"
     r = r + "    fwrite(content.data, 1, content.len, f);\n"
     r = r + "    fclose(f);\n"
+    r = r + "}\n\n"
+    r = r + "static inline void dm_append_file(dm_string path, dm_string content) {\n"
+    r = r + "    char* cpath = (char*)malloc(path.len + 1);\n"
+    r = r + "    memcpy(cpath, path.data, path.len);\n"
+    r = r + "    cpath[path.len] = '\\0';\n"
+    r = r + "    FILE* f = fopen(cpath, \"ab\");\n"
+    r = r + "    free(cpath);\n"
+    r = r + "    if (!f) dm_panic_cstr(\"file_append: cannot open file\");\n"
+    r = r + "    fwrite(content.data, 1, content.len, f);\n"
+    r = r + "    fclose(f);\n"
+    r = r + "}\n\n"
+    r = r + "static inline bool dm_file_exists(dm_string path) {\n"
+    r = r + "    char* cpath = (char*)malloc(path.len + 1);\n"
+    r = r + "    memcpy(cpath, path.data, path.len);\n"
+    r = r + "    cpath[path.len] = '\\0';\n"
+    r = r + "    FILE* f = fopen(cpath, \"r\");\n"
+    r = r + "    free(cpath);\n"
+    r = r + "    if (f) { fclose(f); return true; }\n"
+    r = r + "    return false;\n"
     r = r + "}\n\n"
     r = r + "static inline dm_string dm_string_substr(dm_string s, int64_t start, int64_t length) {\n"
     r = r + "    if (start < 0 || (size_t)start >= s.len) return (dm_string){ .data = \"\", .len = 0, .capacity = 0 };\n"
@@ -4228,6 +6015,60 @@ fn emit_runtime() -> string {
     r = r + "    }\n"
     r = r + "}\n\n"
 
+    r = r + "static void* dm_arena_alloc(dm_arena* arena, size_t size) {\n"
+    r = r + "    if (arena->used + size > arena->size) {\n"
+    r = r + "        size_t new_size = arena->size * 2;\n"
+    r = r + "        if (new_size < size) new_size = size + arena->size;\n"
+    r = r + "        dm_arena* next = dm_arena_create(new_size);\n"
+    r = r + "        next->next = arena->next;\n"
+    r = r + "        arena->next = next;\n"
+    r = r + "        void* ptr = next->data;\n"
+    r = r + "        next->used = size;\n"
+    r = r + "        return ptr;\n"
+    r = r + "    }\n"
+    r = r + "    void* ptr = arena->data + arena->used;\n"
+    r = r + "    arena->used += size;\n"
+    r = r + "    return ptr;\n"
+    r = r + "}\n\n"
+
+    r = r + "static inline dm_string dm_string_concat_arena(dm_arena* arena, dm_string a, dm_string b) {\n"
+    r = r + "    size_t new_len = a.len + b.len;\n"
+    r = r + "    char* buf = (char*)dm_arena_alloc(arena, new_len + 1);\n"
+    r = r + "    memcpy(buf, a.data, a.len);\n"
+    r = r + "    memcpy(buf + a.len, b.data, b.len);\n"
+    r = r + "    buf[new_len] = '\\0';\n"
+    r = r + "    return (dm_string){ .data = buf, .len = new_len, .capacity = new_len };\n"
+    r = r + "}\n\n"
+
+    -- SIMD vector type definitions (GCC/Clang vector extensions)
+    r = r + "// SIMD Vector Types\n\n"
+    r = r + "typedef float dm_f32x4 __attribute__((vector_size(16)));\n"
+    r = r + "typedef float dm_f32x8 __attribute__((vector_size(32)));\n"
+    r = r + "typedef double dm_f64x2 __attribute__((vector_size(16)));\n"
+    r = r + "typedef double dm_f64x4 __attribute__((vector_size(32)));\n"
+    r = r + "typedef int32_t dm_i32x4 __attribute__((vector_size(16)));\n"
+    r = r + "typedef int32_t dm_i32x8 __attribute__((vector_size(32)));\n"
+    r = r + "typedef int64_t dm_i64x2 __attribute__((vector_size(16)));\n"
+    r = r + "typedef int64_t dm_i64x4 __attribute__((vector_size(32)));\n\n"
+    -- SIMD splat helpers
+    r = r + "static inline dm_f32x4 dm_simd_splat_f32x4(float v) { return (dm_f32x4){v,v,v,v}; }\n"
+    r = r + "static inline dm_f32x8 dm_simd_splat_f32x8(float v) { return (dm_f32x8){v,v,v,v,v,v,v,v}; }\n"
+    r = r + "static inline dm_f64x2 dm_simd_splat_f64x2(double v) { return (dm_f64x2){v,v}; }\n"
+    r = r + "static inline dm_f64x4 dm_simd_splat_f64x4(double v) { return (dm_f64x4){v,v,v,v}; }\n"
+    r = r + "static inline dm_i32x4 dm_simd_splat_i32x4(int32_t v) { return (dm_i32x4){v,v,v,v}; }\n"
+    r = r + "static inline dm_i32x8 dm_simd_splat_i32x8(int32_t v) { return (dm_i32x8){v,v,v,v,v,v,v,v}; }\n"
+    r = r + "static inline dm_i64x2 dm_simd_splat_i64x2(int64_t v) { return (dm_i64x2){v,v}; }\n"
+    r = r + "static inline dm_i64x4 dm_simd_splat_i64x4(int64_t v) { return (dm_i64x4){v,v,v,v}; }\n\n"
+    -- SIMD set helpers
+    r = r + "static inline dm_f32x4 dm_simd_set_f32x4(float a, float b, float c, float d) { return (dm_f32x4){a,b,c,d}; }\n"
+    r = r + "static inline dm_f32x8 dm_simd_set_f32x8(float a, float b, float c, float d, float e, float f, float g, float h) { return (dm_f32x8){a,b,c,d,e,f,g,h}; }\n"
+    r = r + "static inline dm_f64x2 dm_simd_set_f64x2(double a, double b) { return (dm_f64x2){a,b}; }\n"
+    r = r + "static inline dm_f64x4 dm_simd_set_f64x4(double a, double b, double c, double d) { return (dm_f64x4){a,b,c,d}; }\n"
+    r = r + "static inline dm_i32x4 dm_simd_set_i32x4(int32_t a, int32_t b, int32_t c, int32_t d) { return (dm_i32x4){a,b,c,d}; }\n"
+    r = r + "static inline dm_i32x8 dm_simd_set_i32x8(int32_t a, int32_t b, int32_t c, int32_t d, int32_t e, int32_t f, int32_t g, int32_t h) { return (dm_i32x8){a,b,c,d,e,f,g,h}; }\n"
+    r = r + "static inline dm_i64x2 dm_simd_set_i64x2(int64_t a, int64_t b) { return (dm_i64x2){a,b}; }\n"
+    r = r + "static inline dm_i64x4 dm_simd_set_i64x4(int64_t a, int64_t b, int64_t c, int64_t d) { return (dm_i64x4){a,b,c,d}; }\n\n"
+
     r = r + "// End of Runtime\n\n"
     return r
 }
@@ -4260,8 +6101,17 @@ fn assemble_output(c: Compiler) -> string {
     -- List type definitions (after forward declarations, before full struct defs)
     out = out + c.list_type_defs
 
+    -- Map type definitions (after list types, since maps may use list types for keys/values)
+    out = out + c.map_type_defs
+
+    -- Array type definitions (after list types, before option/result/struct)
+    out = out + c.array_type_defs
+
     -- Option/Result type definitions
     out = out + c.option_type_defs
+
+    -- Future type definitions (for async/await)
+    out = out + c.future_type_defs
 
     -- Struct/enum definitions
     let mut i = 0
@@ -4269,6 +6119,9 @@ fn assemble_output(c: Compiler) -> string {
         out = out + c.struct_defs[i]
         i = i + 1
     }
+
+    -- Dynamic trait dispatch definitions (vtable structs, fat pointers, dispatch functions)
+    out = out + c.dyn_trait_defs
 
     -- Forward declarations
     let mut j = 0
@@ -4576,6 +6429,230 @@ fn resolve_imports(source: string, filename: string) -> string {
     return result.source + "\n" + main_no_imports
 }
 
+-- [module: package]
+
+-- ============================================================
+-- PACKAGE MANAGER (TOML Manifest + Dependency Resolution)
+-- ============================================================
+
+-- Package manifest data stored as parallel lists for checker compatibility.
+-- Each index i represents one dependency with:
+--   dep_names[i], dep_versions[i], dep_paths[i], dep_gits[i]
+struct PackageManifest {
+    name: string,
+    version: string,
+    dep_names: List[string],
+    dep_versions: List[string],
+    dep_paths: List[string],
+    dep_gits: List[string]
+}
+
+-- Parse a simple TOML file into a PackageManifest struct
+-- Supports: [package] name/version, [dependencies] name = "version" or name = { path = "..." }
+fn parse_toml_manifest(content: string) -> PackageManifest {
+    let mut pkg_name = ""
+    let mut pkg_version = ""
+    let mut dep_names: List[string] = []
+    let mut dep_versions: List[string] = []
+    let mut dep_paths: List[string] = []
+    let mut dep_gits: List[string] = []
+    let mut in_package = false
+    let mut in_deps = false
+
+    let lines = string_split(content, "\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = string_trim(lines[i])
+        -- Skip empty lines and comments
+        if line == "" or starts_with(line, "#") {
+            i = i + 1
+            continue
+        }
+        -- Section headers
+        if line == "[package]" {
+            in_package = true
+            in_deps = false
+            i = i + 1
+            continue
+        }
+        if line == "[dependencies]" {
+            in_package = false
+            in_deps = true
+            i = i + 1
+            continue
+        }
+        if starts_with(line, "[") {
+            in_package = false
+            in_deps = false
+            i = i + 1
+            continue
+        }
+        -- Key-value pairs
+        let eq_pos = string_find(line, "=")
+        if eq_pos > 0 {
+            let key = string_trim(substr(line, 0, eq_pos))
+            let val_raw = string_trim(substr(line, eq_pos + 1, len(line) - eq_pos - 1))
+            -- Remove quotes from value
+            let mut val = val_raw
+            if starts_with(val, "\"") and ends_with(val, "\"") {
+                val = substr(val, 1, len(val) - 2)
+            }
+            if in_package {
+                if key == "name" { pkg_name = val }
+                if key == "version" { pkg_version = val }
+            }
+            if in_deps {
+                -- Simple version dep: name = "version"
+                -- Path dep: name = { path = "..." }
+                -- Git dep: name = { git = "..." }
+                let dname = key
+                if starts_with(val_raw, "{") {
+                    -- Inline table: parse path/git/version
+                    let mut dp = ""
+                    let mut dg = ""
+                    let mut dv = ""
+                    if string_contains(val_raw, "path") {
+                        let path_pos = string_find(val_raw, "path")
+                        let after_path = substr(val_raw, path_pos + 4, len(val_raw) - path_pos - 4)
+                        let eq2 = string_find(after_path, "=")
+                        if eq2 >= 0 {
+                            let path_val_raw = string_trim(substr(after_path, eq2 + 1, len(after_path) - eq2 - 1))
+                            let mut pv = path_val_raw
+                            -- Remove quotes and trailing }
+                            pv = string_replace(pv, "\"", "")
+                            pv = string_replace(pv, "}", "")
+                            pv = string_replace(pv, ",", "")
+                            dp = string_trim(pv)
+                        }
+                    }
+                    if string_contains(val_raw, "git") {
+                        let git_pos = string_find(val_raw, "git")
+                        let after_git = substr(val_raw, git_pos + 3, len(val_raw) - git_pos - 3)
+                        let eq3 = string_find(after_git, "=")
+                        if eq3 >= 0 {
+                            let git_val_raw = string_trim(substr(after_git, eq3 + 1, len(after_git) - eq3 - 1))
+                            let mut gv = git_val_raw
+                            gv = string_replace(gv, "\"", "")
+                            gv = string_replace(gv, "}", "")
+                            gv = string_replace(gv, ",", "")
+                            dg = string_trim(gv)
+                        }
+                    }
+                    if string_contains(val_raw, "version") {
+                        let ver_pos = string_find(val_raw, "version")
+                        let after_ver = substr(val_raw, ver_pos + 7, len(val_raw) - ver_pos - 7)
+                        let eq4 = string_find(after_ver, "=")
+                        if eq4 >= 0 {
+                            let ver_val_raw = string_trim(substr(after_ver, eq4 + 1, len(after_ver) - eq4 - 1))
+                            let mut vv = ver_val_raw
+                            vv = string_replace(vv, "\"", "")
+                            vv = string_replace(vv, "}", "")
+                            vv = string_replace(vv, ",", "")
+                            dv = string_trim(vv)
+                        }
+                    }
+                    dep_names.push(dname)
+                    dep_versions.push(dv)
+                    dep_paths.push(dp)
+                    dep_gits.push(dg)
+                } else {
+                    dep_names.push(dname)
+                    dep_versions.push(val)
+                    dep_paths.push("")
+                    dep_gits.push("")
+                }
+            }
+        }
+        i = i + 1
+    }
+    return PackageManifest { name: pkg_name, version: pkg_version, dep_names: dep_names, dep_versions: dep_versions, dep_paths: dep_paths, dep_gits: dep_gits }
+}
+
+-- Generate a default daimond.toml content
+fn generate_default_toml(project_name: string) -> string {
+    let mut content = "[package]\n"
+    content = content + "name = \"" + project_name + "\"\n"
+    content = content + "version = \"0.1.0\"\n\n"
+    content = content + "[dependencies]\n"
+    return content
+}
+
+-- Add a dependency to the toml content
+fn add_dependency_to_toml(content: string, dep_name: string, dep_version: string) -> string {
+    -- Find [dependencies] section and add after it
+    let deps_pos = string_find(content, "[dependencies]")
+    if deps_pos < 0 {
+        return content + "\n[dependencies]\n" + dep_name + " = \"" + dep_version + "\"\n"
+    }
+    -- Find end of [dependencies] line
+    let after_deps = substr(content, deps_pos, len(content) - deps_pos)
+    let nl_pos = string_find(after_deps, "\n")
+    if nl_pos < 0 {
+        return content + "\n" + dep_name + " = \"" + dep_version + "\"\n"
+    }
+    let insert_pos = deps_pos + nl_pos + 1
+    let before = substr(content, 0, insert_pos)
+    let after = substr(content, insert_pos, len(content) - insert_pos)
+    return before + dep_name + " = \"" + dep_version + "\"\n" + after
+}
+
+-- Handle 'pkg init' command: create daimond.toml
+fn pkg_init() {
+    if file_exists("daimond.toml") {
+        println("daimond.toml already exists")
+        return
+    }
+    let content = generate_default_toml("my-project")
+    file_write("daimond.toml", content)
+    println("Created daimond.toml")
+}
+
+-- Handle 'pkg add <name>' command: add dependency
+fn pkg_add(dep_name: string) {
+    if file_exists("daimond.toml") == false {
+        eprintln("Error: no daimond.toml found. Run 'pkg init' first.")
+        exit(1)
+    }
+    let content = file_read("daimond.toml")
+    let new_content = add_dependency_to_toml(content, dep_name, "*")
+    file_write("daimond.toml", new_content)
+    println("Added dependency: " + dep_name)
+}
+
+-- Handle 'pkg list' command: list dependencies
+fn pkg_list() {
+    if file_exists("daimond.toml") == false {
+        eprintln("Error: no daimond.toml found. Run 'pkg init' first.")
+        exit(1)
+    }
+    let content = file_read("daimond.toml")
+    let pkg = parse_toml_manifest(content)
+    println("Package: " + pkg.name + " v" + pkg.version)
+    if pkg.dep_names.len() == 0 {
+        println("No dependencies")
+        return
+    }
+    println("Dependencies:")
+    let mut i = 0
+    while i < pkg.dep_names.len() {
+        let mut info = "  " + pkg.dep_names[i]
+        let dver = "" + pkg.dep_versions[i]
+        let dpath = "" + pkg.dep_paths[i]
+        let dgit = "" + pkg.dep_gits[i]
+        if dver != "" {
+            info = info + " = \"" + dver + "\""
+        }
+        if dpath != "" {
+            info = info + " (path: " + dpath + ")"
+        }
+        if dgit != "" {
+            info = info + " (git: " + dgit + ")"
+        }
+        println(info)
+        i = i + 1
+    }
+}
+
 -- [module: main]
 
 
@@ -4583,29 +6660,79 @@ fn resolve_imports(source: string, filename: string) -> string {
 -- MAIN ENTRY POINT
 -- ============================================================
 
+fn print_help() {
+    println("dAImond Stage 1 Compiler v0.2.0")
+    println("Usage: daimond1 [command] <file.dm> [options]")
+    println("")
+    println("Commands:")
+    println("  <file.dm>          Compile a dAImond source file")
+    println("  run <file.dm>      Compile and run")
+    println("  compile <file.dm>  Compile (same as no command)")
+    println("  lex <file.dm>      Show tokens")
+    println("  parse <file.dm>    Show declarations")
+    println("  check <file.dm>    Type check only")
+    println("  fmt <file.dm>      Format source code")
+    println("  test <file.dm>     Run test_* functions")
+    println("  pkg init           Create daimond.toml manifest")
+    println("  pkg add <name>     Add a dependency")
+    println("  pkg list           List dependencies")
+    println("  clean              Remove generated files")
+    println("")
+    println("Options:")
+    println("  -o <file>       Output file path")
+    println("  -c              Compile to C only (no binary)")
+    println("  --emit-c        Emit C code alongside binary")
+    println("  -v, --verbose   Verbose output")
+    println("  --version       Show version")
+    println("  -h, --help      Show this help")
+}
+
 fn main() {
     let argc = args_len()
     if argc < 2 {
-        println("dAImond Stage 1 Compiler v0.2.0")
-        println("Usage: daimond1 [command] <file.dm> [options]")
-        println("")
-        println("Commands:")
-        println("  <file.dm>       Compile a dAImond source file")
-        println("  run <file.dm>   Compile and run")
-        println("  compile <file.dm>  Compile (same as no command)")
-        println("")
-        println("Options:")
-        println("  -o <file>       Output file path")
-        println("  -c              Compile to C only (no binary)")
-        println("  --emit-c        Emit C code alongside binary")
-        println("  -v, --verbose   Verbose output")
-        println("  --version       Show version")
-        println("  -h, --help      Show this help")
+        print_help()
+        exit(1)
+    }
+
+    -- Handle clean command early (no filename needed)
+    if args_get(1) == "clean" {
+        println("Clean: no compilation cache in Stage 1")
+        exit(0)
+    }
+
+    -- Handle pkg commands early (before filename parsing)
+    if args_get(1) == "pkg" {
+        if argc < 3 {
+            println("Usage: daimond1 pkg <command>")
+            println("  pkg init        Create daimond.toml manifest")
+            println("  pkg add <name>  Add a dependency")
+            println("  pkg list        List dependencies")
+            exit(1)
+        }
+        let pkg_cmd = args_get(2)
+        if pkg_cmd == "init" {
+            pkg_init()
+            exit(0)
+        }
+        if pkg_cmd == "add" {
+            if argc < 4 {
+                eprintln("Error: 'pkg add' requires a package name")
+                exit(1)
+            }
+            pkg_add(args_get(3))
+            exit(0)
+        }
+        if pkg_cmd == "list" {
+            pkg_list()
+            exit(0)
+        }
+        eprintln("Error: unknown pkg command '" + pkg_cmd + "'")
         exit(1)
     }
 
     -- Parse arguments
     let mut filename = ""
+    let mut command = "compile"
     let mut do_run = false
     let mut output_file = ""
     let mut c_only = false
@@ -4619,29 +6746,42 @@ fn main() {
             exit(0)
         }
         if arg == "-h" or arg == "--help" {
-            println("dAImond Stage 1 Compiler v0.2.0")
-            println("Usage: daimond1 [command] <file.dm> [options]")
-            println("")
-            println("Commands:")
-            println("  <file.dm>       Compile a dAImond source file")
-            println("  run <file.dm>   Compile and run")
-            println("  compile <file.dm>  Compile (same as no command)")
-            println("")
-            println("Options:")
-            println("  -o <file>       Output file path")
-            println("  -c              Compile to C only (no binary)")
-            println("  --emit-c        Emit C code alongside binary")
-            println("  -v, --verbose   Verbose output")
-            println("  --version       Show version")
-            println("  -h, --help      Show this help")
+            print_help()
             exit(0)
         }
         if arg == "run" and filename == "" {
+            command = "run"
             do_run = true
             i = i + 1
             continue
         }
         if arg == "compile" and filename == "" {
+            command = "compile"
+            i = i + 1
+            continue
+        }
+        if arg == "lex" and filename == "" {
+            command = "lex"
+            i = i + 1
+            continue
+        }
+        if arg == "parse" and filename == "" {
+            command = "parse"
+            i = i + 1
+            continue
+        }
+        if arg == "check" and filename == "" {
+            command = "check"
+            i = i + 1
+            continue
+        }
+        if arg == "fmt" and filename == "" {
+            command = "fmt"
+            i = i + 1
+            continue
+        }
+        if arg == "test" and filename == "" {
+            command = "test"
             i = i + 1
             continue
         }
@@ -4686,11 +6826,205 @@ fn main() {
     -- Resolve imports (concatenate imported files before tokenizing)
     let source = resolve_imports(raw_source, filename)
 
+    -- ============================================================
+    -- Command: lex - Show tokens
+    -- ============================================================
+    if command == "lex" {
+        let tokens = tokenize(source)
+        let mut ti = 0
+        while ti < tokens.len() {
+            let t = tokens[ti]
+            if t.kind != TK_NEWLINE() and t.kind != TK_EOF() {
+                println(int_to_string(t.line) + ":" + int_to_string(t.col) + " " + token_kind_name(t.kind) + " " + t.value)
+            }
+            ti = ti + 1
+        }
+        return
+    }
+
+    -- ============================================================
+    -- Command: parse - Show declarations
+    -- ============================================================
+    if command == "parse" {
+        let tokens = tokenize(source)
+        let mut ti = 0
+        while ti < tokens.len() {
+            let t = tokens[ti]
+            if t.kind == TK_FN() {
+                let mut fname = "<anonymous>"
+                if ti + 1 < tokens.len() {
+                    let fname_tok = tokens[ti + 1]
+                    fname = fname_tok.value
+                }
+                println("fn " + fname + " at line " + int_to_string(t.line))
+            }
+            if t.kind == TK_STRUCT() {
+                let mut sname = "<anonymous>"
+                if ti + 1 < tokens.len() {
+                    let stok = tokens[ti + 1]
+                    sname = stok.value
+                }
+                println("struct " + sname + " at line " + int_to_string(t.line))
+            }
+            if t.kind == TK_ENUM() {
+                let mut ename = "<anonymous>"
+                if ti + 1 < tokens.len() {
+                    let etok = tokens[ti + 1]
+                    ename = etok.value
+                }
+                println("enum " + ename + " at line " + int_to_string(t.line))
+            }
+            if t.kind == TK_TRAIT() {
+                let mut tname = "<anonymous>"
+                if ti + 1 < tokens.len() {
+                    let ttok = tokens[ti + 1]
+                    tname = ttok.value
+                }
+                println("trait " + tname + " at line " + int_to_string(t.line))
+            }
+            if t.kind == TK_IMPL() {
+                println("impl block at line " + int_to_string(t.line))
+            }
+            if t.kind == TK_IMPORT() {
+                let mut iname = ""
+                if ti + 1 < tokens.len() {
+                    let itok = tokens[ti + 1]
+                    iname = itok.value
+                }
+                println("import " + iname + " at line " + int_to_string(t.line))
+            }
+            ti = ti + 1
+        }
+        return
+    }
+
+    -- ============================================================
+    -- Command: fmt - Format source code
+    -- ============================================================
+    if command == "fmt" {
+        let mut formatted = ""
+        let mut indent = 0
+        let lines = string_split(source, "\n")
+        let mut li = 0
+        while li < lines.len() {
+            let line = string_trim(lines[li])
+            if line == "" {
+                formatted = formatted + "\n"
+            } else {
+                -- Dedent for lines starting with }
+                if starts_with(line, "}") {
+                    indent = indent - 1
+                    if indent < 0 {
+                        indent = 0
+                    }
+                }
+                let mut ind = ""
+                let mut ii = 0
+                while ii < indent {
+                    ind = ind + "    "
+                    ii = ii + 1
+                }
+                formatted = formatted + ind + line + "\n"
+                -- Indent after lines ending with {
+                if ends_with(line, "{") {
+                    indent = indent + 1
+                }
+            }
+            li = li + 1
+        }
+        file_write(filename, formatted)
+        println("Formatted: " + filename)
+        return
+    }
+
     -- Tokenize
     let tokens = tokenize(source)
     if verbose {
         println("Tokens: " + int_to_string(tokens.len()))
     }
+
+    -- ============================================================
+    -- Command: check - Type check only (compile but don't emit binary)
+    -- ============================================================
+    if command == "check" {
+        let mut comp = compiler_new(tokens)
+        comp = compile_source(comp)
+        if comp.errors.len() > 0 {
+            let mut ei = 0
+            while ei < comp.errors.len() {
+                eprintln(comp.errors[ei])
+                ei = ei + 1
+            }
+            exit(1)
+        }
+        println("OK: no errors found")
+        return
+    }
+
+    -- ============================================================
+    -- Command: test - Run test_* functions
+    -- ============================================================
+    if command == "test" {
+        -- Find test_* functions by scanning tokens
+        let mut test_names: List[string] = []
+        let mut ti = 0
+        while ti < tokens.len() {
+            let test_tok = tokens[ti]
+            if test_tok.kind == TK_FN() and ti + 1 < tokens.len() {
+                let fname_tok = tokens[ti + 1]
+                let fname = fname_tok.value
+                if starts_with(fname, "test_") {
+                    test_names.push(fname)
+                }
+            }
+            ti = ti + 1
+        }
+        if test_names.len() == 0 {
+            println("No test functions found")
+            return
+        }
+        println("Found " + int_to_string(test_names.len()) + " test(s)")
+        -- Compile the file normally then run it
+        -- (test functions use assert/assert_eq internally)
+        let mut comp = compiler_new(tokens)
+        comp = compile_source(comp)
+        if comp.errors.len() > 0 {
+            eprintln("Compilation errors:")
+            let mut ei = 0
+            while ei < comp.errors.len() {
+                eprintln(comp.errors[ei])
+                ei = ei + 1
+            }
+            exit(1)
+        }
+        let c_code = assemble_output(comp)
+        let c_file = string_replace(filename, ".dm", ".c")
+        let bin_file = string_replace(filename, ".dm", "")
+        file_write(c_file, c_code)
+        let compile_cmd = "cc -o " + bin_file + " " + c_file + " -lm"
+        let cc_exit = system(compile_cmd)
+        if cc_exit != 0 {
+            eprintln("C compilation failed")
+            exit(1)
+        }
+        let run_exit = system("./" + bin_file)
+        if run_exit != 0 {
+            eprintln("Tests failed")
+            exit(1)
+        }
+        -- Print results
+        let mut ti2 = 0
+        while ti2 < test_names.len() {
+            println("  PASS: " + test_names[ti2])
+            ti2 = ti2 + 1
+        }
+        println(int_to_string(test_names.len()) + " test(s) passed")
+        return
+    }
+
+    -- ============================================================
+    -- Command: compile / run - Full compilation pipeline
+    -- ============================================================
 
     -- Compile
     let mut comp = compiler_new(tokens)

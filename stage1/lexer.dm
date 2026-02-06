@@ -82,7 +82,32 @@ fn tokenize(source: string) -> List[Token] {
                     lex.col = lex.col + 1
                 }
                 let text = substr(lex.source, sp, lex.pos - sp)
-                tokens.push(token_new(keyword_lookup(text), text, sl, sc))
+                -- Check for f-string: identifier "f" immediately followed by "
+                let mut is_fstr = false
+                if text == "f" and lex.pos < lex.src_len and char_at(lex.source, lex.pos) == "\"" {
+                    is_fstr = true
+                    lex.pos = lex.pos + 1  -- skip opening "
+                    lex.col = lex.col + 1
+                    let fstart = lex.pos
+                    while lex.pos < lex.src_len and char_at(lex.source, lex.pos) != "\"" {
+                        if char_at(lex.source, lex.pos) == "\\" {
+                            lex.pos = lex.pos + 2
+                            lex.col = lex.col + 2
+                        } else {
+                            lex.pos = lex.pos + 1
+                            lex.col = lex.col + 1
+                        }
+                    }
+                    let ftext = substr(lex.source, fstart, lex.pos - fstart)
+                    if lex.pos < lex.src_len {
+                        lex.pos = lex.pos + 1  -- skip closing "
+                        lex.col = lex.col + 1
+                    }
+                    tokens.push(token_new(TK_FSTRING(), ftext, sl, sc))
+                }
+                if is_fstr == false {
+                    tokens.push(token_new(keyword_lookup(text), text, sl, sc))
+                }
             } else if is_digit_char(ch) {
                 while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
                     lex.pos = lex.pos + 1

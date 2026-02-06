@@ -63,3 +63,38 @@ fn string_reverse(s: string) -> string {
     }
     return result
 }
+
+-- Parse a string as an integer
+fn to_int(s: string) -> int {
+    return parse_int(s)
+}
+
+-- Parse a string as a float
+fn to_float(s: string) -> float {
+    return parse_float(s)
+}
+
+-- Split a string by delimiter
+fn split(s: string, delim: string) -> List[string] {
+    return string_split(s, delim)
+}
+
+-- Replace all occurrences of old with new
+fn replace(s: string, old: string, new_str: string) -> string {
+    return string_replace(s, old, new_str)
+}
+
+-- Trim whitespace from both ends
+fn trim(s: string) -> string {
+    return string_trim(s)
+}
+
+-- Convert to uppercase
+fn to_upper(s: string) -> string {
+    return string_to_upper(s)
+}
+
+-- Convert to lowercase
+fn to_lower(s: string) -> string {
+    return string_to_lower(s)
+}
