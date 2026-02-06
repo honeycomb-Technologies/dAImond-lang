@@ -3441,6 +3441,243 @@ pub const comptime_tests = [_]TestCase{
         ,
         .expected_output = "4096\n",
     },
+    // Wave 6.1: const references and let bindings
+    .{
+        .name = "comptime_const_ref",
+        .source =
+            \\module test
+            \\
+            \\const A = comptime 10
+            \\const B = comptime A + 5
+            \\
+            \\fn main() {
+            \\    println(int_to_string(B))
+            \\}
+        ,
+        .expected_output = "15\n",
+    },
+    .{
+        .name = "comptime_let_binding",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime { let x = 3; let y = 4; x + y }
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+    // Wave 6.1: if/else, blocks, match
+    .{
+        .name = "comptime_if",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime { if true { 42 } else { 0 } }
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "comptime_if_else",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime { let a = 5; if a > 3 { a * 2 } else { a } }
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "10\n",
+    },
+    .{
+        .name = "comptime_block",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime { let mut x = 0; x = x + 1; x = x + 2; x }
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "3\n",
+    },
+    .{
+        .name = "comptime_match",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime { let v = 2; match v { 1 => 10, 2 => 20, _ => 0 } }
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "20\n",
+    },
+    // Wave 6.2: while/for loops
+    .{
+        .name = "comptime_while_loop",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime {
+            \\    let mut i = 0
+            \\    let mut sum = 0
+            \\    while i < 10 {
+            \\        sum = sum + i
+            \\        i = i + 1
+            \\    }
+            \\    sum
+            \\}
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "45\n",
+    },
+    .{
+        .name = "comptime_while_break",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime {
+            \\    let mut i = 0
+            \\    while true {
+            \\        if i == 5 { break }
+            \\        i = i + 1
+            \\    }
+            \\    i
+            \\}
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "5\n",
+    },
+    .{
+        .name = "comptime_for_loop",
+        .source =
+            \\module test
+            \\
+            \\const X = comptime {
+            \\    let arr = [1, 2, 3, 4, 5]
+            \\    let mut sum = 0
+            \\    for v in arr {
+            \\        sum = sum + v
+            \\    }
+            \\    sum
+            \\}
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "15\n",
+    },
+    // Wave 6.2: function calls and recursion
+    .{
+        .name = "comptime_fn_call",
+        .source =
+            \\module test
+            \\
+            \\fn double(x: int) -> int {
+            \\    return x * 2
+            \\}
+            \\
+            \\const X = comptime double(21)
+            \\
+            \\fn main() {
+            \\    println(int_to_string(X))
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "comptime_recursion",
+        .source =
+            \\module test
+            \\
+            \\fn fib(n: int) -> int {
+            \\    if n <= 1 { return n }
+            \\    return fib(n - 1) + fib(n - 2)
+            \\}
+            \\
+            \\const FIB10 = comptime fib(10)
+            \\
+            \\fn main() {
+            \\    println(int_to_string(FIB10))
+            \\}
+        ,
+        .expected_output = "55\n",
+    },
+    .{
+        .name = "comptime_factorial",
+        .source =
+            \\module test
+            \\
+            \\fn factorial(n: int) -> int {
+            \\    if n <= 1 { return 1 }
+            \\    return n * factorial(n - 1)
+            \\}
+            \\
+            \\const F10 = comptime factorial(10)
+            \\
+            \\fn main() {
+            \\    println(int_to_string(F10))
+            \\}
+        ,
+        .expected_output = "3628800\n",
+    },
+    // Wave 6.3: arrays, structs, field access, indexing, string ops
+    .{
+        .name = "comptime_array",
+        .source =
+            \\module test
+            \\
+            \\const SECOND = comptime { let arr = [10, 20, 30]; arr[1] }
+            \\
+            \\fn main() {
+            \\    println(int_to_string(SECOND))
+            \\}
+        ,
+        .expected_output = "20\n",
+    },
+    .{
+        .name = "comptime_string_concat",
+        .source =
+            \\module test
+            \\
+            \\const S = comptime "hello" + " " + "world"
+            \\
+            \\fn main() {
+            \\    println(S)
+            \\}
+        ,
+        .expected_output = "hello world\n",
+    },
+    .{
+        .name = "comptime_string_len",
+        .source =
+            \\module test
+            \\
+            \\const N = comptime len("hello")
+            \\
+            \\fn main() {
+            \\    println(int_to_string(N))
+            \\}
+        ,
+        .expected_output = "5\n",
+    },
 };
 
 pub const effect_tests = [_]TestCase{
@@ -3874,7 +4111,7 @@ pub const async_phase_b_tests = [_]TestCase{
         .expected_output = "16\n",
     },
     .{
-        .name = "async_phase_b_reject_loop",
+        .name = "async_phase_b_await_in_loop",
         .source =
             \\module test
             \\
@@ -3882,7 +4119,7 @@ pub const async_phase_b_tests = [_]TestCase{
             \\    return 1
             \\}
             \\
-            \\async fn bad_loop() -> int {
+            \\async fn loop_sum() -> int {
             \\    let mut sum = 0
             \\    while sum < 10 {
             \\        sum = sum + await get_value()
@@ -3891,15 +4128,14 @@ pub const async_phase_b_tests = [_]TestCase{
             \\}
             \\
             \\fn main() {
-            \\    let result = await bad_loop()
+            \\    let result = await loop_sum()
             \\    println(int_to_string(result))
             \\}
         ,
-        .expected_output = "",
-        .expect_compile_error = true,
+        .expected_output = "10\n",
     },
     .{
-        .name = "async_phase_b_reject_branch",
+        .name = "async_phase_b_await_in_branch",
         .source =
             \\module test
             \\
@@ -3911,7 +4147,7 @@ pub const async_phase_b_tests = [_]TestCase{
             \\    return 2
             \\}
             \\
-            \\async fn bad_branch(flag: bool) -> int {
+            \\async fn branch_await(flag: bool) -> int {
             \\    if flag {
             \\        return await get_a()
             \\    } else {
@@ -3920,12 +4156,160 @@ pub const async_phase_b_tests = [_]TestCase{
             \\}
             \\
             \\fn main() {
-            \\    let result = await bad_branch(true)
+            \\    let result = await branch_await(true)
             \\    println(int_to_string(result))
             \\}
         ,
-        .expected_output = "",
-        .expect_compile_error = true,
+        .expected_output = "1\n",
+    },
+    .{
+        .name = "async_phase_b_if_await",
+        .source =
+            \\module test
+            \\
+            \\async fn get_val(n: int) -> int {
+            \\    return n * 10
+            \\}
+            \\
+            \\async fn conditional(x: int) -> int {
+            \\    if x > 0 {
+            \\        let a = await get_val(x)
+            \\        return a + 1
+            \\    } else {
+            \\        let b = await get_val(0)
+            \\        return b
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = await conditional(5)
+            \\    println(int_to_string(r))
+            \\}
+        ,
+        .expected_output = "51\n",
+    },
+    .{
+        .name = "async_phase_b_loop_await",
+        .source =
+            \\module test
+            \\
+            \\async fn get_val(n: int) -> int {
+            \\    return n
+            \\}
+            \\
+            \\async fn sum_async(n: int) -> int {
+            \\    let mut total = 0
+            \\    let mut i = 0
+            \\    while i < n {
+            \\        total = total + await get_val(i)
+            \\        i = i + 1
+            \\    }
+            \\    return total
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = await sum_async(5)
+            \\    println(int_to_string(r))
+            \\}
+        ,
+        .expected_output = "10\n",
+    },
+    .{
+        .name = "async_phase_b_sequential_awaits",
+        .source =
+            \\module test
+            \\
+            \\async fn get_one() -> int { return 1 }
+            \\async fn get_two() -> int { return 2 }
+            \\async fn get_three() -> int { return 3 }
+            \\
+            \\async fn multi() -> int {
+            \\    let a = await get_one()
+            \\    let b = await get_two()
+            \\    let c = await get_three()
+            \\    return a + b + c
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = await multi()
+            \\    println(int_to_string(r))
+            \\}
+        ,
+        .expected_output = "6\n",
+    },
+    .{
+        .name = "async_phase_b_nested_await",
+        .source =
+            \\module test
+            \\
+            \\async fn inner() -> int { return 100 }
+            \\
+            \\async fn middle() -> int {
+            \\    let y = await inner()
+            \\    return y + 10
+            \\}
+            \\
+            \\async fn outer() -> int {
+            \\    let x = await middle()
+            \\    return x + 1
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = await outer()
+            \\    println(int_to_string(r))
+            \\}
+        ,
+        .expected_output = "111\n",
+    },
+    .{
+        .name = "async_phase_b_while_multi_await",
+        .source =
+            \\module test
+            \\
+            \\async fn transform(n: int) -> int {
+            \\    return n * 2
+            \\}
+            \\
+            \\async fn sum_transformed(n: int) -> int {
+            \\    let mut sum = 0
+            \\    let mut i = 1
+            \\    while i <= n {
+            \\        sum = sum + await transform(i)
+            \\        i = i + 1
+            \\    }
+            \\    return sum
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = await sum_transformed(5)
+            \\    println(int_to_string(r))
+            \\}
+        ,
+        .expected_output = "30\n",
+    },
+    .{
+        .name = "async_phase_b_else_if_await",
+        .source =
+            \\module test
+            \\
+            \\async fn fetch(n: int) -> int { return n * 100 }
+            \\
+            \\async fn classify(x: int) -> int {
+            \\    if x > 10 {
+            \\        return await fetch(3)
+            \\    } else if x > 5 {
+            \\        return await fetch(2)
+            \\    } else {
+            \\        return await fetch(1)
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = await classify(7)
+            \\    println(int_to_string(r))
+            \\}
+        ,
+        .expected_output = "200\n",
     },
 };
 

@@ -1657,6 +1657,14 @@ pub const TypeChecker = struct {
             return try self.inferExpr(result);
         }
 
+        // If the last statement is a return, the block diverges (never type)
+        if (blk.statements.len > 0) {
+            const last = blk.statements[blk.statements.len - 1];
+            if (last.kind == .return_stmt) {
+                return try self.type_ctx.intern(.never);
+            }
+        }
+
         return try self.type_ctx.intern(.unit);
     }
 
@@ -2515,13 +2523,8 @@ pub const TypeChecker = struct {
                 },
             }
 
-            // Validate linear async: reject await in loops/branches
-            if (func.is_async) {
-                switch (body) {
-                    .block => |blk| try self.validateLinearAsync(blk, func.span),
-                    .expression => {},
-                }
-            }
+            // Phase B Full: await is now allowed in all control flow positions
+            // (The linear async restriction has been removed)
 
             // Effect enforcement: if the function declares effects (with [...]),
             // verify the observed effects don't exceed the declared set.

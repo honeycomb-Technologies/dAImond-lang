@@ -334,6 +334,8 @@ pub const CodeGenerator = struct {
     current_function_is_async: bool,
     // The future type name for async function returns (e.g., "dm_future_int64_t")
     current_function_future_type: ?[]const u8,
+    // Nesting depth of blocks within async function (0 = function body level)
+    async_block_depth: u32,
 
     // Track which parameters in the current function are mut (pass-by-reference)
     current_mut_params: std.StringHashMap(void),
@@ -371,6 +373,9 @@ pub const CodeGenerator = struct {
     emit_debug_info: bool,
     source_file_path: ?[]const u8,
     last_debug_line: usize, // track last emitted #line to avoid duplicates
+
+    // Source file reference for comptime function resolution
+    current_source: ?*SourceFile,
 
     const Self = @This();
 
@@ -464,6 +469,7 @@ pub const CodeGenerator = struct {
             .current_function_return_type = null,
             .current_function_is_async = false,
             .current_function_future_type = null,
+            .async_block_depth = 0,
             .current_mut_params = std.StringHashMap(void).init(allocator),
             .function_mut_info = std.StringHashMap([]const bool).init(allocator),
             .region_stack = std.ArrayList([]const u8).init(allocator),
@@ -478,6 +484,7 @@ pub const CodeGenerator = struct {
             .emit_debug_info = false,
             .source_file_path = null,
             .last_debug_line = 0,
+            .current_source = null,
         };
     }
 
@@ -600,6 +607,9 @@ pub const CodeGenerator = struct {
 
     /// Generate C code from a complete source file
     pub fn generate(self: *Self, source: *SourceFile) ![]const u8 {
+        // Store source file reference for comptime function resolution
+        self.current_source = source;
+
         // Generate runtime header
         try self.generateRuntimeHeader();
 
@@ -4479,10 +4489,12 @@ pub const CodeGenerator = struct {
             const future_type_name = try self.generateFutureTypeByName(inner_ret_type);
             self.current_function_is_async = true;
             self.current_function_future_type = future_type_name;
+            self.async_block_depth = 0;
             ret_type = future_type_name;
         } else {
             self.current_function_is_async = false;
             self.current_function_future_type = null;
+            self.async_block_depth = 0;
         }
 
         // Track current function return type for ? operator and Option/Result constructors
@@ -4897,24 +4909,50 @@ pub const CodeGenerator = struct {
     fn generateConstant(self: *Self, const_decl: *ConstDecl) !void {
         // Use raw name (not mangled) so identifier references match the declaration
         const name = const_decl.name.name;
-        const type_str = if (const_decl.type_expr) |t| try self.mapType(t) else blk: {
-            // Infer type from value expression
-            if (const_decl.value) |val| {
-                // Unwrap comptime_expr wrapper to get the inner expression
-                const inner = if (val.kind == .comptime_expr) val.kind.comptime_expr.expr else val;
-                // Try comptime evaluation first for accurate type
-                if (self.evalComptime(inner)) |cv| {
-                    break :blk switch (cv) {
-                        .int_val => @as([]const u8, "int64_t"),
-                        .float_val => "double",
-                        .bool_val => "bool",
-                        .string_val => "dm_string",
-                    };
+
+        // Try comptime evaluation first for fully evaluated static constants
+        if (const_decl.value) |val| {
+            const inner = if (val.kind == .comptime_expr) val.kind.comptime_expr.expr else val;
+            if (self.evalComptime(inner)) |cv| {
+                switch (cv) {
+                    .int_val => |v| {
+                        self.trackVariableType(name, "int64_t");
+                        try self.writer.print("static const int64_t {s} = {d};", .{ name, v });
+                        try self.writer.newline();
+                        return;
+                    },
+                    .float_val => |v| {
+                        self.trackVariableType(name, "double");
+                        try self.writer.print("static const double {s} = {d};", .{ name, v });
+                        try self.writer.newline();
+                        return;
+                    },
+                    .bool_val => |v| {
+                        self.trackVariableType(name, "bool");
+                        try self.writer.print("static const bool {s} = {s};", .{ name, if (v) "true" else "false" });
+                        try self.writer.newline();
+                        return;
+                    },
+                    .string_val => |v| {
+                        self.trackVariableType(name, "dm_string");
+                        // Use C struct literal initializer (valid for static const)
+                        try self.writer.print("static const dm_string {s} = {{.data = \"{s}\", .len = {d}, .capacity = {d}}};", .{ name, v, v.len, v.len });
+                        try self.writer.newline();
+                        return;
+                    },
+                    .void_val => {},
+                    .array_val, .struct_val => {},
                 }
-                // Fallback to expression type inference
+            }
+        }
+
+        // Fallback: infer type and use runtime expression
+        const type_str = if (const_decl.type_expr) |t| try self.mapType(t) else blk: {
+            if (const_decl.value) |val| {
+                const inner = if (val.kind == .comptime_expr) val.kind.comptime_expr.expr else val;
                 break :blk self.inferCTypeFromExpr(inner);
             }
-            break :blk @as([]const u8, "int64_t"); // Default to int64_t instead of const void*
+            break :blk @as([]const u8, "int64_t");
         };
 
         try self.writer.print("static const {s} {s}", .{ type_str, name });
@@ -4933,13 +4971,17 @@ pub const CodeGenerator = struct {
 
     /// Generate a block of statements
     fn generateBlock(self: *Self, block: *BlockExpr) anyerror!void {
+        self.async_block_depth += 1;
+        defer self.async_block_depth -= 1;
+
         for (block.statements) |stmt| {
             try self.generateStatement(stmt);
         }
 
-        // For async void functions, if the block has no result and doesn't end
-        // with a return statement, emit an implicit return dm_future_void_ready()
-        if (block.result == null and self.current_function_is_async) {
+        // For async functions at function body level (depth 1), if the block has no
+        // result and doesn't end with a return, emit an implicit return _ready().
+        // Inner blocks (while/for/if bodies at depth > 1) should NOT get this.
+        if (block.result == null and self.current_function_is_async and self.async_block_depth == 1) {
             // Check if the last statement is already a return
             const has_trailing_return = if (block.statements.len > 0)
                 block.statements[block.statements.len - 1].kind == .return_stmt
@@ -4969,7 +5011,15 @@ pub const CodeGenerator = struct {
             } else if (self.current_function_is_async) {
                 // For async functions, wrap the result in _ready()
                 const future_type = self.current_function_future_type.?;
-                if (std.mem.eql(u8, future_type, "dm_future_void")) {
+                if (result.kind == .if_expr) {
+                    // If/else in return position: generate as statement form.
+                    // Branches with explicit returns already get _ready() wrapping
+                    // via generateReturn. For branches with result expressions,
+                    // use generateIfStatementWithAsyncReturn.
+                    try self.generateIfStatementWithAsyncReturn(result.kind.if_expr);
+                } else if (result.kind == .match_expr) {
+                    try self.generateMatchStatement(result.kind.match_expr);
+                } else if (std.mem.eql(u8, future_type, "dm_future_void")) {
                     // Void future: execute expression, then return _ready()
                     try self.generateExpr(result);
                     try self.writer.writeLine(";");
@@ -5304,6 +5354,59 @@ pub const CodeGenerator = struct {
                 .else_if => |else_if| {
                     try self.writer.write(" else ");
                     try self.generateIfStatementWithReturn(else_if);
+                },
+            }
+        } else {
+            try self.writer.newline();
+        }
+    }
+
+    /// Generate if expression as statement form with async return wrapping.
+    /// Branches with explicit return statements get _ready() wrapping via generateReturn.
+    /// Branches with result expressions get wrapped with return _ready(expr).
+    fn generateIfStatementWithAsyncReturn(self: *Self, if_expr: *IfExpr) anyerror!void {
+        const future_type = self.current_function_future_type.?;
+        try self.writer.write("if (");
+        try self.generateExpr(if_expr.condition);
+        try self.writer.write(")");
+        try self.writer.beginBlock();
+        // Generate then branch
+        for (if_expr.then_branch.statements) |stmt| {
+            try self.generateStatement(stmt);
+        }
+        if (if_expr.then_branch.result) |result| {
+            if (result.kind == .if_expr) {
+                try self.generateIfStatementWithAsyncReturn(result.kind.if_expr);
+            } else {
+                try self.writer.print("return {s}_ready(", .{future_type});
+                try self.generateExpr(result);
+                try self.writer.writeLine(");");
+            }
+        }
+        try self.writer.closeBraceInline();
+
+        if (if_expr.else_branch) |else_br| {
+            switch (else_br) {
+                .else_block => |block| {
+                    try self.writer.write(" else");
+                    try self.writer.beginBlock();
+                    for (block.statements) |stmt| {
+                        try self.generateStatement(stmt);
+                    }
+                    if (block.result) |result| {
+                        if (result.kind == .if_expr) {
+                            try self.generateIfStatementWithAsyncReturn(result.kind.if_expr);
+                        } else {
+                            try self.writer.print("return {s}_ready(", .{future_type});
+                            try self.generateExpr(result);
+                            try self.writer.writeLine(");");
+                        }
+                    }
+                    try self.writer.endBlock();
+                },
+                .else_if => |else_if| {
+                    try self.writer.write(" else ");
+                    try self.generateIfStatementWithAsyncReturn(else_if);
                 },
             }
         } else {
@@ -5927,12 +6030,7 @@ pub const CodeGenerator = struct {
             .comptime_expr => |comp| {
                 // Try to evaluate at compile time
                 if (self.evalComptime(comp.expr)) |result| {
-                    switch (result) {
-                        .int_val => |v| try self.writer.print("{d}", .{v}),
-                        .float_val => |v| try self.writer.print("{d}", .{v}),
-                        .bool_val => |v| try self.writer.write(if (v) "true" else "false"),
-                        .string_val => |v| try self.writer.print("dm_string_from_cstr(\"{s}\")", .{v}),
-                    }
+                    try self.emitComptimeValue(result);
                 } else {
                     // Fall back to runtime evaluation
                     try self.generateExpr(comp.expr);
@@ -7350,11 +7448,93 @@ pub const CodeGenerator = struct {
         float_val: f64,
         bool_val: bool,
         string_val: []const u8,
+        array_val: []ComptimeValue,
+        struct_val: *std.StringHashMap(ComptimeValue),
+        void_val: void,
     };
 
-    /// Try to evaluate an expression at compile time.
+    /// Comptime evaluation environment with lexical scoping.
+    const ComptimeEnv = struct {
+        variables: std.StringHashMap(ComptimeValue),
+        parent: ?*ComptimeEnv,
+        call_depth: u32,
+        iteration_count: u32,
+        max_call_depth: u32,
+        max_iterations: u32,
+        allocator: Allocator,
+
+        fn init(alloc: Allocator, parent: ?*ComptimeEnv) ComptimeEnv {
+            const depth = if (parent) |p| p.call_depth else 0;
+            return .{
+                .variables = std.StringHashMap(ComptimeValue).init(alloc),
+                .parent = parent,
+                .call_depth = depth,
+                .iteration_count = 0,
+                .max_call_depth = 1000,
+                .max_iterations = 100000,
+                .allocator = alloc,
+            };
+        }
+
+        fn deinit(self: *ComptimeEnv) void {
+            self.variables.deinit();
+        }
+
+        fn lookup(self: *const ComptimeEnv, name: []const u8) ?ComptimeValue {
+            if (self.variables.get(name)) |v| return v;
+            if (self.parent) |p| return p.lookup(name);
+            return null;
+        }
+
+        fn put(self: *ComptimeEnv, name: []const u8, val: ComptimeValue) !void {
+            try self.variables.put(name, val);
+        }
+
+        /// Update an existing variable in the nearest scope that contains it
+        fn update(self: *ComptimeEnv, name: []const u8, val: ComptimeValue) bool {
+            if (self.variables.getPtr(name)) |ptr| {
+                ptr.* = val;
+                return true;
+            }
+            if (self.parent) |p| return p.update(name, val);
+            return false;
+        }
+    };
+
+    /// Sentinel errors for comptime control flow
+    const ComptimeControl = enum {
+        break_signal,
+        continue_signal,
+    };
+
+    /// Try to evaluate an expression at compile time (entry point, creates root env).
     /// Returns null if the expression cannot be evaluated statically.
     fn evalComptime(self: *Self, expr: *const Expr) ?ComptimeValue {
+        var root_env = ComptimeEnv.init(self.allocator, null);
+        defer root_env.deinit();
+
+        // Pre-populate root env with file-scope const declarations
+        if (self.current_source) |source| {
+            for (source.declarations) |decl| {
+                switch (decl.kind) {
+                    .constant => |c| {
+                        if (c.value) |val| {
+                            const inner = if (val.kind == .comptime_expr) val.kind.comptime_expr.expr else val;
+                            if (self.evalComptimeExpr(inner, &root_env)) |cv| {
+                                root_env.put(c.name.name, cv) catch {};
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        return self.evalComptimeExpr(expr, &root_env);
+    }
+
+    /// Evaluate an expression in a comptime environment.
+    fn evalComptimeExpr(self: *Self, expr: *const Expr, env: *ComptimeEnv) ?ComptimeValue {
         switch (expr.kind) {
             .literal => |lit| {
                 return switch (lit.kind) {
@@ -7371,8 +7551,11 @@ pub const CodeGenerator = struct {
                     else => null,
                 };
             },
+            .identifier => |ident| {
+                return env.lookup(ident.name);
+            },
             .unary => |un| {
-                const operand = self.evalComptime(un.operand) orelse return null;
+                const operand = self.evalComptimeExpr(un.operand, env) orelse return null;
                 return switch (un.op) {
                     .neg => switch (operand) {
                         .int_val => |v| ComptimeValue{ .int_val = -v },
@@ -7387,13 +7570,474 @@ pub const CodeGenerator = struct {
                 };
             },
             .binary => |bin| {
-                const left = self.evalComptime(bin.left) orelse return null;
-                const right = self.evalComptime(bin.right) orelse return null;
+                const left = self.evalComptimeExpr(bin.left, env) orelse return null;
+                const right = self.evalComptimeExpr(bin.right, env) orelse return null;
+                // Handle string concatenation (needs allocator)
+                if (left == .string_val and right == .string_val and bin.op == .add) {
+                    const s = std.fmt.allocPrint(self.stringAllocator(), "{s}{s}", .{ left.string_val, right.string_val }) catch return null;
+                    return ComptimeValue{ .string_val = s };
+                }
                 return self.evalComptimeBinary(bin.op, left, right);
             },
-            .grouped => |inner| return self.evalComptime(inner),
+            .grouped => |inner| return self.evalComptimeExpr(inner, env),
+            .comptime_expr => |comp| return self.evalComptimeExpr(comp.expr, env),
+            .block => |blk| {
+                const r = self.evalComptimeBlockFull(blk, env) orelse return null;
+                return switch (r) {
+                    .value => |v| v,
+                    .control => null, // return/break/continue at expression level = error
+                };
+            },
+            .if_expr => |ie| {
+                const r = self.evalComptimeIfFull(ie, env) orelse return null;
+                return switch (r) {
+                    .value => |v| v,
+                    .control => null,
+                };
+            },
+            .match_expr => |me| {
+                const r = self.evalComptimeMatchFull(me, env) orelse return null;
+                return switch (r) {
+                    .value => |v| v,
+                    .control => null,
+                };
+            },
+            .function_call => |call| return self.evalComptimeFunctionCall(call, env),
+            .field_access => |fa| return self.evalComptimeFieldAccess(fa, env),
+            .index_access => |ia| return self.evalComptimeIndexAccess(ia, env),
+            .array_literal => |al| return self.evalComptimeArrayLiteral(al, env),
+            .struct_literal => |sl| return self.evalComptimeStructLiteral(sl, env),
             else => return null,
         }
+    }
+
+    /// Evaluate a block expression at comptime, returning full result with control flow signals.
+    fn evalComptimeBlockFull(self: *Self, block: *const BlockExpr, env: *ComptimeEnv) ?ComptimeStmtResult {
+        var child_env = ComptimeEnv.init(self.allocator, env);
+        defer child_env.deinit();
+
+        for (block.statements) |stmt| {
+            const result = self.evalComptimeStatement(stmt, &child_env);
+            if (result) |r| {
+                switch (r) {
+                    .control => return result, // propagate return/break/continue
+                    .value => {},
+                }
+            } else {
+                return null;
+            }
+        }
+
+        if (block.result) |result_expr| {
+            const val = self.evalComptimeExpr(result_expr, &child_env) orelse return null;
+            return comptimeOk(val);
+        }
+
+        return comptimeVoid();
+    }
+
+    /// Result of evaluating a comptime statement
+    const ComptimeStmtResult = union(enum) {
+        value: ComptimeValue,
+        control: ComptimeControlFlow,
+    };
+
+    const ComptimeControlFlow = union(enum) {
+        return_val: ?ComptimeValue,
+        break_signal: void,
+        continue_signal: void,
+    };
+
+    fn comptimeOk(val: ComptimeValue) ?ComptimeStmtResult {
+        return ComptimeStmtResult{ .value = val };
+    }
+
+    fn comptimeVoid() ?ComptimeStmtResult {
+        return ComptimeStmtResult{ .value = ComptimeValue{ .void_val = {} } };
+    }
+
+    /// Evaluate a statement at comptime.
+    fn evalComptimeStatement(self: *Self, stmt: *const Statement, env: *ComptimeEnv) ?ComptimeStmtResult {
+        switch (stmt.kind) {
+            .let_binding => |lb| {
+                if (lb.value) |val_expr| {
+                    const val = self.evalComptimeExpr(val_expr, env) orelse return null;
+                    const var_name = switch (lb.pattern.kind) {
+                        .identifier => |id| id.name.name,
+                        else => return null,
+                    };
+                    env.put(var_name, val) catch return null;
+                    return comptimeVoid();
+                }
+                return null;
+            },
+            .assignment => |assign| {
+                const val = self.evalComptimeExpr(assign.value, env) orelse return null;
+                // Handle compound assignment operators
+                if (assign.op != .assign) {
+                    const target_name = switch (assign.target.kind) {
+                        .identifier => |id| id.name,
+                        else => return null,
+                    };
+                    const old_val = env.lookup(target_name) orelse return null;
+                    const bin_op: BinaryExpr.BinaryOp = switch (assign.op) {
+                        .add_assign => .add,
+                        .sub_assign => .sub,
+                        .mul_assign => .mul,
+                        .div_assign => .div,
+                        else => return null,
+                    };
+                    const new_val = self.evalComptimeBinary(bin_op, old_val, val) orelse return null;
+                    if (!env.update(target_name, new_val)) {
+                        env.put(target_name, new_val) catch return null;
+                    }
+                    return comptimeVoid();
+                }
+                // Simple assignment
+                const target_name = switch (assign.target.kind) {
+                    .identifier => |id| id.name,
+                    else => return null,
+                };
+                if (!env.update(target_name, val)) {
+                    env.put(target_name, val) catch return null;
+                }
+                return comptimeVoid();
+            },
+            .return_stmt => |ret| {
+                if (ret.value) |val_expr| {
+                    const val = self.evalComptimeExpr(val_expr, env) orelse return null;
+                    return ComptimeStmtResult{ .control = .{ .return_val = val } };
+                }
+                return ComptimeStmtResult{ .control = .{ .return_val = null } };
+            },
+            .expression => |expr| {
+                // For expressions that might contain control flow (if/block/match),
+                // use the Full variants to propagate return/break/continue signals
+                switch (expr.kind) {
+                    .if_expr => |ie| return self.evalComptimeIfFull(ie, env),
+                    .block => |blk| return self.evalComptimeBlockFull(blk, env),
+                    .match_expr => |me| return self.evalComptimeMatchFull(me, env),
+                    else => {
+                        _ = self.evalComptimeExpr(expr, env) orelse return null;
+                        return comptimeVoid();
+                    },
+                }
+            },
+            .if_stmt => |ie| {
+                return self.evalComptimeIfFull(ie, env);
+            },
+            .while_loop => |wl| {
+                return self.evalComptimeWhile(wl, env);
+            },
+            .for_loop => |fl| {
+                return self.evalComptimeFor(fl, env);
+            },
+            .break_stmt => {
+                return ComptimeStmtResult{ .control = .{ .break_signal = {} } };
+            },
+            .continue_stmt => {
+                return ComptimeStmtResult{ .control = .{ .continue_signal = {} } };
+            },
+            else => return null,
+        }
+    }
+
+    /// Evaluate if/else at comptime, returning full result with control flow signals.
+    fn evalComptimeIfFull(self: *Self, ie: *const IfExpr, env: *ComptimeEnv) ?ComptimeStmtResult {
+        const cond = self.evalComptimeExpr(ie.condition, env) orelse return null;
+        if (cond != .bool_val) return null;
+
+        if (cond.bool_val) {
+            return self.evalComptimeBlockFull(ie.then_branch, env);
+        } else if (ie.else_branch) |eb| {
+            return switch (eb) {
+                .else_block => |b| self.evalComptimeBlockFull(b, env),
+                .else_if => |elif| self.evalComptimeIfFull(elif, env),
+            };
+        }
+        return comptimeVoid();
+    }
+
+    /// Evaluate match expression at comptime, returning full result with control flow signals.
+    fn evalComptimeMatchFull(self: *Self, me: *const MatchExpr, env: *ComptimeEnv) ?ComptimeStmtResult {
+        const scrutinee = self.evalComptimeExpr(me.scrutinee, env) orelse return null;
+
+        for (me.arms) |arm| {
+            if (self.comptimePatternMatches(arm.pattern, scrutinee, env)) {
+                return switch (arm.body) {
+                    .expression => |expr| blk: {
+                        const val = self.evalComptimeExpr(expr, env) orelse break :blk null;
+                        break :blk comptimeOk(val);
+                    },
+                    .block => |blk| self.evalComptimeBlockFull(blk, env),
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Check if a pattern matches a comptime value, binding variables if needed.
+    fn comptimePatternMatches(self: *Self, pattern: *const Pattern, val: ComptimeValue, env: *ComptimeEnv) bool {
+        _ = self;
+        switch (pattern.kind) {
+            .wildcard => return true,
+            .literal => |lit| {
+                return switch (lit.kind) {
+                    .int => |i| blk: {
+                        if (val != .int_val) break :blk false;
+                        const pv = std.fmt.parseInt(i64, i.value, 10) catch break :blk false;
+                        break :blk val.int_val == pv;
+                    },
+                    .float => |f| blk: {
+                        if (val != .float_val) break :blk false;
+                        const pv = std.fmt.parseFloat(f64, f.value) catch break :blk false;
+                        break :blk val.float_val == pv;
+                    },
+                    .bool => |b| blk: {
+                        if (val != .bool_val) break :blk false;
+                        break :blk val.bool_val == b;
+                    },
+                    .string => |s| blk: {
+                        if (val != .string_val) break :blk false;
+                        break :blk std.mem.eql(u8, val.string_val, s.value);
+                    },
+                    else => false,
+                };
+            },
+            .identifier => |ident| {
+                // Bind variable
+                env.put(ident.name.name, val) catch return false;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
+    /// Evaluate while loop at comptime.
+    fn evalComptimeWhile(self: *Self, wl: *const WhileLoop, env: *ComptimeEnv) ?ComptimeStmtResult {
+        var iterations: u32 = 0;
+        while (true) {
+            iterations += 1;
+            if (iterations > env.max_iterations) return null;
+
+            const cond = self.evalComptimeExpr(wl.condition, env) orelse return null;
+            if (cond != .bool_val) return null;
+            if (!cond.bool_val) break;
+
+            // Evaluate body
+            for (wl.body.statements) |stmt| {
+                const result = self.evalComptimeStatement(stmt, env);
+                if (result) |r| {
+                    switch (r) {
+                        .control => |ctrl| switch (ctrl) {
+                            .return_val => return result,
+                            .break_signal => return comptimeVoid(),
+                            .continue_signal => break,
+                        },
+                        .value => {},
+                    }
+                } else {
+                    return null;
+                }
+            }
+        }
+        return comptimeVoid();
+    }
+
+    /// Evaluate for loop at comptime.
+    fn evalComptimeFor(self: *Self, fl: *const ForLoop, env: *ComptimeEnv) ?ComptimeStmtResult {
+        const iterable = self.evalComptimeExpr(fl.iterator, env) orelse return null;
+        if (iterable != .array_val) return null;
+
+        const loop_var_name = switch (fl.pattern.kind) {
+            .identifier => |id| id.name.name,
+            else => return null,
+        };
+        var iterations: u32 = 0;
+
+        for (iterable.array_val) |elem| {
+            iterations += 1;
+            if (iterations > env.max_iterations) return null;
+
+            // Bind loop variable
+            env.put(loop_var_name, elem) catch return null;
+
+            // Evaluate body
+            for (fl.body.statements) |stmt| {
+                const result = self.evalComptimeStatement(stmt, env);
+                if (result) |r| {
+                    switch (r) {
+                        .control => |ctrl| switch (ctrl) {
+                            .return_val => return result,
+                            .break_signal => return comptimeVoid(),
+                            .continue_signal => break,
+                        },
+                        .value => {},
+                    }
+                } else {
+                    return null;
+                }
+            }
+        }
+        return comptimeVoid();
+    }
+
+    /// Evaluate a function call at comptime.
+    fn evalComptimeFunctionCall(self: *Self, call: *const FunctionCall, env: *ComptimeEnv) ?ComptimeValue {
+        // Get function name
+        const func_name = switch (call.function.kind) {
+            .identifier => |id| id.name,
+            else => return null,
+        };
+
+        // Handle builtin pure functions
+        if (std.mem.eql(u8, func_name, "len")) {
+            if (call.args.len != 1) return null;
+            const arg = self.evalComptimeExpr(call.args[0].value, env) orelse return null;
+            return switch (arg) {
+                .string_val => |s| ComptimeValue{ .int_val = @as(i64, @intCast(s.len)) },
+                .array_val => |a| ComptimeValue{ .int_val = @as(i64, @intCast(a.len)) },
+                else => null,
+            };
+        }
+        if (std.mem.eql(u8, func_name, "int_to_string")) {
+            if (call.args.len != 1) return null;
+            const arg = self.evalComptimeExpr(call.args[0].value, env) orelse return null;
+            if (arg != .int_val) return null;
+            const s = std.fmt.allocPrint(self.stringAllocator(), "{d}", .{arg.int_val}) catch return null;
+            return ComptimeValue{ .string_val = s };
+        }
+
+        // Reject impure builtins
+        const impure_builtins = [_][]const u8{
+            "print",     "println",    "eprint",      "eprintln",
+            "file_read", "file_write", "file_append",  "read_line",
+            "exit",      "system",     "panic",
+        };
+        for (impure_builtins) |name| {
+            if (std.mem.eql(u8, func_name, name)) return null;
+        }
+
+        // Look up function declaration in source file
+        const func_decl = self.findFunctionDecl(func_name) orelse return null;
+        const body = func_decl.body orelse return null;
+        const body_block = switch (body) {
+            .block => |blk| blk,
+            .expression => |expr| {
+                // Expression-body function: just evaluate the expression
+                if (env.call_depth >= env.max_call_depth) return null;
+
+                var call_env = ComptimeEnv.init(self.allocator, env);
+                defer call_env.deinit();
+                call_env.call_depth = env.call_depth + 1;
+
+                // Bind parameters
+                const params = func_decl.params;
+                if (params.len != call.args.len) return null;
+                for (params, 0..) |param, idx| {
+                    const arg_val = self.evalComptimeExpr(call.args[idx].value, env) orelse return null;
+                    call_env.put(param.name.name, arg_val) catch return null;
+                }
+
+                return self.evalComptimeExpr(expr, &call_env);
+            },
+        };
+
+        // Check recursion limit
+        if (env.call_depth >= env.max_call_depth) return null;
+
+        // Create call environment
+        var call_env = ComptimeEnv.init(self.allocator, env);
+        defer call_env.deinit();
+        call_env.call_depth = env.call_depth + 1;
+
+        // Bind parameters
+        const params = func_decl.params;
+        if (params.len != call.args.len) return null;
+        for (params, 0..) |param, idx| {
+            const arg_val = self.evalComptimeExpr(call.args[idx].value, env) orelse return null;
+            call_env.put(param.name.name, arg_val) catch return null;
+        }
+
+        // Evaluate function body
+        for (body_block.statements) |stmt| {
+            const result = self.evalComptimeStatement(stmt, &call_env);
+            if (result) |r| {
+                switch (r) {
+                    .control => |ctrl| switch (ctrl) {
+                        .return_val => |rv| return rv,
+                        else => return null,
+                    },
+                    .value => {},
+                }
+            } else {
+                return null;
+            }
+        }
+
+        // Block result expression
+        if (body_block.result) |result_expr| {
+            return self.evalComptimeExpr(result_expr, &call_env);
+        }
+
+        return ComptimeValue{ .void_val = {} };
+    }
+
+    /// Find a function declaration by name in the current source file.
+    fn findFunctionDecl(self: *Self, name: []const u8) ?*FunctionDecl {
+        const source = self.current_source orelse return null;
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .function => |f| {
+                    if (std.mem.eql(u8, f.name.name, name)) return f;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// Evaluate field access at comptime.
+    fn evalComptimeFieldAccess(self: *Self, fa: *const FieldAccess, env: *ComptimeEnv) ?ComptimeValue {
+        const base = self.evalComptimeExpr(fa.object, env) orelse return null;
+        if (base != .struct_val) return null;
+        return base.struct_val.get(fa.field.name);
+    }
+
+    /// Evaluate index access at comptime.
+    fn evalComptimeIndexAccess(self: *Self, ia: *const IndexAccess, env: *ComptimeEnv) ?ComptimeValue {
+        const base = self.evalComptimeExpr(ia.object, env) orelse return null;
+        const index = self.evalComptimeExpr(ia.index, env) orelse return null;
+        if (base != .array_val or index != .int_val) return null;
+        const idx = index.int_val;
+        if (idx < 0 or idx >= @as(i64, @intCast(base.array_val.len))) return null;
+        return base.array_val[@as(usize, @intCast(idx))];
+    }
+
+    /// Evaluate array literal at comptime.
+    fn evalComptimeArrayLiteral(self: *Self, al: *const ArrayLiteral, env: *ComptimeEnv) ?ComptimeValue {
+        switch (al.kind) {
+            .elements => |elems| {
+                var elements = std.ArrayList(ComptimeValue).init(self.allocator);
+                for (elems) |elem| {
+                    const val = self.evalComptimeExpr(elem, env) orelse return null;
+                    elements.append(val) catch return null;
+                }
+                return ComptimeValue{ .array_val = elements.toOwnedSlice() catch return null };
+            },
+            .repeat => return null,
+        }
+    }
+
+    /// Evaluate struct literal at comptime.
+    fn evalComptimeStructLiteral(self: *Self, sl: *const StructLiteral, env: *ComptimeEnv) ?ComptimeValue {
+        var fields = self.allocator.create(std.StringHashMap(ComptimeValue)) catch return null;
+        fields.* = std.StringHashMap(ComptimeValue).init(self.allocator);
+        for (sl.fields) |field| {
+            const val = self.evalComptimeExpr(field.value, env) orelse return null;
+            fields.put(field.name.name, val) catch return null;
+        }
+        return ComptimeValue{ .struct_val = fields };
     }
 
     /// Evaluate a binary operation on comptime values.
@@ -7450,6 +8094,20 @@ pub const CodeGenerator = struct {
             };
         }
 
+        // String concatenation and comparison
+        if (left == .string_val and right == .string_val) {
+            return switch (op) {
+                .add => blk: {
+                    // We can't allocate here easily without access to self, so return null for complex string ops
+                    // This is handled at a higher level
+                    break :blk null;
+                },
+                .eq => ComptimeValue{ .bool_val = std.mem.eql(u8, left.string_val, right.string_val) },
+                .ne => ComptimeValue{ .bool_val = !std.mem.eql(u8, left.string_val, right.string_val) },
+                else => null,
+            };
+        }
+
         // Boolean logic
         if (left == .bool_val and right == .bool_val) {
             const l = left.bool_val;
@@ -7464,6 +8122,21 @@ pub const CodeGenerator = struct {
         }
 
         return null;
+    }
+
+    /// Emit a comptime value as C code.
+    fn emitComptimeValue(self: *Self, val: ComptimeValue) !void {
+        switch (val) {
+            .int_val => |v| try self.writer.print("{d}", .{v}),
+            .float_val => |v| try self.writer.print("{d}", .{v}),
+            .bool_val => |v| try self.writer.write(if (v) "true" else "false"),
+            .string_val => |v| try self.writer.print("dm_string_from_cstr(\"{s}\")", .{v}),
+            .void_val => try self.writer.write("((void)0)"),
+            .array_val, .struct_val => {
+                // Complex types fall back to runtime generation
+                try self.writer.write("0 /* comptime complex value */");
+            },
+        }
     }
 
     // ========================================================================
