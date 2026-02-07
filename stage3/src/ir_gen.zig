@@ -102,6 +102,10 @@ pub const IRGenerator = struct {
     trait_impl_methods: std.StringHashMap([]const []const u8),
     /// Track user-declared extern functions (not runtime builtins): name -> void
     user_extern_fns: std.StringHashMap(void),
+    /// Track list-typed struct fields: "StructName.field_name" -> ListElemKind
+    field_list_elem_kinds: std.StringHashMap(ListElemKind),
+    /// Track list-typed struct fields element types: "StructName.field_name" -> struct IRType (for .other kind)
+    field_list_elem_types: std.StringHashMap(*const ir.IRType),
 
     pub fn init(allocator: Allocator) IRGenerator {
         return .{
@@ -129,6 +133,8 @@ pub const IRGenerator = struct {
             .dyn_var_traits = std.StringHashMap([]const u8).init(allocator),
             .trait_impl_methods = std.StringHashMap([]const []const u8).init(allocator),
             .user_extern_fns = std.StringHashMap(void).init(allocator),
+            .field_list_elem_kinds = std.StringHashMap(ListElemKind).init(allocator),
+            .field_list_elem_types = std.StringHashMap(*const ir.IRType).init(allocator),
         };
     }
 
@@ -155,6 +161,8 @@ pub const IRGenerator = struct {
         self.dyn_var_traits.deinit();
         self.trait_impl_methods.deinit();
         self.user_extern_fns.deinit();
+        self.field_list_elem_kinds.deinit();
+        self.field_list_elem_types.deinit();
     }
 
     pub fn getModule(self: *IRGenerator) *ir.Module {
@@ -343,7 +351,32 @@ pub const IRGenerator = struct {
                 return self.builder.allocType(.i64_type);
             }
             if (std.mem.eql(u8, name, "List")) {
-                return self.builder.allocType(.{ .ptr = try self.builder.allocType(.i8_type) });
+                // Determine the list element kind to select the right list struct type
+                const lek = self.resolveListElemKind(named);
+                const list_struct_name: []const u8 = switch (lek) {
+                    .int64 => "dm_list_int64",
+                    .float64 => "dm_list_double",
+                    .string => "dm_list_dm_string",
+                    .other => "dm_list_generic",
+                };
+                // Check if this list struct type is already registered
+                if (self.module.struct_defs.get(list_struct_name)) |existing_ty| {
+                    return existing_ty;
+                }
+                // Create and register the list struct type
+                const ptr_field_ty = try self.builder.allocType(.{ .ptr = try self.builder.allocType(.i8_type) });
+                const i64_field_ty = try self.builder.allocType(.i64_type);
+                const list_fields = try self.allocator.dupe(ir.Field, &.{
+                    .{ .name = "data", .ty = ptr_field_ty },
+                    .{ .name = "len", .ty = i64_field_ty },
+                    .{ .name = "capacity", .ty = i64_field_ty },
+                });
+                const list_ty = try self.builder.allocType(.{ .struct_type = .{
+                    .name = list_struct_name,
+                    .fields = list_fields,
+                } });
+                try self.module.struct_defs.put(list_struct_name, list_ty);
+                return list_ty;
             }
             if (std.mem.eql(u8, name, "Map")) {
                 return self.builder.allocType(.{ .ptr = try self.builder.allocType(.i8_type) });
@@ -476,6 +509,23 @@ pub const IRGenerator = struct {
 
         for (sd.fields) |field| {
             const ty = try self.mapTypeExpr(field.type_expr);
+
+            // Detect List[T] fields and register them for field access list dispatch
+            if (field.type_expr.kind == .named) {
+                const named = field.type_expr.kind.named;
+                if (named.path.segments.len == 1 and std.mem.eql(u8, named.path.segments[0].name, "List")) {
+                    const elem_kind = self.resolveListElemKind(named);
+                    const field_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ sd.name.name, field.name.name });
+                    try self.field_list_elem_kinds.put(field_key, elem_kind);
+                    // mapTypeExpr already creates and registers the list struct type
+
+                    // Store element type info for .other kind
+                    if (elem_kind == .other) {
+                        try self.storeFieldListElemType(field_key, named);
+                    }
+                }
+            }
+
             try fields.append(.{ .name = field.name.name, .ty = ty });
             try ir_fields.append(.{ .name = field.name.name, .ty = ty });
         }
@@ -1316,18 +1366,27 @@ pub const IRGenerator = struct {
                 try self.variable_types.put(param.name.name, ty);
             }
 
-            // Detect List[T] and Box[T] parameter type annotations
+            // Detect struct, List[T] and Box[T] parameter type annotations
             if (param.type_expr.kind == .named) {
                 const named = param.type_expr.kind.named;
                 if (named.path.segments.len == 1) {
-                    if (std.mem.eql(u8, named.path.segments[0].name, "List")) {
+                    const ptype_name = named.path.segments[0].name;
+                    // Track struct-typed parameters for field access dispatch
+                    if (self.struct_defs.contains(ptype_name)) {
+                        try self.var_struct_types.put(param.name.name, ptype_name);
+                    }
+                    // Track enum-typed parameters
+                    if (self.enum_defs.contains(ptype_name)) {
+                        try self.var_enum_types.put(param.name.name, ptype_name);
+                    }
+                    if (std.mem.eql(u8, ptype_name, "List")) {
                         const elem_kind = self.resolveListElemKind(named);
                         try self.list_elem_kinds.put(param.name.name, elem_kind);
                         if (elem_kind == .other) {
                             try self.storeListElemType(param.name.name, named);
                         }
                     }
-                    if (std.mem.eql(u8, named.path.segments[0].name, "Box")) {
+                    if (std.mem.eql(u8, ptype_name, "Box")) {
                         // Box[T] parameter: track the inner type
                         if (named.generic_args) |gargs| {
                             if (gargs.len > 0 and gargs[0].kind == .named) {
@@ -1433,26 +1492,8 @@ pub const IRGenerator = struct {
                         try self.storeListElemType(var_name, named);
                     }
 
-                    // List is a struct: { ptr, i64, i64 } — same layout as dm_list_int64/dm_list_dm_string
-                    const list_name: []const u8 = switch (elem_kind) {
-                        .int64 => "dm_list_int64",
-                        .float64 => "dm_list_double",
-                        .string => "dm_list_dm_string",
-                        .other => "dm_list_generic",
-                    };
-                    const ptr_field_ty = try self.builder.allocType(.{ .ptr = try self.builder.allocType(.i8_type) });
-                    const i64_field_ty = try self.builder.allocType(.i64_type);
-                    const list_fields = try self.allocator.dupe(ir.Field, &.{
-                        .{ .name = "data", .ty = ptr_field_ty },
-                        .{ .name = "len", .ty = i64_field_ty },
-                        .{ .name = "capacity", .ty = i64_field_ty },
-                    });
-                    const list_ty = try self.builder.allocType(.{ .struct_type = .{
-                        .name = list_name,
-                        .fields = list_fields,
-                    } });
-                    try self.module.struct_defs.put(list_name, list_ty);
-
+                    // List is a struct: { ptr, i64, i64 } — use the type from mapTypeExpr
+                    const list_ty = try self.mapTypeExpr(ta);
                     const alloca = try self.builder.buildAlloca(list_ty);
 
                     // Initialize list: call dm_list_TYPE_new(&list)
@@ -1808,6 +1849,89 @@ pub const IRGenerator = struct {
                     }
                 }
             }
+            // Propagate struct type when assigning from another struct-typed variable
+            // e.g., `let mut cc = c` where c is of type Compiler
+            if (val_expr.kind == .identifier) {
+                const src_name = val_expr.kind.identifier.name;
+                if (self.var_struct_types.get(src_name)) |stype| {
+                    try self.var_struct_types.put(var_name, stype);
+                }
+                // Also propagate list elem kinds
+                if (self.list_elem_kinds.get(src_name)) |lek| {
+                    try self.list_elem_kinds.put(var_name, lek);
+                }
+                // Also propagate enum type
+                if (self.var_enum_types.get(src_name)) |etype| {
+                    try self.var_enum_types.put(var_name, etype);
+                }
+            }
+            // Propagate struct type from function call returns
+            // e.g., `let cc = some_fn(...)` where the fn returns a struct type
+            if (val_expr.kind == .function_call) {
+                // If the return type is a struct, try to determine which struct
+                const call_ret_ty = try self.inferExprType(val_expr);
+                if (call_ret_ty.* == .struct_type) {
+                    // Find the struct name by matching the IR type
+                    var sit = self.struct_defs.iterator();
+                    while (sit.next()) |entry| {
+                        if (entry.value_ptr.ir_type == call_ret_ty) {
+                            try self.var_struct_types.put(var_name, entry.key_ptr.*);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Propagate struct/enum type from index_access on lists
+            // e.g., `let tok = cc.tokens[i]` where tokens is List[Token]
+            if (val_expr.kind == .index_access) {
+                const idx_ret_ty = try self.inferExprType(val_expr);
+                if (idx_ret_ty.* == .struct_type) {
+                    var sit2 = self.struct_defs.iterator();
+                    while (sit2.next()) |entry| {
+                        if (entry.value_ptr.ir_type == idx_ret_ty) {
+                            try self.var_struct_types.put(var_name, entry.key_ptr.*);
+                            break;
+                        }
+                    }
+                }
+            }
+            // Propagate struct/enum type from field_access on structs
+            // e.g., `let tok = some_struct.field` where field is a struct type
+            if (val_expr.kind == .field_access) {
+                const fa_ret_ty = try self.inferExprType(val_expr);
+                if (fa_ret_ty.* == .struct_type) {
+                    var sit3 = self.struct_defs.iterator();
+                    while (sit3.next()) |entry| {
+                        if (entry.value_ptr.ir_type == fa_ret_ty) {
+                            try self.var_struct_types.put(var_name, entry.key_ptr.*);
+                            break;
+                        }
+                    }
+                }
+                // Also propagate enum type from field_access
+                if (fa_ret_ty.* == .i64_type) {
+                    // Check if the field is an enum type by looking at the parent struct's AST
+                    const fa_val = val_expr.kind.field_access;
+                    if (fa_val.object.kind == .identifier) {
+                        const fa_obj_name = fa_val.object.kind.identifier.name;
+                        if (self.var_struct_types.get(fa_obj_name)) |parent_struct| {
+                            if (self.struct_defs.get(parent_struct)) |sd| {
+                                for (sd.fields) |fld| {
+                                    if (std.mem.eql(u8, fld.name, fa_val.field.name)) {
+                                        // Check if this field type is an enum
+                                        if (fld.ty.* == .struct_type) {
+                                            if (self.enum_defs.contains(fld.ty.struct_type.name)) {
+                                                try self.var_enum_types.put(var_name, fld.ty.struct_type.name);
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Track struct/enum type from type annotation
@@ -1831,6 +1955,7 @@ pub const IRGenerator = struct {
     }
 
     fn resolveListElemKind(self: *IRGenerator, named: *const ast.NamedType) ListElemKind {
+        _ = self;
         if (named.generic_args) |args| {
             if (args.len > 0) {
                 const elem = args[0];
@@ -1841,15 +1966,13 @@ pub const IRGenerator = struct {
                         if (std.mem.eql(u8, name, "int") or std.mem.eql(u8, name, "i64")) return .int64;
                         if (std.mem.eql(u8, name, "float") or std.mem.eql(u8, name, "f64")) return .float64;
                         if (std.mem.eql(u8, name, "string") or std.mem.eql(u8, name, "String")) return .string;
-                        // Check if it's a known struct type
-                        if (self.struct_defs.get(name) != null) return .other;
-                        // Nested List[T] — element is itself a list struct
-                        if (std.mem.eql(u8, name, "List")) return .other;
+                        // Any other named type (struct, enum, List, etc.) is a generic list element
+                        return .other;
                     }
                 }
             }
         }
-        return .int64; // default
+        return .int64; // default when no generic args
     }
 
     /// Store the struct element type for a List[StructName] variable
@@ -1891,6 +2014,148 @@ pub const IRGenerator = struct {
                 }
             }
         }
+    }
+
+    /// Store the struct element type for a List[StructName] field (keyed by "StructName.field_name")
+    fn storeFieldListElemType(self: *IRGenerator, field_key: []const u8, named: *const ast.NamedType) !void {
+        if (named.generic_args) |args| {
+            if (args.len > 0) {
+                const elem = args[0];
+                if (elem.kind == .named) {
+                    const elem_named = elem.kind.named;
+                    if (elem_named.path.segments.len == 1) {
+                        const name = elem_named.path.segments[0].name;
+                        if (self.struct_defs.get(name)) |info| {
+                            try self.field_list_elem_types.put(field_key, info.ir_type);
+                        } else if (std.mem.eql(u8, name, "List")) {
+                            const inner_kind = self.resolveListElemKind(elem_named);
+                            const inner_list_name: []const u8 = switch (inner_kind) {
+                                .int64 => "dm_list_int64",
+                                .float64 => "dm_list_double",
+                                .string => "dm_list_dm_string",
+                                .other => "dm_list_generic",
+                            };
+                            const ptr_field_ty = try self.builder.allocType(.{ .ptr = try self.builder.allocType(.i8_type) });
+                            const i64_field_ty = try self.builder.allocType(.i64_type);
+                            const list_fields = try self.allocator.dupe(ir.Field, &.{
+                                .{ .name = "data", .ty = ptr_field_ty },
+                                .{ .name = "len", .ty = i64_field_ty },
+                                .{ .name = "capacity", .ty = i64_field_ty },
+                            });
+                            const inner_list_ty = try self.builder.allocType(.{ .struct_type = .{
+                                .name = inner_list_name,
+                                .fields = list_fields,
+                            } });
+                            try self.module.struct_defs.put(inner_list_name, inner_list_ty);
+                            try self.field_list_elem_types.put(field_key, inner_list_ty);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Determine if a field_access expression accesses a List-typed struct field.
+    /// Returns the ListElemKind if so, null otherwise.
+    fn inferFieldAccessListKind(self: *IRGenerator, expr: *const ast.Expr) ?ListElemKind {
+        if (expr.kind != .field_access) return null;
+        const fa = expr.kind.field_access;
+
+        // Get the struct variable name from the object
+        const obj_name = if (fa.object.kind == .identifier) fa.object.kind.identifier.name else return null;
+
+        // Look up the struct type for this variable
+        const struct_name = self.var_struct_types.get(obj_name) orelse return null;
+
+        // Look up field list elem kind using "StructName.field_name" key
+        const field_key = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ struct_name, fa.field.name }) catch return null;
+        return self.field_list_elem_kinds.get(field_key);
+    }
+
+    /// Get a temporary alloca containing the list struct extracted from a field access.
+    /// Returns the temp alloca value (a pointer to the list struct), the parent struct alloca,
+    /// the parent struct type, and the field index for writeback.
+    const FieldListInfo = struct {
+        temp_alloca: ir.Value,
+        parent_alloca: ir.Value,
+        parent_ty: *const ir.IRType,
+        field_index: u32,
+        list_ty: *const ir.IRType,
+    };
+
+    fn getFieldListTempAlloca(self: *IRGenerator, fa: *const ast.FieldAccess) !?FieldListInfo {
+        const obj_name = if (fa.object.kind == .identifier) fa.object.kind.identifier.name else return null;
+        const parent_alloca = self.variable_map.get(obj_name) orelse return null;
+        const parent_ty = self.variable_types.get(obj_name) orelse return null;
+
+        if (parent_ty.* != .struct_type) return null;
+
+        // Determine the struct name and list elem kind
+        const struct_name = self.var_struct_types.get(obj_name) orelse return null;
+        const field_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ struct_name, fa.field.name });
+        const ek = self.field_list_elem_kinds.get(field_key) orelse return null;
+
+        // Get the actual list struct type (not the generic ptr(i8) used in the parent struct)
+        const list_name: []const u8 = switch (ek) {
+            .int64 => "dm_list_int64",
+            .float64 => "dm_list_double",
+            .string => "dm_list_dm_string",
+            .other => "dm_list_generic",
+        };
+        const list_ty = self.module.struct_defs.get(list_name) orelse return null;
+
+        // Find the field index in the parent struct
+        for (parent_ty.struct_type.fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, fa.field.name)) {
+                // Load the parent struct, extract the list field as ptr(i8)
+                const parent_val = try self.builder.buildLoad(parent_alloca, parent_ty);
+                const field_val = try self.builder.buildExtractField(parent_val, @intCast(i), field.ty);
+                // The field is ptr(i8) in the struct, but we need a dm_list_* struct.
+                // Create a temp alloca with the proper list struct type and
+                // use bitcast semantics: store the ptr value, then treat the alloca as a list struct.
+                // Actually, since the list is embedded as ptr(i8) which is 8 bytes,
+                // and the list struct is {ptr, i64, i64} = 24 bytes, we can't just reinterpret.
+                // Instead, we need to treat the ptr(i8) as a pointer TO the list struct
+                // and load through it.
+                // Wait - actually, in the C codegen, lists within structs ARE embedded as
+                // dm_list_* structs (24 bytes), not as pointers. The IR type is wrong (ptr(i8))
+                // but the runtime layout is a 24-byte struct.
+                // So we create a temp alloca of the list struct type, store as that type,
+                // then the list operations work on it.
+                _ = field_val;
+                const temp_alloca = try self.builder.buildAlloca(list_ty);
+                // Re-load the parent and extract the field as the list struct type
+                const parent_val2 = try self.builder.buildLoad(parent_alloca, parent_ty);
+                const list_val = try self.builder.buildExtractField(parent_val2, @intCast(i), list_ty);
+                try self.builder.buildStore(temp_alloca, list_val);
+                return FieldListInfo{
+                    .temp_alloca = temp_alloca,
+                    .parent_alloca = parent_alloca,
+                    .parent_ty = parent_ty,
+                    .field_index = @intCast(i),
+                    .list_ty = list_ty,
+                };
+            }
+        }
+        return null;
+    }
+
+    /// Write back the modified list struct from a temp alloca to the parent struct field.
+    fn writebackFieldList(self: *IRGenerator, info: FieldListInfo) !void {
+        // Load the updated list struct from temp alloca
+        const updated_list = try self.builder.buildLoad(info.temp_alloca, info.list_ty);
+        // Load the parent struct
+        const parent_val = try self.builder.buildLoad(info.parent_alloca, info.parent_ty);
+        // Insert the updated list field
+        const updated_parent = try self.builder.buildInsertField(parent_val, updated_list, info.field_index, info.parent_ty);
+        // Store the updated parent struct back
+        try self.builder.buildStore(info.parent_alloca, updated_parent);
+    }
+
+    /// Get the field list elem type for .other kind fields
+    fn getFieldListElemType(self: *IRGenerator, struct_name: []const u8, field_name: []const u8) ?*const ir.IRType {
+        const field_key = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ struct_name, field_name }) catch return null;
+        return self.field_list_elem_types.get(field_key);
     }
 
     /// Resolve the MapKind from a Map[K,V] type annotation
@@ -2063,13 +2328,26 @@ pub const IRGenerator = struct {
             }
         }
 
-        const list_kind: ListElemKind = if (iter_var_name) |name|
+        // Check if iterating over a struct field that is a list (for item in obj.field)
+        const field_list_info: ?FieldListInfo = if (fl.iterator.kind == .field_access) blk: {
+            const fek = self.inferFieldAccessListKind(fl.iterator);
+            if (fek != null) {
+                break :blk try self.getFieldListTempAlloca(fl.iterator.kind.field_access);
+            }
+            break :blk null;
+        } else null;
+
+        const list_kind: ListElemKind = if (field_list_info != null)
+            self.inferFieldAccessListKind(fl.iterator) orelse .int64
+        else if (iter_var_name) |name|
             self.list_elem_kinds.get(name) orelse .int64
         else
             .int64;
 
         // Get pointer to the list (alloca, not loaded value)
-        const list_ptr = if (iter_var_name) |name|
+        const list_ptr = if (field_list_info) |fli|
+            fli.temp_alloca
+        else if (iter_var_name) |name|
             self.variable_map.get(name) orelse return
         else
             try self.generateExpr(fl.iterator);
@@ -2095,7 +2373,12 @@ pub const IRGenerator = struct {
             .string => try self.builder.allocType(.string_type),
             .other => if (iter_var_name) |name|
                 self.list_elem_types.get(name) orelse try self.builder.allocType(.i64_type)
-            else
+            else if (fl.iterator.kind == .field_access) blk: {
+                const fa = fl.iterator.kind.field_access;
+                const fa_obj_name = if (fa.object.kind == .identifier) fa.object.kind.identifier.name else break :blk try self.builder.allocType(.i64_type);
+                const fa_struct_name = self.var_struct_types.get(fa_obj_name) orelse break :blk try self.builder.allocType(.i64_type);
+                break :blk self.getFieldListElemType(fa_struct_name, fa.field.name) orelse try self.builder.allocType(.i64_type);
+            } else
                 try self.builder.allocType(.i64_type),
         };
 
@@ -3010,6 +3293,34 @@ pub const IRGenerator = struct {
                     return self.builder.buildCall(list_len_fn, len_args, i64_ty);
                 }
             }
+            // Handle len() on struct field access (e.g., len(p.tokens))
+            if (call.args[0].value.kind == .field_access) {
+                const field_ek = self.inferFieldAccessListKind(call.args[0].value);
+                if (field_ek) |ek| {
+                    const field_info = try self.getFieldListTempAlloca(call.args[0].value.kind.field_access) orelse {
+                        // Fall through to normal handling
+                        const runtime_name2 = self.mapBuiltinName(callee_name);
+                        const ret_type2 = try self.inferCallReturnType(callee_name);
+                        if (ret_type2.* == .void_type) {
+                            const args_slice2 = try self.allocator.dupe(ir.Value, args.items);
+                            try self.builder.buildCallVoid(runtime_name2, args_slice2);
+                            return ir.Value{ .undef = {} };
+                        } else {
+                            const args_slice2 = try self.allocator.dupe(ir.Value, args.items);
+                            return self.builder.buildCall(runtime_name2, args_slice2, ret_type2);
+                        }
+                    };
+                    const list_len_fn: []const u8 = switch (ek) {
+                        .int64 => "dm_list_int64_len",
+                        .float64 => "dm_list_double_len",
+                        .string => "dm_list_string_len",
+                        .other => "dm_list_generic_len",
+                    };
+                    const fl_i64_ty = try self.builder.allocType(.i64_type);
+                    const len_args = try self.allocator.dupe(ir.Value, &.{field_info.temp_alloca});
+                    return self.builder.buildCall(list_len_fn, len_args, fl_i64_ty);
+                }
+            }
         }
 
         const runtime_name = self.mapBuiltinName(callee_name);
@@ -3874,6 +4185,89 @@ pub const IRGenerator = struct {
             }
         }
 
+        // Check if this is a list method call on a struct field access (e.g., p.tokens.push(x))
+        if (mc.object.kind == .field_access) {
+            const field_ek = self.inferFieldAccessListKind(mc.object);
+            if (field_ek) |ek| {
+                const field_info = try self.getFieldListTempAlloca(mc.object.kind.field_access) orelse return ir.Value{ .undef = {} };
+                const list_ptr = field_info.temp_alloca;
+
+                if (std.mem.eql(u8, method_name, "push")) {
+                    if (ek == .other) {
+                        const fa = mc.object.kind.field_access;
+                        const fa_obj_name = if (fa.object.kind == .identifier) fa.object.kind.identifier.name else "";
+                        const fa_struct_name = self.var_struct_types.get(fa_obj_name) orelse "";
+                        const elem_ty = self.getFieldListElemType(fa_struct_name, fa.field.name);
+                        const val = try self.generateExpr(mc.args[0]);
+                        const actual_elem_ty = elem_ty orelse try self.builder.allocType(.i64_type);
+                        const temp_val_alloca = try self.builder.buildAlloca(actual_elem_ty);
+                        try self.builder.buildStore(temp_val_alloca, val);
+                        const elem_size = estimateTypeSize(actual_elem_ty);
+                        const push_args_slice = try self.allocator.dupe(ir.Value, &.{
+                            list_ptr, temp_val_alloca, .{ .const_int = elem_size },
+                        });
+                        try self.builder.buildCallVoid("dm_list_generic_push", push_args_slice);
+                    } else {
+                        var push_args = std.ArrayList(ir.Value).init(self.allocator);
+                        defer push_args.deinit();
+                        try push_args.append(list_ptr);
+                        for (mc.args) |arg| {
+                            try push_args.append(try self.generateExpr(arg));
+                        }
+                        const push_fn: []const u8 = switch (ek) {
+                            .int64 => "dm_list_int64_push",
+                            .float64 => "dm_list_double_push",
+                            .string => "dm_list_string_push",
+                            .other => unreachable,
+                        };
+                        const push_args_slice = try self.allocator.dupe(ir.Value, push_args.items);
+                        try self.builder.buildCallVoid(push_fn, push_args_slice);
+                    }
+                    // Writeback the modified list to the struct field
+                    try self.writebackFieldList(field_info);
+                    return ir.Value{ .undef = {} };
+                }
+                if (std.mem.eql(u8, method_name, "pop")) {
+                    const pop_fn: []const u8 = switch (ek) {
+                        .int64 => "dm_list_int64_pop",
+                        .float64 => "dm_list_double_get",
+                        .string => "dm_list_string_get",
+                        .other => "dm_list_int64_pop",
+                    };
+                    const ret_ty = try self.builder.allocType(.i64_type);
+                    const pop_args = try self.allocator.dupe(ir.Value, &.{list_ptr});
+                    const result = try self.builder.buildCall(pop_fn, pop_args, ret_ty);
+                    try self.writebackFieldList(field_info);
+                    return result;
+                }
+                if (std.mem.eql(u8, method_name, "len")) {
+                    const len_fn: []const u8 = switch (ek) {
+                        .int64 => "dm_list_int64_len",
+                        .float64 => "dm_list_double_len",
+                        .string => "dm_list_string_len",
+                        .other => "dm_list_generic_len",
+                    };
+                    const i64_ty = try self.builder.allocType(.i64_type);
+                    const len_args = try self.allocator.dupe(ir.Value, &.{list_ptr});
+                    return self.builder.buildCall(len_fn, len_args, i64_ty);
+                }
+                if (std.mem.eql(u8, method_name, "contains")) {
+                    if (mc.args.len > 0) {
+                        const search_val = try self.generateExpr(mc.args[0]);
+                        const contains_fn: []const u8 = switch (ek) {
+                            .int64 => "dm_list_int64_contains",
+                            .string => "dm_list_string_contains",
+                            else => "dm_list_int64_contains",
+                        };
+                        const bool_ty = try self.builder.allocType(.bool_type);
+                        const contains_args = try self.allocator.dupe(ir.Value, &.{ list_ptr, search_val });
+                        return self.builder.buildCall(contains_fn, contains_args, bool_ty);
+                    }
+                    return ir.Value{ .const_bool = false };
+                }
+            }
+        }
+
         // Non-list method call — standard handling
         // Determine the actual function name (possibly mangled with struct type)
         var actual_method_name: []const u8 = method_name;
@@ -4277,6 +4671,45 @@ pub const IRGenerator = struct {
             };
             const get_args = try self.allocator.dupe(ir.Value, &.{ list_ptr, idx });
             return self.builder.buildCall(get_fn, get_args, ret_ty);
+        }
+
+        // Field access list index: obj.field[i] where field is a List[T]
+        if (ia.object.kind == .field_access) {
+            const field_ek = self.inferFieldAccessListKind(ia.object);
+            if (field_ek) |ek| {
+                const field_info = try self.getFieldListTempAlloca(ia.object.kind.field_access) orelse return ir.Value{ .undef = {} };
+                const fl_list_ptr = field_info.temp_alloca;
+                const idx = try self.generateExpr(ia.index);
+
+                if (ek == .other) {
+                    const fa = ia.object.kind.field_access;
+                    const fa_obj_name = if (fa.object.kind == .identifier) fa.object.kind.identifier.name else "";
+                    const fa_struct_name = self.var_struct_types.get(fa_obj_name) orelse "";
+                    const elem_ty = self.getFieldListElemType(fa_struct_name, fa.field.name) orelse try self.builder.allocType(.i64_type);
+                    const out_alloca = try self.builder.buildAlloca(elem_ty);
+                    const elem_size = estimateTypeSize(elem_ty);
+                    const get_args = try self.allocator.dupe(ir.Value, &.{
+                        out_alloca, fl_list_ptr, idx, .{ .const_int = elem_size },
+                    });
+                    try self.builder.buildCallVoid("dm_list_generic_get", get_args);
+                    return self.builder.buildLoad(out_alloca, elem_ty);
+                }
+
+                const get_fn: []const u8 = switch (ek) {
+                    .int64 => "dm_list_int64_get",
+                    .float64 => "dm_list_double_get",
+                    .string => "dm_list_string_get",
+                    .other => unreachable,
+                };
+                const ret_ty: *const ir.IRType = switch (ek) {
+                    .int64 => try self.builder.allocType(.i64_type),
+                    .float64 => try self.builder.allocType(.f64_type),
+                    .string => try self.builder.allocType(.string_type),
+                    .other => unreachable,
+                };
+                const get_args = try self.allocator.dupe(ir.Value, &.{ fl_list_ptr, idx });
+                return self.builder.buildCall(get_fn, get_args, ret_ty);
+            }
         }
 
         // Chained index access: outer[i][j] where outer is a List[List[T]]
@@ -5269,7 +5702,21 @@ pub const IRGenerator = struct {
                     break :blk self.builder.allocType(.{ .option_type = i64_ty });
                 }
                 if (self.variable_types.get(id.name)) |ty| {
+                    // If the stored type is i64 but we know this var holds a struct, use the struct type
+                    if (ty.* == .i64_type) {
+                        if (self.var_struct_types.get(id.name)) |sname| {
+                            if (self.struct_defs.get(sname)) |sd| {
+                                break :blk sd.ir_type;
+                            }
+                        }
+                    }
                     break :blk ty;
+                }
+                // Fallback: check var_struct_types for struct-typed variables
+                if (self.var_struct_types.get(id.name)) |sname| {
+                    if (self.struct_defs.get(sname)) |sd| {
+                        break :blk sd.ir_type;
+                    }
                 }
                 break :blk self.builder.allocType(.i64_type);
             },
@@ -5440,6 +5887,21 @@ pub const IRGenerator = struct {
                     }
                     if (self.variable_types.get(obj_name)) |vty| {
                         if (vty.* == .string_type) break :blk try self.builder.allocType(.string_type);
+                    }
+                }
+                // Field access list index: obj.field[i] where field is a List[T]
+                if (ia.object.kind == .field_access) {
+                    const field_ek = self.inferFieldAccessListKind(ia.object);
+                    if (field_ek) |ek| {
+                        const fa_ia = ia.object.kind.field_access;
+                        const fa_ia_obj_name = if (fa_ia.object.kind == .identifier) fa_ia.object.kind.identifier.name else "";
+                        const fa_ia_struct_name = self.var_struct_types.get(fa_ia_obj_name) orelse "";
+                        break :blk switch (ek) {
+                            .int64 => try self.builder.allocType(.i64_type),
+                            .float64 => try self.builder.allocType(.f64_type),
+                            .string => try self.builder.allocType(.string_type),
+                            .other => self.getFieldListElemType(fa_ia_struct_name, fa_ia.field.name) orelse try self.builder.allocType(.i64_type),
+                        };
                     }
                 }
                 // Default: infer from the object type
