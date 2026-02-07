@@ -398,7 +398,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 1. **Stage 0** (Complete): Hand-written compiler in Zig, compiles dAImond -> C
 2. **Stage 1** (Complete): Compiler rewritten in dAImond, compiled by Stage 0
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
-4. **Stage 3** (Complete): LLVM backend for optimized native code -- full test parity with Stage 0 (254/254 tests pass)
+4. **Stage 3** (Complete): LLVM backend for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 
 ## Current Status
 
@@ -466,10 +466,11 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Map[K,V] operations, operator overloading, extern string wrappers
 - [x] Async/await (int and string returns), closures with capture, regions
 - [x] Optimization passes via LLVM (`-O0` through `-O3`)
+- [x] Self-hosting: Stage 3 compiles Stage 1, verified fixed-point bootstrap
 
 ### Upcoming
 - [ ] Debug info (DWARF) in Stage 3
-- [ ] Stage 3 self-hosting (Stage 3 compiles Stage 1)
+- [ ] Stage 4: LLVM backend rewritten in dAImond (full self-hosting)
 
 ## Design Principles
 
