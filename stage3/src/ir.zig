@@ -66,6 +66,8 @@ pub const IRType = union(enum) {
     future_type: *const IRType,
     // Slice (fat pointer: ptr + len)
     slice_type: *const IRType,
+    // SIMD vector types
+    vector_type: VectorType,
 
     pub fn format(self: IRType, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
         switch (self) {
@@ -107,6 +109,7 @@ pub const IRType = union(enum) {
             .result_type => |r| try writer.print("Result[{s}, {s}]", .{ r.ok.*, r.err.* }),
             .future_type => |inner| try writer.print("Future[{s}]", .{inner.*}),
             .slice_type => |inner| try writer.print("Slice[{s}]", .{inner.*}),
+            .vector_type => |v| try writer.writeAll(v.name()),
         }
     }
 };
@@ -120,6 +123,36 @@ pub const Variant = struct {
     name: []const u8,
     tag: u32,
     payload: ?*const IRType,
+};
+
+/// SIMD vector element kind
+pub const VectorElementKind = enum {
+    f32_elem,
+    f64_elem,
+    i32_elem,
+    i64_elem,
+
+    pub fn isFloat(self: VectorElementKind) bool {
+        return self == .f32_elem or self == .f64_elem;
+    }
+};
+
+/// SIMD vector type descriptor
+pub const VectorType = struct {
+    elem_kind: VectorElementKind,
+    lanes: u8,
+
+    pub fn name(self: VectorType) []const u8 {
+        if (self.elem_kind == .f32_elem and self.lanes == 4) return "f32x4";
+        if (self.elem_kind == .f32_elem and self.lanes == 8) return "f32x8";
+        if (self.elem_kind == .f64_elem and self.lanes == 2) return "f64x2";
+        if (self.elem_kind == .f64_elem and self.lanes == 4) return "f64x4";
+        if (self.elem_kind == .i32_elem and self.lanes == 4) return "i32x4";
+        if (self.elem_kind == .i32_elem and self.lanes == 8) return "i32x8";
+        if (self.elem_kind == .i64_elem and self.lanes == 2) return "i64x2";
+        if (self.elem_kind == .i64_elem and self.lanes == 4) return "i64x4";
+        return "vector_unknown";
+    }
 };
 
 // ========================================================================
@@ -229,6 +262,14 @@ pub const Instruction = struct {
         arena_create: Value, // size
         arena_destroy: Value, // arena ptr
         arena_alloc: struct { arena: Value, size: Value },
+        // SIMD operations
+        simd_splat: SimdSplatOp,
+        simd_set: SimdSetOp,
+        simd_add: BinaryOp,
+        simd_sub: BinaryOp,
+        simd_mul: BinaryOp,
+        simd_div: BinaryOp,
+        simd_extract: SimdExtractOp,
         // Runtime
         panic_inst: Value, // message string
     };
@@ -265,6 +306,7 @@ pub const GepOp = struct {
 pub const ExtractFieldOp = struct {
     base: Value,
     field_index: u32,
+    field_type: ?*const IRType = null,
 };
 
 pub const InsertFieldOp = struct {
@@ -311,6 +353,21 @@ pub const MapInsertOp = struct {
     map: Value,
     key: Value,
     val: Value,
+};
+
+pub const SimdSplatOp = struct {
+    scalar: Value,
+    vec_type: *const IRType, // must be vector_type
+};
+
+pub const SimdSetOp = struct {
+    elements: []const Value,
+    vec_type: *const IRType, // must be vector_type
+};
+
+pub const SimdExtractOp = struct {
+    vector: Value,
+    index: Value,
 };
 
 // ========================================================================
@@ -426,6 +483,8 @@ pub const Module = struct {
     globals: std.ArrayList(GlobalVar),
     struct_defs: std.StringHashMap(*const IRType),
     extern_decls: std.ArrayList(ExternDecl),
+    /// User-declared extern functions (not runtime builtins) that need special wrapper generation
+    user_extern_fns: std.StringHashMap(void),
     allocator: Allocator,
 
     pub const ExternDecl = struct {
@@ -439,6 +498,7 @@ pub const Module = struct {
             .globals = std.ArrayList(GlobalVar).init(allocator),
             .struct_defs = std.StringHashMap(*const IRType).init(allocator),
             .extern_decls = std.ArrayList(ExternDecl).init(allocator),
+            .user_extern_fns = std.StringHashMap(void).init(allocator),
             .allocator = allocator,
         };
     }
@@ -451,6 +511,7 @@ pub const Module = struct {
         self.globals.deinit();
         self.struct_defs.deinit();
         self.extern_decls.deinit();
+        self.user_extern_fns.deinit();
     }
 
     pub fn addFunction(self: *Module, name: []const u8, params: []const Param, return_type: *const IRType) !*Function {
@@ -598,11 +659,15 @@ pub const IRBuilder = struct {
 
     // Struct builders
     pub fn buildExtractField(self: *IRBuilder, base: Value, field_index: u32, result_ty: *const IRType) !Value {
-        return self.addInstruction(.{ .extractfield = .{ .base = base, .field_index = field_index } }, result_ty);
+        return self.addInstruction(.{ .extractfield = .{ .base = base, .field_index = field_index, .field_type = result_ty } }, result_ty);
     }
 
     pub fn buildInsertField(self: *IRBuilder, base: Value, value: Value, field_index: u32, struct_ty: *const IRType) !Value {
         return self.addInstruction(.{ .insertfield = .{ .base = base, .value = value, .field_index = field_index } }, struct_ty);
+    }
+
+    pub fn buildCast(self: *IRBuilder, value: Value, from_type: *const IRType, to_type: *const IRType) !Value {
+        return self.addInstruction(.{ .cast = .{ .value = value, .from_type = from_type, .to_type = to_type } }, to_type);
     }
 
     // Call builders
@@ -612,6 +677,14 @@ pub const IRBuilder = struct {
 
     pub fn buildCallVoid(self: *IRBuilder, callee: []const u8, args: []const Value) !void {
         return self.addVoidInstruction(.{ .call = .{ .callee = callee, .args = args } });
+    }
+
+    pub fn buildCallPtr(self: *IRBuilder, callee: Value, args: []const Value, ret_type: *const IRType) !Value {
+        return self.addInstruction(.{ .callptr = .{ .callee = callee, .args = args } }, ret_type);
+    }
+
+    pub fn buildCallPtrVoid(self: *IRBuilder, callee: Value, args: []const Value) !void {
+        return self.addVoidInstruction(.{ .callptr = .{ .callee = callee, .args = args } });
     }
 
     // Terminator builders
@@ -776,6 +849,19 @@ fn printOp(op: Instruction.Op, writer: anytype) !void {
         .arena_create => |v| try writer.print("arena.create {s}", .{v}),
         .arena_destroy => |v| try writer.print("arena.destroy {s}", .{v}),
         .arena_alloc => |a| try writer.print("arena.alloc {s}, {s}", .{ a.arena, a.size }),
+        .simd_splat => |s| try writer.print("simd.splat {s}", .{s.scalar}),
+        .simd_set => |s| {
+            try writer.writeAll("simd.set ");
+            for (s.elements, 0..) |e, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try writer.print("{s}", .{e});
+            }
+        },
+        .simd_add => |b| try writer.print("simd.add {s}, {s}", .{ b.lhs, b.rhs }),
+        .simd_sub => |b| try writer.print("simd.sub {s}, {s}", .{ b.lhs, b.rhs }),
+        .simd_mul => |b| try writer.print("simd.mul {s}, {s}", .{ b.lhs, b.rhs }),
+        .simd_div => |b| try writer.print("simd.div {s}, {s}", .{ b.lhs, b.rhs }),
+        .simd_extract => |e| try writer.print("simd.extract {s}, {s}", .{ e.vector, e.index }),
         .panic_inst => |v| try writer.print("panic {s}", .{v}),
     }
 }

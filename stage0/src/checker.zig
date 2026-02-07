@@ -1217,7 +1217,10 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, name, "tcp_close") or
                 std.mem.eql(u8, name, "thread_join") or
                 std.mem.eql(u8, name, "mutex_lock") or std.mem.eql(u8, name, "mutex_unlock") or
-                std.mem.eql(u8, name, "mutex_destroy"))
+                std.mem.eql(u8, name, "mutex_destroy") or
+                std.mem.eql(u8, name, "sleep_ms") or
+                std.mem.eql(u8, name, "flush") or
+                std.mem.eql(u8, name, "mem_sweep"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
@@ -1235,6 +1238,8 @@ pub const TypeChecker = struct {
                     std.mem.eql(u8, name, "fs_write") or std.mem.eql(u8, name, "fs_append"))
                 {
                     self.current_effects.addBuiltin(.file_system);
+                } else if (std.mem.eql(u8, name, "sleep_ms") or std.mem.eql(u8, name, "flush")) {
+                    self.current_effects.addBuiltin(.io);
                 }
                 return try self.type_ctx.intern(.unit);
             }
@@ -1247,7 +1252,10 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir") or
                 std.mem.eql(u8, name, "tcp_listen") or std.mem.eql(u8, name, "tcp_accept") or
                 std.mem.eql(u8, name, "tcp_connect") or std.mem.eql(u8, name, "tcp_write") or
-                std.mem.eql(u8, name, "thread_spawn") or std.mem.eql(u8, name, "mutex_new"))
+                std.mem.eql(u8, name, "thread_spawn") or std.mem.eql(u8, name, "mutex_new") or
+                std.mem.eql(u8, name, "read_key") or std.mem.eql(u8, name, "read_key_nb") or
+                std.mem.eql(u8, name, "term_width") or std.mem.eql(u8, name, "term_height") or
+                std.mem.eql(u8, name, "time_ms") or std.mem.eql(u8, name, "mem_mark"))
             {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
@@ -1261,6 +1269,13 @@ pub const TypeChecker = struct {
                     std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir"))
                 {
                     self.current_effects.addBuiltin(.file_system);
+                } else if (std.mem.eql(u8, name, "read_key") or std.mem.eql(u8, name, "read_key_nb")) {
+                    self.current_effects.addBuiltin(.io);
+                    self.current_effects.addBuiltin(.console);
+                } else if (std.mem.eql(u8, name, "term_width") or std.mem.eql(u8, name, "term_height") or
+                    std.mem.eql(u8, name, "time_ms"))
+                {
+                    self.current_effects.addBuiltin(.io);
                 }
                 return try self.type_ctx.intern(.{ .int = .i64 });
             }
@@ -1282,7 +1297,7 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, name, "string_to_upper") or std.mem.eql(u8, name, "string_to_lower") or
                 std.mem.eql(u8, name, "path_dirname") or std.mem.eql(u8, name, "path_basename") or
                 std.mem.eql(u8, name, "path_extension") or std.mem.eql(u8, name, "path_stem") or
-                std.mem.eql(u8, name, "path_join") or std.mem.eql(u8, name, "read_line") or
+                std.mem.eql(u8, name, "path_join") or std.mem.eql(u8, name, "read_line") or std.mem.eql(u8, name, "chr") or
                 std.mem.eql(u8, name, "fs_readdir") or std.mem.eql(u8, name, "fs_getcwd") or
                 std.mem.eql(u8, name, "env_get") or
                 std.mem.eql(u8, name, "tcp_read"))
@@ -1716,26 +1731,59 @@ pub const TypeChecker = struct {
     }
 
     fn inferPipeline(self: *Self, pipe: *const ast.PipelineExpr) anyerror!TypeId {
-        const left_type = try self.inferExpr(pipe.left);
-        const right_type = try self.inferExpr(pipe.right);
-
-        const resolved_right = self.resolveType(right_type);
-        const typ = self.type_ctx.get(resolved_right) orelse {
-            try self.reportError(.expected_function_type, "pipeline requires function on right", pipe.span);
-            return try self.type_ctx.intern(.error_type);
-        };
-
-        if (typ != .function) {
-            try self.reportError(.expected_function_type, "pipeline requires function", pipe.span);
-            return try self.type_ctx.intern(.error_type);
+        // Pipeline desugars: x |> f => f(x), x |> f(a,b) => f(x,a,b)
+        // We construct a virtual function call and type-check it normally.
+        switch (pipe.right.kind) {
+            .function_call => |fc| {
+                // x |> f(args...) => f(x, args...)
+                // Build new args array with pipe.left prepended
+                const new_args = try self.allocator.alloc(*ast.FunctionCall.CallArg, fc.args.len + 1);
+                const left_arg = try self.allocator.create(ast.FunctionCall.CallArg);
+                left_arg.* = .{ .name = null, .value = pipe.left };
+                new_args[0] = left_arg;
+                for (fc.args, 0..) |arg, i| {
+                    new_args[i + 1] = arg;
+                }
+                const virtual_call = try self.allocator.create(ast.FunctionCall);
+                virtual_call.* = .{
+                    .function = fc.function,
+                    .generic_args = fc.generic_args,
+                    .args = new_args,
+                    .span = pipe.span,
+                };
+                return self.inferFunctionCall(virtual_call);
+            },
+            .identifier => {
+                // x |> f => f(x)
+                const left_arg = try self.allocator.create(ast.FunctionCall.CallArg);
+                left_arg.* = .{ .name = null, .value = pipe.left };
+                const new_args = try self.allocator.alloc(*ast.FunctionCall.CallArg, 1);
+                new_args[0] = left_arg;
+                const virtual_call = try self.allocator.create(ast.FunctionCall);
+                virtual_call.* = .{
+                    .function = pipe.right,
+                    .generic_args = null,
+                    .args = new_args,
+                    .span = pipe.span,
+                };
+                return self.inferFunctionCall(virtual_call);
+            },
+            else => {
+                // Fallback: try original approach
+                _ = try self.inferExpr(pipe.left);
+                const right_type = try self.inferExpr(pipe.right);
+                const resolved_right = self.resolveType(right_type);
+                const typ = self.type_ctx.get(resolved_right) orelse {
+                    try self.reportError(.expected_function_type, "pipeline requires function on right", pipe.span);
+                    return try self.type_ctx.intern(.error_type);
+                };
+                if (typ != .function) {
+                    try self.reportError(.expected_function_type, "pipeline requires function", pipe.span);
+                    return try self.type_ctx.intern(.error_type);
+                }
+                return typ.function.return_type;
+            },
         }
-
-        // Check first argument matches
-        if (typ.function.param_types.len > 0) {
-            try self.unify(left_type, typ.function.param_types[0], pipe.span);
-        }
-
-        return typ.function.return_type;
     }
 
     fn inferErrorPropagate(self: *Self, ep: *const ast.ErrorPropagateExpr) anyerror!TypeId {
@@ -2291,6 +2339,44 @@ pub const TypeChecker = struct {
 
                 if (!has_wildcard and !(has_true and has_false)) {
                     try self.reportError(.missing_match_arm, "non-exhaustive pattern", span);
+                }
+            },
+            .result => {
+                // Result[T, E] is exhaustive if Ok + Err are covered (or wildcard)
+                var has_ok = false;
+                var has_err = false;
+                var has_wildcard = false;
+                for (arms) |arm| {
+                    switch (arm.pattern.kind) {
+                        .wildcard, .identifier => has_wildcard = true,
+                        .enum_variant => |ev| {
+                            if (std.mem.eql(u8, ev.variant.name, "Ok")) has_ok = true;
+                            if (std.mem.eql(u8, ev.variant.name, "Err")) has_err = true;
+                        },
+                        else => {},
+                    }
+                }
+                if (!has_wildcard and !(has_ok and has_err)) {
+                    try self.reportError(.missing_match_arm, "non-exhaustive pattern: add a wildcard", span);
+                }
+            },
+            .option => {
+                // Option[T] is exhaustive if Some + None are covered (or wildcard)
+                var has_some = false;
+                var has_none = false;
+                var has_wildcard = false;
+                for (arms) |arm| {
+                    switch (arm.pattern.kind) {
+                        .wildcard, .identifier => has_wildcard = true,
+                        .enum_variant => |ev| {
+                            if (std.mem.eql(u8, ev.variant.name, "Some")) has_some = true;
+                            if (std.mem.eql(u8, ev.variant.name, "None")) has_none = true;
+                        },
+                        else => {},
+                    }
+                }
+                if (!has_wildcard and !(has_some and has_none)) {
+                    try self.reportError(.missing_match_arm, "non-exhaustive pattern: add a wildcard", span);
                 }
             },
             else => {

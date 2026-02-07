@@ -61,7 +61,7 @@ pub fn main() !void {
     // Read source file
     const source = std.fs.cwd().readFileAlloc(allocator, input_file, 10 * 1024 * 1024) catch |err| {
         std.debug.print("Error reading file '{s}': {}\n", .{ input_file, err });
-        return;
+        std.process.exit(1);
     };
     defer allocator.free(source);
 
@@ -74,7 +74,7 @@ pub fn main() !void {
 
     if (lexer.hasErrors()) {
         std.debug.print("Lexer errors found\n", .{});
-        return;
+        std.process.exit(1);
     }
 
     // Phase 2: Parse
@@ -83,33 +83,43 @@ pub fn main() !void {
     defer parser.deinit();
     const ast_result = parser.parse() catch |err| {
         std.debug.print("Parse error: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
 
     if (parser.hasErrors()) {
         std.debug.print("Parse errors found\n", .{});
-        return;
+        std.process.exit(1);
     }
+
+    // Phase 2.5: Resolve imports
+    const final_ast = if (ast_result.imports.len > 0) blk: {
+        if (verbose) std.debug.print("  [2.5/6] Resolving imports...\n", .{});
+        const input_dir = std.fs.path.dirname(input_file) orelse ".";
+        break :blk resolveImports(allocator, ast_result, input_dir, verbose) catch |err| {
+            std.debug.print("Import resolution error: {}\n", .{err});
+            std.process.exit(1);
+        };
+    } else ast_result;
 
     // Phase 3: Type check
     if (verbose) std.debug.print("  [3/6] Type checking...\n", .{});
     var type_checker = frontend.TypeChecker.init(allocator) catch |err| {
         std.debug.print("Error initializing type checker: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
     defer type_checker.deinit();
 
     type_checker.setSource(source);
     type_checker.setSourceFile(input_file);
 
-    type_checker.checkSourceFile(ast_result) catch |err| {
+    type_checker.checkSourceFile(final_ast) catch |err| {
         std.debug.print("Type check error: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
 
     if (type_checker.hasErrors()) {
         std.debug.print("Type errors found\n", .{});
-        return;
+        std.process.exit(1);
     }
 
     // Phase 4: IR Generation
@@ -117,9 +127,9 @@ pub fn main() !void {
     var ir_generator = ir_gen.IRGenerator.init(allocator);
     defer ir_generator.deinit();
 
-    ir_generator.generate(ast_result) catch |err| {
+    ir_generator.generate(final_ast) catch |err| {
         std.debug.print("IR generation error: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
 
     // Print dAImond IR if requested
@@ -141,15 +151,38 @@ pub fn main() !void {
 
     gen.generate(ir_generator.getModule()) catch |err| {
         std.debug.print("LLVM generation error: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
 
     gen.module.verify() catch |err| {
         std.debug.print("LLVM verification error: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
 
-    // Print LLVM IR if requested
+    // Phase 5b: Run optimization passes if requested
+    if (opt_level != .O0) {
+        if (verbose) std.debug.print("  [5b/6] Running optimization passes ({s})...\n", .{@tagName(opt_level)});
+
+        const tm_for_passes = llvm.TargetMachine.create(llvm.getDefaultTriple(), opt_level) catch |err| {
+            std.debug.print("Error creating target machine for passes: {}\n", .{err});
+            std.process.exit(1);
+        };
+        defer tm_for_passes.dispose();
+
+        const pass_pipeline: [*:0]const u8 = switch (opt_level) {
+            .O0 => unreachable,
+            .O1 => "default<O1>",
+            .O2 => "default<O2>",
+            .O3 => "default<O3>",
+        };
+
+        gen.module.runPasses(pass_pipeline, tm_for_passes) catch |err| {
+            std.debug.print("Optimization pass error: {}\n", .{err});
+            // Non-fatal: continue without optimizations
+        };
+    }
+
+    // Print LLVM IR if requested (after optimization)
     if (emit_llvm) {
         const ir_str = gen.module.printToString();
         std.debug.print("\nGenerated LLVM IR:\n{s}\n", .{std.mem.span(ir_str)});
@@ -160,30 +193,44 @@ pub fn main() !void {
 
     const tm = llvm.TargetMachine.create(triple, opt_level) catch |err| {
         std.debug.print("Error creating target machine: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
     defer tm.dispose();
 
-    tm.emitToFile(gen.module, "/tmp/daimond_out.o", .object) catch |err| {
+    // Generate unique temp file names based on output path to avoid races
+    const obj_path = try std.fmt.allocPrintZ(allocator, "{s}.o", .{output_file});
+    defer allocator.free(obj_path);
+    const runtime_obj_path = try std.fmt.allocPrintZ(allocator, "{s}_runtime.o", .{output_file});
+    defer allocator.free(runtime_obj_path);
+    const wrappers_obj_path = try std.fmt.allocPrintZ(allocator, "{s}_wrappers.o", .{output_file});
+    defer allocator.free(wrappers_obj_path);
+
+    tm.emitToFile(gen.module, obj_path, .object) catch |err| {
         std.debug.print("Error emitting object file: {}\n", .{err});
-        return;
+        std.process.exit(1);
+    };
+
+    // Find project root for runtime source files
+    const project_root = findProjectRoot(allocator) catch |err| {
+        std.debug.print("Error finding project root: {}\n", .{err});
+        std.process.exit(1);
     };
 
     // Compile runtime and ABI wrappers
-    const runtime_obj = compileRuntime(allocator) catch |err| {
+    const runtime_obj = compileRuntime(allocator, project_root, runtime_obj_path) catch |err| {
         std.debug.print("Error compiling runtime: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
-    const wrappers_obj = compileWrappers(allocator) catch |err| {
+    const wrappers_obj = compileWrappers(allocator, project_root, wrappers_obj_path) catch |err| {
         std.debug.print("Error compiling ABI wrappers: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
 
     // Link with runtime, wrappers, and system libraries
     var link_argv = std.ArrayList([]const u8).init(allocator);
     defer link_argv.deinit();
     try link_argv.append("cc");
-    try link_argv.append("/tmp/daimond_out.o");
+    try link_argv.append(obj_path);
     if (runtime_obj) |rt| try link_argv.append(rt);
     if (wrappers_obj) |wr| try link_argv.append(wr);
     try link_argv.append("-o");
@@ -196,21 +243,63 @@ pub fn main() !void {
         .argv = link_args,
     }) catch |err| {
         std.debug.print("Linker error: {}\n", .{err});
-        return;
+        std.process.exit(1);
     };
 
     if (link_result.term.Exited != 0) {
         std.debug.print("Linker failed:\n{s}\n", .{link_result.stderr});
-        return;
+        std.process.exit(1);
     }
+
+    // Clean up temp object files
+    std.fs.cwd().deleteFile(obj_path) catch {};
+    std.fs.cwd().deleteFile(runtime_obj_path) catch {};
+    std.fs.cwd().deleteFile(wrappers_obj_path) catch {};
 
     std.debug.print("Successfully compiled: {s}\n", .{output_file});
 }
 
+/// Find the project root by locating the directory containing stage0/ and stage3/
+/// relative to the executable's location
+fn findProjectRoot(allocator: std.mem.Allocator) ![]const u8 {
+    // Get the directory containing the executable
+    const exe_path = try std.fs.selfExeDirPathAlloc(allocator);
+    defer allocator.free(exe_path);
+
+    // Walk up from exe dir (stage3/zig-out/bin/) to find project root
+    var dir = exe_path;
+    var attempts: u32 = 0;
+    while (attempts < 10) : (attempts += 1) {
+        // Check if stage0/runtime/daimond_runtime.c exists relative to this dir
+        const check_path = try std.fmt.allocPrint(allocator, "{s}/stage0/runtime/daimond_runtime.c", .{dir});
+        defer allocator.free(check_path);
+        std.fs.cwd().access(check_path, .{}) catch {
+            // Go up one directory
+            const parent = std.fs.path.dirname(dir) orelse break;
+            dir = try allocator.dupe(u8, parent);
+            continue;
+        };
+        return allocator.dupe(u8, dir);
+    }
+
+    // Fallback: try CWD-relative paths
+    // Check ../stage0/ (if running from stage3/)
+    std.fs.cwd().access("../stage0/runtime/daimond_runtime.c", .{}) catch {
+        // Check stage0/ (if running from project root)
+        std.fs.cwd().access("stage0/runtime/daimond_runtime.c", .{}) catch {
+            return error.ProjectRootNotFound;
+        };
+        return allocator.dupe(u8, ".");
+    };
+    return allocator.dupe(u8, "..");
+}
+
 /// Compile the LLVM ABI wrapper functions to an object file
-fn compileWrappers(allocator: std.mem.Allocator) !?[]const u8 {
-    const wrappers_c = "../stage3/runtime/llvm_wrappers.c";
-    const wrappers_o = "/tmp/daimond_wrappers.o";
+fn compileWrappers(allocator: std.mem.Allocator, project_root: []const u8, wrappers_o: []const u8) !?[]const u8 {
+    const wrappers_c = try std.fmt.allocPrint(allocator, "{s}/stage3/runtime/llvm_wrappers.c", .{project_root});
+    defer allocator.free(wrappers_c);
+    const runtime_inc = try std.fmt.allocPrint(allocator, "{s}/stage0/runtime", .{project_root});
+    defer allocator.free(runtime_inc);
 
     std.fs.cwd().access(wrappers_c, .{}) catch return null;
 
@@ -218,7 +307,7 @@ fn compileWrappers(allocator: std.mem.Allocator) !?[]const u8 {
         .allocator = allocator,
         .argv = &.{
             "cc", "-c", "-O2",
-            "-I", "../stage0/runtime",
+            "-I", runtime_inc,
             wrappers_c,
             "-o", wrappers_o,
         },
@@ -233,20 +322,19 @@ fn compileWrappers(allocator: std.mem.Allocator) !?[]const u8 {
 }
 
 /// Compile the dAImond C runtime to an object file
-fn compileRuntime(allocator: std.mem.Allocator) !?[]const u8 {
-    const runtime_c = "../stage0/runtime/daimond_runtime.c";
-    const runtime_h = "../stage0/runtime/daimond_runtime.h";
-    const runtime_o = "/tmp/daimond_runtime.o";
+fn compileRuntime(allocator: std.mem.Allocator, project_root: []const u8, runtime_o: []const u8) !?[]const u8 {
+    const runtime_c = try std.fmt.allocPrint(allocator, "{s}/stage0/runtime/daimond_runtime.c", .{project_root});
+    defer allocator.free(runtime_c);
+    const runtime_inc = try std.fmt.allocPrint(allocator, "{s}/stage0/runtime", .{project_root});
+    defer allocator.free(runtime_inc);
 
-    // Check if runtime source exists
     std.fs.cwd().access(runtime_c, .{}) catch return null;
-    _ = std.fs.cwd().statFile(runtime_h) catch return null;
 
     const result = try std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{
             "cc", "-c", "-O2",
-            "-I", "../stage0/runtime",
+            "-I", runtime_inc,
             runtime_c,
             "-o", runtime_o,
         },
@@ -258,4 +346,151 @@ fn compileRuntime(allocator: std.mem.Allocator) !?[]const u8 {
     }
 
     return runtime_o;
+}
+
+// ========================================================================
+// Import Resolution
+// ========================================================================
+
+const ast = frontend.ast;
+
+/// Resolve import declarations by loading, lexing, and parsing imported files,
+/// then merging their declarations into a single SourceFile.
+fn resolveImports(
+    allocator: std.mem.Allocator,
+    source_file: *ast.SourceFile,
+    input_dir: []const u8,
+    verbose: bool,
+) !*ast.SourceFile {
+    var all_decls = std.ArrayList(*ast.Declaration).init(allocator);
+    var loaded_paths = std.StringHashMap(void).init(allocator);
+    defer loaded_paths.deinit();
+
+    // Recursively process imports
+    try processFileImports(allocator, source_file, input_dir, &all_decls, &loaded_paths, verbose);
+
+    // Add entry file's own declarations after imported ones
+    for (source_file.declarations) |decl| {
+        try all_decls.append(decl);
+    }
+
+    // Create merged source file
+    const merged = try allocator.create(ast.SourceFile);
+    merged.* = .{
+        .module_decl = source_file.module_decl,
+        .imports = &[_]*ast.ImportDecl{},
+        .declarations = try all_decls.toOwnedSlice(),
+        .span = source_file.span,
+    };
+    return merged;
+}
+
+/// Process imports from a single source file, recursively loading transitive imports.
+fn processFileImports(
+    allocator: std.mem.Allocator,
+    source_file: *ast.SourceFile,
+    file_dir: []const u8,
+    all_decls: *std.ArrayList(*ast.Declaration),
+    loaded_paths: *std.StringHashMap(void),
+    verbose: bool,
+) !void {
+    for (source_file.imports) |import_decl| {
+        const resolved_path = try resolveImportPath(allocator, import_decl, file_dir);
+
+        // Skip if already loaded (handles diamond imports)
+        if (loaded_paths.contains(resolved_path)) {
+            allocator.free(resolved_path);
+            continue;
+        }
+        try loaded_paths.put(resolved_path, {});
+
+        if (verbose) std.debug.print("    Loading import: {s}\n", .{resolved_path});
+
+        // Read the file
+        const imp_source = std.fs.cwd().readFileAlloc(allocator, resolved_path, 10 * 1024 * 1024) catch |err| {
+            std.debug.print("Error reading imported file '{s}': {}\n", .{ resolved_path, err });
+            return error.ImportFileNotFound;
+        };
+
+        // Lex
+        var lexer = frontend.Lexer.init(imp_source, allocator);
+        defer lexer.deinit();
+        const imp_tokens = try lexer.scanAll();
+        defer allocator.free(imp_tokens);
+
+        if (lexer.hasErrors()) {
+            std.debug.print("Lexer errors in imported file '{s}'\n", .{resolved_path});
+            return error.ImportLexError;
+        }
+
+        // Parse
+        var imp_parser = frontend.Parser.init(imp_tokens, allocator);
+        defer imp_parser.deinit();
+        const imp_ast = imp_parser.parse() catch |err| {
+            std.debug.print("Parse error in imported file '{s}': {}\n", .{ resolved_path, err });
+            return error.ImportParseError;
+        };
+
+        if (imp_parser.hasErrors()) {
+            std.debug.print("Parse errors in imported file '{s}'\n", .{resolved_path});
+            return error.ImportParseError;
+        }
+
+        // Recursively process imports from the imported file
+        const import_dir = std.fs.path.dirname(resolved_path) orelse ".";
+        try processFileImports(allocator, imp_ast, import_dir, all_decls, loaded_paths, verbose);
+
+        // Add declarations from imported file, filtered by selective imports
+        if (import_decl.items) |items| {
+            // Selective import: only add named declarations
+            for (imp_ast.declarations) |decl| {
+                const decl_name = getDeclName(decl) orelse continue;
+                for (items) |item| {
+                    if (std.mem.eql(u8, decl_name, item.name.name)) {
+                        try all_decls.append(decl);
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Import all declarations
+            for (imp_ast.declarations) |decl| {
+                try all_decls.append(decl);
+            }
+        }
+    }
+}
+
+/// Resolve an import path to a filesystem path.
+/// `import foo` -> `<dir>/foo.dm`
+/// `import foo::bar` -> `<dir>/foo/bar.dm`
+fn resolveImportPath(allocator: std.mem.Allocator, import_decl: *const ast.ImportDecl, importing_dir: []const u8) ![]const u8 {
+    const segments = import_decl.path.segments;
+    if (segments.len == 0) return error.EmptyImportPath;
+
+    // Build path from segments
+    var path_parts = std.ArrayList([]const u8).init(allocator);
+    defer path_parts.deinit();
+
+    try path_parts.append(importing_dir);
+    for (segments) |seg| {
+        try path_parts.append(seg.name);
+    }
+
+    const joined = try std.fs.path.join(allocator, path_parts.items);
+    defer allocator.free(joined);
+
+    return std.fmt.allocPrint(allocator, "{s}.dm", .{joined});
+}
+
+/// Get the name of a declaration for selective import filtering.
+fn getDeclName(decl: *ast.Declaration) ?[]const u8 {
+    return switch (decl.kind) {
+        .function => |f| f.name.name,
+        .struct_def => |s| s.name.name,
+        .enum_def => |e| e.name.name,
+        .trait_def => |t| t.name.name,
+        .constant => |c| c.name.name,
+        .impl_block => null,
+    };
 }

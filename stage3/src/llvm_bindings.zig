@@ -11,6 +11,7 @@ pub const c = @cImport({
     @cInclude("llvm-c/Target.h");
     @cInclude("llvm-c/TargetMachine.h");
     @cInclude("llvm-c/BitWriter.h");
+    @cInclude("llvm-c/Transforms/PassBuilder.h");
 });
 
 // ========================================================================
@@ -93,6 +94,18 @@ pub const Module = struct {
             return error.WriteBitcodeFailed;
         }
     }
+
+    /// Run LLVM optimization passes on this module using the new pass manager.
+    /// The passes string uses LLVM's textual pass pipeline format.
+    pub fn runPasses(self: Module, passes: [*:0]const u8, tm: TargetMachine) !void {
+        const opts = c.LLVMCreatePassBuilderOptions();
+        defer c.LLVMDisposePassBuilderOptions(opts);
+        const err = c.LLVMRunPasses(self.ref, passes, tm.ref, opts);
+        if (err != null) {
+            defer c.LLVMDisposeErrorMessage(c.LLVMGetErrorMessage(err));
+            return error.PassRunFailed;
+        }
+    }
 };
 
 // ========================================================================
@@ -168,8 +181,21 @@ pub const Type = struct {
         c.LLVMStructSetBody(self.ref, c_fields, @intCast(fields.len), if (is_packed) 1 else 0);
     }
 
+    pub fn getStructElementType(self: Type, index: u32) Type {
+        return .{ .ref = c.LLVMStructGetTypeAtIndex(self.ref, index) };
+    }
+
     pub fn getTypeKind(self: Type) c.LLVMTypeKind {
         return c.LLVMGetTypeKind(self.ref);
+    }
+
+    pub fn getIntTypeWidth(self: Type) u32 {
+        return c.LLVMGetIntTypeWidth(self.ref);
+    }
+
+    // Vector type (SIMD)
+    pub fn vector(elem: Type, count: u32) Type {
+        return .{ .ref = c.LLVMVectorType(elem.ref, count) };
     }
 
     // Function type
@@ -244,6 +270,10 @@ pub const Value = struct {
         c.LLVMSetLinkage(self.ref, linkage);
     }
 
+    pub fn setExternallyInitialized(self: Value, is_ext: bool) void {
+        c.LLVMSetExternallyInitialized(self.ref, if (is_ext) 1 else 0);
+    }
+
     pub fn getParam(self: Value, index: u32) Value {
         return .{ .ref = c.LLVMGetParam(self.ref, index) };
     }
@@ -290,6 +320,10 @@ pub const Builder = struct {
 
     pub fn positionAtEnd(self: Builder, block: BasicBlock) void {
         c.LLVMPositionBuilderAtEnd(self.ref, block.ref);
+    }
+
+    pub fn getInsertBlock(self: Builder) BasicBlock {
+        return .{ .ref = c.LLVMGetInsertBlock(self.ref) };
     }
 
     // Arithmetic
@@ -385,6 +419,10 @@ pub const Builder = struct {
         return .{ .ref = c.LLVMBuildRetVoid(self.ref) };
     }
 
+    pub fn buildUnreachable(self: Builder) Value {
+        return .{ .ref = c.LLVMBuildUnreachable(self.ref) };
+    }
+
     // Function calls
     pub fn buildCall2(self: Builder, fn_ty: Type, func: Value, args: []const Value, name: [*:0]const u8) Value {
         const c_args = @as([*c]c.LLVMValueRef, @ptrCast(@constCast(args.ptr)));
@@ -409,8 +447,20 @@ pub const Builder = struct {
         return .{ .ref = c.LLVMBuildSIToFP(self.ref, val.ref, dest_ty.ref, name) };
     }
 
+    pub fn buildUIToFP(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
+        return .{ .ref = c.LLVMBuildUIToFP(self.ref, val.ref, dest_ty.ref, name) };
+    }
+
     pub fn buildFPToSI(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
         return .{ .ref = c.LLVMBuildFPToSI(self.ref, val.ref, dest_ty.ref, name) };
+    }
+
+    pub fn buildTrunc(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
+        return .{ .ref = c.LLVMBuildTrunc(self.ref, val.ref, dest_ty.ref, name) };
+    }
+
+    pub fn buildSExt(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
+        return .{ .ref = c.LLVMBuildSExt(self.ref, val.ref, dest_ty.ref, name) };
     }
 
     pub fn buildBitCast(self: Builder, val: Value, dest_ty: Type, name: [*:0]const u8) Value {
@@ -441,6 +491,19 @@ pub const Builder = struct {
 
     pub fn buildFRem(self: Builder, lhs: Value, rhs: Value, name: [*:0]const u8) Value {
         return .{ .ref = c.LLVMBuildFRem(self.ref, lhs.ref, rhs.ref, name) };
+    }
+
+    // Vector (SIMD) operations
+    pub fn buildInsertElement(self: Builder, vec: Value, elem: Value, idx: Value, name: [*:0]const u8) Value {
+        return .{ .ref = c.LLVMBuildInsertElement(self.ref, vec.ref, elem.ref, idx.ref, name) };
+    }
+
+    pub fn buildExtractElement(self: Builder, vec: Value, idx: Value, name: [*:0]const u8) Value {
+        return .{ .ref = c.LLVMBuildExtractElement(self.ref, vec.ref, idx.ref, name) };
+    }
+
+    pub fn buildShuffleVector(self: Builder, v1: Value, v2: Value, mask: Value, name: [*:0]const u8) Value {
+        return .{ .ref = c.LLVMBuildShuffleVector(self.ref, v1.ref, v2.ref, mask.ref, name) };
     }
 
     // Global strings

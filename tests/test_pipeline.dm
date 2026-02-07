@@ -10,6 +10,10 @@ fn add(a: int, b: int) -> int {
     return a + b
 }
 
+fn to_upper(s: string) -> string {
+    return string_to_upper(s)
+}
+
 fn main() {
     -- Simple pipe: 5 |> double => double(5) = 10
     let a = 5 |> double
@@ -23,7 +27,7 @@ fn main() {
     let c = 5 |> double |> double
     println("chained_pipe=" + int_to_string(c))
 
-    -- String pipes
-    let d = "hello" |> string_to_upper
+    -- String pipes via wrapper function
+    let d = "hello" |> to_upper
     println("string_pipe=" + d)
 }

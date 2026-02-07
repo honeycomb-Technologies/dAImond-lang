@@ -68,8 +68,16 @@ dAImond-lang/
 ├── docs/                  # Design documents
 │   ├── ir-spec.md         # dAImond IR specification (SSA-based, typed)
 │   └── llvm-backend.md    # Stage 3 LLVM backend architecture
-├── stage3/                # Stage 3 LLVM backend (planned)
-│   └── src/               # Placeholder for LLVM backend source
+├── stage3/                # Stage 3 LLVM backend
+│   ├── build.zig          # Zig build configuration (links LLVM-C)
+│   ├── src/               # LLVM backend source
+│   │   ├── main.zig       # CLI entry point, pipeline orchestration
+│   │   ├── ir.zig         # dAImond IR definitions (SSA types, instructions, builder)
+│   │   ├── ir_gen.zig     # IR generation from typed AST
+│   │   ├── llvm_gen.zig   # LLVM IR generation from dAImond IR
+│   │   └── llvm_bindings.zig  # Safe Zig wrappers for LLVM-C API
+│   └── runtime/
+│       └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
 └── tests/                 # Integration test programs (.dm files)
     ├── arithmetic.dm      # Arithmetic validation
     ├── structs.dm         # Struct/enum/pattern matching tests
@@ -86,8 +94,14 @@ dAImond-lang/
 
 ## Compiler Pipeline
 
+Stage 0 (C backend):
 ```
 Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> Codegen -> C Code -> cc -> Binary
+```
+
+Stage 3 (LLVM backend):
+```
+Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR -> LLVM -> Native Binary
 ```
 
 Each stage maps to a source file: `lexer.zig` -> `parser.zig` -> `ast.zig`/`types.zig` -> `checker.zig` -> `codegen.zig`.
@@ -134,6 +148,30 @@ cd stage0 && ./zig-out/bin/daimond pkg list           # List dependencies
 
 # Start LSP server (for IDE integration, communicates via JSON-RPC/stdio)
 cd stage0 && ./zig-out/bin/daimond-lsp
+```
+
+### Stage 3 (LLVM Backend)
+
+Stage 3 build commands run from the `stage3/` directory. Requires **LLVM 17+** development libraries.
+
+```bash
+# Build the LLVM compiler
+cd stage3 && zig build
+
+# Run unit tests (IR definitions, LLVM bindings)
+cd stage3 && zig build test
+
+# Compile a dAImond program to native binary via LLVM
+cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> -o output
+
+# Compile with optimization
+cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> -o output -O2
+
+# Emit dAImond IR (debugging)
+cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> --emit-ir
+
+# Emit LLVM IR (debugging)
+cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> --emit-llvm
 ```
 
 ## Testing Strategy
@@ -204,7 +242,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is feature-complete with verified fixed-point bootstrap.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is feature-complete with verified fixed-point bootstrap. Stage 3 LLVM backend is implemented with 18 integration tests matching Stage 0 output.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -275,7 +313,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Error diagnostics with colored output
 - C runtime library (strings, arenas, option/result, I/O, networking sockets, threading)
 - CLI with commands: compile, run, lex, parse, check, fmt, test, pkg
-- Integration test harness (233 pass, 0 fail, 0 skipped)
+- Integration test harness (254 pass, 0 fail, 0 skipped)
 - Map[K,V] type with full method support (insert, get, contains, remove, len, keys, values, set, indexing)
 - Map iteration via for-in loops (iterates over map keys using runtime entry scanning)
 - String split returning List[string]
@@ -291,7 +329,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Enum payload construction and pattern matching
 - Nested if-without-else codegen fix (statement vs value position detection)
 - Region memory allocation redirection (arena allocator for allocations within region blocks)
-- Comptime evaluation (arithmetic and boolean expressions evaluated at compile time)
+- Comptime Turing-complete evaluation (arithmetic, boolean, variables, if/else, while/for loops, match, function calls with recursion, arrays, structs, string concatenation — all at compile time)
 - Effect system enforcement (opt-in via `with [IO, Console, FileSystem, ...]` declarations)
 - Custom user-defined effects (tracked in EffectSet alongside builtins, enforced via subset checking in with [...] declarations)
 - Dynamic trait dispatch (`dyn Trait` with vtable-based fat pointers)
@@ -299,7 +337,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - SIMD intrinsics (f32x4, f32x8, f64x2, f64x4, i32x4, i32x8, i64x2, i64x4 types with simd_add/sub/mul/div/splat/set/extract builtins via GCC/Clang vector extensions)
 - Compile-time array size evaluation (array types [T; N] where N is a comptime expression)
 - Async/await with `Future[T]` type (`async fn` declarations, `await` expressions, synchronous Phase A semantics with monomorphized future struct generation)
-- Async Phase B Lite (state machine frame/poll/wrapper for linear async functions with await points; checker rejects await in loops/branches)
+- Async Phase B Full (true stackless coroutines — state machine frame/poll/wrapper for async functions with await in if/else, while/for loops, match arms, nested async calls)
 - Standard library (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
 - `daimond fmt` code formatter (indent normalization, brace-counting)
 - `daimond test` testing framework (test_* function discovery, setjmp-based panic catching, assert/assert_eq)
@@ -310,12 +348,14 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - List bounds checking (index access emits `dm_bounds_check()` that panics with informative message on out-of-bounds)
 - Arena OOM panic (`dm_arena_alloc_aligned()` panics instead of returning NULL on allocation failure)
 - Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete with verified fixed-point. Split into ~11 modules. Full feature parity with Stage 0 subset: enum payloads, Option/Result, match expressions (including bare Ok/Err/Some/None patterns), multi-file imports, lambdas, generic monomorphization, pipeline operator `|>`, error propagation `?`, Box[T] support, compound assignment operators (`+=`, `-=`, `*=`, `/=`), modulo `%`, all builtins (including `eprint`, `parse_float`, `string_to_upper`, `string_to_lower`), full CLI commands (lex, parse, check, fmt, test, compile, run, pkg init/add/list, clean), nested for-loop support, for-loop element type inference, traits (static dispatch via mangled names, `trait`/`impl` blocks), effect enforcement (builtin-to-effect mapping with subset checking in `with [...]` declarations), regions with allocation redirection (`region name { ... }` blocks with arena allocation/cleanup and string concat redirected to arena), package management (TOML manifest parsing, pkg init/add/list). Hardened: monomorphization propagates all counters/state, type inference covers all builtin return types, runtime uses safe `strtoll` parsing with overflow protection, pipeline operator uses balanced-paren matching.
-- Stage 3 LLVM backend — IR specification and architecture documents complete (`docs/ir-spec.md`, `docs/llvm-backend.md`), directory structure created
+- Comptime Turing-complete evaluation (variables, if/else, while/for loops, match, function calls, recursion, arrays, structs, string concatenation at compile time; `comptime fib(10)` == 55)
+- Async Phase B Full (true stackless coroutines — await in if/else, while/for loops, match arms, nested async calls; state machine frame/poll/wrapper generation)
+- Stage 3 LLVM backend — compiles dAImond to native binaries via LLVM. Reuses Stage 0 frontend (lexer, parser, checker). Supports: functions, structs, enums, generics (monomorphization), closures/lambdas, Result/Option types with `?` operator and match, string interpolation, `as` numeric casts, for/while/if control flow, pipeline operator `|>`, compound assignment, Box[T], List[T] with typed operations, filesystem/OS builtins, async/await (Phase A passthrough semantics). Optimization passes via LLVM's new pass manager (`-O0` through `-O3`). 18 integration tests pass with output matching Stage 0.
 
 ### Not Yet Implemented
-- LLVM backend implementation (Stage 3) — IR spec and architecture documented in `docs/ir-spec.md` and `docs/llvm-backend.md`
-- True stackless coroutines for async/await (Phase B Full — Phase B Lite with linear state machines is implemented)
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0)
+- SIMD intrinsics in Stage 3 (implemented in Stage 0)
+- Debug info (DWARF) in Stage 3
 
 ## Documentation Maintenance
 
