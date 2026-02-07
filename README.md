@@ -67,6 +67,26 @@ zig build test
 zig build test-integration
 ```
 
+### Stage 3 (LLVM Backend)
+
+Requires **LLVM 17+** development libraries.
+
+```bash
+cd stage3
+
+# Build the LLVM compiler
+zig build
+
+# Compile a dAImond program to native binary
+./zig-out/bin/daimond-llvm examples/hello.dm -o hello
+
+# Compile with optimization
+./zig-out/bin/daimond-llvm myfile.dm -o output -O2
+
+# Run integration tests (254 tests, same as Stage 0)
+zig build test-integration
+```
+
 ## Project Structure
 
 ```
@@ -84,13 +104,14 @@ dAImond-lang/
 │   │   ├── codegen.zig        # C11 code generator
 │   │   ├── errors.zig         # Diagnostic reporting, colored output
 │   │   ├── package.zig        # Package manager (TOML manifest, dependencies)
+│   │   ├── cache.zig          # Compilation cache (SHA-256 content hashing)
 │   │   └── lsp.zig            # Language Server Protocol implementation
 │   ├── runtime/               # C runtime library
 │   │   ├── daimond_runtime.h  # Runtime API (strings, arenas, I/O, sockets, threads)
 │   │   ├── daimond_runtime.c  # Runtime implementation
 │   │   └── test_runtime.c     # Runtime unit tests
 │   └── tests/
-│       └── runner.zig         # Integration test harness (233 tests)
+│       └── runner.zig         # Integration test harness (254 tests)
 ├── stage1/                    # Stage 1 self-hosting compiler (written in dAImond)
 │   ├── main.dm                # Monolithic bootstrap file (generated)
 │   ├── main_split.dm          # Entry point with imports (for self-compilation)
@@ -119,6 +140,21 @@ dAImond-lang/
 │   ├── arithmetic.dm          # Basic math operations
 │   ├── fibonacci.dm           # Recursive functions
 │   └── calculator.dm          # Scientific calculator
+├── stage3/                    # Stage 3 LLVM backend (full test parity with Stage 0)
+│   ├── build.zig              # Zig build configuration (links LLVM-C)
+│   ├── src/
+│   │   ├── main.zig           # CLI entry point, pipeline orchestration
+│   │   ├── ir.zig             # dAImond IR definitions (SSA types, instructions)
+│   │   ├── ir_gen.zig         # IR generation from typed AST
+│   │   ├── llvm_gen.zig       # LLVM IR generation from dAImond IR
+│   │   └── llvm_bindings.zig  # Safe Zig wrappers for LLVM-C API
+│   ├── runtime/
+│   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
+│   └── tests/
+│       └── runner.zig         # Integration test harness (254 tests)
+├── docs/                      # Design documents
+│   ├── ir-spec.md             # dAImond IR specification (SSA-based, typed)
+│   └── llvm-backend.md        # Stage 3 LLVM backend architecture
 └── tests/                     # Integration test programs (.dm files)
 ```
 
@@ -362,7 +398,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 1. **Stage 0** (Complete): Hand-written compiler in Zig, compiles dAImond -> C
 2. **Stage 1** (Complete): Compiler rewritten in dAImond, compiled by Stage 0
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
-4. **Stage 3**: LLVM backend for optimized native code
+4. **Stage 3** (Complete): LLVM backend for optimized native code -- full test parity with Stage 0 (254/254 tests pass)
 
 ## Current Status
 
@@ -371,7 +407,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Error diagnostics with colored output
 - [x] C runtime library (strings, arenas, option/result, I/O, networking, threading)
 - [x] CLI: compile, run, lex, parse, check, fmt, test, pkg
-- [x] 233 integration tests passing, 0 failing, 0 skipped
+- [x] 254 integration tests passing, 0 failing, 0 skipped
 
 ### Language Features -- Complete
 - [x] Map[K,V] with full method support (insert, get, contains, remove, len, keys, values, indexing)
@@ -387,11 +423,11 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Implicit generic type inference across multiple call sites with different types
 - [x] Enum payloads with construction and pattern matching
 - [x] Region memory allocation redirection (arena allocator)
-- [x] Comptime evaluation (arithmetic and boolean expressions)
+- [x] Comptime Turing-complete evaluation (variables, if/else, while/for, match, functions, recursion, arrays, structs, string concatenation)
 - [x] Effect system enforcement (opt-in via `with [IO, Console, FileSystem]`)
 - [x] Concurrency primitives (thread spawn/join, mutex)
 - [x] SIMD intrinsics (f32x4, f32x8, f64x2, f64x4, i32x4, i32x8, i64x2, i64x4)
-- [x] Async/await with Future[T] (Phase A: synchronous semantics)
+- [x] Async/await with Future[T] (Phase A synchronous semantics + Phase B stackless coroutines)
 - [x] Custom user-defined effects
 - [x] Package registry download
 - [x] Compile-time array sizes
@@ -423,10 +459,17 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] `daimond pkg` -- Package manager (TOML manifest, version/path/git dependencies)
 - [x] `daimond-lsp` -- Language Server Protocol (diagnostics, completion, hover)
 
+### Stage 3 LLVM Backend -- Complete
+- [x] LLVM backend with full test parity (254/254 integration tests match Stage 0 output)
+- [x] SIMD intrinsics (f32x4, f32x8, f64x2, f64x4, i32x4, i32x8, i64x2, i64x4)
+- [x] Dynamic trait dispatch (`dyn Trait`)
+- [x] Map[K,V] operations, operator overloading, extern string wrappers
+- [x] Async/await (int and string returns), closures with capture, regions
+- [x] Optimization passes via LLVM (`-O0` through `-O3`)
+
 ### Upcoming
-- [x] Async/await Phase B Lite (cooperative futures with poll/ready semantics)
-- [ ] Async/await Phase B Full (true stackless coroutines with state machine transformation)
-- [ ] LLVM backend (Stage 3)
+- [ ] Debug info (DWARF) in Stage 3
+- [ ] Stage 3 self-hosting (Stage 3 compiles Stage 1)
 
 ## Design Principles
 

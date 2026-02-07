@@ -76,8 +76,10 @@ dAImond-lang/
 │   │   ├── ir_gen.zig     # IR generation from typed AST
 │   │   ├── llvm_gen.zig   # LLVM IR generation from dAImond IR
 │   │   └── llvm_bindings.zig  # Safe Zig wrappers for LLVM-C API
-│   └── runtime/
-│       └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
+│   ├── runtime/
+│   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
+│   └── tests/
+│       └── runner.zig         # Integration test harness (254 tests, mirrors Stage 0)
 └── tests/                 # Integration test programs (.dm files)
     ├── arithmetic.dm      # Arithmetic validation
     ├── structs.dm         # Struct/enum/pattern matching tests
@@ -180,7 +182,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 233 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 254 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -242,7 +244,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is feature-complete with verified fixed-point bootstrap. Stage 3 LLVM backend is implemented with 18 integration tests matching Stage 0 output.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is feature-complete with verified fixed-point bootstrap. Stage 3 LLVM backend achieves full test parity with Stage 0 (254/254 integration tests pass).
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -350,11 +352,10 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete with verified fixed-point. Split into ~11 modules. Full feature parity with Stage 0 subset: enum payloads, Option/Result, match expressions (including bare Ok/Err/Some/None patterns), multi-file imports, lambdas, generic monomorphization, pipeline operator `|>`, error propagation `?`, Box[T] support, compound assignment operators (`+=`, `-=`, `*=`, `/=`), modulo `%`, all builtins (including `eprint`, `parse_float`, `string_to_upper`, `string_to_lower`), full CLI commands (lex, parse, check, fmt, test, compile, run, pkg init/add/list, clean), nested for-loop support, for-loop element type inference, traits (static dispatch via mangled names, `trait`/`impl` blocks), effect enforcement (builtin-to-effect mapping with subset checking in `with [...]` declarations), regions with allocation redirection (`region name { ... }` blocks with arena allocation/cleanup and string concat redirected to arena), package management (TOML manifest parsing, pkg init/add/list). Hardened: monomorphization propagates all counters/state, type inference covers all builtin return types, runtime uses safe `strtoll` parsing with overflow protection, pipeline operator uses balanced-paren matching.
 - Comptime Turing-complete evaluation (variables, if/else, while/for loops, match, function calls, recursion, arrays, structs, string concatenation at compile time; `comptime fib(10)` == 55)
 - Async Phase B Full (true stackless coroutines — await in if/else, while/for loops, match arms, nested async calls; state machine frame/poll/wrapper generation)
-- Stage 3 LLVM backend — compiles dAImond to native binaries via LLVM. Reuses Stage 0 frontend (lexer, parser, checker). Supports: functions, structs, enums, generics (monomorphization), closures/lambdas, Result/Option types with `?` operator and match, string interpolation, `as` numeric casts, for/while/if control flow, pipeline operator `|>`, compound assignment, Box[T], List[T] with typed operations, filesystem/OS builtins, async/await (Phase A passthrough semantics). Optimization passes via LLVM's new pass manager (`-O0` through `-O3`). 18 integration tests pass with output matching Stage 0.
+- Stage 3 LLVM backend — compiles dAImond to native binaries via LLVM. Reuses Stage 0 frontend (lexer, parser, checker). Full feature parity with Stage 0: functions, structs, enums, generics (monomorphization), closures/lambdas with variable capture, Result/Option types with `?` operator and match, string interpolation, `as` numeric casts, for/while/if control flow, range for-loops, pipeline operator `|>`, compound assignment, Box[T], List[T] with typed operations (including List[List[T]]), Map[K,V] with full method support and for-in iteration, operator overloading, dynamic trait dispatch (`dyn Trait`), SIMD intrinsics (f32x4/f32x8/f64x2/f64x4/i32x4/i32x8/i64x2/i64x4), extern function declarations with string ABI wrappers, multi-file imports, filesystem/OS builtins, async/await (string and int returns), region memory management, division safety, string comparison operators. Optimization passes via LLVM's new pass manager (`-O0` through `-O3`). 254 integration tests pass with output matching Stage 0 (full parity).
 
 ### Not Yet Implemented
-- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0)
-- SIMD intrinsics in Stage 3 (implemented in Stage 0)
+- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0 and Stage 3)
 - Debug info (DWARF) in Stage 3
 
 ## Documentation Maintenance
