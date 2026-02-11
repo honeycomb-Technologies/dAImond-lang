@@ -280,7 +280,11 @@ pub const CodeGenerator = struct {
 
     // Track generated map types: maps map type name -> MapTypeInfo
     generated_map_types: std.StringHashMap(MapTypeInfo),
-    // Deferred buffer for map type definitions
+    // Track C types used as Map values (need full definition before map entry types)
+    map_value_types: std.StringHashMap(void),
+    // Deferred buffer for map type struct definitions (emitted before user structs)
+    map_type_struct_writer: CWriter,
+    // Deferred buffer for map type function definitions (emitted after user structs)
     map_type_writer: CWriter,
 
     // Track generated option types: maps option type name -> inner C type
@@ -339,6 +343,9 @@ pub const CodeGenerator = struct {
 
     // Track which parameters in the current function are mut (pass-by-reference)
     current_mut_params: std.StringHashMap(void),
+    /// Track variables defined within the current function (cleared per function).
+    /// Used to distinguish variable calls from function calls in generateFunctionCall.
+    function_local_vars: std.StringHashMap(void),
 
     // Track which function parameters are mut: function name → array of is_mut flags
     function_mut_info: std.StringHashMap([]const bool),
@@ -446,6 +453,8 @@ pub const CodeGenerator = struct {
             .generated_box_types = std.StringHashMap([]const u8).init(allocator),
             .box_type_writer = CWriter.init(allocator),
             .generated_map_types = std.StringHashMap(MapTypeInfo).init(allocator),
+            .map_value_types = std.StringHashMap(void).init(allocator),
+            .map_type_struct_writer = CWriter.init(allocator),
             .map_type_writer = CWriter.init(allocator),
             .generated_option_types = std.StringHashMap([]const u8).init(allocator),
             .option_type_writer = CWriter.init(allocator),
@@ -471,6 +480,7 @@ pub const CodeGenerator = struct {
             .current_function_future_type = null,
             .async_block_depth = 0,
             .current_mut_params = std.StringHashMap(void).init(allocator),
+            .function_local_vars = std.StringHashMap(void).init(allocator),
             .function_mut_info = std.StringHashMap([]const bool).init(allocator),
             .region_stack = std.ArrayList([]const u8).init(allocator),
             .known_functions = std.StringHashMap([]const u8).init(allocator),
@@ -525,6 +535,8 @@ pub const CodeGenerator = struct {
         self.generated_box_types.deinit();
         self.box_type_writer.deinit();
         self.generated_map_types.deinit();
+        self.map_value_types.deinit();
+        self.map_type_struct_writer.deinit();
         self.map_type_writer.deinit();
         self.generated_option_types.deinit();
         self.option_type_writer.deinit();
@@ -539,6 +551,7 @@ pub const CodeGenerator = struct {
         self.mono_emit_queue.deinit();
         if (self.active_type_substitutions) |*subs| subs.deinit();
         self.current_mut_params.deinit();
+        self.function_local_vars.deinit();
         self.function_mut_info.deinit();
         self.region_stack.deinit();
         self.known_functions.deinit();
@@ -671,12 +684,92 @@ pub const CodeGenerator = struct {
             try self.writer.write(self.future_type_writer.getOutput());
         }
 
-        // Generate user type definitions (structs and enums)
+        // Forward-declare all user struct types so map entry types can reference them
         for (source.declarations) |decl| {
             switch (decl.kind) {
-                .struct_def => |s| try self.generateStruct(s),
-                .enum_def => |e| try self.generateEnum(e),
+                .struct_def => |s| {
+                    const fname = try self.mangleTypeName(s.name.name);
+                    try self.writer.printLine("typedef struct {s} {s};", .{ fname, fname });
+                },
                 else => {},
+            }
+        }
+
+        // Collect all user struct C type names for dependency analysis
+        var all_user_struct_names = std.StringHashMap(void).init(self.allocator);
+        defer all_user_struct_names.deinit();
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .struct_def => |s| {
+                    const fname = try self.mangleTypeName(s.name.name);
+                    try all_user_struct_names.put(fname, {});
+                },
+                else => {},
+            }
+        }
+
+        // Phase 1: Emit struct definitions needed by map entries (embedded by value in map entry types)
+        for (source.declarations) |decl| {
+            switch (decl.kind) {
+                .struct_def => |s| {
+                    const fname = try self.mangleTypeName(s.name.name);
+                    if (self.map_value_types.contains(fname)) {
+                        try self.generateStruct(s);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Insert map type STRUCT definitions (now their value types are fully defined)
+        if (self.map_type_struct_writer.getOutput().len > 0) {
+            try self.writer.blankLine();
+            try self.writer.writeLineComment("Monomorphized Map Type Structs");
+            try self.writer.write(self.map_type_struct_writer.getOutput());
+        }
+
+        // Phase 2: Generate remaining user type definitions in dependency order.
+        // Multi-pass: each pass emits structs whose by-value field deps are all already emitted.
+        // This handles cases like MatchArm embedding Pattern by value.
+        {
+            var passes: usize = 0;
+            while (passes < 10) : (passes += 1) {
+                var progress = false;
+                for (source.declarations) |decl| {
+                    switch (decl.kind) {
+                        .struct_def => |s| {
+                            const fname = try self.mangleTypeName(s.name.name);
+                            if (self.generated_structs.contains(fname)) continue;
+
+                            // Check if all by-value struct field deps are emitted
+                            var deps_met = true;
+                            for (s.fields) |field| {
+                                const ft = try self.mapType(field.type_expr);
+                                if (all_user_struct_names.contains(ft) and !self.generated_structs.contains(ft)) {
+                                    deps_met = false;
+                                    break;
+                                }
+                            }
+
+                            if (deps_met) {
+                                try self.generateStruct(s);
+                                progress = true;
+                            }
+                        },
+                        .enum_def => |e| try self.generateEnum(e),
+                        else => {},
+                    }
+                }
+                if (!progress) break;
+            }
+
+            // Final pass: emit any remaining structs (handles circular deps or unresolved)
+            for (source.declarations) |decl| {
+                switch (decl.kind) {
+                    .struct_def => |s| try self.generateStruct(s),
+                    .enum_def => |e| try self.generateEnum(e),
+                    else => {},
+                }
             }
         }
 
@@ -2899,32 +2992,40 @@ pub const CodeGenerator = struct {
 
     /// Emit a monomorphized map type struct and helper functions
     fn emitMapTypeDefinition(self: *Self, map_type_name: []const u8, key_type: []const u8, val_type: []const u8) !void {
-        var w = &self.map_type_writer;
         const safe_key = try self.sanitizeTypeName(key_type);
         const safe_val = try self.sanitizeTypeName(val_type);
         const key_list_type = try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_key});
         const val_list_type = try std.fmt.allocPrint(self.stringAllocator(), "dm_list_{s}", .{safe_val});
         const is_string_key = std.mem.eql(u8, key_type, "dm_string");
 
+        // Track the value type so its struct definition can be emitted before map entries
+        try self.map_value_types.put(val_type, {});
+
+        // Entry and Map struct typedefs go to map_type_struct_writer (emitted before user structs)
+        var sw = &self.map_type_struct_writer;
+
         // Entry struct
-        try w.printLine("typedef struct {s}_entry {{", .{map_type_name});
-        w.indent();
-        try w.printLine("{s} key;", .{key_type});
-        try w.printLine("{s} value;", .{val_type});
-        try w.writeLine("int state;  /* 0=empty, 1=occupied, 2=tombstone */");
-        w.dedent();
-        try w.printLine("}} {s}_entry;", .{map_type_name});
-        try w.blankLine();
+        try sw.printLine("typedef struct {s}_entry {{", .{map_type_name});
+        sw.indent();
+        try sw.printLine("{s} key;", .{key_type});
+        try sw.printLine("{s} value;", .{val_type});
+        try sw.writeLine("int state;  /* 0=empty, 1=occupied, 2=tombstone */");
+        sw.dedent();
+        try sw.printLine("}} {s}_entry;", .{map_type_name});
+        try sw.blankLine();
 
         // Map struct
-        try w.printLine("typedef struct {s} {{", .{map_type_name});
-        w.indent();
-        try w.printLine("{s}_entry* entries;", .{map_type_name});
-        try w.writeLine("size_t len;");
-        try w.writeLine("size_t capacity;");
-        w.dedent();
-        try w.printLine("}} {s};", .{map_type_name});
-        try w.blankLine();
+        try sw.printLine("typedef struct {s} {{", .{map_type_name});
+        sw.indent();
+        try sw.printLine("{s}_entry* entries;", .{map_type_name});
+        try sw.writeLine("size_t len;");
+        try sw.writeLine("size_t capacity;");
+        sw.dedent();
+        try sw.printLine("}} {s};", .{map_type_name});
+        try sw.blankLine();
+
+        // Helper functions go to map_type_writer (emitted after user structs)
+        var w = &self.map_type_writer;
 
         // Hash function
         try w.printLine("static inline size_t {s}_hash({s} key) {{", .{ map_type_name, key_type });
@@ -3652,7 +3753,15 @@ pub const CodeGenerator = struct {
                 break :blk switch (un.op) {
                     .not => "bool",
                     .neg, .bit_not => self.inferCTypeFromExpr(un.operand),
-                    .deref, .ref => "void*",
+                    .deref => deref_blk: {
+                        // Infer inner type by stripping pointer from operand's type
+                        const operand_type = self.inferCTypeFromExpr(un.operand);
+                        if (operand_type.len > 1 and operand_type[operand_type.len - 1] == '*') {
+                            break :deref_blk operand_type[0 .. operand_type.len - 1];
+                        }
+                        break :deref_blk operand_type;
+                    },
+                    .ref => "void*",
                 };
             },
             .function_call => |call| blk: {
@@ -3994,6 +4103,8 @@ pub const CodeGenerator = struct {
     /// Track a variable's C type
     fn trackVariableType(self: *Self, name: []const u8, c_type: []const u8) void {
         self.variable_types.put(name, c_type) catch {};
+        // Also track as function-local variable (for call-site dm_ prefix decision)
+        self.function_local_vars.put(name, {}) catch {};
     }
 
     /// Track a function's return C type
@@ -4532,11 +4643,28 @@ pub const CodeGenerator = struct {
         }
 
         // String types detected — emit wrapper function that converts dm_string <-> const char*.
-        // We do NOT emit an extern declaration for the C function because it may already
-        // be declared in system headers (e.g., getenv in <stdlib.h>) and re-declaring it
-        // with different types (const char* vs char*) would cause a C compilation error.
-        // The function is expected to be available at link time.
         const wrapper_name = try self.mangleFunctionName(func_name, null);
+
+        // For user-defined extern functions (e.g., dm_llvm_*), emit an extern forward
+        // declaration with C types. System functions (getenv, etc.) are already declared
+        // in system headers, so we skip them to avoid conflicting declarations.
+        if (std.mem.startsWith(u8, func_name, "dm_")) {
+            const c_ret = if (std.mem.eql(u8, ret_type, "dm_string")) "const char*" else ret_type;
+            try self.writer.print("extern {s} {s}(", .{ c_ret, func_name });
+            var ef = true;
+            for (func.params) |param| {
+                if (!ef) try self.writer.write(", ");
+                ef = false;
+                const pt = try self.mapType(param.type_expr);
+                if (std.mem.eql(u8, pt, "dm_string")) {
+                    try self.writer.write("const char*");
+                } else {
+                    try self.writer.write(pt);
+                }
+            }
+            if (func.params.len == 0) try self.writer.write("void");
+            try self.writer.writeLine(");");
+        }
 
         // Emit static wrapper function dm_{name} that converts types
         try self.writer.print("static {s} {s}(", .{ ret_type, wrapper_name });
@@ -4708,6 +4836,10 @@ pub const CodeGenerator = struct {
                 try self.writer.write(", ");
             }
         }
+
+        // Clear function-local variable tracking for this function scope
+        self.function_local_vars.clearRetainingCapacity();
+        defer self.function_local_vars.clearRetainingCapacity();
 
         // Clear and populate mut params for this function
         self.current_mut_params.clearRetainingCapacity();
@@ -5425,7 +5557,12 @@ pub const CodeGenerator = struct {
         try self.generateExpr(if_expr.condition);
         try self.writer.write(")");
         try self.writer.beginBlock();
+        // If-statements (not if-expressions) should not add 'return' to block results.
+        // Temporarily mark as void to suppress return insertion in generateBlock.
+        const prev_void = self.current_function_is_void;
+        self.current_function_is_void = true;
         try self.generateBlock(if_expr.then_branch);
+        self.current_function_is_void = prev_void;
         try self.writer.closeBraceInline();
 
         if (if_expr.else_branch) |else_br| {
@@ -5433,7 +5570,9 @@ pub const CodeGenerator = struct {
                 .else_block => |block| {
                     try self.writer.write(" else");
                     try self.writer.beginBlock();
+                    self.current_function_is_void = true;
                     try self.generateBlock(block);
+                    self.current_function_is_void = prev_void;
                     try self.writer.endBlock();
                 },
                 .else_if => |else_if| {
@@ -6105,6 +6244,16 @@ pub const CodeGenerator = struct {
         };
 
         try self.writer.write(op_str);
+
+        // Set expected_type from the target so compound literals (Map_new, List_new, etc.)
+        // can emit proper typed initializers in assignment context
+        const prev_expected = self.expected_type;
+        const target_type = self.inferCTypeFromExpr(assign.target);
+        if (!std.mem.eql(u8, target_type, "void*")) {
+            self.expected_type = target_type;
+        }
+        defer self.expected_type = prev_expected;
+
         try self.generateExpr(assign.value);
         try self.writer.writeLine(";");
     }
@@ -6501,15 +6650,20 @@ pub const CodeGenerator = struct {
             try self.writer.write("])");
         } else if (std.mem.startsWith(u8, obj_type, "dm_list_")) {
             // dm_list_X is a struct: list[i] -> bounds-checked (list).data[i]
+            // Use GCC statement expression so the result is an lvalue
+            // (comma expressions produce rvalues which can't be used with & or assignment)
+            // Emit: (dm_bounds_check(idx, len, "list"), list.data)[idx]
+            // This produces an lvalue because pointer[idx] is always an lvalue,
+            // unlike comma expressions or statement expressions which yield rvalues.
             try self.writer.write("(dm_bounds_check((int64_t)(");
             try self.generateExpr(idx.index);
             try self.writer.write("), (int64_t)(");
             try self.generateExpr(idx.object);
             try self.writer.write(").len, \"list\"), (");
             try self.generateExpr(idx.object);
-            try self.writer.write(").data[");
+            try self.writer.write(").data)[");
             try self.generateExpr(idx.index);
-            try self.writer.write("])");
+            try self.writer.write("]");
         } else {
             try self.generateExpr(idx.object);
             try self.writer.write("[");
@@ -6608,7 +6762,7 @@ pub const CodeGenerator = struct {
                 return;
             }
             // Check if this is a variable holding a function pointer (local var or parameter)
-            if (self.variable_types.contains(name) or self.current_mut_params.contains(name)) {
+            if (self.function_local_vars.contains(name) or self.current_mut_params.contains(name)) {
                 // Variable call - function pointer, use name as-is
                 try self.writer.write(name);
             } else if (self.generic_functions.get(name)) |generic_func| {
@@ -6949,8 +7103,11 @@ pub const CodeGenerator = struct {
             return true;
         } else if (std.mem.eql(u8, name, "List_new")) {
             // List_new() -> zero-initialized list struct
-            // Type will be inferred from the let binding's type annotation
-            try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
+            if (self.expected_type) |et| {
+                try self.writer.print("({s}){{ .data = NULL, .len = 0, .capacity = 0 }}", .{et});
+            } else {
+                try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
+            }
             return true;
         } else if (std.mem.eql(u8, name, "Box_new")) {
             // Box_new(value) -> heap-allocate value via monomorphized helper
@@ -6974,7 +7131,11 @@ pub const CodeGenerator = struct {
             return true;
         } else if (std.mem.eql(u8, name, "Map_new")) {
             // Map_new() -> zero-initialized map struct
-            try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
+            if (self.expected_type) |et| {
+                try self.writer.print("({s}){{ .entries = NULL, .len = 0, .capacity = 0 }}", .{et});
+            } else {
+                try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
+            }
             return true;
         } else if (std.mem.eql(u8, name, "string_split")) {
             // Ensure dm_list_dm_string type is generated
@@ -7442,6 +7603,12 @@ pub const CodeGenerator = struct {
         for (lit.fields, 0..) |field, i| {
             if (i > 0) try self.writer.write(", ");
             try self.writer.print(".{s} = ", .{field.name.name});
+            // Clear expected_type for field values — the parent struct's type
+            // is not the field's type (e.g., Map_new() inside a struct literal
+            // should not use the parent struct as the compound literal type)
+            const prev_expected = self.expected_type;
+            self.expected_type = null;
+            defer self.expected_type = prev_expected;
             try self.generateExpr(field.value);
         }
 

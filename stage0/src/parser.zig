@@ -1745,6 +1745,23 @@ pub const Parser = struct {
             };
             return expr;
         }
+        if (self.match(.star)) {
+            const operand = try self.parseUnaryImpl(allow_struct_lit);
+
+            const unary = try self.astAllocator().create(UnaryExpr);
+            unary.* = .{
+                .op = .deref,
+                .operand = operand,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const expr = try self.astAllocator().create(Expr);
+            expr.* = .{
+                .kind = .{ .unary = unary },
+                .span = unary.span,
+            };
+            return expr;
+        }
 
         return self.parsePostfixImpl(allow_struct_lit);
     }

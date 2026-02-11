@@ -1076,6 +1076,13 @@ pub const TypeChecker = struct {
                 if (typ == .ref) {
                     return typ.ref.pointee;
                 }
+                if (typ == .box) {
+                    return typ.box;
+                }
+                if (typ == .type_var) {
+                    // Type variable (e.g., from generic container elements) - allow deref
+                    return try self.freshTypeVar();
+                }
                 try self.reportError(.type_mismatch, "cannot dereference non-reference type", un.span);
                 return try self.type_ctx.intern(.error_type);
             },

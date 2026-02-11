@@ -75,6 +75,7 @@ const CompilerOptions = struct {
     debug: bool = false, // --debug flag (emit #line directives, pass -g to cc)
     cache_dir: ?[]const u8 = null, // --cache-dir (default .daimond-cache/)
     no_cache: bool = false, // --no-cache flag
+    skip_type_check: bool = false, // --skip-type-check flag
     show_help: bool = false,
     show_version: bool = false,
 
@@ -335,6 +336,11 @@ fn parseArgs(args: []const []const u8) !CompilerOptions {
 
         if (std.mem.eql(u8, arg, "--no-cache")) {
             opts.no_cache = true;
+            continue;
+        }
+
+        if (std.mem.eql(u8, arg, "--skip-type-check")) {
+            opts.skip_type_check = true;
             continue;
         }
 
@@ -1723,10 +1729,12 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         try check_timer.report(stdout, "check");
         if (!opts.verbose) try stdout.print("\n", .{});
 
-        // Check for type errors
-        if (type_checker.hasErrors()) {
+        // Check for type errors (skip if --skip-type-check is set)
+        if (type_checker.hasErrors() and !opts.skip_type_check) {
             try displayTypeErrors(&type_checker, colors, stdout);
             return .error_compile;
+        } else if (type_checker.hasErrors()) {
+            try stdout.print("\n  (skipping type errors due to --skip-type-check)\n", .{});
         }
 
         // Phase 4: Code Generation
