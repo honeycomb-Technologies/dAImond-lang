@@ -4,7 +4,7 @@
 
 dAImond is a systems programming language designed to be the fastest compiled language, the most AI-generatable language, self-compiling, memory-safe without garbage collection (region-based with full inference), and fully Turing-complete at compile time.
 
-The repository contains the **Stage 0 bootstrap compiler**, written in Zig, which compiles dAImond source code to C11. A system C compiler (gcc/clang) then produces the final binary.
+The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 4 LLVM backend** (dAImond + LLVM) — achieving full self-hosting without any Zig dependency.
 
 ## Repository Structure
 
@@ -68,7 +68,7 @@ dAImond-lang/
 ├── docs/                  # Design documents
 │   ├── ir-spec.md         # dAImond IR specification (SSA-based, typed)
 │   └── llvm-backend.md    # Stage 3 LLVM backend architecture
-├── stage3/                # Stage 3 LLVM backend
+├── stage3/                # Stage 3 LLVM backend (Zig)
 │   ├── build.zig          # Zig build configuration (links LLVM-C)
 │   ├── src/               # LLVM backend source
 │   │   ├── main.zig       # CLI entry point, pipeline orchestration
@@ -80,6 +80,29 @@ dAImond-lang/
 │   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
 │   └── tests/
 │       └── runner.zig         # Integration test harness (254 tests, mirrors Stage 0)
+├── stage4/                # Stage 4 LLVM backend (dAImond — no Zig dependency)
+│   ├── main.dm            # Monolithic bootstrap file (generated, ~18.7K lines)
+│   ├── main_split.dm      # Entry point with imports (for modular development)
+│   ├── token.dm           # Token kinds, Token struct, keyword lookup
+│   ├── lexer.dm           # Lexer struct, tokenize, character helpers
+│   ├── parser.dm          # Recursive descent + Pratt parser
+│   ├── ast.dm             # AST node type definitions (integer kind tags)
+│   ├── ir.dm              # dAImond IR definitions (SSA types, instructions)
+│   ├── ir_builder.dm      # IR builder (basic blocks, instruction emission)
+│   ├── ir_gen.dm          # IR generation entry point, struct/enum registration
+│   ├── ir_gen_expr.dm     # Expression IR generation (calls, generics, closures)
+│   ├── ir_gen_stmt.dm     # Statement IR generation (let, if, for, while, match)
+│   ├── ir_gen_decl.dm     # Declaration IR generation (functions, impls)
+│   ├── ir_gen_builtins.dm # Builtin function IR generation
+│   ├── ir_gen_comptime.dm # Comptime evaluation
+│   ├── llvm.dm            # LLVM type definitions and helpers
+│   ├── llvm_gen.dm        # LLVM IR generation from dAImond IR
+│   ├── llvm_gen_call.dm   # LLVM call instruction generation
+│   ├── llvm_gen_simd.dm   # LLVM SIMD instruction generation
+│   ├── llvm_bridge.c      # C bridge to LLVM-C API (extern FFI)
+│   ├── runtime/
+│   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
+│   └── gen_bootstrap.sh   # Concatenates modules into main.dm
 └── tests/                 # Integration test programs (.dm files)
     ├── arithmetic.dm      # Arithmetic validation
     ├── structs.dm         # Struct/enum/pattern matching tests
@@ -101,12 +124,17 @@ Stage 0 (C backend):
 Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> Codegen -> C Code -> cc -> Binary
 ```
 
-Stage 3 (LLVM backend):
+Stage 3 (LLVM backend, Zig):
 ```
 Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR -> LLVM -> Native Binary
 ```
 
-Each stage maps to a source file: `lexer.zig` -> `parser.zig` -> `ast.zig`/`types.zig` -> `checker.zig` -> `codegen.zig`.
+Stage 4 (LLVM backend, dAImond):
+```
+Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Validation -> Effect Check -> IR Gen -> dAImond IR -> LLVM Gen (via llvm_bridge.c FFI) -> LLVM IR -> LLVM -> Native Binary
+```
+
+Each Stage 0 stage maps to a source file: `lexer.zig` -> `parser.zig` -> `ast.zig`/`types.zig` -> `checker.zig` -> `codegen.zig`.
 
 ## Build Commands
 
@@ -174,6 +202,35 @@ cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> --emit-ir
 
 # Emit LLVM IR (debugging)
 cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> --emit-llvm
+```
+
+### Stage 4 (LLVM Backend in dAImond)
+
+Stage 4 is compiled by Stage 0. It requires **LLVM 17+** development libraries and the C runtime.
+
+```bash
+# Build Stage 4 compiler (Stage 0 compiles main.dm to C, then gcc produces binary)
+cd stage0 && ./zig-out/bin/daimond ../stage4/main.dm --skip-type-check -c -o /tmp/stage4.c
+gcc -c /tmp/stage4.c -o /tmp/stage4.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
+gcc -c ../stage4/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
+gcc -c ../stage4/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
+gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
+gcc /tmp/stage4.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o -o /tmp/stage4_bin -lm -lpthread $(llvm-config --libs --ldflags)
+
+# Compile a dAImond program to native binary via Stage 4
+/tmp/stage4_bin <file.dm> -o output
+
+# Compile with optimization
+/tmp/stage4_bin <file.dm> -o output -O2
+
+# Emit dAImond IR (debugging)
+/tmp/stage4_bin <file.dm> --emit-ir
+
+# Emit LLVM IR (debugging)
+/tmp/stage4_bin <file.dm> --emit-llvm
+
+# Regenerate monolithic main.dm from modules
+cd stage4 && bash gen_bootstrap.sh
 ```
 
 ## Testing Strategy
@@ -244,7 +301,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend). Stage 0 is complete; Stage 1 is feature-complete with verified fixed-point bootstrap. Stage 3 LLVM backend achieves full test parity with Stage 0 (254/254 integration tests pass).
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond). All stages complete. Stage 4 achieves full self-hosting without Zig dependency (254/254 integration tests pass).
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -353,11 +410,12 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Comptime Turing-complete evaluation (variables, if/else, while/for loops, match, function calls, recursion, arrays, structs, string concatenation at compile time; `comptime fib(10)` == 55)
 - Async Phase B Full (true stackless coroutines — await in if/else, while/for loops, match arms, nested async calls; state machine frame/poll/wrapper generation)
 - Stage 3 LLVM backend — compiles dAImond to native binaries via LLVM. Reuses Stage 0 frontend (lexer, parser, checker). Full feature parity with Stage 0: functions, structs, enums, generics (monomorphization), closures/lambdas with variable capture, Result/Option types with `?` operator and match, string interpolation, `as` numeric casts, for/while/if control flow, range for-loops, pipeline operator `|>`, compound assignment, Box[T], List[T] with typed operations (including List[List[T]] and struct field list access), Map[K,V] with full method support and for-in iteration, operator overloading, dynamic trait dispatch (`dyn Trait`), SIMD intrinsics (f32x4/f32x8/f64x2/f64x4/i32x4/i32x8/i64x2/i64x4), extern function declarations with string ABI wrappers, multi-file imports, filesystem/OS builtins, async/await (string and int returns), region memory management, division safety, string comparison operators. Optimization passes via LLVM's new pass manager (`-O0` through `-O3`). 254 integration tests pass with output matching Stage 0 (full parity). Self-hosting verified: Stage 3 compiles Stage 1, and the LLVM-compiled Stage 1 self-compiles with identical C output (fixed-point bootstrap).
+- Stage 4 LLVM backend in dAImond — entire LLVM backend rewritten in dAImond (~18.7K lines monolithic, ~15 split modules). Compiled by Stage 0 to C, then gcc. Calls LLVM-C API via extern FFI through llvm_bridge.c. Full compiler pipeline in dAImond: lexer, parser, AST (integer kind tags), dAImond IR (SSA-based), LLVM IR generation. Includes error detection: unterminated string detection in lexer, post-parse AST validation (malformed syntax), undefined function detection in IR generation (known_functions map), parser support for `with [...] -> T` effect/return-type ordering, effect system enforcement (builtin-to-effect mapping + callee effect subset checking). 254 integration tests pass (full parity with Stage 0 and Stage 3). Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1). No Zig dependency — full self-hosting achieved.
 
 ### Not Yet Implemented
-- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0 and Stage 3)
-- Debug info (DWARF) in Stage 3
-- Stage 4: LLVM backend rewritten in dAImond (full self-hosting without Zig dependency)
+- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 4)
+- Debug info (DWARF) in Stage 3/4
+- Stage 4 self-compilation (Stage 4 compiles itself)
 
 ## Documentation Maintenance
 
@@ -595,8 +653,78 @@ stage1_v2 compiles main_split.dm → stage1_v3
 diff stage1_v2.c stage1_v3.c → fixed point ✓
 ```
 
+## Stage 4 Compiler Architecture
+
+Stage 4 is the LLVM backend rewritten entirely in dAImond. It is compiled by Stage 0 (to C), then gcc. It produces native binaries by calling LLVM-C API functions via extern FFI through `llvm_bridge.c`.
+
+### Design Decisions
+- **Same architecture as Stage 3**: Lexer → Parser → AST → dAImond IR (SSA) → LLVM IR → native binary. The pipeline mirrors Stage 3 but is implemented in dAImond instead of Zig.
+- **Integer kind tags**: Like Stage 1, uses `fn EXPR_FUNCTION_CALL() -> int { return 40 }` constants instead of Zig tagged unions.
+- **No type checker**: Relies on the C compiler (via Stage 0 compilation) to catch type errors in the compiler itself, and on runtime error detection for compiled programs.
+- **LLVM-C FFI bridge**: All LLVM API calls go through `llvm_bridge.c` which is declared as `extern fn` in dAImond. This bridges dAImond's `dm_string` type to C's `const char*` for LLVM API calls.
+- **Modular source, monolithic bootstrap**: Same pattern as Stage 1 — split `.dm` module files for development, `gen_bootstrap.sh` concatenates into `main.dm` for compilation by Stage 0.
+
+### Module Layout
+```
+token.dm           — Token kinds, Token struct, keyword lookup
+lexer.dm           — Lexer struct, tokenize, character helpers
+parser.dm          — Recursive descent + Pratt parser
+ast.dm             — AST node types (expressions, statements, declarations)
+ir.dm              — dAImond IR definitions (SSA instructions, basic blocks)
+ir_builder.dm      — IR builder (instruction emission, block management)
+ir_gen.dm          — IR generation entry point, struct/enum registration
+ir_gen_expr.dm     — Expression IR generation (largest module, ~4.7K lines)
+ir_gen_stmt.dm     — Statement IR generation (let, if, for, while, match, region)
+ir_gen_decl.dm     — Declaration IR generation (functions, impl blocks)
+ir_gen_builtins.dm — Builtin function IR generation (println, file_read, etc.)
+ir_gen_comptime.dm — Comptime evaluation (arithmetic, variables, functions)
+llvm.dm            — LLVM type definitions and helpers
+llvm_gen.dm        — LLVM IR generation from dAImond IR (main module)
+llvm_gen_call.dm   — LLVM call instruction generation
+llvm_gen_simd.dm   — LLVM SIMD instruction generation
+llvm_bridge.c      — C bridge: extern fn declarations for LLVM-C API
+main_split.dm      — Entry point with imports (for modular development)
+main.dm            — Monolithic bootstrap file (~18.7K lines, generated)
+```
+
+### Error Detection
+Stage 4 includes compile-time error detection for:
+- **Unterminated strings**: Lexer detects EOF inside string literals and exits with error
+- **Syntax errors**: Post-parse AST validation catches malformed function declarations (e.g., missing parameter types)
+- **Undefined functions**: IR generation checks a `known_functions` map before generating calls
+- **Effect violations**: Builtin-to-effect mapping (e.g., `file_read` → `FileSystem`) with callee effect subset checking ensures functions only call operations permitted by their `with [...]` declarations
+
+### Building Stage 4
+```bash
+# Stage 0 compiles Stage 4 (from monolithic main.dm)
+cd stage0 && ./zig-out/bin/daimond ../stage4/main.dm --skip-type-check -c -o /tmp/stage4.c
+
+# Compile C output + LLVM bridge + runtime to binary
+gcc -c /tmp/stage4.c -o /tmp/stage4.o -I runtime
+gcc -c ../stage4/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
+gcc -c ../stage4/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
+gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
+gcc /tmp/stage4.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o \
+    -o /tmp/stage4_bin -lm -lpthread $(llvm-config --libs --ldflags)
+
+# Stage 4 compiles a test program
+/tmp/stage4_bin test_program.dm -o test_program
+
+# Regenerate monolithic main.dm from modules
+cd stage4 && bash gen_bootstrap.sh
+```
+
+### Full Bootstrap Chain
+```
+Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
+stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
+Stage 0 (Zig) compiles Stage 4 (dAImond→LLVM)   → stage4_bin
+stage4_bin compiles test programs                 → native binaries (254/254 tests pass)
+```
+
 ## Important Notes
 
 - The `.gitignore` in `stage0/` excludes `*.c` files (generated output) but includes `!src/*.c` to allow runtime C source files.
 - Zig version is pinned to 0.13.0 via `.mise.toml`. Do not upgrade without testing compatibility.
 - The largest source files are `codegen.zig` (~6830 lines), `parser.zig` (~3630 lines), and `checker.zig` (~3116 lines). Changes to these require careful testing.
+- Stage 4's `main.dm` is ~18.7K lines (the largest dAImond source file). The monolithic file is generated by `gen_bootstrap.sh` — edit the split module files for development.

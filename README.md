@@ -140,7 +140,7 @@ dAImond-lang/
 │   ├── arithmetic.dm          # Basic math operations
 │   ├── fibonacci.dm           # Recursive functions
 │   └── calculator.dm          # Scientific calculator
-├── stage3/                    # Stage 3 LLVM backend (full test parity with Stage 0)
+├── stage3/                    # Stage 3 LLVM backend (Zig, full test parity with Stage 0)
 │   ├── build.zig              # Zig build configuration (links LLVM-C)
 │   ├── src/
 │   │   ├── main.zig           # CLI entry point, pipeline orchestration
@@ -152,6 +152,29 @@ dAImond-lang/
 │   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
 │   └── tests/
 │       └── runner.zig         # Integration test harness (254 tests)
+├── stage4/                    # Stage 4 LLVM backend (written in dAImond, no Zig dependency)
+│   ├── main.dm                # Monolithic bootstrap file (18.7K lines, generated)
+│   ├── main_split.dm          # Entry point with imports (for modular development)
+│   ├── token.dm               # Token kinds, Token struct, keyword lookup
+│   ├── lexer.dm               # Lexer struct, tokenize, character helpers
+│   ├── parser.dm              # Recursive descent + Pratt parser
+│   ├── ast.dm                 # AST node type definitions
+│   ├── ir.dm                  # dAImond IR definitions (SSA types, instructions)
+│   ├── ir_builder.dm          # IR builder (basic blocks, instructions)
+│   ├── ir_gen.dm              # IR generation entry point, module/struct/enum
+│   ├── ir_gen_expr.dm         # Expression IR generation
+│   ├── ir_gen_stmt.dm         # Statement IR generation
+│   ├── ir_gen_decl.dm         # Declaration IR generation (functions, impls)
+│   ├── ir_gen_builtins.dm     # Builtin function IR generation
+│   ├── ir_gen_comptime.dm     # Comptime evaluation
+│   ├── llvm.dm                # LLVM type definitions and helpers
+│   ├── llvm_gen.dm            # LLVM IR generation from dAImond IR
+│   ├── llvm_gen_call.dm       # LLVM call instruction generation
+│   ├── llvm_gen_simd.dm       # LLVM SIMD instruction generation
+│   ├── llvm_bridge.c          # C bridge to LLVM-C API
+│   ├── runtime/
+│   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
+│   └── gen_bootstrap.sh       # Concatenates modules into main.dm
 ├── docs/                      # Design documents
 │   ├── ir-spec.md             # dAImond IR specification (SSA-based, typed)
 │   └── llvm-backend.md        # Stage 3 LLVM backend architecture
@@ -392,13 +415,14 @@ Found 2 test(s) in my_tests.dm
 ## Bootstrap Path
 
 ```
-Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
+Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Zig) -> Stage 4 (LLVM/dAImond)
 ```
 
 1. **Stage 0** (Complete): Hand-written compiler in Zig, compiles dAImond -> C
 2. **Stage 1** (Complete): Compiler rewritten in dAImond, compiled by Stage 0
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
-4. **Stage 3** (Complete): LLVM backend for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
+4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
+5. **Stage 4** (Complete): LLVM backend rewritten entirely in dAImond -- full self-hosting without Zig dependency, 254/254 tests pass
 
 ## Current Status
 
@@ -468,9 +492,18 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM)
 - [x] Optimization passes via LLVM (`-O0` through `-O3`)
 - [x] Self-hosting: Stage 3 compiles Stage 1, verified fixed-point bootstrap
 
+### Stage 4 LLVM Backend in dAImond -- Complete
+- [x] Entire LLVM backend rewritten in dAImond (~18.7K lines monolithic, ~15 split modules)
+- [x] Full test parity with Stage 0 and Stage 3 (254/254 integration tests pass)
+- [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
+- [x] LLVM-C bridge via extern FFI (llvm_bridge.c)
+- [x] Error detection: unterminated strings, syntax errors, undefined functions, effect enforcement
+- [x] No Zig dependency -- full self-hosting achieved
+- [x] Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1)
+
 ### Upcoming
-- [ ] Debug info (DWARF) in Stage 3
-- [ ] Stage 4: LLVM backend rewritten in dAImond (full self-hosting)
+- [ ] Debug info (DWARF) in Stage 3/4
+- [ ] Stage 4 self-compilation (Stage 4 compiles itself)
 
 ## Design Principles
 
