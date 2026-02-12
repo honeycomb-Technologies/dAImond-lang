@@ -14,6 +14,9 @@
 #include <ctype.h>
 #include <sys/resource.h>
 
+// Forward declaration: string pool tracking for mem_mark/mem_sweep
+static void _dm_str_track(char* p);
+
 // Increase default stack size to 64MB for LLVM-compiled binaries.
 // LLVM passes large structs by value through recursive calls, consuming
 // more stack than equivalent C code (e.g., the Stage 1 compiler's ~922-byte
@@ -41,22 +44,27 @@ void llvm_dm_string_new(dm_string* out, const char* s) {
 
 void llvm_dm_string_concat(dm_string* out, const dm_string* a, const dm_string* b) {
     *out = dm_string_concat(*a, *b);
+    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
 }
 
 void llvm_dm_int_to_string(dm_string* out, int64_t n) {
     *out = dm_int_to_string(n);
+    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
 }
 
 void llvm_dm_float_to_string(dm_string* out, double n) {
     *out = dm_float_to_string(n);
+    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
 }
 
 void llvm_dm_bool_to_string(dm_string* out, int b) {
     *out = b ? dm_string_new("true") : dm_string_new("false");
+    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
 }
 
 void llvm_dm_read_line(dm_string* out) {
     *out = dm_read_line();
+    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
 }
 
 // =====================================================================
@@ -144,6 +152,7 @@ void llvm_dm_char_at(dm_string* out, const dm_string* s, int64_t idx) {
     char* buf = (char*)malloc(2);
     buf[0] = s->data[idx];
     buf[1] = '\0';
+    _dm_str_track(buf);
     *out = (dm_string){ .data = buf, .len = 1, .cap = 1 };
 }
 
@@ -191,6 +200,7 @@ void llvm_dm_substr(dm_string* out, const dm_string* s, int64_t start, int64_t l
     char* buf = (char*)malloc(actual_len + 1);
     memcpy(buf, s->data + start, actual_len);
     buf[actual_len] = '\0';
+    _dm_str_track(buf);
     *out = (dm_string){ .data = buf, .len = actual_len, .cap = actual_len };
 }
 
@@ -234,6 +244,7 @@ void llvm_dm_string_trim(dm_string* out, const dm_string* s) {
     char* buf = (char*)malloc(new_len + 1);
     memcpy(buf, s->data + start, new_len);
     buf[new_len] = '\0';
+    _dm_str_track(buf);
     *out = (dm_string){ .data = buf, .len = new_len, .cap = new_len };
 }
 
@@ -242,6 +253,7 @@ void llvm_dm_string_replace(dm_string* out, const dm_string* s, const dm_string*
         char* buf = (char*)malloc(s->len + 1);
         memcpy(buf, s->data, s->len);
         buf[s->len] = '\0';
+        _dm_str_track(buf);
         *out = (dm_string){ .data = buf, .len = s->len, .cap = s->len };
         return;
     }
@@ -254,6 +266,7 @@ void llvm_dm_string_replace(dm_string* out, const dm_string* s, const dm_string*
         char* buf = (char*)malloc(s->len + 1);
         memcpy(buf, s->data, s->len);
         buf[s->len] = '\0';
+        _dm_str_track(buf);
         *out = (dm_string){ .data = buf, .len = s->len, .cap = s->len };
         return;
     }
@@ -266,6 +279,7 @@ void llvm_dm_string_replace(dm_string* out, const dm_string* s, const dm_string*
         } else { buf[pos++] = s->data[i++]; }
     }
     buf[new_len] = '\0';
+    _dm_str_track(buf);
     *out = (dm_string){ .data = buf, .len = new_len, .cap = new_len };
 }
 
@@ -274,6 +288,7 @@ void llvm_dm_string_to_upper(dm_string* out, const dm_string* s) {
     for (size_t i = 0; i < s->len; i++)
         buf[i] = (s->data[i] >= 'a' && s->data[i] <= 'z') ? s->data[i] - 32 : s->data[i];
     buf[s->len] = '\0';
+    _dm_str_track(buf);
     *out = (dm_string){ .data = buf, .len = s->len, .cap = s->len };
 }
 
@@ -282,6 +297,7 @@ void llvm_dm_string_to_lower(dm_string* out, const dm_string* s) {
     for (size_t i = 0; i < s->len; i++)
         buf[i] = (s->data[i] >= 'A' && s->data[i] <= 'Z') ? s->data[i] + 32 : s->data[i];
     buf[s->len] = '\0';
+    _dm_str_track(buf);
     *out = (dm_string){ .data = buf, .len = s->len, .cap = s->len };
 }
 
@@ -1064,4 +1080,94 @@ void llvm_dm_path_stem(dm_string* out, const dm_string* path) {
 
 void llvm_dm_path_join(dm_string* out, const dm_string* a, const dm_string* b) {
     *out = dm_path_join_impl(*a, *b);
+}
+
+// =====================================================================
+// Game/Terminal Builtins
+// =====================================================================
+
+#include <time.h>
+#include <poll.h>
+#include <termios.h>
+#include <sys/ioctl.h>
+
+// chr(n) -> string: convert codepoint to single-byte string (sret wrapper)
+void llvm_dm_chr(dm_string* out, int64_t n) {
+    char* buf = (char*)malloc(2);
+    buf[0] = (char)n;
+    buf[1] = '\0';
+    _dm_str_track(buf);
+    *out = (dm_string){ .data = buf, .len = 1, .cap = 1 };
+}
+
+// flush() -> void: flush stdout
+void dm_flush(void) {
+    fflush(stdout);
+}
+
+// read_key() -> int: blocking single-key read
+int64_t dm_read_key(void) {
+    return (int64_t)getchar();
+}
+
+// read_key_nb() -> int: non-blocking key read (-1 if nothing)
+int64_t dm_read_key_nb(void) {
+    struct pollfd pfd = { .fd = 0, .events = POLLIN, .revents = 0 };
+    if (poll(&pfd, 1, 0) > 0) return (int64_t)getchar();
+    return -1;
+}
+
+// time_ms() -> int: current monotonic time in milliseconds
+int64_t dm_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + (int64_t)ts.tv_nsec / 1000000;
+}
+
+// sleep_ms(ms) -> void: sleep for ms milliseconds
+void dm_sleep_ms(int64_t ms) {
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000;
+    nanosleep(&ts, NULL);
+}
+
+// String allocation pool for mem_mark/mem_sweep
+static char** _dm_str_pool = NULL;
+static int64_t _dm_str_pool_len = 0;
+static int64_t _dm_str_pool_cap = 0;
+
+static void _dm_str_track(char* p) {
+    if (_dm_str_pool_len >= _dm_str_pool_cap) {
+        _dm_str_pool_cap = _dm_str_pool_cap ? _dm_str_pool_cap * 2 : 4096;
+        _dm_str_pool = (char**)realloc(_dm_str_pool, (size_t)_dm_str_pool_cap * sizeof(char*));
+    }
+    _dm_str_pool[_dm_str_pool_len++] = p;
+}
+
+// mem_mark() -> int: return current pool position
+int64_t dm_mem_mark(void) {
+    return _dm_str_pool_len;
+}
+
+// mem_sweep(mark) -> void: free all strings allocated since mark
+void dm_mem_sweep(int64_t mark) {
+    for (int64_t i = mark; i < _dm_str_pool_len; i++) {
+        free(_dm_str_pool[i]);
+    }
+    _dm_str_pool_len = mark;
+}
+
+// term_width() -> int: terminal column count (default 80)
+int64_t dm_term_width(void) {
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return (int64_t)ws.ws_col;
+    return 80;
+}
+
+// term_height() -> int: terminal row count (default 24)
+int64_t dm_term_height(void) {
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0) return (int64_t)ws.ws_row;
+    return 24;
 }

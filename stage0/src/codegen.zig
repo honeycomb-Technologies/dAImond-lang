@@ -7654,6 +7654,16 @@ pub const CodeGenerator = struct {
     fn generateArrayLiteral(self: *Self, arr: *ArrayLiteral) anyerror!void {
         switch (arr.kind) {
             .elements => |elems| {
+                if (elems.len == 0) {
+                    // Empty list [] — use compound literal so it works in both
+                    // initialization (let x: List[T] = []) and assignment (x = []) contexts.
+                    if (self.expected_type) |et| {
+                        if (std.mem.startsWith(u8, et, "dm_list_")) {
+                            try self.writer.print("({s}){{ .data = NULL, .len = 0, .capacity = 0 }}", .{et});
+                            return;
+                        }
+                    }
+                }
                 try self.writer.write("{ ");
                 for (elems, 0..) |elem, i| {
                     if (i > 0) try self.writer.write(", ");

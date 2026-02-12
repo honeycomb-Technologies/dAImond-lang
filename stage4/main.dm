@@ -4740,6 +4740,17 @@ fn map_builtin_name(name: string) -> string {
     if name == "fs_remove" { return "dm_fs_remove" }
     -- OS builtins
     if name == "os_getenv" { return "dm_os_getenv" }
+    -- Game/terminal builtins
+    if name == "chr" { return "dm_chr" }
+    if name == "flush" { return "dm_flush" }
+    if name == "read_key" { return "dm_read_key" }
+    if name == "read_key_nb" { return "dm_read_key_nb" }
+    if name == "time_ms" { return "dm_time_ms" }
+    if name == "sleep_ms" { return "dm_sleep_ms" }
+    if name == "mem_mark" { return "dm_mem_mark" }
+    if name == "mem_sweep" { return "dm_mem_sweep" }
+    if name == "term_width" { return "dm_term_width" }
+    if name == "term_height" { return "dm_term_height" }
     return name
 }
 
@@ -4770,6 +4781,12 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "fs_getcwd" or name == "fs_readdir" or name == "fs_rename" { return true }
     if name == "fs_mkdir" or name == "fs_remove" { return true }
     if name == "os_getenv" { return true }
+    -- Game/terminal builtins
+    if name == "chr" or name == "flush" { return true }
+    if name == "read_key" or name == "read_key_nb" { return true }
+    if name == "time_ms" or name == "sleep_ms" { return true }
+    if name == "mem_mark" or name == "mem_sweep" { return true }
+    if name == "term_width" or name == "term_height" { return true }
     return false
 }
 
@@ -4818,6 +4835,12 @@ fn builtin_return_type(name: string) -> string {
     if name == "fs_remove" { return "i64" }
     -- OS builtins
     if name == "os_getenv" { return "string" }
+    -- Game/terminal builtins
+    if name == "chr" { return "string" }
+    if name == "read_key" or name == "read_key_nb" { return "i64" }
+    if name == "time_ms" or name == "mem_mark" { return "i64" }
+    if name == "term_width" or name == "term_height" { return "i64" }
+    if name == "flush" or name == "sleep_ms" or name == "mem_sweep" { return "void" }
     return "void"
 }
 
@@ -5158,6 +5181,18 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- OS
     g = declare_extern(g, "dm_os_getenv", "string", "string")
+
+    -- Game/terminal builtins
+    g = declare_extern(g, "dm_chr", "i64", "string")
+    g = declare_extern0(g, "dm_flush", "void")
+    g = declare_extern0(g, "dm_read_key", "i64")
+    g = declare_extern0(g, "dm_read_key_nb", "i64")
+    g = declare_extern0(g, "dm_time_ms", "i64")
+    g = declare_extern(g, "dm_sleep_ms", "i64", "void")
+    g = declare_extern0(g, "dm_mem_mark", "i64")
+    g = declare_extern(g, "dm_mem_sweep", "i64", "void")
+    g = declare_extern0(g, "dm_term_width", "i64")
+    g = declare_extern0(g, "dm_term_height", "i64")
 
     -- String split
     g = declare_extern3(g, "dm_string_split", "ptr", "string", "string", "void")
@@ -18197,29 +18232,32 @@ fn find_runtime_dir(input_dir: string) -> string {
     return "../stage0/runtime"
 }
 
--- Find the Stage 3 runtime (llvm_wrappers.c) directory
+-- Find the LLVM wrappers (llvm_wrappers.c) directory
+-- Prefers stage4/runtime over stage3/runtime since Stage 4 has the full builtin set
 fn find_wrappers_dir(input_dir: string) -> string {
-    -- Strategy 1: Go up from input file dir
-    let try1 = input_dir + "/../stage3/runtime"
-    if file_exists(try1 + "/llvm_wrappers.c") {
-        return try1
-    }
-
-    -- Also check stage4/runtime which may have its own copy
+    -- Strategy 1: Go up from input file dir (prefer stage4 first)
     let try1b = input_dir + "/../stage4/runtime"
     if file_exists(try1b + "/llvm_wrappers.c") {
         return try1b
     }
 
-    -- Strategy 2: Relative (assume running from stage4/)
+    let try1 = input_dir + "/../stage3/runtime"
+    if file_exists(try1 + "/llvm_wrappers.c") {
+        return try1
+    }
+
+    -- Strategy 2: Relative (assume running from stage4/ or stage0/)
     if file_exists("runtime/llvm_wrappers.c") {
         return "runtime"
+    }
+    if file_exists("../stage4/runtime/llvm_wrappers.c") {
+        return "../stage4/runtime"
     }
     if file_exists("../stage3/runtime/llvm_wrappers.c") {
         return "../stage3/runtime"
     }
 
-    -- Strategy 3: From project root
+    -- Strategy 3: From project root (prefer stage4 first)
     if file_exists("stage4/runtime/llvm_wrappers.c") {
         return "stage4/runtime"
     }
@@ -18363,6 +18401,9 @@ fn builtin_required_effect(name: string) -> string {
     if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
     if name == "args_get" or name == "args_len" { return "IO" }
     if name == "system" or name == "exit" { return "Process" }
+    if name == "flush" or name == "read_key" or name == "read_key_nb" { return "Console" }
+    if name == "time_ms" or name == "sleep_ms" { return "IO" }
+    if name == "term_width" or name == "term_height" { return "Console" }
     return ""
 }
 
