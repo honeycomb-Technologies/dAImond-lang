@@ -67,7 +67,8 @@ dAImond-lang/
 │   └── calculator.dm      # Full scientific calculator demo
 ├── docs/                  # Design documents
 │   ├── ir-spec.md         # dAImond IR specification (SSA-based, typed)
-│   └── llvm-backend.md    # Stage 3 LLVM backend architecture
+│   ├── llvm-backend.md    # Stage 3 LLVM backend architecture
+│   └── stage-history.md   # Archived Stage 1/3 documentation
 ├── stage3/                # Stage 3 LLVM backend (Zig)
 │   ├── build.zig          # Zig build configuration (links LLVM-C)
 │   ├── src/               # LLVM backend source
@@ -180,29 +181,9 @@ cd stage0 && ./zig-out/bin/daimond pkg list           # List dependencies
 cd stage0 && ./zig-out/bin/daimond-lsp
 ```
 
-### Stage 3 (LLVM Backend)
+### Stage 3 (LLVM Backend — Archived)
 
-Stage 3 build commands run from the `stage3/` directory. Requires **LLVM 17+** development libraries.
-
-```bash
-# Build the LLVM compiler
-cd stage3 && zig build
-
-# Run unit tests (IR definitions, LLVM bindings)
-cd stage3 && zig build test
-
-# Compile a dAImond program to native binary via LLVM
-cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> -o output
-
-# Compile with optimization
-cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> -o output -O2
-
-# Emit dAImond IR (debugging)
-cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> --emit-ir
-
-# Emit LLVM IR (debugging)
-cd stage3 && ./zig-out/bin/daimond-llvm <file.dm> --emit-llvm
-```
+Stage 3 is frozen. See `docs/stage-history.md` for build commands.
 
 ### Stage 4 (LLVM Backend in dAImond)
 
@@ -363,54 +344,22 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 ## Current Status
 
 ### Implemented
-- Lexer with comprehensive token support
-- Recursive descent + Pratt parser
-- AST definitions for all language constructs
-- Type system with inference and unification
-- Type checker with symbol tables and scope management
-- C11 code generator (Box helpers emitted after struct defs for correct ordering)
-- Error diagnostics with colored output
-- C runtime library (strings, arenas, option/result, I/O, networking sockets, threading)
-- CLI with commands: compile, run, lex, parse, check, fmt, test, pkg
-- Integration test harness (254 pass, 0 fail, 0 skipped)
-- Map[K,V] type with full method support (insert, get, contains, remove, len, keys, values, set, indexing)
-- Map iteration via for-in loops (iterates over map keys using runtime entry scanning)
-- String split returning List[string]
-- Multi-file imports in Stage 0 (import resolution, stdlib path resolution, diamond import deduplication)
-- String interpolation (f"Hello {name}")
-- FFI / extern function declarations
-- All numeric types (i8, i16, i32, u8, u16, u32, i64, u64, f32, f64) with `as` cast expressions
-- Trait static dispatch with trait bounds on generic functions
-- Closures with variable capture (free variables captured into closure struct)
-- Operator overloading via impl methods (+, -, *, /, ==, !=, <, >, <=, >=)
-- Bare `self` / `mut self` parameter syntax in impl methods (no explicit type annotation needed)
-- Implicit generic type inference for multiple call sites with different types
-- Enum payload construction and pattern matching
-- Nested if-without-else codegen fix (statement vs value position detection)
-- Region memory allocation redirection (arena allocator for allocations within region blocks)
-- Comptime Turing-complete evaluation (arithmetic, boolean, variables, if/else, while/for loops, match, function calls with recursion, arrays, structs, string concatenation — all at compile time)
-- Effect system enforcement (opt-in via `with [IO, Console, FileSystem, ...]` declarations)
-- Custom user-defined effects (tracked in EffectSet alongside builtins, enforced via subset checking in with [...] declarations)
-- Dynamic trait dispatch (`dyn Trait` with vtable-based fat pointers)
-- Concurrency primitives (thread spawn/join, mutex lock/unlock via pthreads)
-- SIMD intrinsics (f32x4, f32x8, f64x2, f64x4, i32x4, i32x8, i64x2, i64x4 types with simd_add/sub/mul/div/splat/set/extract builtins via GCC/Clang vector extensions)
-- Compile-time array size evaluation (array types [T; N] where N is a comptime expression)
-- Async/await with `Future[T]` type (`async fn` declarations, `await` expressions, synchronous Phase A semantics with monomorphized future struct generation)
-- Async Phase B Full (true stackless coroutines — state machine frame/poll/wrapper for async functions with await in if/else, while/for loops, match arms, nested async calls)
-- Standard library (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
-- `daimond fmt` code formatter (indent normalization, brace-counting)
-- `daimond test` testing framework (test_* function discovery, setjmp-based panic catching, assert/assert_eq)
-- `daimond pkg` package manager (init, add, list; TOML manifest; version/path/git dependencies)
-- Package registry support (version dependencies resolved via HTTP download from configurable registry URL)
-- LSP server (`daimond-lsp`) for IDE integration (diagnostics, completion, hover)
-- Division-by-zero runtime protection (all `/` and `%` operations emit safe helpers that panic on zero divisor)
-- List bounds checking (index access emits `dm_bounds_check()` that panics with informative message on out-of-bounds)
-- Arena OOM panic (`dm_arena_alloc_aligned()` panics instead of returning NULL on allocation failure)
-- Stage 1 compiler (dAImond self-hosting) — self-hosting bootstrap complete with verified fixed-point. Split into ~11 modules. Full feature parity with Stage 0 subset: enum payloads, Option/Result, match expressions (including bare Ok/Err/Some/None patterns), multi-file imports, lambdas, generic monomorphization, pipeline operator `|>`, error propagation `?`, Box[T] support, compound assignment operators (`+=`, `-=`, `*=`, `/=`), modulo `%`, all builtins (including `eprint`, `parse_float`, `string_to_upper`, `string_to_lower`), full CLI commands (lex, parse, check, fmt, test, compile, run, pkg init/add/list, clean), nested for-loop support, for-loop element type inference, traits (static dispatch via mangled names, `trait`/`impl` blocks), effect enforcement (builtin-to-effect mapping with subset checking in `with [...]` declarations), regions with allocation redirection (`region name { ... }` blocks with arena allocation/cleanup and string concat redirected to arena), package management (TOML manifest parsing, pkg init/add/list). Hardened: monomorphization propagates all counters/state, type inference covers all builtin return types, runtime uses safe `strtoll` parsing with overflow protection, pipeline operator uses balanced-paren matching.
-- Comptime Turing-complete evaluation (variables, if/else, while/for loops, match, function calls, recursion, arrays, structs, string concatenation at compile time; `comptime fib(10)` == 55)
-- Async Phase B Full (true stackless coroutines — await in if/else, while/for loops, match arms, nested async calls; state machine frame/poll/wrapper generation)
-- Stage 3 LLVM backend — compiles dAImond to native binaries via LLVM. Reuses Stage 0 frontend (lexer, parser, checker). Full feature parity with Stage 0: functions, structs, enums, generics (monomorphization), closures/lambdas with variable capture, Result/Option types with `?` operator and match, string interpolation, `as` numeric casts, for/while/if control flow, range for-loops, pipeline operator `|>`, compound assignment, Box[T], List[T] with typed operations (including List[List[T]] and struct field list access), Map[K,V] with full method support and for-in iteration, operator overloading, dynamic trait dispatch (`dyn Trait`), SIMD intrinsics (f32x4/f32x8/f64x2/f64x4/i32x4/i32x8/i64x2/i64x4), extern function declarations with string ABI wrappers, multi-file imports, filesystem/OS builtins, async/await (string and int returns), region memory management, division safety, string comparison operators. Optimization passes via LLVM's new pass manager (`-O0` through `-O3`). 254 integration tests pass with output matching Stage 0 (full parity). Self-hosting verified: Stage 3 compiles Stage 1, and the LLVM-compiled Stage 1 self-compiles with identical C output (fixed-point bootstrap).
-- Stage 4 LLVM backend in dAImond — entire LLVM backend rewritten in dAImond (~18.7K lines monolithic, ~15 split modules). Compiled by Stage 0 to C, then gcc. Calls LLVM-C API via extern FFI through llvm_bridge.c. Full compiler pipeline in dAImond: lexer, parser, AST (integer kind tags), dAImond IR (SSA-based), LLVM IR generation. Includes error detection: unterminated string detection in lexer, post-parse AST validation (malformed syntax), undefined function detection in IR generation (known_functions map), parser support for `with [...] -> T` effect/return-type ordering, effect system enforcement (builtin-to-effect mapping + callee effect subset checking). 254 integration tests pass (full parity with Stage 0 and Stage 3). Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1). No Zig dependency — full self-hosting achieved.
+
+**Language features**: Full type inference (Hindley-Milner), generics (monomorphization), closures with variable capture, traits (static + dynamic dispatch via `dyn Trait`), enums with payloads, Option/Result with `?` propagation, pattern matching, async/await (stackless coroutines), SIMD intrinsics (f32x4/f32x8/f64x2/f64x4/i32x4/i32x8/i64x2/i64x4), effect system (builtin + user-defined), regions (arena-based), comptime Turing-complete evaluation, operator overloading, string interpolation, FFI/extern, all numeric types (i8-i64, u8-u64, f32, f64) with `as` casts, pipeline operator `|>`, concurrency (threads, mutexes)
+
+**Data structures**: List[T], Map[K,V], Box[T] with full method support, for-in iteration
+
+**Tooling**: CLI (compile, run, lex, parse, check, fmt, test, pkg), LSP server, code formatter, test framework, package manager (TOML manifest, registry support)
+
+**Runtime safety**: Division-by-zero protection, list bounds checking, arena OOM panic
+
+**Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
+
+**Compiler stages** (all complete):
+- Stage 0 (Zig → C): Bootstrap compiler, 254/254 integration tests
+- Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
+- Stage 3 (Zig + LLVM): Native binary output, full test parity
+- Stage 4 (dAImond + LLVM): Full self-hosting, no Zig dependency, 254/254 tests
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 4)
@@ -427,9 +376,9 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 Documentation that contradicts the code is worse than no documentation. When in doubt, check the source code -- it is always the ground truth.
 
-## Stage 0 Known Working Builtins
+## Language Builtins Reference
 
-These are the built-in functions available in dAImond programs compiled by Stage 0. They are recognized by name in `checker.zig` and emitted directly in `codegen.zig`.
+These built-in functions are available in dAImond programs across all compiler stages. In Stage 0 they are recognized by name in `checker.zig` and emitted in `codegen.zig`.
 
 ### I/O Functions
 | Function | Signature | Description |
@@ -556,102 +505,9 @@ fn is_alpha_char(ch: string) -> bool {
 }
 ```
 
-### Previously Fixed Issues
-The following issues from earlier versions are now resolved:
-- **Enum payload construction/matching** — fixed with proper name mangling and tag comparisons
-- **Nested if-without-else type errors** — fixed with statement/value position detection
-- **`string_split()` type mismatch** — now correctly returns `List[string]`
-- **Bare `self` in impl methods** — `fn greet(self)` and `fn update(mut self)` now work without explicit type annotation inside `impl` blocks
-- **Implicit generic multi-type calls** — calling a generic function like `identity(42)` then `identity("hello")` now works without explicit `[T]` type arguments
-- **Comptime const type inference** — `const SIZE = comptime 4 * 1024` now emits correct C type (`int64_t`) instead of `const void*`
-- **Closure block body** — `|x: int| -> int { return x + 1 }` now compiles correctly
-- **Stdlib name collisions** — `import std.os`, `import std.fs`, `import std.collections` no longer produce C compilation errors from conflicting `extern fn` declarations
-- **Extern string wrapper** — `extern fn getenv(name: string) -> string` now generates a static wrapper that converts between `dm_string` and `const char*`, avoiding C type conflicts with system headers
-- **Monomorphization forward declarations** — nested generic calls (e.g., `apply_double[T]` calling `double[T]`) now emit forward declarations before implementations via writer splicing, preventing implicit function declaration errors in C
-- **fs.dm infinite recursion** — stdlib filesystem wrapper functions renamed to avoid shadowing builtins (e.g., `fs_mkdir` -> `mkdir`, `fs_readdir` -> `readdir`, `fs_remove` -> `remove_file`)
-- **Division/modulo undefined behavior on zero divisor** — all `/` and `%` operations now emit safe helpers (`dm_safe_div`, `dm_safe_mod`, etc.) that runtime-check for zero and panic with clear error message
-- **Arena allocation silent NULL on OOM** — `dm_arena_alloc_aligned()` now panics instead of silently returning NULL when out of memory
-- **Unsupported pattern type silent comment in codegen** — unsupported pattern types in let bindings now return `error.CodegenFailed` instead of silently emitting a comment
+## Stage 1 & Stage 3 (Archived)
 
-## Stage 1 Compiler Architecture
-
-Stage 1 is written in dAImond and compiled by Stage 0. It compiles a subset of dAImond to C11, sufficient to compile itself (bootstrap proof).
-
-### Design Decisions
-- **Modular source, monolithic bootstrap**: Development happens on split module files (`token.dm`, `lexer.dm`, etc.) using the multi-file import system. For Stage 0 bootstrap (which requires a single file), `gen_bootstrap.sh` concatenates all modules into `main.dm`.
-- **Struct-based AST**: Uses integer kind tags instead of enum payloads to work around codegen bugs.
-- **No type checker**: Generates C directly from AST; the C compiler catches type errors.
-- **String-based codegen**: Builds C code via string concatenation.
-- **Subset compiler**: Only supports features used within Stage 1 itself.
-
-### Module Layout
-```
-token.dm           (no imports)        — Token kinds, Token struct, keyword_lookup
-lexer.dm           → token             — Lexer struct, tokenize, character helpers
-compiler.dm        → token             — Compiler struct, parser helpers, type mapping
-compile_expr.dm    → compiler          — Expression compiler chain, lambda, generics
-compile_stmt.dm    → compiler          — Statement compiler, type tracking/inference
-compile_match.dm   → compiler          — Match expressions and statements
-compile_decl.dm    → compiler          — Function/struct/enum/impl declarations, prescan
-runtime.dm         → compiler          — C runtime emission, output assembly
-imports.dm         (no imports)        — Multi-file import resolver
-package.dm         (no imports)        — Package manager (TOML manifest, pkg commands)
-main_split.dm      → all of the above  — Entry point with main()
-```
-
-Cross-module function calls (e.g., compile_stmt calls compile_expr) work because:
-1. The import system concatenates all source before tokenization
-2. `prescan_declarations` registers all function names as forward references
-3. The C compiler sees forward declarations for all functions
-
-### Stage 1 Feature Support
-- **Core**: structs, simple enums, List[T], Box[T], if/else/while/for/loop/break/continue, functions, string ops, file I/O, method calls (.push/.len/.pop), struct literals, type inference, forward references
-- **Enum payloads**: `enum Shape { Circle(float), Rect(float, float), Point }` with constructor syntax `Shape.Circle(5.0)` and `Shape.Point`
-- **Option[T]**: `Option[int]` with `Some(val)` / `None` constructors (type annotation required on let bindings)
-- **Result[T, E]**: `Result[int, string]` with `Ok(val)` / `Err(msg)` constructors (type annotation required on let bindings)
-- **Match expressions**: `match expr { Pattern => body }` with enum variant patterns, payload binding, wildcard `_`, literal patterns, and bare `Ok(v)`/`Err(e)`/`Some(v)`/`None` patterns. Works as both statement and expression.
-- **Multi-file imports**: `import module_name` resolves to `module_name.dm` in same directory. `import std.helpers` resolves to `std/helpers.dm`. Transitive imports supported with deduplication (diamond imports handled). Source concatenated before tokenization.
-- **Lambda expressions**: `|x: int| x * 2` for expression body, `|a: int, b: int| { ... }` for block body. Lifted to static functions at file scope. Function pointer types generated automatically for variable declarations.
-- **Generic monomorphization**: `fn max[T](a: T, b: T) -> T { ... }` with explicit (`max[int](3, 7)`) or implicit (`max(3, 7)`) type arguments. Generates specialized copies at call sites with deduplication.
-- **Pipeline operator**: `x |> f` desugars to `f(x)`, `x |> f(y)` desugars to `f(x, y)`. Supports chaining: `x |> f |> g`.
-- **Error propagation**: `expr?` on `Result[T, E]` unwraps `Ok` or early-returns `Err`. On `Option[T]` unwraps `Some` or early-returns `None`.
-- **Box[T]**: `Box_new(value)` heap-allocates, `Box_null()` returns NULL. Type `Box[T]` maps to `T*` in C.
-- **Compound assignment**: `+=`, `-=`, `*=`, `/=` operators
-- **Modulo**: `%` operator
-- **All builtins**: `print`, `println`, `eprint`, `eprintln`, `panic`, `exit`, `len`, `char_at`, `substr`, `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_replace`, `string_trim`, `string_to_upper`, `string_to_lower`, `file_read`, `file_write`, `args_get`, `args_len`, `system`, `Box_new`, `Box_null`
-- **CLI flags**: `-o`, `-c`, `--emit-c`, `-v`/`--verbose`, `--version`, `-h`/`--help`, `run`, `compile` commands
-- **Traits**: `trait Name { fn method(self) -> Type }` and `impl TraitName for TypeName { ... }` with static dispatch via mangled C function names (e.g., `dm_TypeName_method`)
-- **Effects**: `with [IO, Console, FileSystem, Process]` annotations on function signatures are enforced — builtins are mapped to required effects (`println`→Console, `file_read`→FileSystem, `exit`→Process, etc.) and callers without the required effect in their `with [...]` clause get a compile error
-- **Regions**: `region name { ... }` blocks generate `dm_arena_create(4096)` / `dm_arena_destroy()` calls with allocation redirection — string concatenation within a region uses `dm_string_concat_arena` to allocate from the arena. Arena struct and functions emitted inline in Stage 1's runtime. Nested regions supported with unique arena names.
-- **Package management**: `pkg init` (create daimond.toml), `pkg add <name>` (add dependency), `pkg list` (list dependencies). TOML manifest parsing with version/path/git dependency support.
-- **CLI commands**: `lex`, `parse`, `check`, `fmt`, `test`, `compile`, `run`, `pkg init/add/list`, `clean` — full command parity with Stage 0
-- **Not yet supported in Stage 1**: dynamic dispatch (`dyn Trait`)
-
-### Building Stage 1
-```bash
-# Stage 0 compiles Stage 1 (from monolithic main.dm)
-cd stage0 && ./zig-out/bin/daimond compile ../stage1/main.dm -o stage1_compiler
-
-# Stage 1 compiles a test program
-./stage1_compiler test_program.dm
-
-# Run the result
-./test_program
-
-# Stage 1 self-compiles from split modules
-./stage1_compiler ../stage1/main_split.dm
-
-# Regenerate monolithic main.dm from modules
-cd stage1 && bash gen_bootstrap.sh
-```
-
-### Bootstrap Chain
-```
-Stage 0 compiles main.dm (monolithic) → stage1_compiler
-stage1_compiler compiles main_split.dm (with imports) → stage1_v2
-stage1_v2 compiles main_split.dm → stage1_v3
-diff stage1_v2.c stage1_v3.c → fixed point ✓
-```
+Stage 1 (dAImond → C self-hosting) and Stage 3 (LLVM backend in Zig) are complete and frozen. Stage 1 achieved bootstrap fixed-point. Stage 3 achieved 254/254 test parity. Both are superseded by Stage 4. See `docs/stage-history.md` for detailed architecture, module layout, feature lists, and build commands.
 
 ## Stage 4 Compiler Architecture
 
