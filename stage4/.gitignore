@@ -1,0 +1,5 @@
+# Compiled test binaries
+test_*
+*.o
+*.out
+*.ll

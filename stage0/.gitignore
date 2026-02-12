@@ -10,9 +10,17 @@ zig-out/
 # Compiled binaries and objects
 *.o
 *.out
+*.ll
 main
 hello
 test
 test_*
+arithmetic
+bare_self
+closure_block
+comptime_const
+comptime_str
+implicit_generics
+snake
 stage1_compiler
 /tmp/

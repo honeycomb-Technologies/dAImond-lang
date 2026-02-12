@@ -1,0 +1,5 @@
+# Generated intermediate and binary files
+*.ll
+*.c
+*.o
+*.out

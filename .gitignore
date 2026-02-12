@@ -1,9 +1,20 @@
-# Compiled binaries
+# Compiled binaries and objects
 *.o
 *.out
 
-# Generated C files at root
+# Generated intermediate files
+*.ll
 /main.c
+
+# Test binaries (ELF executables left by manual test runs)
+/arithmetic
+/bare_self
+/closure_block
+/comptime_const
+/comptime_str
+/implicit_generics
+/t_*
+/test_*
 
 # Compilation cache
 .daimond-cache/

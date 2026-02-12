@@ -1,6 +1,9 @@
 # Generated C files from test compilation
 *.c
 
+# Generated LLVM IR files
+*.ll
+
 # Compiled test binaries
 *.o
 *.out
