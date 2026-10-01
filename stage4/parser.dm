@@ -378,6 +378,13 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_NOT(), operand.expr, tok.line, tok.col) }
     }
 
+    -- Dereference *expr (Box[T] -> T)
+    if tok.kind == TK_STAR() {
+        pp = p_advance(pp)
+        let operand = parse_expr_pratt(pp, 8)
+        return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_DEREF(), operand.expr, tok.line, tok.col) }
+    }
+
     -- Parenthesized expression
     if tok.kind == TK_LPAREN() {
         pp = p_advance(pp)
@@ -506,11 +513,20 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                 pp = p_skip_newlines(pp)
                 let fname = p_cur(pp).value
                 pp = p_advance(pp)
-                pp = p_expect(pp, TK_COLON())
-                let fval = parse_expr(pp)
-                pp = fval.p
-                field_names.push(fname)
-                field_values.push(fval.expr)
+                -- Support shorthand: Point { x, y } means Point { x: x, y: y }
+                if p_peek(pp) == TK_COLON() {
+                    pp = p_advance(pp)
+                    let fval = parse_expr(pp)
+                    pp = fval.p
+                    field_names.push(fname)
+                    field_values.push(fval.expr)
+                } else {
+                    -- Shorthand: field name = identifier with same name
+                    field_names.push(fname)
+                    let mut shorthand_expr = expr_new(EXPR_IDENTIFIER(), p_cur(pp).line, p_cur(pp).col)
+                    shorthand_expr.name = fname
+                    field_values.push(shorthand_expr)
+                }
                 pp = p_skip_newlines(pp)
                 if p_peek(pp) == TK_COMMA() {
                     pp = p_advance(pp)

@@ -7317,6 +7317,13 @@ pub const CodeGenerator = struct {
                 try self.writer.write(")");
             }
             return true;
+        } else if (std.mem.eql(u8, name, "thread_spawn")) {
+            if (call.args.len > 0) {
+                try self.writer.write("dm_thread_spawn_fn(");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(")");
+            }
+            return true;
         } else if (std.mem.eql(u8, name, "thread_join")) {
             if (call.args.len > 0) {
                 try self.writer.write("dm_thread_join_id(");

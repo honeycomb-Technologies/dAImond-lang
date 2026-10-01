@@ -178,11 +178,7 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     if type_name == "ptr" { return dm_llvm_pointer_type(ctx) }
     -- Pointer types: ptr(...)
     if starts_with(type_name, "ptr(") { return dm_llvm_pointer_type(ctx) }
-    -- List and Map types: opaque pointers to runtime structs
-    if starts_with(type_name, "list") { return dm_llvm_pointer_type(ctx) }
-    if starts_with(type_name, "map") { return dm_llvm_pointer_type(ctx) }
-    if type_name == "list" { return dm_llvm_pointer_type(ctx) }
-    if type_name == "map" { return dm_llvm_pointer_type(ctx) }
+    -- List and Map types (found via struct_type_map registered in register_builtin_struct_types)
     -- SIMD vector types
     if lg_is_simd_type(type_name) {
         return get_simd_llvm_type(gen, type_name)
@@ -190,6 +186,14 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     -- Struct types: look up in struct_type_map
     if gen.struct_type_map.contains(type_name) {
         return gen.struct_type_map.get(type_name)
+    }
+    -- Strip generic parameters: "Option[int]" -> "Option"
+    let bracket_pos = string_find(type_name, "[")
+    if bracket_pos >= 0 {
+        let base_name = substr(type_name, 0, bracket_pos)
+        if gen.struct_type_map.contains(base_name) {
+            return gen.struct_type_map.get(base_name)
+        }
     }
     -- Struct names prefixed with "struct "
     if starts_with(type_name, "struct ") {
@@ -205,6 +209,64 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
 -- ============================================================
 -- STRUCT TYPE DECLARATION
 -- ============================================================
+
+fn register_builtin_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
+    let mut g = gen
+    let ctx = g.context
+
+    -- Register Result type: { i64 tag, i64 ok_val, i64 err_val }
+    -- All fields are i64 for uniform insertvalue/extractvalue (avoids i32/i64 mismatch)
+    if g.struct_type_map.contains("result") == false {
+        let result_struct = dm_llvm_struct_create_named(ctx, "result")
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_struct_set_body_buf(result_struct, 0)
+        g.struct_type_map.insert("result", result_struct)
+        g.struct_type_map.insert("Result", result_struct)
+    }
+
+    -- Register Option type: { i64 has_value, i64 value }
+    if g.struct_type_map.contains("option") == false {
+        let option_struct = dm_llvm_struct_create_named(ctx, "option")
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_struct_set_body_buf(option_struct, 0)
+        g.struct_type_map.insert("option", option_struct)
+        g.struct_type_map.insert("Option", option_struct)
+    }
+
+    -- Register list and map runtime struct types: { ptr, i64, i64 }
+    -- All list types share one LLVM named struct, same for all map types.
+    -- This avoids type mismatches when list values move between contexts.
+    let list_struct = dm_llvm_struct_create_named(ctx, "dm_list")
+    dm_llvm_buf_clear()
+    dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_struct_set_body_buf(list_struct, 0)
+    g.struct_type_map.insert("dm_list", list_struct)
+    g.struct_type_map.insert("dm_list_int64", list_struct)
+    g.struct_type_map.insert("dm_list_double", list_struct)
+    g.struct_type_map.insert("dm_list_dm_string", list_struct)
+    g.struct_type_map.insert("dm_list_generic", list_struct)
+    g.struct_type_map.insert("list", list_struct)
+
+    let map_struct = dm_llvm_struct_create_named(ctx, "dm_map")
+    dm_llvm_buf_clear()
+    dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_struct_set_body_buf(map_struct, 0)
+    g.struct_type_map.insert("dm_map", map_struct)
+    g.struct_type_map.insert("dm_map_string_int", map_struct)
+    g.struct_type_map.insert("dm_map_int_string", map_struct)
+    g.struct_type_map.insert("map", map_struct)
+
+    return g
+}
 
 fn declare_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
     let mut g = gen
@@ -465,8 +527,8 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
         return dm_llvm_const_real(dm_llvm_double_type(ctx), val.float_val)
     }
     if val.kind == VAL_CONST_BOOL() {
-        let bval = 0
-        if val.bool_val { let bval = 1 }
+        let mut bval = 0
+        if val.bool_val { bval = 1 }
         return dm_llvm_const_int(dm_llvm_int1_type(ctx), bval, 0)
     }
     if val.kind == VAL_CONST_STRING() {
@@ -750,6 +812,13 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, ptr_val) }
             return g
         }
+        -- List/Map loads return the pointer itself (runtime funcs always take pointers)
+        if starts_with(inst.load_type, "dm_list") or starts_with(inst.load_type, "dm_map") or inst.load_type == "list" or inst.load_type == "map" {
+            let ptr_val = resolve_value(g, inst.load_ptr)
+            g = resolve_value_with_counter(g, inst.load_ptr)
+            if inst.has_result { g.value_map.insert(id_key, ptr_val) }
+            return g
+        }
         let load_ty = map_ir_type_to_llvm(g, inst.load_type)
         let ptr_val = resolve_value(g, inst.load_ptr)
         g = resolve_value_with_counter(g, inst.load_ptr)
@@ -797,10 +866,27 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let result = dm_llvm_build_extract_value(b, base, inst.field_index, "field")
         -- If extracted field is dm_string, store to alloca and track
         if inst.field_type == "string" {
+            if inst.result_type == "i64" {
+                -- Result/Option case: string was stored via ptrtoint, extractvalue returns i64
+                -- Convert i64 back to ptr (the original dm_string pointer)
+                let ptr_val = dm_llvm_build_int_to_ptr(b, result, dm_llvm_pointer_type(g.context), "i2p.str")
+                g.string_ptrs.insert(id_key, true)
+                if inst.has_result { g.value_map.insert(id_key, ptr_val) }
+                return g
+            }
+            -- Normal struct: extractvalue returns dm_string struct, store to alloca
             let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.extract")
             dm_llvm_build_store(b, result, str_alloca)
             g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, str_alloca) }
+            return g
+        }
+        -- If extracted field is a list/map, store to alloca (runtime funcs need pointers)
+        if starts_with(inst.field_type, "dm_list") or starts_with(inst.field_type, "dm_map") or inst.field_type == "list" or inst.field_type == "map" {
+            let lm_ty = map_ir_type_to_llvm(g, inst.field_type)
+            let lm_alloca = dm_llvm_build_alloca(b, lm_ty, "lm.extract")
+            dm_llvm_build_store(b, result, lm_alloca)
+            if inst.has_result { g.value_map.insert(id_key, lm_alloca) }
             return g
         }
         if inst.has_result { g.value_map.insert(id_key, result) }
@@ -820,8 +906,18 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let mut val = resolve_value(g, inst.field_value)
         g = resolve_value_with_counter(g, inst.field_value)
         -- If inserting a string value (pointer to dm_string), load the actual struct
+        -- But for result/option types, convert pointer to i64 instead
         if is_string_ptr(g, inst.field_value) {
-            val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
+            if inst.result_type == "result" or inst.result_type == "option" {
+                val = dm_llvm_build_ptr_to_int(b, val, dm_llvm_int64_type(g.context), "ptr2int")
+            } else {
+                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
+            }
+        }
+        -- If inserting a list/map value, load the struct from the alloca pointer
+        if starts_with(inst.field_type, "dm_list") or starts_with(inst.field_type, "dm_map") or inst.field_type == "list" or inst.field_type == "map" {
+            let lm_ty = map_ir_type_to_llvm(g, inst.field_type)
+            val = dm_llvm_build_load2(b, lm_ty, val, "lm.load")
         }
         let result = dm_llvm_build_insert_value(b, base_val, val, inst.field_index, "insert")
         if inst.has_result { g.value_map.insert(id_key, result) }
@@ -1059,14 +1155,18 @@ fn create_dm_string(gen: LLVMGenerator, raw_str: int) -> int {
 fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let mut g = gen
     let id_key = int_to_string(inst.id)
-    -- Call dm_list_new() runtime function
-    if g.function_map.contains("dm_list_new") {
-        let func = g.function_map.get("dm_list_new")
-        let fn_ty = g.fn_type_map.get("dm_list_new")
+    -- Allocate an int64 list on stack and initialize
+    let list_ty = map_ir_type_to_llvm(g, "dm_list_int64")
+    let alloca_val = dm_llvm_build_alloca(g.builder, list_ty, "list")
+    let fn_name = "dm_list_int64_new"
+    if g.function_map.contains(fn_name) {
+        let func = g.function_map.get(fn_name)
+        let fn_ty = g.fn_type_map.get(fn_name)
         dm_llvm_buf_clear()
-        let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "list")
-        if inst.has_result { g.value_map.insert(id_key, result) }
+        dm_llvm_buf_push(alloca_val)
+        dm_llvm_build_call2_buf(g.builder, fn_ty, func, "")
     }
+    if inst.has_result { g.value_map.insert(id_key, alloca_val) }
     return g
 }
 
@@ -1077,8 +1177,7 @@ fn generate_list_push(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let elem_val = resolve_value(g, inst.rhs)
     g = resolve_value_with_counter(g, inst.lhs)
     g = resolve_value_with_counter(g, inst.rhs)
-    -- Call dm_list_push_int64/dm_list_push_string etc. based on element type
-    let fn_name = "dm_list_push_int64"
+    let fn_name = "dm_list_int64_push"
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -1098,7 +1197,71 @@ fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let idx_val = resolve_value(g, inst.rhs)
     g = resolve_value_with_counter(g, inst.lhs)
     g = resolve_value_with_counter(g, inst.rhs)
-    let fn_name = "dm_list_get_int64"
+
+    let rtype = inst.result_type
+
+    -- String elements: call dm_list_string_get (wrapper uses sret)
+    if rtype == "string" {
+        let fn_name = "dm_list_string_get"
+        if g.function_map.contains(fn_name) {
+            let func = g.function_map.get(fn_name)
+            let fn_ty = g.fn_type_map.get(fn_name)
+            -- Allocate sret buffer for the returned dm_string
+            let sret_name = "sret." + int_to_string(g.sret_counter)
+            g.sret_counter = g.sret_counter + 1
+            let sret = dm_llvm_build_alloca(b, g.dm_string_type, sret_name)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(sret)
+            dm_llvm_buf_push(list_val)
+            dm_llvm_buf_push(idx_val)
+            dm_llvm_build_call2_buf(b, fn_ty, func, "")
+            g.string_ptrs.insert(id_key, true)
+            if inst.has_result { g.value_map.insert(id_key, sret) }
+        }
+        return g
+    }
+
+    -- Float elements: call dm_list_double_get
+    if rtype == "f64" {
+        let fn_name = "dm_list_double_get"
+        if g.function_map.contains(fn_name) {
+            let func = g.function_map.get(fn_name)
+            let fn_ty = g.fn_type_map.get(fn_name)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(list_val)
+            dm_llvm_buf_push(idx_val)
+            let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
+            if inst.has_result { g.value_map.insert(id_key, result) }
+        }
+        return g
+    }
+
+    -- Struct elements: call dm_list_generic_get with buffer
+    if g.struct_type_map.contains(rtype) {
+        let fn_name = "dm_list_generic_get"
+        if g.function_map.contains(fn_name) {
+            let struct_ty = g.struct_type_map.get(rtype)
+            -- Allocate buffer for the struct
+            let buf_alloca = dm_llvm_build_alloca(b, struct_ty, "listbuf")
+            -- Get sizeof the struct type
+            let size_val = dm_llvm_sizeof_type(struct_ty)
+            let func = g.function_map.get(fn_name)
+            let fn_ty = g.fn_type_map.get(fn_name)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(list_val)
+            dm_llvm_buf_push(buf_alloca)
+            dm_llvm_buf_push(idx_val)
+            dm_llvm_buf_push(size_val)
+            dm_llvm_build_call2_buf(b, fn_ty, func, "")
+            -- Load the struct from the buffer
+            let result = dm_llvm_build_load2(b, struct_ty, buf_alloca, "listget")
+            if inst.has_result { g.value_map.insert(id_key, result) }
+        }
+        return g
+    }
+
+    -- Default: int elements, call dm_list_int64_get
+    let fn_name = "dm_list_int64_get"
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -1328,6 +1491,8 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = get_dm_string_type(g)
     -- Phase 1: Declare struct types
     g = declare_struct_types(g)
+    -- Phase 1.5: Register built-in Result/Option struct types
+    g = register_builtin_struct_types(g)
     -- Phase 2: Generate global variables
     g = generate_globals(g)
     -- Phase 3: Declare all functions

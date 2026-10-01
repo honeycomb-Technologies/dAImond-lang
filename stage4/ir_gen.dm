@@ -98,10 +98,14 @@ struct IRGenerator {
     trait_impl_methods: Map[string, string],
     -- User extern function names
     user_extern_fns: Map[string, bool],
+    -- Function name -> return type (IR type string)
+    fn_return_types: Map[string, string],
     -- "StructName.field" -> list elem kind
     field_list_elem_kinds: Map[string, int],
     -- "StructName.field" -> list elem type name
     field_list_elem_types: Map[string, string],
+    -- "StructName.field" -> map kind
+    field_map_kinds: Map[string, int],
     -- Label counter for unique block names
     label_counter: int,
     -- Lambda counter
@@ -119,7 +123,9 @@ struct IRGenerator {
     -- Source declarations for comptime resolution
     declarations: List[Declaration],
     -- Completed blocks that need to be added to the function
-    completed_blocks: List[IRBasicBlock]
+    completed_blocks: List[IRBasicBlock],
+    -- Variable name -> full type annotation (e.g., "Result[int, string]")
+    var_type_annotations: Map[string, string]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -147,8 +153,10 @@ fn ir_generator_new() -> IRGenerator {
         dyn_var_traits: Map_new(),
         trait_impl_methods: Map_new(),
         user_extern_fns: Map_new(),
+        fn_return_types: Map_new(),
         field_list_elem_kinds: Map_new(),
         field_list_elem_types: Map_new(),
+        field_map_kinds: Map_new(),
         label_counter: 0,
         lambda_counter: 0,
         break_target: "",
@@ -159,7 +167,8 @@ fn ir_generator_new() -> IRGenerator {
         current_impl_type: "",
         has_impl_type: false,
         declarations: [],
-        completed_blocks: []
+        completed_blocks: [],
+        var_type_annotations: Map_new()
     }
 }
 
@@ -217,6 +226,9 @@ fn map_type_name(name: string) -> string {
     if name == "i32x8" { return "i32x8" }
     if name == "i64x2" { return "i64x2" }
     if name == "i64x4" { return "i64x4" }
+    -- Composite types: Result[T, E] and Option[T]
+    if starts_with(name, "Result[") { return "result" }
+    if starts_with(name, "Option[") { return "option" }
     -- Default: return as-is (struct name, enum name, etc.)
     return name
 }
@@ -458,9 +470,29 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                 -- Store generic function for later monomorphization
                 g.generic_fn_decls.insert(fd.name, i)
             }
+            -- Track return type for all functions
+            let ret = if len(fd.return_type) > 0 {
+                parse_type_to_ir(fd.return_type)
+            } else {
+                "void"
+            }
+            g.fn_return_types.insert(fd.name, ret)
         } else if decl.kind == DECL_IMPL() {
             let ib = *decl.impl_block
             g = register_impl_methods(g, ib)
+            -- Track return types for impl methods
+            let mut mi = 0
+            while mi < ib.methods.len() {
+                let method = ib.methods[mi]
+                let method_name = ib.target_type + "_" + method.name
+                let mret = if len(method.return_type) > 0 {
+                    parse_type_to_ir(method.return_type)
+                } else {
+                    "void"
+                }
+                g.fn_return_types.insert(method_name, mret)
+                mi = mi + 1
+            }
         }
         i = i + 1
     }

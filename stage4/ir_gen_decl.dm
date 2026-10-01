@@ -20,11 +20,29 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
         let f = sd.fields[i]
         let fname = f.name
         let ftype = f.type_name
-        let ir_type_name = map_type_name(ftype)
+        let mut ir_type_name = parse_type_to_ir(ftype)
 
+        -- For List/Map fields, use concrete runtime struct type names
+        -- so LLVM struct layout matches C struct layout (embedded by value)
+        if starts_with(ftype, "List[") {
+            let inner = extract_inner_type(ftype, "List[")
+            let ek = classify_list_elem(inner)
+            if ek == LIST_ELEM_INT() { ir_type_name = "dm_list_int64" }
+            else if ek == LIST_ELEM_FLOAT() { ir_type_name = "dm_list_double" }
+            else if ek == LIST_ELEM_STRING() { ir_type_name = "dm_list_dm_string" }
+            else { ir_type_name = "dm_list_generic" }
+        }
+        if starts_with(ftype, "Map[") {
+            let minner = extract_inner_type(ftype, "Map[")
+            if starts_with(minner, "string") { ir_type_name = "dm_map_string_int" }
+            else { ir_type_name = "dm_map_int_string" }
+        }
+
+        -- Store original type for tracking (Box[T], List[T], etc.)
         info.field_names.push(fname)
-        info.field_types.push(ir_type_name)
+        info.field_types.push(ftype)
 
+        -- Use IR-mapped type for LLVM generation
         let field = ir_field_new(fname, ir_type_name)
         ir_fields.push(field)
 
@@ -37,6 +55,18 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
             if elem_kind == LIST_ELEM_OTHER() {
                 g.field_list_elem_types.insert(field_key, inner)
             }
+        }
+
+        -- Detect Map[K,V] fields for field access dispatch
+        if starts_with(ftype, "Map[") {
+            let inner = extract_inner_type(ftype, "Map[")
+            let map_kind = if starts_with(inner, "string") {
+                MAP_KIND_STRING_INT()
+            } else {
+                MAP_KIND_INT_STRING()
+            }
+            let field_key = sd.name + "." + fname
+            g.field_map_kinds.insert(field_key, map_kind)
         }
 
         i = i + 1
@@ -358,7 +388,7 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     let mut g = gen
 
     let ret_type = if len(fd.return_type) > 0 {
-        map_type_name(fd.return_type)
+        parse_type_to_ir(fd.return_type)
     } else {
         "void"
     }
@@ -372,8 +402,12 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        let ptype_str = p.type_name
-        let ptype = map_type_name(ptype_str)
+        let mut ptype_str = p.type_name
+        -- Resolve bare "self" parameter type from the current impl block
+        if pname == "self" and (len(ptype_str) == 0 or ptype_str == "self" or ptype_str == "Self") and g.has_impl_type {
+            ptype_str = g.current_impl_type
+        }
+        let ptype = parse_type_to_ir(ptype_str)
 
         let actual_type = if p.is_mut {
             "ptr"
@@ -435,7 +469,7 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
 
     -- Set current return type
     let ret_type = if len(fd.return_type) > 0 {
-        map_type_name(fd.return_type)
+        parse_type_to_ir(fd.return_type)
     } else {
         "void"
     }
@@ -456,8 +490,12 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        let ptype_str = p.type_name
-        let ptype = map_type_name(ptype_str)
+        let mut ptype_str = p.type_name
+        -- Resolve bare "self" parameter type from the current impl block
+        if pname == "self" and (len(ptype_str) == 0 or ptype_str == "self" or ptype_str == "Self") and g.has_impl_type {
+            ptype_str = g.current_impl_type
+        }
+        let ptype = parse_type_to_ir(ptype_str)
 
         if p.is_mut {
             -- Mut param: alloca + store from param ref (pointer semantics)
@@ -517,6 +555,10 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         if starts_with(ptype_str, "Box[") {
             let inner = extract_inner_type(ptype_str, "Box[")
             g.box_inner_types.insert(pname, inner)
+        }
+        -- Track Map/List/Result/Option type annotations for parameters
+        if starts_with(ptype_str, "Map[") or starts_with(ptype_str, "List[") or starts_with(ptype_str, "Result[") or starts_with(ptype_str, "Option[") {
+            g.var_type_annotations.insert(pname, ptype_str)
         }
 
         i = i + 1

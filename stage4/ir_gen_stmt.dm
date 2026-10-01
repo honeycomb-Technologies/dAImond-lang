@@ -32,6 +32,35 @@ fn expr_result(g: IRGenerator, b: IRBasicBlock, v: int) -> ExprResult {
     return ExprResult { gen: g, block: b, val_id: v }
 }
 
+-- Resolve the original (source-level) type of a field access expression
+fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
+    let obj = *expr.object
+    let field = expr.field
+    let mut sname = ""
+    if obj.kind == EXPR_IDENTIFIER() {
+        if gen.var_struct_types.contains(obj.name) {
+            sname = gen.var_struct_types.get(obj.name)
+        }
+    }
+    if sname == "" {
+        let obj_type = infer_expr_type(gen, obj)
+        if gen.struct_defs.contains(obj_type) {
+            sname = obj_type
+        }
+    }
+    if sname != "" and gen.struct_defs.contains(sname) {
+        let sinfo = gen.struct_defs.get(sname)
+        let mut fi = 0
+        while fi < sinfo.field_names.len() {
+            if sinfo.field_names[fi] == field {
+                return sinfo.field_types[fi]
+            }
+            fi = fi + 1
+        }
+    }
+    return ""
+}
+
 -- ============================================================
 -- STATEMENT GENERATION
 -- ============================================================
@@ -286,11 +315,16 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         return gen_result(g, b)
     }
 
-    -- Regular let binding
-    let ir_type = if len(type_str) > 0 {
-        map_type_name(type_str)
+    -- Regular let binding: determine IR type
+    let mut ir_type = "i64"
+    if len(type_str) > 0 {
+        ir_type = map_type_name(type_str)
     } else {
-        "i64"
+        -- Infer type from the value expression
+        let val_expr_for_type = *stmt.let_value
+        if val_expr_for_type.kind != EXPR_LITERAL_NULL() {
+            ir_type = infer_expr_type(g, val_expr_for_type)
+        }
     }
 
     let alloca_id = g.builder.next_id
@@ -328,6 +362,132 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             if g.var_enum_types.contains(val_expr.name) {
                 g.var_enum_types.insert(var_name, g.var_enum_types.get(val_expr.name))
             }
+            if g.box_inner_types.contains(val_expr.name) {
+                g.box_inner_types.insert(var_name, g.box_inner_types.get(val_expr.name))
+            }
+        }
+        -- Track struct/enum type from function/method call return type
+        if val_expr.kind == EXPR_FUNCTION_CALL() or val_expr.kind == EXPR_METHOD_CALL() {
+            let inferred = infer_expr_type(g, val_expr)
+            if g.struct_defs.contains(inferred) {
+                g.var_struct_types.insert(var_name, inferred)
+            }
+            if g.enum_defs.contains(inferred) {
+                g.var_enum_types.insert(var_name, inferred)
+            }
+        }
+        -- Track Map/List type from method calls like .keys(), .values()
+        if val_expr.kind == EXPR_METHOD_CALL() {
+            let mc_method = val_expr.method
+            let mc_obj = *val_expr.object
+            -- Map.keys() returns List[K], Map.values() returns List[V]
+            if mc_method == "keys" or mc_method == "values" {
+                let mut mc_map_type = ""
+                if mc_obj.kind == EXPR_IDENTIFIER() and g.var_type_annotations.contains(mc_obj.name) {
+                    mc_map_type = g.var_type_annotations.get(mc_obj.name)
+                }
+                if mc_obj.kind == EXPR_FIELD_ACCESS() {
+                    let mc_fa_type = resolve_field_original_type(g, mc_obj)
+                    if starts_with(mc_fa_type, "Map[") {
+                        mc_map_type = mc_fa_type
+                    }
+                }
+                if starts_with(mc_map_type, "Map[") {
+                    let mc_inner = extract_inner_type(mc_map_type, "Map[")
+                    let mc_comma = string_find(mc_inner, ",")
+                    if mc_comma >= 0 {
+                        if mc_method == "keys" {
+                            let key_t = string_trim(substr(mc_inner, 0, mc_comma))
+                            let key_kind = classify_list_elem(key_t)
+                            g.list_elem_kinds.insert(var_name, key_kind)
+                            if key_kind == LIST_ELEM_OTHER() {
+                                g.list_elem_types.insert(var_name, key_t)
+                            }
+                        } else {
+                            let val_t = string_trim(substr(mc_inner, mc_comma + 1, len(mc_inner) - mc_comma - 1))
+                            let val_kind = classify_list_elem(val_t)
+                            g.list_elem_kinds.insert(var_name, val_kind)
+                            if val_kind == LIST_ELEM_OTHER() {
+                                g.list_elem_types.insert(var_name, val_t)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        -- Track struct/list/enum type from field access
+        if val_expr.kind == EXPR_FIELD_ACCESS() {
+            let fa_obj = *val_expr.object
+            let fa_field = val_expr.field
+            let mut fa_sname = ""
+            if fa_obj.kind == EXPR_IDENTIFIER() {
+                if g.var_struct_types.contains(fa_obj.name) {
+                    fa_sname = g.var_struct_types.get(fa_obj.name)
+                }
+            }
+            -- Handle compound objects (deref, nested field access, etc.)
+            if fa_sname == "" {
+                let fa_obj_type = infer_expr_type(g, fa_obj)
+                if g.struct_defs.contains(fa_obj_type) {
+                    fa_sname = fa_obj_type
+                }
+            }
+            if fa_sname != "" {
+                let flek = fa_sname + "." + fa_field
+                -- Propagate list elem kinds/types from struct field
+                if g.field_list_elem_kinds.contains(flek) {
+                    g.list_elem_kinds.insert(var_name, g.field_list_elem_kinds.get(flek))
+                }
+                if g.field_list_elem_types.contains(flek) {
+                    g.list_elem_types.insert(var_name, g.field_list_elem_types.get(flek))
+                }
+                -- Propagate struct/enum/box/map type from field
+                if g.struct_defs.contains(fa_sname) {
+                    let fa_sinfo = g.struct_defs.get(fa_sname)
+                    let mut fai = 0
+                    while fai < fa_sinfo.field_names.len() {
+                        if fa_sinfo.field_names[fai] == fa_field {
+                            let fa_ftype = fa_sinfo.field_types[fai]
+                            if g.struct_defs.contains(fa_ftype) {
+                                g.var_struct_types.insert(var_name, fa_ftype)
+                            }
+                            if g.enum_defs.contains(fa_ftype) {
+                                g.var_enum_types.insert(var_name, fa_ftype)
+                            }
+                            if starts_with(fa_ftype, "Box[") {
+                                let fa_inner = extract_inner_type(fa_ftype, "Box[")
+                                g.box_inner_types.insert(var_name, fa_inner)
+                            }
+                            -- Propagate Map/List type annotations from field
+                            if starts_with(fa_ftype, "Map[") or starts_with(fa_ftype, "List[") {
+                                g.var_type_annotations.insert(var_name, fa_ftype)
+                            }
+                        }
+                        fai = fai + 1
+                    }
+                }
+            }
+        }
+        -- Track struct type from index access into struct-typed lists
+        if val_expr.kind == EXPR_INDEX_ACCESS() {
+            let ia_obj = *val_expr.object
+            if ia_obj.kind == EXPR_IDENTIFIER() {
+                if g.list_elem_types.contains(ia_obj.name) {
+                    let elem_type = g.list_elem_types.get(ia_obj.name)
+                    if g.struct_defs.contains(elem_type) {
+                        g.var_struct_types.insert(var_name, elem_type)
+                    }
+                    if g.enum_defs.contains(elem_type) {
+                        g.var_enum_types.insert(var_name, elem_type)
+                    }
+                }
+            }
+        }
+        -- Track struct type from deref or other complex expressions via ir_type
+        if g.struct_defs.contains(ir_type) {
+            if g.var_struct_types.contains(var_name) == false {
+                g.var_struct_types.insert(var_name, ir_type)
+            }
         }
         if val_expr.kind == EXPR_LAMBDA() {
             g.fn_ptr_vars.insert(var_name, val_expr.str_val)
@@ -336,11 +496,21 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
 
     -- Track struct/enum type from type annotation
     if len(type_str) > 0 {
-        if g.struct_defs.contains(type_str) {
-            g.var_struct_types.insert(var_name, type_str)
+        let mut ann_type = type_str
+        -- Strip generic params for struct/enum lookup: "Option[int]" -> "Option"
+        let ann_bracket = string_find(type_str, "[")
+        if ann_bracket >= 0 {
+            ann_type = substr(type_str, 0, ann_bracket)
         }
-        if g.enum_defs.contains(type_str) {
-            g.var_enum_types.insert(var_name, type_str)
+        if g.struct_defs.contains(ann_type) {
+            g.var_struct_types.insert(var_name, ann_type)
+        }
+        if g.enum_defs.contains(ann_type) {
+            g.var_enum_types.insert(var_name, ann_type)
+        }
+        -- Track full type annotation for Result/Option/Map/List types
+        if starts_with(type_str, "Result[") or starts_with(type_str, "Option[") or starts_with(type_str, "Map[") or starts_with(type_str, "List[") {
+            g.var_type_annotations.insert(var_name, type_str)
         }
     }
 
@@ -537,11 +707,76 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     b = iter_result.block
     let list_ptr = iter_result.val_id
 
-    -- Determine list kind from iterator name or default
-    let list_kind = if iter_expr.kind == EXPR_IDENTIFIER() and g.list_elem_kinds.contains(iter_expr.name) {
-        g.list_elem_kinds.get(iter_expr.name)
-    } else {
-        LIST_ELEM_INT()
+    -- Determine list kind from iterator expression
+    let mut list_kind = LIST_ELEM_INT()
+    let mut list_elem_type_name = ""
+    if iter_expr.kind == EXPR_IDENTIFIER() and g.list_elem_kinds.contains(iter_expr.name) {
+        list_kind = g.list_elem_kinds.get(iter_expr.name)
+        if list_kind == LIST_ELEM_OTHER() and g.list_elem_types.contains(iter_expr.name) {
+            list_elem_type_name = g.list_elem_types.get(iter_expr.name)
+        }
+    } else if iter_expr.kind == EXPR_FIELD_ACCESS() {
+        -- Handle field access iterator: obj.field
+        let fa_obj = *iter_expr.object
+        let mut fa_sname = ""
+        if fa_obj.kind == EXPR_IDENTIFIER() {
+            if g.var_struct_types.contains(fa_obj.name) {
+                fa_sname = g.var_struct_types.get(fa_obj.name)
+            }
+        }
+        if fa_sname == "" {
+            let fa_obj_type = infer_expr_type(g, fa_obj)
+            if g.struct_defs.contains(fa_obj_type) {
+                fa_sname = fa_obj_type
+            }
+        }
+        if fa_sname != "" {
+            let flek = fa_sname + "." + iter_expr.field
+            if g.field_list_elem_kinds.contains(flek) {
+                list_kind = g.field_list_elem_kinds.get(flek)
+                if list_kind == LIST_ELEM_OTHER() and g.field_list_elem_types.contains(flek) {
+                    list_elem_type_name = g.field_list_elem_types.get(flek)
+                }
+            }
+        }
+    } else if iter_expr.kind == EXPR_METHOD_CALL() {
+        -- Handle method call iterator: map.keys(), map.values(), list_returning_method()
+        let mc_obj = *iter_expr.object
+        let mc_method = iter_expr.method
+        -- Check if this is a .keys() or .values() call on a Map
+        if mc_method == "keys" or mc_method == "values" {
+            let mut mk = -1
+            -- Direct map variable: my_map.keys()
+            if mc_obj.kind == EXPR_IDENTIFIER() and g.map_var_kinds.contains(mc_obj.name) {
+                mk = g.map_var_kinds.get(mc_obj.name)
+            }
+            -- Map field access: g.variable_map.keys()
+            if mk == -1 and mc_obj.kind == EXPR_FIELD_ACCESS() {
+                let mc_fa_obj = *mc_obj.object
+                let mc_fa_field = mc_obj.field
+                let mut mc_sname = ""
+                if mc_fa_obj.kind == EXPR_IDENTIFIER() and g.var_struct_types.contains(mc_fa_obj.name) {
+                    mc_sname = g.var_struct_types.get(mc_fa_obj.name)
+                }
+                if len(mc_sname) > 0 {
+                    let mc_key = mc_sname + "." + mc_fa_field
+                    if g.field_map_kinds.contains(mc_key) {
+                        mk = g.field_map_kinds.get(mc_key)
+                    }
+                }
+            }
+            if mk >= 0 {
+                -- MAP_KIND_STRING_INT: keys=string, values=int
+                -- MAP_KIND_INT_STRING: keys=int, values=string
+                if mk == MAP_KIND_STRING_INT() {
+                    if mc_method == "keys" { list_kind = LIST_ELEM_STRING() }
+                    else { list_kind = LIST_ELEM_INT() }
+                } else {
+                    if mc_method == "keys" { list_kind = LIST_ELEM_INT() }
+                    else { list_kind = LIST_ELEM_STRING() }
+                }
+            }
+        }
     }
 
     -- Get list length
@@ -578,10 +813,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.builder.next_id = g.builder.next_id + 1
 
     -- Determine element type
-    let elem_type = if list_kind == LIST_ELEM_INT() { "i64" }
-    else if list_kind == LIST_ELEM_FLOAT() { "f64" }
-    else if list_kind == LIST_ELEM_STRING() { "string" }
-    else { "i64" }
+    let mut elem_type = "i64"
+    if list_kind == LIST_ELEM_INT() { elem_type = "i64" }
+    else if list_kind == LIST_ELEM_FLOAT() { elem_type = "f64" }
+    else if list_kind == LIST_ELEM_STRING() { elem_type = "string" }
+    else if list_kind == LIST_ELEM_OTHER() and list_elem_type_name != "" {
+        elem_type = list_elem_type_name
+    }
 
     -- Create element variable
     let elem_alloca_id = g.builder.next_id
@@ -594,6 +832,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
 
     g.variable_map.insert(var_name, elem_alloca_id)
     g.variable_types.insert(var_name, elem_type)
+    -- Track struct/enum type for element variable
+    if g.struct_defs.contains(elem_type) {
+        g.var_struct_types.insert(var_name, elem_type)
+    }
+    if g.enum_defs.contains(elem_type) {
+        g.var_enum_types.insert(var_name, elem_type)
+    }
 
     -- Labels
     let header_label = gen_next_label(g, "for_header")
@@ -652,18 +897,10 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let idx_val2_id = g.builder.next_id
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Get element from list
-    let get_fn = if list_kind == LIST_ELEM_INT() { "dm_list_int64_get" }
-    else if list_kind == LIST_ELEM_FLOAT() { "dm_list_double_get" }
-    else if list_kind == LIST_ELEM_STRING() { "dm_list_string_get" }
-    else { "dm_list_generic_get" }
-
-    let mut get_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-    get_inst.callee = get_fn
-    let mut get_args: List[IRValue] = []
-    get_args.push(ir_val_inst(list_ptr))
-    get_args.push(ir_val_inst(idx_val2_id))
-    get_inst.call_args = get_args
+    -- Get element from list (use OP_LIST_GET so LLVM gen handles struct elements)
+    let mut get_inst = ir_inst_new(g.builder.next_id, OP_LIST_GET())
+    get_inst.lhs = ir_val_inst(list_ptr)
+    get_inst.rhs = ir_val_inst(idx_val2_id)
     get_inst.result_type = elem_type
     get_inst.has_result = true
     body_block.instructions.push(get_inst)
@@ -1410,6 +1647,23 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     insert_inst.field_index = field_idx
                     insert_inst.result_type = struct_name
                     insert_inst.has_result = true
+                    -- Set field_type for list/map handling in LLVM gen
+                    if field_idx < info.field_types.len() {
+                        let assign_ftype = info.field_types[field_idx]
+                        if starts_with(assign_ftype, "List[") {
+                            let af_inner = extract_inner_type(assign_ftype, "List[")
+                            let af_ek = classify_list_elem(af_inner)
+                            if af_ek == LIST_ELEM_INT() { insert_inst.field_type = "dm_list_int64" }
+                            else if af_ek == LIST_ELEM_FLOAT() { insert_inst.field_type = "dm_list_double" }
+                            else if af_ek == LIST_ELEM_STRING() { insert_inst.field_type = "dm_list_dm_string" }
+                            else { insert_inst.field_type = "dm_list_generic" }
+                        }
+                        if starts_with(assign_ftype, "Map[") {
+                            let af_minner = extract_inner_type(assign_ftype, "Map[")
+                            if starts_with(af_minner, "string") { insert_inst.field_type = "dm_map_string_int" }
+                            else { insert_inst.field_type = "dm_map_int_string" }
+                        }
+                    }
                     b.instructions.push(insert_inst)
                     let new_struct_id = g.builder.next_id
                     g.builder.next_id = g.builder.next_id + 1

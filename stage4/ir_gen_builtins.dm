@@ -470,7 +470,8 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     b = val_result.block
 
     -- Allocate memory via malloc
-    let size = 8  -- default pointer-sized allocation
+    let val_type = infer_expr_type(g, args[0])
+    let size = estimate_type_size(val_type)
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
     malloc_inst.callee = "malloc"

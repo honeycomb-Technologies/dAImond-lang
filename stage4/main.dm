@@ -241,48 +241,6 @@ fn lexer_skip_ws(lex: Lexer) -> Lexer {
     return l
 }
 
-fn unescape_string(s: string) -> string {
-    -- Quick check: if no backslashes, return as-is
-    if string_find(s, "\\") < 0 {
-        return s
-    }
-    let mut result = ""
-    let mut i = 0
-    let slen = len(s)
-    while i < slen {
-        let ch = char_at(s, i)
-        if ch == "\\" and i + 1 < slen {
-            let next = char_at(s, i + 1)
-            if next == "n" {
-                result = result + "\n"
-                i = i + 2
-            } else if next == "t" {
-                result = result + "\t"
-                i = i + 2
-            } else if next == "r" {
-                result = result + "\r"
-                i = i + 2
-            } else if next == "\\" {
-                result = result + "\\"
-                i = i + 2
-            } else if next == "\"" {
-                result = result + "\""
-                i = i + 2
-            } else if next == "'" {
-                result = result + "'"
-                i = i + 2
-            } else {
-                result = result + ch
-                i = i + 1
-            }
-        } else {
-            result = result + ch
-            i = i + 1
-        }
-    }
-    return result
-}
-
 fn tokenize(source: string) -> List[Token] {
     let mut lex = lexer_new(source)
     let mut tokens: List[Token] = []
@@ -371,14 +329,11 @@ fn tokenize(source: string) -> List[Token] {
                         lex.col = lex.col + 1
                     }
                 }
-                if lex.pos >= lex.src_len {
-                    eprintln("Error: unterminated string at line " + int_to_string(sl))
-                    exit(1)
+                if lex.pos < lex.src_len {
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
                 }
-                lex.pos = lex.pos + 1
-                lex.col = lex.col + 1
-                let raw_text = substr(lex.source, sp + 1, lex.pos - sp - 2)
-                let text = unescape_string(raw_text)
+                let text = substr(lex.source, sp + 1, lex.pos - sp - 2)
                 tokens.push(token_new(TK_STRING(), text, sl, sc))
             } else if ch == "(" {
                 tokens.push(token_new(TK_LPAREN(), "(", sl, sc))
@@ -439,15 +394,7 @@ fn tokenize(source: string) -> List[Token] {
                     lex.col = lex.col + 1
                 }
             } else if ch == "/" {
-                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "/" {
-                    -- C-style // comment: skip to end of line
-                    lex.pos = lex.pos + 2
-                    lex.col = lex.col + 2
-                    while lex.pos < lex.src_len and char_at(lex.source, lex.pos) != "\n" {
-                        lex.pos = lex.pos + 1
-                        lex.col = lex.col + 1
-                    }
-                } else if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
+                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
                     tokens.push(token_new(TK_SLASHEQ(), "/=", sl, sc))
                     lex.pos = lex.pos + 2
                     lex.col = lex.col + 2
@@ -658,6 +605,7 @@ fn BINOP_SHR() -> int { return 34 }
 fn UNOP_NEG() -> int { return 1 }
 fn UNOP_NOT() -> int { return 2 }
 fn UNOP_BIT_NOT() -> int { return 3 }
+fn UNOP_DEREF() -> int { return 4 }
 
 -- ============================================================
 -- ASSIGNMENT OPERATOR KINDS
@@ -1444,7 +1392,6 @@ fn VAL_INST_REF() -> int { return 5 }
 fn VAL_PARAM_REF() -> int { return 6 }
 fn VAL_GLOBAL_REF() -> int { return 7 }
 fn VAL_UNDEF() -> int { return 8 }
-fn VAL_BREAK_SENTINEL() -> int { return 9 }
 
 struct IRValue {
     kind: int,
@@ -1485,10 +1432,6 @@ fn ir_val_global(name: string) -> IRValue {
 
 fn ir_val_undef() -> IRValue {
     return IRValue { kind: VAL_UNDEF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
-}
-
-fn ir_val_break() -> IRValue {
-    return IRValue { kind: VAL_BREAK_SENTINEL(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
 }
 
 -- ============================================================
@@ -2441,7 +2384,9 @@ extern fn dm_llvm_build_fp_to_si(b: int, val: int, dest_ty: int, name: string) -
 extern fn dm_llvm_build_trunc(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_sext(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_bit_cast(b: int, val: int, dest_ty: int, name: string) -> int
+extern fn dm_llvm_build_ptr_to_int(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_int_to_ptr(b: int, val: int, dest_ty: int, name: string) -> int
+extern fn dm_llvm_sizeof_type(ty: int) -> int
 
 -- Logical
 extern fn dm_llvm_build_and(b: int, lhs: int, rhs: int, name: string) -> int
@@ -2493,7 +2438,6 @@ extern fn dm_llvm_free_c_string(c_str_ptr: int)
 -- Buffer-based API (for passing arrays to LLVM without raw pointers)
 extern fn dm_llvm_buf_clear()
 extern fn dm_llvm_buf_push(ref: int)
-extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int
 extern fn dm_llvm_struct_set_body_buf(struct_ty: int, is_packed: int)
 extern fn dm_llvm_function_type_buf(ret: int, is_var_arg: int) -> int
 extern fn dm_llvm_build_call2_buf(b: int, fn_ty: int, func: int, name: string) -> int
@@ -2672,40 +2616,6 @@ fn parse_type(p: Parser) -> ParseTypeResult {
         return ParseTypeResult { p: pp, type_name: type_str }
     }
 
-    -- Reference type: &T or &Self
-    if tok.kind == TK_AMP() {
-        pp = p_advance(pp)
-        -- Skip 'mut' if present (&mut T)
-        if p_peek(pp) == TK_MUT() {
-            pp = p_advance(pp)
-        }
-        let inner = parse_type(pp)
-        -- For the LLVM backend, &T is treated the same as T (pass by pointer)
-        return ParseTypeResult { p: inner.p, type_name: inner.type_name }
-    }
-
-    -- Fixed-size array type: [T; N]
-    if tok.kind == TK_LBRACKET() {
-        pp = p_advance(pp)
-        let inner = parse_type(pp)
-        pp = inner.p
-        pp = p_skip_newlines(pp)
-        -- Expect semicolon separator
-        if p_peek(pp) == TK_SEMICOLON() {
-            pp = p_advance(pp)
-            pp = p_skip_newlines(pp)
-            let size_tok = p_cur(pp)
-            pp = p_advance(pp)
-            pp = p_skip_newlines(pp)
-            pp = p_expect(pp, TK_RBRACKET())
-            let type_str = "[" + inner.type_name + "; " + size_tok.value + "]"
-            return ParseTypeResult { p: pp, type_name: type_str }
-        }
-        -- Not a fixed array, might be something else - return what we can
-        pp = p_expect(pp, TK_RBRACKET())
-        return ParseTypeResult { p: pp, type_name: "[" + inner.type_name + "]" }
-    }
-
     if tok.kind != TK_IDENT() and tok.kind != TK_SELF() {
         return ParseTypeResult { p: pp, type_name: "" }
     }
@@ -2774,21 +2684,11 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
                     pp = p_advance(pp)
                     let mut args: List[Expr] = []
                     if p_peek(p_skip_newlines(pp)) != TK_RPAREN() {
-                        -- Skip 'mut' keyword before argument
-                        if p_peek(p_skip_newlines(pp)) == TK_MUT() {
-                            pp = p_skip_newlines(pp)
-                            pp = p_advance(pp)
-                        }
                         let arg = parse_expr(pp)
                         pp = arg.p
                         args.push(arg.expr)
                         while p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                             pp = p_expect(pp, TK_COMMA())
-                            -- Skip 'mut' keyword before argument
-                            if p_peek(p_skip_newlines(pp)) == TK_MUT() {
-                                pp = p_skip_newlines(pp)
-                                pp = p_advance(pp)
-                            }
                             let next_arg = parse_expr(pp)
                             pp = next_arg.p
                             args.push(next_arg.expr)
@@ -2839,19 +2739,8 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             let op_tok = p_cur(pp)
             let op_kind = p_peek(pp)
 
-            -- Range operator (.. and ..=)
-            if op_kind == TK_DOTDOT() or op_kind == TK_DOTDOTEQ() {
-                let range_op = if op_kind == TK_DOTDOTEQ() { BINOP_LE() } else { BINOP_LT() }
-                pp = p_advance(pp)
-                let right_result = parse_expr_pratt(pp, prec + 1)
-                pp = right_result.p
-                let mut e = expr_new(EXPR_RANGE(), op_tok.line, op_tok.col)
-                e.left = Box_new(left)
-                e.right = Box_new(right_result.expr)
-                e.op = range_op
-                left = e
             -- Pipeline operator
-            } else if op_kind == TK_PIPEGT() {
+            if op_kind == TK_PIPEGT() {
                 pp = p_advance(pp)
                 let right_result = parse_expr_pratt(pp, prec + 1)
                 pp = right_result.p
@@ -2877,7 +2766,6 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
 }
 
 fn infix_prec(kind: int) -> int {
-    if kind == TK_DOTDOT() or kind == TK_DOTDOTEQ() { return 0 }
     if kind == TK_OR() { return 1 }
     if kind == TK_AND() { return 2 }
     if kind == TK_EQEQ() or kind == TK_BANGEQ() { return 3 }
@@ -2960,6 +2848,13 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_NOT(), operand.expr, tok.line, tok.col) }
     }
 
+    -- Dereference *expr (Box[T] -> T)
+    if tok.kind == TK_STAR() {
+        pp = p_advance(pp)
+        let operand = parse_expr_pratt(pp, 8)
+        return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_DEREF(), operand.expr, tok.line, tok.col) }
+    }
+
     -- Parenthesized expression
     if tok.kind == TK_LPAREN() {
         pp = p_advance(pp)
@@ -3007,17 +2902,6 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
         let mut e = expr_new(EXPR_AWAIT(), tok.line, tok.col)
         e.operand = Box_new(inner.expr)
         return ParseExprResult { p: inner.p, expr: e }
-    }
-
-    -- Block expression: { stmts... }
-    if tok.kind == TK_LBRACE() {
-        pp = p_advance(pp)
-        let body = parse_block_body(pp)
-        pp = body.p
-        pp = p_expect(pp, TK_RBRACE())
-        let mut e = expr_new(EXPR_BLOCK(), tok.line, tok.col)
-        e.stmts = body.stmts
-        return ParseExprResult { p: pp, expr: e }
     }
 
     -- Identifier / function call / struct literal / enum literal
@@ -3071,21 +2955,11 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         pp = p_advance(pp)
         let mut args: List[Expr] = []
         if p_peek(p_skip_newlines(pp)) != TK_RPAREN() {
-            -- Skip 'mut' keyword before argument
-            if p_peek(p_skip_newlines(pp)) == TK_MUT() {
-                pp = p_skip_newlines(pp)
-                pp = p_advance(pp)
-            }
             let arg = parse_expr(pp)
             pp = arg.p
             args.push(arg.expr)
             while p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                 pp = p_expect(pp, TK_COMMA())
-                -- Skip 'mut' keyword before argument
-                if p_peek(p_skip_newlines(pp)) == TK_MUT() {
-                    pp = p_skip_newlines(pp)
-                    pp = p_advance(pp)
-                }
                 let next_arg = parse_expr(pp)
                 pp = next_arg.p
                 args.push(next_arg.expr)
@@ -3097,7 +2971,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         return ParseExprResult { p: pp, expr: e }
     }
 
-    -- Check for struct literal: Name { field: val, ... } or Name { field, ... }
+    -- Check for struct literal: Name { field: val, ... }
     if p_peek(pp) == TK_LBRACE() {
         -- Only treat as struct literal if first char is uppercase
         if len(name) > 0 and char_at(name, 0) >= "A" and char_at(name, 0) <= "Z" {
@@ -3109,7 +2983,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                 pp = p_skip_newlines(pp)
                 let fname = p_cur(pp).value
                 pp = p_advance(pp)
-                -- Support both explicit (field: expr) and shorthand (field) syntax
+                -- Support shorthand: Point { x, y } means Point { x: x, y: y }
                 if p_peek(pp) == TK_COLON() {
                     pp = p_advance(pp)
                     let fval = parse_expr(pp)
@@ -3117,9 +2991,11 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                     field_names.push(fname)
                     field_values.push(fval.expr)
                 } else {
-                    -- Shorthand: field name = variable name (Pair { first, second })
+                    -- Shorthand: field name = identifier with same name
                     field_names.push(fname)
-                    field_values.push(expr_ident(fname, tok.line, tok.col))
+                    let mut shorthand_expr = expr_new(EXPR_IDENTIFIER(), p_cur(pp).line, p_cur(pp).col)
+                    shorthand_expr.name = fname
+                    field_values.push(shorthand_expr)
                 }
                 pp = p_skip_newlines(pp)
                 if p_peek(pp) == TK_COMMA() {
@@ -3135,8 +3011,8 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         }
     }
 
-    -- Check for enum variant: Name.Variant or Name::Variant
-    if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
+    -- Check for enum variant: Name.Variant or Name.Variant(payload)
+    if p_peek(pp) == TK_DOT() {
         let saved = pp
         pp = p_advance(pp)
         let variant_tok = p_cur(pp)
@@ -3190,30 +3066,6 @@ fn parse_array_literal(p: Parser) -> ParseExprResult {
         pp = elem.p
         elems.push(elem.expr)
         pp = p_skip_newlines(pp)
-        -- Check for array repeat syntax: [value; count]
-        if p_peek(pp) == TK_SEMICOLON() and elems.len() == 1 {
-            pp = p_advance(pp) -- skip ;
-            pp = p_skip_newlines(pp)
-            let count_result = parse_expr(pp)
-            pp = count_result.p
-            pp = p_skip_newlines(pp)
-            pp = p_expect(pp, TK_RBRACKET())
-            -- Expand: repeat the element 'count' times
-            let repeat_val = elems[0]
-            let mut repeat_count = 0
-            if count_result.expr.kind == EXPR_LITERAL_INT() {
-                repeat_count = count_result.expr.int_val
-            }
-            let mut expanded: List[Expr] = []
-            let mut ri = 0
-            while ri < repeat_count {
-                expanded.push(repeat_val)
-                ri = ri + 1
-            }
-            let mut e = expr_new(EXPR_ARRAY_LITERAL(), tok.line, tok.col)
-            e.elements = expanded
-            return ParseExprResult { p: pp, expr: e }
-        }
         if p_peek(pp) == TK_COMMA() {
             pp = p_advance(pp)
         }
@@ -3509,8 +3361,8 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
             return ParsePatternResult { p: pp, pattern: pattern_enum_variant("", name, bindings) }
         }
 
-        if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
-            -- Qualified enum: EnumName.Variant or EnumName::Variant
+        if p_peek(pp) == TK_DOT() {
+            -- Qualified enum: EnumName.Variant or EnumName.Variant(bindings)
             pp = p_advance(pp)
             let variant_tok = p_cur(pp)
             pp = p_advance(pp)
@@ -3870,8 +3722,8 @@ fn parse_source_file(p: Parser) -> SourceFile {
         pp = p_skip_newlines(pp)
         let mut path = p_cur(pp).value
         pp = p_advance(pp)
-        -- Handle dotted paths: import std.io and import foo::bar
-        while p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
+        -- Handle dotted paths: import std.io
+        while p_peek(pp) == TK_DOT() {
             pp = p_advance(pp)
             path = path + "." + p_cur(pp).value
             pp = p_advance(pp)
@@ -3971,9 +3823,7 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
             if p_peek(p_skip_newlines(next_pp)) == TK_SELF() {
                 is_mut = true
                 pp = p_skip_newlines(next_pp)
-                let mut self_param = func_param_new("self", "Self")
-                self_param.is_mut = true
-                fd.params.push(self_param)
+                fd.params.push(func_param_new("self", "Self"))
                 pp = p_advance(pp)
                 if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                     pp = p_advance(pp)
@@ -3985,18 +3835,8 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
             pp = next_pp
         }
         if p_peek(pp) == TK_SELF() {
+            fd.params.push(func_param_new("self", "Self"))
             pp = p_advance(pp)
-            -- Check if self has explicit type annotation: self: Type
-            let mut self_type = "Self"
-            if p_peek(pp) == TK_COLON() {
-                pp = p_expect(pp, TK_COLON())
-                let st = parse_type(pp)
-                pp = st.p
-                self_type = st.type_name
-            }
-            let mut self_param = func_param_new("self", self_type)
-            self_param.is_mut = is_mut
-            fd.params.push(self_param)
             if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                 pp = p_advance(pp)
             }
@@ -4043,15 +3883,6 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
             }
         }
         pp = p_expect(pp, TK_RBRACKET())
-    }
-
-    -- Return type may also come AFTER effects: fn foo() with [...] -> T
-    if p_peek(p_skip_newlines(pp)) == TK_ARROW() {
-        pp = p_skip_newlines(pp)
-        pp = p_advance(pp)
-        let rty2 = parse_type(pp)
-        pp = rty2.p
-        fd.return_type = rty2.type_name
     }
 
     -- Body
@@ -4245,24 +4076,11 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
     pp = p_advance(pp) -- skip 'impl'
     pp = p_skip_newlines(pp)
 
-    -- Parse: impl Type { ... } or impl Type[A, B] { ... }
-    --    or impl Trait for Type { ... }
+    -- Parse: impl Type { ... } or impl Trait for Type { ... }
     let first_name = p_cur(pp).value
     pp = p_advance(pp)
 
     let mut ib = impl_block_new(first_name, tok.line, tok.col)
-
-    -- Parse optional generic params [A, B] after the type name
-    if p_peek(pp) == TK_LBRACKET() {
-        pp = p_advance(pp)
-        while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
-            pp = p_skip_newlines(pp)
-            ib.generic_params.push(p_cur(pp).value)
-            pp = p_advance(pp)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
-        }
-        pp = p_expect(pp, TK_RBRACKET())
-    }
 
     pp = p_skip_newlines(pp)
     if p_peek(pp) == TK_FOR() {
@@ -4273,17 +4091,6 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
         pp = p_advance(pp)
         ib.trait_name = first_name
         ib.target_type = target_name
-        -- Parse optional generic params on the target type too
-        if p_peek(pp) == TK_LBRACKET() {
-            pp = p_advance(pp)
-            while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
-                pp = p_skip_newlines(pp)
-                ib.generic_params.push(p_cur(pp).value)
-                pp = p_advance(pp)
-                if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
-            }
-            pp = p_expect(pp, TK_RBRACKET())
-        }
     }
 
     pp = p_expect(pp, TK_LBRACE())
@@ -4433,14 +4240,14 @@ struct IRGenerator {
     trait_impl_methods: Map[string, string],
     -- User extern function names
     user_extern_fns: Map[string, bool],
+    -- Function name -> return type (IR type string)
+    fn_return_types: Map[string, string],
     -- "StructName.field" -> list elem kind
     field_list_elem_kinds: Map[string, int],
     -- "StructName.field" -> list elem type name
     field_list_elem_types: Map[string, string],
-    -- Variable name -> true if it's a mut pointer (e.g. mut self)
-    mut_ptr_vars: Map[string, bool],
-    -- Variable name -> param index for mut pointer params (no alloca created)
-    param_ptr_map: Map[string, int],
+    -- "StructName.field" -> map kind
+    field_map_kinds: Map[string, int],
     -- Label counter for unique block names
     label_counter: int,
     -- Lambda counter
@@ -4459,8 +4266,8 @@ struct IRGenerator {
     declarations: List[Declaration],
     -- Completed blocks that need to be added to the function
     completed_blocks: List[IRBasicBlock],
-    -- Known user-defined function names (for undefined function detection)
-    known_functions: Map[string, bool]
+    -- Variable name -> full type annotation (e.g., "Result[int, string]")
+    var_type_annotations: Map[string, string]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -4488,10 +4295,10 @@ fn ir_generator_new() -> IRGenerator {
         dyn_var_traits: Map_new(),
         trait_impl_methods: Map_new(),
         user_extern_fns: Map_new(),
+        fn_return_types: Map_new(),
         field_list_elem_kinds: Map_new(),
         field_list_elem_types: Map_new(),
-        mut_ptr_vars: Map_new(),
-        param_ptr_map: Map_new(),
+        field_map_kinds: Map_new(),
         label_counter: 0,
         lambda_counter: 0,
         break_target: "",
@@ -4503,7 +4310,7 @@ fn ir_generator_new() -> IRGenerator {
         has_impl_type: false,
         declarations: [],
         completed_blocks: [],
-        known_functions: Map_new()
+        var_type_annotations: Map_new()
     }
 }
 
@@ -4561,10 +4368,9 @@ fn map_type_name(name: string) -> string {
     if name == "i32x8" { return "i32x8" }
     if name == "i64x2" { return "i64x2" }
     if name == "i64x4" { return "i64x4" }
-    -- Function pointer type: fn(int, int) -> int becomes ptr
-    if starts_with(name, "fn(") {
-        return "ptr"
-    }
+    -- Composite types: Result[T, E] and Option[T]
+    if starts_with(name, "Result[") { return "result" }
+    if starts_with(name, "Option[") { return "option" }
     -- Default: return as-is (struct name, enum name, etc.)
     return name
 }
@@ -4675,7 +4481,7 @@ fn extract_inner_type(type_str: string, prefix: string) -> string {
 fn classify_list_elem(elem_type: string) -> int {
     if elem_type == "int" or elem_type == "i64" { return LIST_ELEM_INT() }
     if elem_type == "float" or elem_type == "f64" { return LIST_ELEM_FLOAT() }
-    if elem_type == "string" or elem_type == "String" { return LIST_ELEM_STRING() }
+    if elem_type == "string" { return LIST_ELEM_STRING() }
     return LIST_ELEM_OTHER()
 }
 
@@ -4690,7 +4496,7 @@ fn map_builtin_name(name: string) -> string {
     if name == "eprint" { return "dm_eprint" }
     if name == "eprintln" { return "dm_eprintln" }
     if name == "panic" { return "dm_panic" }
-    if name == "exit" { return "exit" }
+    if name == "exit" { return "dm_exit" }
     if name == "len" { return "dm_string_len" }
     if name == "char_at" { return "dm_char_at" }
     if name == "substr" { return "dm_substr" }
@@ -4718,39 +4524,6 @@ fn map_builtin_name(name: string) -> string {
     if name == "system" { return "dm_system" }
     if name == "assert" { return "dm_assert" }
     if name == "assert_eq" { return "dm_assert_eq" }
-    -- Character classification
-    if name == "is_alpha" { return "dm_is_alpha" }
-    if name == "is_digit" { return "dm_is_digit" }
-    if name == "is_whitespace" { return "dm_is_whitespace" }
-    if name == "is_alnum" { return "dm_is_alnum" }
-    -- Character/string conversion
-    if name == "char_to_string" { return "dm_char_to_string" }
-    if name == "string_to_int" { return "dm_parse_int" }
-    -- Path utilities
-    if name == "path_dirname" { return "dm_path_dirname" }
-    if name == "path_basename" { return "dm_path_basename" }
-    if name == "path_extension" { return "dm_path_extension" }
-    if name == "path_stem" { return "dm_path_stem" }
-    if name == "path_join" { return "dm_path_join" }
-    -- Filesystem builtins
-    if name == "fs_getcwd" { return "dm_fs_getcwd" }
-    if name == "fs_readdir" { return "dm_fs_readdir" }
-    if name == "fs_rename" { return "dm_fs_rename" }
-    if name == "fs_mkdir" { return "dm_fs_mkdir" }
-    if name == "fs_remove" { return "dm_fs_remove" }
-    -- OS builtins
-    if name == "os_getenv" { return "dm_os_getenv" }
-    -- Game/terminal builtins
-    if name == "chr" { return "dm_chr" }
-    if name == "flush" { return "dm_flush" }
-    if name == "read_key" { return "dm_read_key" }
-    if name == "read_key_nb" { return "dm_read_key_nb" }
-    if name == "time_ms" { return "dm_time_ms" }
-    if name == "sleep_ms" { return "dm_sleep_ms" }
-    if name == "mem_mark" { return "dm_mem_mark" }
-    if name == "mem_sweep" { return "dm_mem_sweep" }
-    if name == "term_width" { return "dm_term_width" }
-    if name == "term_height" { return "dm_term_height" }
     return name
 }
 
@@ -4773,20 +4546,6 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "assert" or name == "assert_eq" { return true }
     if name == "Box_new" or name == "Box_null" { return true }
     if name == "Map_new" { return true }
-    if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return true }
-    if name == "char_to_string" { return true }
-    if name == "string_to_int" { return true }
-    if name == "path_dirname" or name == "path_basename" or name == "path_extension" or name == "path_stem" { return true }
-    if name == "path_join" { return true }
-    if name == "fs_getcwd" or name == "fs_readdir" or name == "fs_rename" { return true }
-    if name == "fs_mkdir" or name == "fs_remove" { return true }
-    if name == "os_getenv" { return true }
-    -- Game/terminal builtins
-    if name == "chr" or name == "flush" { return true }
-    if name == "read_key" or name == "read_key_nb" { return true }
-    if name == "time_ms" or name == "sleep_ms" { return true }
-    if name == "mem_mark" or name == "mem_sweep" { return true }
-    if name == "term_width" or name == "term_height" { return true }
     return false
 }
 
@@ -4804,8 +4563,7 @@ fn builtin_return_type(name: string) -> string {
     if name == "bool_to_string" { return "string" }
     if name == "parse_int" { return "i64" }
     if name == "parse_float" { return "f64" }
-    if name == "string_contains" { return "bool" }
-    if name == "string_find" { return "i64" }
+    if name == "string_contains" or name == "string_find" { return "i64" }
     if name == "starts_with" or name == "ends_with" { return "bool" }
     if name == "string_trim" { return "string" }
     if name == "string_replace" { return "string" }
@@ -4819,28 +4577,6 @@ fn builtin_return_type(name: string) -> string {
     if name == "args_get" { return "string" }
     if name == "system" { return "i64" }
     if name == "assert" or name == "assert_eq" { return "void" }
-    -- Character classification
-    if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return "bool" }
-    -- Character/string conversion
-    if name == "char_to_string" { return "string" }
-    if name == "string_to_int" { return "i64" }
-    -- Path utilities
-    if name == "path_dirname" or name == "path_basename" or name == "path_extension" or name == "path_stem" { return "string" }
-    if name == "path_join" { return "string" }
-    -- Filesystem builtins
-    if name == "fs_getcwd" { return "string" }
-    if name == "fs_readdir" { return "string" }
-    if name == "fs_rename" { return "i64" }
-    if name == "fs_mkdir" { return "i64" }
-    if name == "fs_remove" { return "i64" }
-    -- OS builtins
-    if name == "os_getenv" { return "string" }
-    -- Game/terminal builtins
-    if name == "chr" { return "string" }
-    if name == "read_key" or name == "read_key_nb" { return "i64" }
-    if name == "time_ms" or name == "mem_mark" { return "i64" }
-    if name == "term_width" or name == "term_height" { return "i64" }
-    if name == "flush" or name == "sleep_ms" or name == "mem_sweep" { return "void" }
     return "void"
 }
 
@@ -4872,14 +4608,33 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
         let decl = source.declarations[i]
         if decl.kind == DECL_FUNCTION() {
             let fd = *decl.func_decl
-            g.known_functions.insert(fd.name, true)
             if fd.generic_params.len() > 0 {
                 -- Store generic function for later monomorphization
                 g.generic_fn_decls.insert(fd.name, i)
             }
+            -- Track return type for all functions
+            let ret = if len(fd.return_type) > 0 {
+                parse_type_to_ir(fd.return_type)
+            } else {
+                "void"
+            }
+            g.fn_return_types.insert(fd.name, ret)
         } else if decl.kind == DECL_IMPL() {
             let ib = *decl.impl_block
             g = register_impl_methods(g, ib)
+            -- Track return types for impl methods
+            let mut mi = 0
+            while mi < ib.methods.len() {
+                let method = ib.methods[mi]
+                let method_name = ib.target_type + "_" + method.name
+                let mret = if len(method.return_type) > 0 {
+                    parse_type_to_ir(method.return_type)
+                } else {
+                    "void"
+                }
+                g.fn_return_types.insert(method_name, mret)
+                mi = mi + 1
+            }
         }
         i = i + 1
     }
@@ -4940,11 +4695,29 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
         let f = sd.fields[i]
         let fname = f.name
         let ftype = f.type_name
-        let ir_type_name = map_type_name(ftype)
+        let mut ir_type_name = parse_type_to_ir(ftype)
 
+        -- For List/Map fields, use concrete runtime struct type names
+        -- so LLVM struct layout matches C struct layout (embedded by value)
+        if starts_with(ftype, "List[") {
+            let inner = extract_inner_type(ftype, "List[")
+            let ek = classify_list_elem(inner)
+            if ek == LIST_ELEM_INT() { ir_type_name = "dm_list_int64" }
+            else if ek == LIST_ELEM_FLOAT() { ir_type_name = "dm_list_double" }
+            else if ek == LIST_ELEM_STRING() { ir_type_name = "dm_list_dm_string" }
+            else { ir_type_name = "dm_list_generic" }
+        }
+        if starts_with(ftype, "Map[") {
+            let minner = extract_inner_type(ftype, "Map[")
+            if starts_with(minner, "string") { ir_type_name = "dm_map_string_int" }
+            else { ir_type_name = "dm_map_int_string" }
+        }
+
+        -- Store original type for tracking (Box[T], List[T], etc.)
         info.field_names.push(fname)
-        info.field_types.push(ir_type_name)
+        info.field_types.push(ftype)
 
+        -- Use IR-mapped type for LLVM generation
         let field = ir_field_new(fname, ir_type_name)
         ir_fields.push(field)
 
@@ -4957,6 +4730,18 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
             if elem_kind == LIST_ELEM_OTHER() {
                 g.field_list_elem_types.insert(field_key, inner)
             }
+        }
+
+        -- Detect Map[K,V] fields for field access dispatch
+        if starts_with(ftype, "Map[") {
+            let inner = extract_inner_type(ftype, "Map[")
+            let map_kind = if starts_with(inner, "string") {
+                MAP_KIND_STRING_INT()
+            } else {
+                MAP_KIND_INT_STRING()
+            }
+            let field_key = sd.name + "." + fname
+            g.field_map_kinds.insert(field_key, map_kind)
         }
 
         i = i + 1
@@ -5049,20 +4834,6 @@ fn register_impl_methods(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
     let mut i = 0
     while i < ib.methods.len() {
         g.method_struct_map.insert(ib.methods[i].name, struct_name)
-
-        -- For generic impl blocks, register each method as a generic fn decl
-        -- so it can be monomorphized when called
-        if ib.generic_params.len() > 0 {
-            let mangled = struct_name + "_" + ib.methods[i].name
-            -- Create a modified FunctionDecl with the impl's generic params
-            let mut method_fd = ib.methods[i]
-            method_fd.generic_params = ib.generic_params
-            -- Push it as a synthetic declaration and record its index
-            let decl_idx = g.declarations.len()
-            g.declarations.push(decl_function(method_fd))
-            g.generic_fn_decls.insert(mangled, decl_idx)
-        }
-
         i = i + 1
     }
 
@@ -5107,12 +4878,11 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_string_to_upper", "string", "string")
     g = declare_extern(g, "dm_string_to_lower", "string", "string")
 
-    -- Character classification and conversion
+    -- Character classification
     g = declare_extern(g, "dm_is_alpha", "string", "bool")
     g = declare_extern(g, "dm_is_digit", "string", "bool")
     g = declare_extern(g, "dm_is_whitespace", "string", "bool")
     g = declare_extern(g, "dm_is_alnum", "string", "bool")
-    g = declare_extern(g, "dm_char_to_string", "string", "string")
 
     -- List contains
     g = declare_extern2(g, "dm_list_int64_contains", "ptr", "i64", "bool")
@@ -5181,18 +4951,6 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- OS
     g = declare_extern(g, "dm_os_getenv", "string", "string")
-
-    -- Game/terminal builtins
-    g = declare_extern(g, "dm_chr", "i64", "string")
-    g = declare_extern0(g, "dm_flush", "void")
-    g = declare_extern0(g, "dm_read_key", "i64")
-    g = declare_extern0(g, "dm_read_key_nb", "i64")
-    g = declare_extern0(g, "dm_time_ms", "i64")
-    g = declare_extern(g, "dm_sleep_ms", "i64", "void")
-    g = declare_extern0(g, "dm_mem_mark", "i64")
-    g = declare_extern(g, "dm_mem_sweep", "i64", "void")
-    g = declare_extern0(g, "dm_term_width", "i64")
-    g = declare_extern0(g, "dm_term_height", "i64")
 
     -- String split
     g = declare_extern3(g, "dm_string_split", "ptr", "string", "string", "void")
@@ -5305,7 +5063,7 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     let mut g = gen
 
     let ret_type = if len(fd.return_type) > 0 {
-        map_type_name(fd.return_type)
+        parse_type_to_ir(fd.return_type)
     } else {
         "void"
     }
@@ -5319,29 +5077,12 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        -- Resolve "Self" to current impl type
-        let mut ptype_str = if p.type_name == "Self" and g.has_impl_type {
-            g.current_impl_type
-        } else {
-            p.type_name
+        let mut ptype_str = p.type_name
+        -- Resolve bare "self" parameter type from the current impl block
+        if pname == "self" and (len(ptype_str) == 0 or ptype_str == "self" or ptype_str == "Self") and g.has_impl_type {
+            ptype_str = g.current_impl_type
         }
-        -- Resolve dyn Trait to concrete implementor type
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        ptype_str = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-        }
-        let ptype = map_type_name(ptype_str)
+        let ptype = parse_type_to_ir(ptype_str)
 
         let actual_type = if p.is_mut {
             "ptr"
@@ -5403,17 +5144,15 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
 
     -- Set current return type
     let ret_type = if len(fd.return_type) > 0 {
-        map_type_name(fd.return_type)
+        parse_type_to_ir(fd.return_type)
     } else {
         "void"
     }
     g.current_return_type = ret_type
 
-    -- Reset variable maps for this function
+    -- Reset variable maps and completed blocks for this function
     g.variable_map = Map_new()
     g.variable_types = Map_new()
-    g.mut_ptr_vars = Map_new()
-    g.param_ptr_map = Map_new()
     let empty_blocks: List[IRBasicBlock] = []
     g.completed_blocks = empty_blocks
 
@@ -5426,38 +5165,32 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        -- Resolve "Self" to current impl type
-        let mut ptype_str = if p.type_name == "Self" and g.has_impl_type {
-            g.current_impl_type
-        } else {
-            p.type_name
+        let mut ptype_str = p.type_name
+        -- Resolve bare "self" parameter type from the current impl block
+        if pname == "self" and (len(ptype_str) == 0 or ptype_str == "self" or ptype_str == "Self") and g.has_impl_type {
+            ptype_str = g.current_impl_type
         }
-        -- Resolve dyn Trait to concrete implementor type
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        ptype_str = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-        }
-        let ptype = map_type_name(ptype_str)
+        let ptype = parse_type_to_ir(ptype_str)
 
         if p.is_mut {
-            -- Mut param: the caller passes a POINTER to the struct.
-            -- Do NOT create an alloca — use the param ref directly as a pointer.
-            -- Loads/stores go through the caller's memory, so mutations are visible.
-            g.variable_map.insert(pname, -(i + 1))
+            -- Mut param: alloca + store from param ref (pointer semantics)
+            let alloca_id = g.builder.next_id
+            let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
+            alloca_inst.alloc_type = ptype
+            alloca_inst.result_type = "ptr(" + ptype + ")"
+            alloca_inst.has_result = true
+            blk.instructions.push(alloca_inst)
+            g.builder.next_id = g.builder.next_id + 1
+
+            let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+            store_inst.store_ptr = ir_val_inst(alloca_id)
+            store_inst.store_val = ir_val_param(i)
+            store_inst.has_result = false
+            blk.instructions.push(store_inst)
+            g.builder.next_id = g.builder.next_id + 1
+
+            g.variable_map.insert(pname, alloca_id)
             g.variable_types.insert(pname, ptype)
-            g.mut_ptr_vars.insert(pname, true)
-            g.param_ptr_map.insert(pname, i)
         } else {
             -- Regular param: alloca + store
             let alloca_id = g.builder.next_id
@@ -5479,35 +5212,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             g.variable_types.insert(pname, ptype)
         }
 
-        -- Track dyn Trait parameters: resolve to concrete implementor
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait_name = substr(ptype_str, 4, len(ptype_str) - 4)
-            -- Find a concrete type that implements this trait
-            let mut concrete_found = ""
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait_name) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        concrete_found = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-            if len(concrete_found) > 0 {
-                g.dyn_var_concrete.insert(pname, concrete_found)
-                g.dyn_var_traits.insert(pname, dyn_trait_name)
-                g.var_struct_types.insert(pname, concrete_found)
-            }
-        }
-
-        -- Track function-pointer-typed parameters for indirect calls
-        if starts_with(ptype_str, "fn(") {
-            g.variable_types.insert(pname, ptype_str)
-        }
-
         -- Track struct/enum/list/box typed parameters
         if g.struct_defs.contains(ptype_str) {
             g.var_struct_types.insert(pname, ptype_str)
@@ -5526,6 +5230,10 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         if starts_with(ptype_str, "Box[") {
             let inner = extract_inner_type(ptype_str, "Box[")
             g.box_inner_types.insert(pname, inner)
+        }
+        -- Track Map/List/Result/Option type annotations for parameters
+        if starts_with(ptype_str, "Map[") or starts_with(ptype_str, "List[") or starts_with(ptype_str, "Result[") or starts_with(ptype_str, "Option[") {
+            g.var_type_annotations.insert(pname, ptype_str)
         }
 
         i = i + 1
@@ -5555,25 +5263,15 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         }
     }
 
-    -- Add blocks to function in correct order (entry block must be first)
+    -- Add blocks to function
     let mut func = g.ir_mod.functions[func_idx]
-    -- Find and push the entry block first
+    -- First push all completed blocks (terminated blocks from control flow)
     i = 0
     while i < g.completed_blocks.len() {
-        if g.completed_blocks[i].label == "entry" {
-            func.blocks.push(g.completed_blocks[i])
-        }
+        func.blocks.push(g.completed_blocks[i])
         i = i + 1
     }
-    -- Push remaining completed blocks (non-entry)
-    i = 0
-    while i < g.completed_blocks.len() {
-        if g.completed_blocks[i].label != "entry" {
-            func.blocks.push(g.completed_blocks[i])
-        }
-        i = i + 1
-    }
-    -- Then push the final block (if it's the entry and no blocks, push it; otherwise push as last)
+    -- Then push the final block
     func.blocks.push(blk)
     g.ir_mod.functions[func_idx] = func
 
@@ -5587,12 +5285,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
 fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
     let mut g = gen
     let struct_name = ib.target_type
-
-    -- Skip generic impl blocks — their methods are monomorphized on demand
-    if ib.generic_params.len() > 0 {
-        return g
-    }
-
     g.current_impl_type = struct_name
     g.has_impl_type = true
 
@@ -5620,33 +5312,8 @@ fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
 fn generate_constant(gen: IRGenerator, cd: ConstDecl) -> IRGenerator {
     let mut g = gen
 
-    -- Pre-grow globals list to avoid realloc during comptime evaluation.
-    -- Comptime recursion copies the generator by value, sharing the list buffer.
-    -- A realloc in a callee would free the buffer the caller is still using.
-    -- By pre-growing, we ensure enough capacity for comptime variable pushes.
-    if cd.is_comptime {
-        let mut prealloc_i = 0
-        while prealloc_i < 1024 {
-            let mut dummy = ir_global_new("__comptime_prealloc__", "i64")
-            dummy.has_init = false
-            dummy.is_const = false
-            g.ir_mod.globals.push(dummy)
-            prealloc_i = prealloc_i + 1
-        }
-        let mut pop_i = 0
-        while pop_i < 1024 {
-            g.ir_mod.globals.pop()
-            pop_i = pop_i + 1
-        }
-    }
-
     -- Try to evaluate the value at compile time
-    -- Use the full comptime evaluator for comptime expressions (blocks, fn calls, etc.)
-    let val = if cd.is_comptime {
-        eval_comptime_expr(g, *cd.value)
-    } else {
-        eval_const_value(g, cd.value)
-    }
+    let val = eval_const_value(g, cd.value)
 
     let ty = if len(cd.type_name) > 0 {
         map_type_name(cd.type_name)
@@ -5706,19 +5373,8 @@ fn eval_const_value(gen: IRGenerator, expr_box: Box[Expr]) -> IRValue {
         if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
             if e.op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
         }
-        -- Boolean AND/OR
-        if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
-            if e.op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
-            if e.op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
-        }
     }
     if e.kind == EXPR_UNARY() {
-        if e.op == UNOP_NOT() {
-            let operand_val = eval_const_value(gen, e.operand)
-            if operand_val.kind == VAL_CONST_BOOL() {
-                return ir_val_bool(operand_val.bool_val == false)
-            }
-        }
         if e.op == UNOP_NEG() {
             let operand_val = eval_const_value(gen, e.operand)
             if operand_val.kind == VAL_CONST_INT() {
@@ -5757,29 +5413,6 @@ fn estimate_type_size(type_name: string) -> int {
     return 64
 }
 
-fn estimate_type_size_gen(gen: IRGenerator, type_name: string) -> int {
-    if type_name == "i8" or type_name == "u8" or type_name == "bool" { return 1 }
-    if type_name == "i16" or type_name == "u16" { return 2 }
-    if type_name == "i32" or type_name == "u32" or type_name == "f32" { return 4 }
-    if type_name == "i64" or type_name == "u64" or type_name == "f64" or type_name == "ptr" { return 8 }
-    if type_name == "string" { return 24 }
-    -- Look up struct definition
-    if gen.struct_defs.contains(type_name) {
-        let info = gen.struct_defs.get(type_name)
-        let mut size = 0
-        let mut fi = 0
-        while fi < info.field_names.len() {
-            let field_type = info.field_types[fi]
-            let fs = estimate_type_size(field_type)
-            let aligned = if fs < 8 { 8 } else { fs }
-            size = size + aligned
-            fi = fi + 1
-        }
-        return size
-    }
-    return 64
-}
-
 
 -- ============================================================
 -- GenResult: return both generator and current block
@@ -5806,6 +5439,35 @@ struct ExprResult {
 
 fn expr_result(g: IRGenerator, b: IRBasicBlock, v: int) -> ExprResult {
     return ExprResult { gen: g, block: b, val_id: v }
+}
+
+-- Resolve the original (source-level) type of a field access expression
+fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
+    let obj = *expr.object
+    let field = expr.field
+    let mut sname = ""
+    if obj.kind == EXPR_IDENTIFIER() {
+        if gen.var_struct_types.contains(obj.name) {
+            sname = gen.var_struct_types.get(obj.name)
+        }
+    }
+    if sname == "" {
+        let obj_type = infer_expr_type(gen, obj)
+        if gen.struct_defs.contains(obj_type) {
+            sname = obj_type
+        }
+    }
+    if sname != "" and gen.struct_defs.contains(sname) {
+        let sinfo = gen.struct_defs.get(sname)
+        let mut fi = 0
+        while fi < sinfo.field_names.len() {
+            if sinfo.field_names[fi] == field {
+                return sinfo.field_types[fi]
+            }
+            fi = fi + 1
+        }
+    }
+    return ""
 }
 
 -- ============================================================
@@ -5880,16 +5542,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
     let mut g = gen
     let mut b = block
     let var_name = stmt.let_name
-    let mut type_str = stmt.let_type
-
-    -- Normalize fixed-size array type [T; N] to List[T]
-    if starts_with(type_str, "[") {
-        let semi_pos = string_find(type_str, ";")
-        if semi_pos > 0 {
-            let inner_type = string_trim(substr(type_str, 1, semi_pos - 1))
-            type_str = "List[" + inner_type + "]"
-        }
-    }
+    let type_str = stmt.let_type
 
     -- Detect List[T] type annotation
     if starts_with(type_str, "List[") {
@@ -5921,10 +5574,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         g.builder.next_id = g.builder.next_id + 1
 
         -- Call new function to initialize
-        let new_fn = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_new" }
-        else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_new" }
-        else if elem_kind == LIST_ELEM_STRING() { "dm_list_string_new" }
-        else { "dm_list_generic_new" }
+        let new_fn = list_type + "_new"
         let mut call_inst = ir_inst_new(g.builder.next_id, OP_CALL())
         call_inst.callee = new_fn
         let mut call_args: List[IRValue] = []
@@ -5934,32 +5584,6 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         call_inst.has_result = false
         b.instructions.push(call_inst)
         g.builder.next_id = g.builder.next_id + 1
-
-        -- If the initializer is a non-empty array literal, push elements into the list
-        let init_expr = *stmt.let_value
-        if init_expr.kind == EXPR_ARRAY_LITERAL() and init_expr.elements.len() > 0 {
-            let push_fn_name = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_push" }
-            else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_push" }
-            else if elem_kind == LIST_ELEM_STRING() { "llvm_dm_list_string_push" }
-            else { "dm_list_generic_push" }
-            let mut ei = 0
-            while ei < init_expr.elements.len() {
-                let elem_result = generate_expr(g, b, init_expr.elements[ei])
-                g = elem_result.gen
-                b = elem_result.block
-                let mut push_call_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-                push_call_inst.callee = push_fn_name
-                let mut push_call_args: List[IRValue] = []
-                push_call_args.push(ir_val_inst(alloca_id))
-                push_call_args.push(ir_val_inst(elem_result.val_id))
-                push_call_inst.call_args = push_call_args
-                push_call_inst.result_type = "void"
-                push_call_inst.has_result = false
-                b.instructions.push(push_call_inst)
-                g.builder.next_id = g.builder.next_id + 1
-                ei = ei + 1
-            }
-        }
 
         g.variable_map.insert(var_name, alloca_id)
         g.variable_types.insert(var_name, list_type)
@@ -6044,146 +5668,71 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
     if starts_with(type_str, "dyn ") {
         let trait_name = substr(type_str, 4, len(type_str) - 4)
 
-        let val_expr = *stmt.let_value
-        -- Infer concrete type from value expression
-        let mut concrete = ""
-        if val_expr.kind == EXPR_IDENTIFIER() {
-            if g.var_struct_types.contains(val_expr.name) {
-                concrete = g.var_struct_types.get(val_expr.name)
-            }
-        } else if val_expr.kind == EXPR_STRUCT_LITERAL() {
-            concrete = val_expr.type_name
-        }
-
-        -- Use concrete struct type for alloca so the struct is stored directly
-        let alloc_type = if len(concrete) > 0 { concrete } else { "ptr" }
         let alloca_id = g.builder.next_id
         let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
-        alloca_inst.alloc_type = alloc_type
-        alloca_inst.result_type = "ptr(" + alloc_type + ")"
+        alloca_inst.alloc_type = "ptr"
+        alloca_inst.result_type = "ptr(ptr)"
         alloca_inst.has_result = true
         b.instructions.push(alloca_inst)
         g.builder.next_id = g.builder.next_id + 1
 
+        let val_expr = *stmt.let_value
         if val_expr.kind != EXPR_LITERAL_NULL() {
             let result = generate_expr(g, b, val_expr)
             g = result.gen
             b = result.block
 
-            if len(concrete) > 0 {
-                g.dyn_var_concrete.insert(var_name, concrete)
-                g.dyn_var_traits.insert(var_name, trait_name)
+            -- Infer concrete type from value
+            if val_expr.kind == EXPR_IDENTIFIER() {
+                if g.var_struct_types.contains(val_expr.name) {
+                    let concrete = g.var_struct_types.get(val_expr.name)
+                    g.dyn_var_concrete.insert(var_name, concrete)
+                    g.dyn_var_traits.insert(var_name, trait_name)
+                }
             }
 
+            -- Heap allocate and store
+            let size = estimate_type_size("ptr")
+            let mut malloc_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+            malloc_inst.callee = "malloc"
+            let mut margs: List[IRValue] = []
+            margs.push(ir_val_int(size))
+            malloc_inst.call_args = margs
+            malloc_inst.result_type = "ptr"
+            malloc_inst.has_result = true
+            b.instructions.push(malloc_inst)
+            let data_ptr_id = g.builder.next_id
+            g.builder.next_id = g.builder.next_id + 1
+
             let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_inst.store_ptr = ir_val_inst(alloca_id)
+            store_inst.store_ptr = ir_val_inst(data_ptr_id)
             store_inst.store_val = ir_val_inst(result.val_id)
             store_inst.has_result = false
             b.instructions.push(store_inst)
             g.builder.next_id = g.builder.next_id + 1
+
+            let mut store2 = ir_inst_new(g.builder.next_id, OP_STORE())
+            store2.store_ptr = ir_val_inst(alloca_id)
+            store2.store_val = ir_val_inst(data_ptr_id)
+            store2.has_result = false
+            b.instructions.push(store2)
+            g.builder.next_id = g.builder.next_id + 1
         }
 
         g.variable_map.insert(var_name, alloca_id)
-        if len(concrete) > 0 {
-            g.variable_types.insert(var_name, concrete)
-            g.var_struct_types.insert(var_name, concrete)
-        } else {
-            g.variable_types.insert(var_name, "ptr")
-        }
+        g.variable_types.insert(var_name, "ptr")
         return gen_result(g, b)
     }
 
-    -- Regular let binding: infer type from annotation or value expression
-    let infer_val = *stmt.let_value
-
-    -- Early handling: method calls that return lists (.keys(), .values())
-    -- These produce list allocas directly; bypass normal alloca+store
-    if len(type_str) == 0 and infer_val.kind == EXPR_METHOD_CALL() {
-        let early_method = infer_val.method
-        if early_method == "keys" or early_method == "values" {
-            let early_obj = *infer_val.object
-            if early_obj.kind == EXPR_IDENTIFIER() {
-                let early_obj_name = early_obj.name
-                if g.map_var_kinds.contains(early_obj_name) {
-                    let early_mk = g.map_var_kinds.get(early_obj_name)
-                    let result = generate_expr(g, b, infer_val)
-                    g = result.gen
-                    b = result.block
-                    if early_method == "keys" {
-                        if early_mk == MAP_KIND_STRING_INT() {
-                            g.list_elem_kinds.insert(var_name, LIST_ELEM_STRING())
-                        } else {
-                            g.list_elem_kinds.insert(var_name, LIST_ELEM_INT())
-                        }
-                    } else {
-                        if early_mk == MAP_KIND_STRING_INT() {
-                            g.list_elem_kinds.insert(var_name, LIST_ELEM_INT())
-                        } else {
-                            g.list_elem_kinds.insert(var_name, LIST_ELEM_STRING())
-                        }
-                    }
-                    g.variable_map.insert(var_name, result.val_id)
-                    g.variable_types.insert(var_name, "list")
-                    return gen_result(g, b)
-                }
-            }
-        }
-    }
-
-    -- Early handling: string_split() calls return list allocas directly
-    if len(type_str) == 0 and infer_val.kind == EXPR_FUNCTION_CALL() {
-        let early_callee = *infer_val.callee
-        if early_callee.kind == EXPR_IDENTIFIER() and early_callee.name == "string_split" {
-            let result = generate_expr(g, b, infer_val)
-            g = result.gen
-            b = result.block
-            g.list_elem_kinds.insert(var_name, LIST_ELEM_STRING())
-            g.variable_map.insert(var_name, result.val_id)
-            g.variable_types.insert(var_name, "list")
-            return gen_result(g, b)
-        }
-    }
-
-    -- Early handling: array literal [elem1, elem2, ...] without type annotation
-    -- Treat as List[T] where T is inferred from the first element
-    if infer_val.kind == EXPR_ARRAY_LITERAL() and infer_val.elements.len() > 0 {
-        let arr_elem_type = infer_expr_type(g, infer_val.elements[0])
-        let arr_elem_kind = if arr_elem_type == "i64" or arr_elem_type == "int" { LIST_ELEM_INT() }
-            else if arr_elem_type == "f64" or arr_elem_type == "float" { LIST_ELEM_FLOAT() }
-            else if arr_elem_type == "string" { LIST_ELEM_STRING() }
-            else { LIST_ELEM_OTHER() }
-        let result = generate_expr(g, b, infer_val)
-        g = result.gen
-        b = result.block
-        g.list_elem_kinds.insert(var_name, arr_elem_kind)
-        g.variable_map.insert(var_name, result.val_id)
-        g.variable_types.insert(var_name, "list")
-        return gen_result(g, b)
-    }
-
+    -- Regular let binding: determine IR type
     let mut ir_type = "i64"
     if len(type_str) > 0 {
         ir_type = map_type_name(type_str)
-        -- If the type annotation is Result[T, E] or Option[T], preserve the full type string
-        if starts_with(type_str, "Result[") or starts_with(type_str, "Option[") {
-            ir_type = type_str
-        }
-    } else if infer_val.kind != EXPR_LITERAL_NULL() {
-        ir_type = infer_expr_type(g, infer_val)
-    }
-
-    -- Additional check: if value is a function call and type is still i64,
-    -- try infer_call_return_type to detect Result/Option return types
-    if ir_type == "i64" and infer_val.kind == EXPR_FUNCTION_CALL() {
-        let call_callee = *infer_val.callee
-        if call_callee.kind == EXPR_IDENTIFIER() {
-            let call_ret = infer_call_return_type(g, call_callee.name)
-            if starts_with(call_ret, "Result[") or starts_with(call_ret, "result_") or call_ret == "result" {
-                ir_type = call_ret
-            }
-            if starts_with(call_ret, "Option[") or starts_with(call_ret, "option_") or call_ret == "option" {
-                ir_type = call_ret
-            }
+    } else {
+        -- Infer type from the value expression
+        let val_expr_for_type = *stmt.let_value
+        if val_expr_for_type.kind != EXPR_LITERAL_NULL() {
+            ir_type = infer_expr_type(g, val_expr_for_type)
         }
     }
 
@@ -6201,26 +5750,9 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         g = result.gen
         b = result.block
 
-        -- If the alloca type differs from the expression type, insert a cast
-        -- This handles cases like `let x: i32 = 42` where the literal is i64
-        let expr_type = infer_expr_type(g, val_expr)
-        let mut store_val_id = result.val_id
-        if expr_type != ir_type and (is_integer_type(ir_type) or is_float_type(ir_type)) {
-            let cast_id = g.builder.next_id
-            let mut cast_inst = ir_inst_new(cast_id, OP_CAST())
-            cast_inst.cast_val = ir_val_inst(result.val_id)
-            cast_inst.cast_from = expr_type
-            cast_inst.cast_to = ir_type
-            cast_inst.result_type = ir_type
-            cast_inst.has_result = true
-            b.instructions.push(cast_inst)
-            g.builder.next_id = g.builder.next_id + 1
-            store_val_id = cast_id
-        }
-
         let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
         store_inst.store_ptr = ir_val_inst(alloca_id)
-        store_inst.store_val = ir_val_inst(store_val_id)
+        store_inst.store_val = ir_val_inst(result.val_id)
         store_inst.has_result = false
         b.instructions.push(store_inst)
         g.builder.next_id = g.builder.next_id + 1
@@ -6228,22 +5760,6 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         -- Track struct type
         if val_expr.kind == EXPR_STRUCT_LITERAL() {
             g.var_struct_types.insert(var_name, val_expr.type_name)
-        }
-        -- Track struct type from index access on a list of structs
-        if val_expr.kind == EXPR_INDEX_ACCESS() {
-            let idx_obj = *val_expr.object
-            if idx_obj.kind == EXPR_IDENTIFIER() {
-                let idx_var = idx_obj.name
-                if g.list_elem_kinds.contains(idx_var) {
-                    let ek = g.list_elem_kinds.get(idx_var)
-                    if ek == LIST_ELEM_OTHER() and g.list_elem_types.contains(idx_var) {
-                        let elem_t = g.list_elem_types.get(idx_var)
-                        if g.struct_defs.contains(elem_t) {
-                            g.var_struct_types.insert(var_name, elem_t)
-                        }
-                    }
-                }
-            }
         }
         if val_expr.kind == EXPR_IDENTIFIER() {
             if g.var_struct_types.contains(val_expr.name) {
@@ -6255,50 +5771,160 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             if g.var_enum_types.contains(val_expr.name) {
                 g.var_enum_types.insert(var_name, g.var_enum_types.get(val_expr.name))
             }
+            if g.box_inner_types.contains(val_expr.name) {
+                g.box_inner_types.insert(var_name, g.box_inner_types.get(val_expr.name))
+            }
+        }
+        -- Track struct/enum type from function/method call return type
+        if val_expr.kind == EXPR_FUNCTION_CALL() or val_expr.kind == EXPR_METHOD_CALL() {
+            let inferred = infer_expr_type(g, val_expr)
+            if g.struct_defs.contains(inferred) {
+                g.var_struct_types.insert(var_name, inferred)
+            }
+            if g.enum_defs.contains(inferred) {
+                g.var_enum_types.insert(var_name, inferred)
+            }
+        }
+        -- Track Map/List type from method calls like .keys(), .values()
+        if val_expr.kind == EXPR_METHOD_CALL() {
+            let mc_method = val_expr.method
+            let mc_obj = *val_expr.object
+            -- Map.keys() returns List[K], Map.values() returns List[V]
+            if mc_method == "keys" or mc_method == "values" {
+                let mut mc_map_type = ""
+                if mc_obj.kind == EXPR_IDENTIFIER() and g.var_type_annotations.contains(mc_obj.name) {
+                    mc_map_type = g.var_type_annotations.get(mc_obj.name)
+                }
+                if mc_obj.kind == EXPR_FIELD_ACCESS() {
+                    let mc_fa_type = resolve_field_original_type(g, mc_obj)
+                    if starts_with(mc_fa_type, "Map[") {
+                        mc_map_type = mc_fa_type
+                    }
+                }
+                if starts_with(mc_map_type, "Map[") {
+                    let mc_inner = extract_inner_type(mc_map_type, "Map[")
+                    let mc_comma = string_find(mc_inner, ",")
+                    if mc_comma >= 0 {
+                        if mc_method == "keys" {
+                            let key_t = string_trim(substr(mc_inner, 0, mc_comma))
+                            let key_kind = classify_list_elem(key_t)
+                            g.list_elem_kinds.insert(var_name, key_kind)
+                            if key_kind == LIST_ELEM_OTHER() {
+                                g.list_elem_types.insert(var_name, key_t)
+                            }
+                        } else {
+                            let val_t = string_trim(substr(mc_inner, mc_comma + 1, len(mc_inner) - mc_comma - 1))
+                            let val_kind = classify_list_elem(val_t)
+                            g.list_elem_kinds.insert(var_name, val_kind)
+                            if val_kind == LIST_ELEM_OTHER() {
+                                g.list_elem_types.insert(var_name, val_t)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        -- Track struct/list/enum type from field access
+        if val_expr.kind == EXPR_FIELD_ACCESS() {
+            let fa_obj = *val_expr.object
+            let fa_field = val_expr.field
+            let mut fa_sname = ""
+            if fa_obj.kind == EXPR_IDENTIFIER() {
+                if g.var_struct_types.contains(fa_obj.name) {
+                    fa_sname = g.var_struct_types.get(fa_obj.name)
+                }
+            }
+            -- Handle compound objects (deref, nested field access, etc.)
+            if fa_sname == "" {
+                let fa_obj_type = infer_expr_type(g, fa_obj)
+                if g.struct_defs.contains(fa_obj_type) {
+                    fa_sname = fa_obj_type
+                }
+            }
+            if fa_sname != "" {
+                let flek = fa_sname + "." + fa_field
+                -- Propagate list elem kinds/types from struct field
+                if g.field_list_elem_kinds.contains(flek) {
+                    g.list_elem_kinds.insert(var_name, g.field_list_elem_kinds.get(flek))
+                }
+                if g.field_list_elem_types.contains(flek) {
+                    g.list_elem_types.insert(var_name, g.field_list_elem_types.get(flek))
+                }
+                -- Propagate struct/enum/box/map type from field
+                if g.struct_defs.contains(fa_sname) {
+                    let fa_sinfo = g.struct_defs.get(fa_sname)
+                    let mut fai = 0
+                    while fai < fa_sinfo.field_names.len() {
+                        if fa_sinfo.field_names[fai] == fa_field {
+                            let fa_ftype = fa_sinfo.field_types[fai]
+                            if g.struct_defs.contains(fa_ftype) {
+                                g.var_struct_types.insert(var_name, fa_ftype)
+                            }
+                            if g.enum_defs.contains(fa_ftype) {
+                                g.var_enum_types.insert(var_name, fa_ftype)
+                            }
+                            if starts_with(fa_ftype, "Box[") {
+                                let fa_inner = extract_inner_type(fa_ftype, "Box[")
+                                g.box_inner_types.insert(var_name, fa_inner)
+                            }
+                            -- Propagate Map/List type annotations from field
+                            if starts_with(fa_ftype, "Map[") or starts_with(fa_ftype, "List[") {
+                                g.var_type_annotations.insert(var_name, fa_ftype)
+                            }
+                        }
+                        fai = fai + 1
+                    }
+                }
+            }
+        }
+        -- Track struct type from index access into struct-typed lists
+        if val_expr.kind == EXPR_INDEX_ACCESS() {
+            let ia_obj = *val_expr.object
+            if ia_obj.kind == EXPR_IDENTIFIER() {
+                if g.list_elem_types.contains(ia_obj.name) {
+                    let elem_type = g.list_elem_types.get(ia_obj.name)
+                    if g.struct_defs.contains(elem_type) {
+                        g.var_struct_types.insert(var_name, elem_type)
+                    }
+                    if g.enum_defs.contains(elem_type) {
+                        g.var_enum_types.insert(var_name, elem_type)
+                    }
+                }
+            }
+        }
+        -- Track struct type from deref or other complex expressions via ir_type
+        if g.struct_defs.contains(ir_type) {
+            if g.var_struct_types.contains(var_name) == false {
+                g.var_struct_types.insert(var_name, ir_type)
+            }
         }
         if val_expr.kind == EXPR_LAMBDA() {
-            -- The lambda was just generated by generate_expr, which advanced lambda_counter.
-            -- So the lambda name is __lambda_(counter-1).
-            let actual_lambda_name = "__lambda_" + int_to_string(g.lambda_counter - 1)
-            g.fn_ptr_vars.insert(var_name, actual_lambda_name)
-        }
-        -- If the value is a function name (identifier referencing a known function),
-        -- register it in fn_ptr_vars so indirect calls work correctly
-        if val_expr.kind == EXPR_IDENTIFIER() and starts_with(type_str, "fn(") {
-            let fn_ref_name = val_expr.name
-            -- Verify it's a known function
-            let mut fn_found = false
-            let mut fn_check = 0
-            while fn_check < g.ir_mod.functions.len() {
-                if g.ir_mod.functions[fn_check].name == fn_ref_name {
-                    fn_found = true
-                }
-                fn_check = fn_check + 1
-            }
-            if fn_found {
-                g.fn_ptr_vars.insert(var_name, fn_ref_name)
-            }
+            g.fn_ptr_vars.insert(var_name, val_expr.str_val)
         }
     }
 
     -- Track struct/enum type from type annotation
     if len(type_str) > 0 {
-        if g.struct_defs.contains(type_str) {
-            g.var_struct_types.insert(var_name, type_str)
+        let mut ann_type = type_str
+        -- Strip generic params for struct/enum lookup: "Option[int]" -> "Option"
+        let ann_bracket = string_find(type_str, "[")
+        if ann_bracket >= 0 {
+            ann_type = substr(type_str, 0, ann_bracket)
         }
-        if g.enum_defs.contains(type_str) {
-            g.var_enum_types.insert(var_name, type_str)
+        if g.struct_defs.contains(ann_type) {
+            g.var_struct_types.insert(var_name, ann_type)
+        }
+        if g.enum_defs.contains(ann_type) {
+            g.var_enum_types.insert(var_name, ann_type)
+        }
+        -- Track full type annotation for Result/Option/Map/List types
+        if starts_with(type_str, "Result[") or starts_with(type_str, "Option[") or starts_with(type_str, "Map[") or starts_with(type_str, "List[") {
+            g.var_type_annotations.insert(var_name, type_str)
         }
     }
 
     g.variable_map.insert(var_name, alloca_id)
-    -- For function pointer type annotations, preserve the full fn(...) -> T string
-    -- so that indirect call dispatch can detect it
-    if starts_with(type_str, "fn(") {
-        g.variable_types.insert(var_name, type_str)
-    } else {
-        g.variable_types.insert(var_name, ir_type)
-    }
+    g.variable_types.insert(var_name, ir_type)
     return gen_result(g, b)
 }
 
@@ -6365,6 +5991,7 @@ fn generate_if_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> G
         then_block.has_terminator = true
     }
     g.completed_blocks.push(then_block)
+
     -- Else block (if present)
     let mut else_block = ir_block_new(else_label)
     if stmt.has_else_branch {
@@ -6413,6 +6040,7 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     b.terminator = Box_new(term_br(header_label))
     b.has_terminator = true
     g.completed_blocks.push(b)
+
     -- Header block: evaluate condition
     let mut header_block = ir_block_new(header_label)
     let cond_result = generate_expr(g, header_block, *stmt.while_cond)
@@ -6422,6 +6050,7 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     header_block.terminator = Box_new(term_br_cond(ir_val_inst(cond_result.val_id), body_label, exit_label))
     header_block.has_terminator = true
     g.completed_blocks.push(header_block)
+
     -- Body block
     let mut body_block = ir_block_new(body_label)
     let body_result = generate_block_stmts(g, body_block, stmt.while_body)
@@ -6431,8 +6060,8 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
-    -- Push completed body block (b and header_block already pushed above)
     g.completed_blocks.push(body_block)
+
     -- Restore break/continue targets
     g.break_target = prev_break
     g.continue_target = prev_continue
@@ -6461,11 +6090,6 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
         return generate_range_for_loop(g, b, stmt, iter_expr)
     }
 
-    -- Check for string literal iteration (for c in "abc")
-    if iter_expr.kind == EXPR_LITERAL_STRING() {
-        return generate_string_for_loop(g, b, stmt, "")
-    }
-
     -- Check for string iteration (if iter is identifier and tracked as string type)
     if iter_expr.kind == EXPR_IDENTIFIER() {
         let iter_name = iter_expr.name
@@ -6492,11 +6116,76 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     b = iter_result.block
     let list_ptr = iter_result.val_id
 
-    -- Determine list kind from iterator name or default
-    let list_kind = if iter_expr.kind == EXPR_IDENTIFIER() and g.list_elem_kinds.contains(iter_expr.name) {
-        g.list_elem_kinds.get(iter_expr.name)
-    } else {
-        LIST_ELEM_INT()
+    -- Determine list kind from iterator expression
+    let mut list_kind = LIST_ELEM_INT()
+    let mut list_elem_type_name = ""
+    if iter_expr.kind == EXPR_IDENTIFIER() and g.list_elem_kinds.contains(iter_expr.name) {
+        list_kind = g.list_elem_kinds.get(iter_expr.name)
+        if list_kind == LIST_ELEM_OTHER() and g.list_elem_types.contains(iter_expr.name) {
+            list_elem_type_name = g.list_elem_types.get(iter_expr.name)
+        }
+    } else if iter_expr.kind == EXPR_FIELD_ACCESS() {
+        -- Handle field access iterator: obj.field
+        let fa_obj = *iter_expr.object
+        let mut fa_sname = ""
+        if fa_obj.kind == EXPR_IDENTIFIER() {
+            if g.var_struct_types.contains(fa_obj.name) {
+                fa_sname = g.var_struct_types.get(fa_obj.name)
+            }
+        }
+        if fa_sname == "" {
+            let fa_obj_type = infer_expr_type(g, fa_obj)
+            if g.struct_defs.contains(fa_obj_type) {
+                fa_sname = fa_obj_type
+            }
+        }
+        if fa_sname != "" {
+            let flek = fa_sname + "." + iter_expr.field
+            if g.field_list_elem_kinds.contains(flek) {
+                list_kind = g.field_list_elem_kinds.get(flek)
+                if list_kind == LIST_ELEM_OTHER() and g.field_list_elem_types.contains(flek) {
+                    list_elem_type_name = g.field_list_elem_types.get(flek)
+                }
+            }
+        }
+    } else if iter_expr.kind == EXPR_METHOD_CALL() {
+        -- Handle method call iterator: map.keys(), map.values(), list_returning_method()
+        let mc_obj = *iter_expr.object
+        let mc_method = iter_expr.method
+        -- Check if this is a .keys() or .values() call on a Map
+        if mc_method == "keys" or mc_method == "values" {
+            let mut mk = -1
+            -- Direct map variable: my_map.keys()
+            if mc_obj.kind == EXPR_IDENTIFIER() and g.map_var_kinds.contains(mc_obj.name) {
+                mk = g.map_var_kinds.get(mc_obj.name)
+            }
+            -- Map field access: g.variable_map.keys()
+            if mk == -1 and mc_obj.kind == EXPR_FIELD_ACCESS() {
+                let mc_fa_obj = *mc_obj.object
+                let mc_fa_field = mc_obj.field
+                let mut mc_sname = ""
+                if mc_fa_obj.kind == EXPR_IDENTIFIER() and g.var_struct_types.contains(mc_fa_obj.name) {
+                    mc_sname = g.var_struct_types.get(mc_fa_obj.name)
+                }
+                if len(mc_sname) > 0 {
+                    let mc_key = mc_sname + "." + mc_fa_field
+                    if g.field_map_kinds.contains(mc_key) {
+                        mk = g.field_map_kinds.get(mc_key)
+                    }
+                }
+            }
+            if mk >= 0 {
+                -- MAP_KIND_STRING_INT: keys=string, values=int
+                -- MAP_KIND_INT_STRING: keys=int, values=string
+                if mk == MAP_KIND_STRING_INT() {
+                    if mc_method == "keys" { list_kind = LIST_ELEM_STRING() }
+                    else { list_kind = LIST_ELEM_INT() }
+                } else {
+                    if mc_method == "keys" { list_kind = LIST_ELEM_INT() }
+                    else { list_kind = LIST_ELEM_STRING() }
+                }
+            }
+        }
     }
 
     -- Get list length
@@ -6533,14 +6222,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.builder.next_id = g.builder.next_id + 1
 
     -- Determine element type
-    let iter_name = if iter_expr.kind == EXPR_IDENTIFIER() { iter_expr.name } else { "" }
-    let elem_type = if list_kind == LIST_ELEM_INT() { "i64" }
-    else if list_kind == LIST_ELEM_FLOAT() { "f64" }
-    else if list_kind == LIST_ELEM_STRING() { "string" }
-    else if list_kind == LIST_ELEM_OTHER() and len(iter_name) > 0 and g.list_elem_types.contains(iter_name) {
-        g.list_elem_types.get(iter_name)
+    let mut elem_type = "i64"
+    if list_kind == LIST_ELEM_INT() { elem_type = "i64" }
+    else if list_kind == LIST_ELEM_FLOAT() { elem_type = "f64" }
+    else if list_kind == LIST_ELEM_STRING() { elem_type = "string" }
+    else if list_kind == LIST_ELEM_OTHER() and list_elem_type_name != "" {
+        elem_type = list_elem_type_name
     }
-    else { "i64" }
 
     -- Create element variable
     let elem_alloca_id = g.builder.next_id
@@ -6553,6 +6241,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
 
     g.variable_map.insert(var_name, elem_alloca_id)
     g.variable_types.insert(var_name, elem_type)
+    -- Track struct/enum type for element variable
+    if g.struct_defs.contains(elem_type) {
+        g.var_struct_types.insert(var_name, elem_type)
+    }
+    if g.enum_defs.contains(elem_type) {
+        g.var_enum_types.insert(var_name, elem_type)
+    }
 
     -- Labels
     let header_label = gen_next_label(g, "for_header")
@@ -6611,47 +6306,22 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let idx_val2_id = g.builder.next_id
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Get element from list
-    if list_kind == LIST_ELEM_OTHER() {
-        -- Generic list: dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
-        let elem_size = estimate_type_size_gen(g, elem_type)
-        let mut get_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-        get_inst.callee = "dm_list_generic_get"
-        let mut get_args: List[IRValue] = []
-        get_args.push(ir_val_inst(elem_alloca_id))
-        get_args.push(ir_val_inst(list_ptr))
-        get_args.push(ir_val_inst(idx_val2_id))
-        get_args.push(ir_val_int(elem_size))
-        get_inst.call_args = get_args
-        get_inst.result_type = "void"
-        get_inst.has_result = false
-        body_block.instructions.push(get_inst)
-        g.builder.next_id = g.builder.next_id + 1
-        -- elem_alloca is already populated by dm_list_generic_get, no store needed
-    } else {
-        let get_fn = if list_kind == LIST_ELEM_INT() { "dm_list_int64_get" }
-        else if list_kind == LIST_ELEM_FLOAT() { "dm_list_double_get" }
-        else { "dm_list_string_get" }
+    -- Get element from list (use OP_LIST_GET so LLVM gen handles struct elements)
+    let mut get_inst = ir_inst_new(g.builder.next_id, OP_LIST_GET())
+    get_inst.lhs = ir_val_inst(list_ptr)
+    get_inst.rhs = ir_val_inst(idx_val2_id)
+    get_inst.result_type = elem_type
+    get_inst.has_result = true
+    body_block.instructions.push(get_inst)
+    let elem_val_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
 
-        let mut get_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-        get_inst.callee = get_fn
-        let mut get_args: List[IRValue] = []
-        get_args.push(ir_val_inst(list_ptr))
-        get_args.push(ir_val_inst(idx_val2_id))
-        get_inst.call_args = get_args
-        get_inst.result_type = elem_type
-        get_inst.has_result = true
-        body_block.instructions.push(get_inst)
-        let elem_val_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_elem = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_elem.store_ptr = ir_val_inst(elem_alloca_id)
-        store_elem.store_val = ir_val_inst(elem_val_id)
-        store_elem.has_result = false
-        body_block.instructions.push(store_elem)
-        g.builder.next_id = g.builder.next_id + 1
-    }
+    let mut store_elem = ir_inst_new(g.builder.next_id, OP_STORE())
+    store_elem.store_ptr = ir_val_inst(elem_alloca_id)
+    store_elem.store_val = ir_val_inst(elem_val_id)
+    store_elem.has_result = false
+    body_block.instructions.push(store_elem)
+    g.builder.next_id = g.builder.next_id + 1
 
     -- Generate body
     let body_result = generate_block_stmts(g, body_block, stmt.for_body)
@@ -6694,11 +6364,6 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
-
-    -- Push completed blocks
-    g.completed_blocks.push(b)
-    g.completed_blocks.push(header_block)
-    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -6761,6 +6426,7 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     -- Branch to header
     b.terminator = Box_new(term_br(header_label))
     b.has_terminator = true
+    g.completed_blocks.push(b)
 
     -- Header: check i < end (or i <= end for inclusive)
     let mut header_block = ir_block_new(header_label)
@@ -6787,6 +6453,7 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
 
     header_block.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), body_label, exit_label))
     header_block.has_terminator = true
+    g.completed_blocks.push(header_block)
 
     -- Body
     let mut body_block = ir_block_new(body_label)
@@ -6824,16 +6491,12 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
+    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
-
-    -- Push completed blocks
-    g.completed_blocks.push(b)
-    g.completed_blocks.push(header_block)
-    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -6998,16 +6661,12 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
+    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
-
-    -- Push completed blocks
-    g.completed_blocks.push(b)
-    g.completed_blocks.push(header_block)
-    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -7202,16 +6861,12 @@ fn generate_map_for_in(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, iter_n
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
+    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
-
-    -- Push completed blocks
-    g.completed_blocks.push(b)
-    g.completed_blocks.push(header_block)
-    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -7249,16 +6904,13 @@ fn generate_loop_stmt(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
     if body_block.has_terminator == false {
         body_block.terminator = Box_new(term_br(body_label))
         body_block.has_terminator = true
+    g.completed_blocks.push(body_block)
     }
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
-
-    -- Push completed blocks
-    g.completed_blocks.push(b)
-    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -7312,13 +6964,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             if g.variable_map.contains(target_name) {
                 let ptr = g.variable_map.get(target_name)
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                -- For mut params, store through the param pointer (no alloca exists)
-                if g.param_ptr_map.contains(target_name) {
-                    let pidx = g.param_ptr_map.get(target_name)
-                    store_inst.store_ptr = ir_val_param(pidx)
-                } else {
-                    store_inst.store_ptr = ir_val_inst(ptr)
-                }
+                store_inst.store_ptr = ir_val_inst(ptr)
                 store_inst.store_val = ir_val_inst(val_result.val_id)
                 store_inst.has_result = false
                 b.instructions.push(store_inst)
@@ -7334,17 +6980,9 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     "i64"
                 }
 
-                -- Determine the pointer value for load/store
-                -- For mut params, use the param pointer directly (no alloca exists)
-                let mut ptr_val = ir_val_inst(ptr)
-                if g.param_ptr_map.contains(target_name) {
-                    let pidx = g.param_ptr_map.get(target_name)
-                    ptr_val = ir_val_param(pidx)
-                }
-
                 -- Load current value
                 let mut load_inst = ir_inst_new(g.builder.next_id, OP_LOAD())
-                load_inst.load_ptr = ptr_val
+                load_inst.load_ptr = ir_val_inst(ptr)
                 load_inst.load_type = ty
                 load_inst.result_type = ty
                 load_inst.has_result = true
@@ -7370,7 +7008,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
 
                 -- Store new value
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                store_inst.store_ptr = ptr_val
+                store_inst.store_ptr = ir_val_inst(ptr)
                 store_inst.store_val = ir_val_inst(new_val_id)
                 store_inst.has_result = false
                 b.instructions.push(store_inst)
@@ -7401,18 +7039,9 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     fi = fi + 1
                 }
                 if field_idx >= 0 {
-                    -- Determine the struct pointer source:
-                    -- For mut pointer params (mut self): use param ref directly
-                    -- For regular vars: use the alloca instruction ref
-                    let mut load_ptr_val = ir_val_inst(ptr)
-                    if g.param_ptr_map.contains(obj.name) {
-                        let pidx = g.param_ptr_map.get(obj.name)
-                        load_ptr_val = ir_val_param(pidx)
-                    }
-
                     -- Load current struct value
                     let mut load_inst = ir_inst_new(g.builder.next_id, OP_LOAD())
-                    load_inst.load_ptr = load_ptr_val
+                    load_inst.load_ptr = ir_val_inst(ptr)
                     load_inst.load_type = struct_name
                     load_inst.result_type = struct_name
                     load_inst.has_result = true
@@ -7427,13 +7056,30 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     insert_inst.field_index = field_idx
                     insert_inst.result_type = struct_name
                     insert_inst.has_result = true
+                    -- Set field_type for list/map handling in LLVM gen
+                    if field_idx < info.field_types.len() {
+                        let assign_ftype = info.field_types[field_idx]
+                        if starts_with(assign_ftype, "List[") {
+                            let af_inner = extract_inner_type(assign_ftype, "List[")
+                            let af_ek = classify_list_elem(af_inner)
+                            if af_ek == LIST_ELEM_INT() { insert_inst.field_type = "dm_list_int64" }
+                            else if af_ek == LIST_ELEM_FLOAT() { insert_inst.field_type = "dm_list_double" }
+                            else if af_ek == LIST_ELEM_STRING() { insert_inst.field_type = "dm_list_dm_string" }
+                            else { insert_inst.field_type = "dm_list_generic" }
+                        }
+                        if starts_with(assign_ftype, "Map[") {
+                            let af_minner = extract_inner_type(assign_ftype, "Map[")
+                            if starts_with(af_minner, "string") { insert_inst.field_type = "dm_map_string_int" }
+                            else { insert_inst.field_type = "dm_map_int_string" }
+                        }
+                    }
                     b.instructions.push(insert_inst)
                     let new_struct_id = g.builder.next_id
                     g.builder.next_id = g.builder.next_id + 1
 
-                    -- Store back through the pointer
+                    -- Store back
                     let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                    store_inst.store_ptr = load_ptr_val
+                    store_inst.store_ptr = ir_val_inst(ptr)
                     store_inst.store_val = ir_val_inst(new_struct_id)
                     store_inst.has_result = false
                     b.instructions.push(store_inst)
@@ -7482,6 +7128,108 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
 -- Main dispatcher and all expression kind handlers
 -- Port of stage3/src/ir_gen.zig generateExpr
 -- ============================================================
+
+-- Parse the error type from a "Result[T, E]" type annotation string
+-- Returns the mapped IR type of E (e.g., "string" or "i64")
+fn parse_result_err_type(type_ann: string) -> string {
+    -- Find first "[" and last "]"
+    let open_bracket = string_find(type_ann, "[")
+    if open_bracket < 0 { return "i64" }
+    let close_bracket = len(type_ann) - 1
+    if char_at(type_ann, close_bracket) != "]" { return "i64" }
+    -- Extract inner: "int, string"
+    let inner = substr(type_ann, open_bracket + 1, close_bracket - open_bracket - 1)
+    -- Find the comma that separates T and E (handle nested brackets)
+    let mut depth = 0
+    let mut ci = 0
+    while ci < len(inner) {
+        let ch = char_at(inner, ci)
+        if ch == "[" { depth = depth + 1 }
+        if ch == "]" { depth = depth - 1 }
+        if ch == "," and depth == 0 {
+            let err_type = string_trim(substr(inner, ci + 1, len(inner) - ci - 1))
+            return map_type_name(err_type)
+        }
+        ci = ci + 1
+    }
+    return "i64"
+}
+
+-- Parse the ok type from a "Result[T, E]" type annotation string
+fn parse_result_ok_type(type_ann: string) -> string {
+    let open_bracket = string_find(type_ann, "[")
+    if open_bracket < 0 { return "i64" }
+    let close_bracket = len(type_ann) - 1
+    if char_at(type_ann, close_bracket) != "]" { return "i64" }
+    let inner = substr(type_ann, open_bracket + 1, close_bracket - open_bracket - 1)
+    -- Find the comma that separates T and E
+    let mut depth = 0
+    let mut ci = 0
+    while ci < len(inner) {
+        let ch = char_at(inner, ci)
+        if ch == "[" { depth = depth + 1 }
+        if ch == "]" { depth = depth - 1 }
+        if ch == "," and depth == 0 {
+            let ok_type = string_trim(substr(inner, 0, ci))
+            return map_type_name(ok_type)
+        }
+        ci = ci + 1
+    }
+    return "i64"
+}
+
+-- Extract Map value type from "Map[K, V]" annotation
+fn extract_map_value_type(map_type: string) -> string {
+    let inner = extract_inner_type(map_type, "Map[")
+    let comma_pos = string_find(inner, ",")
+    if comma_pos >= 0 {
+        let val_type = string_trim(substr(inner, comma_pos + 1, len(inner) - comma_pos - 1))
+        return val_type
+    }
+    return "i64"
+}
+
+-- Infer return type of a method call given the original collection type
+fn infer_collection_method_type(gen: IRGenerator, coll_type: string, method_name: string) -> string {
+    if starts_with(coll_type, "Map[") {
+        if method_name == "get" {
+            let val_type = extract_map_value_type(coll_type)
+            return map_type_name(val_type)
+        }
+        if method_name == "contains" { return "bool" }
+        if method_name == "len" { return "i64" }
+        if method_name == "keys" or method_name == "values" { return "list" }
+    }
+    if starts_with(coll_type, "List[") {
+        if method_name == "len" { return "i64" }
+        if method_name == "pop" {
+            let inner = extract_inner_type(coll_type, "List[")
+            return map_type_name(inner)
+        }
+    }
+    return ""
+}
+
+-- Parse the value type from an "Option[T]" type annotation string
+fn parse_option_value_type(type_ann: string) -> string {
+    let open_bracket = string_find(type_ann, "[")
+    if open_bracket < 0 { return "i64" }
+    let close_bracket = len(type_ann) - 1
+    if char_at(type_ann, close_bracket) != "]" { return "i64" }
+    let inner = substr(type_ann, open_bracket + 1, close_bracket - open_bracket - 1)
+    return map_type_name(string_trim(inner))
+}
+
+-- Look up the Result type annotation for a scrutinee expression
+fn get_scrutinee_type_annotation(gen: IRGenerator, scrut_expr: Expr) -> string {
+    if scrut_expr.kind == EXPR_IDENTIFIER() {
+        let name = scrut_expr.name
+        if gen.var_type_annotations.contains(name) {
+            return gen.var_type_annotations.get(name)
+        }
+    }
+    return ""
+}
 
 fn generate_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     if expr.kind == EXPR_LITERAL_INT() {
@@ -7763,21 +7511,6 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
             "i64"
         }
 
-        -- For mut pointer vars (mut self): load struct through the param pointer.
-        -- The param IS a pointer to the struct (no alloca was created).
-        if g.param_ptr_map.contains(name) {
-            let param_idx = g.param_ptr_map.get(name)
-            let load_id = g.builder.next_id
-            let mut load_struct = ir_inst_new(load_id, OP_LOAD())
-            load_struct.load_ptr = ir_val_param(param_idx)
-            load_struct.load_type = var_type
-            load_struct.result_type = var_type
-            load_struct.has_result = true
-            b.instructions.push(load_struct)
-            g.builder.next_id = g.builder.next_id + 1
-            return expr_result(g, b, load_id)
-        }
-
         let load_id = g.builder.next_id
         let mut load = ir_inst_new(load_id, OP_LOAD())
         load.load_ptr = ir_val_inst(alloca_id)
@@ -7787,147 +7520,6 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         b.instructions.push(load)
         g.builder.next_id = g.builder.next_id + 1
         return expr_result(g, b, load_id)
-    }
-
-    -- Check for global constants (const SIZE = 4096, etc.)
-    let mut gi = 0
-    while gi < g.ir_mod.globals.len() {
-        let glob = g.ir_mod.globals[gi]
-        if glob.name == name and glob.has_init {
-            let init = glob.init_value
-            if init.kind == VAL_CONST_INT() {
-                let id = g.builder.next_id
-                let mut ai = ir_inst_new(id, OP_ALLOCA())
-                ai.alloc_type = "i64"
-                ai.result_type = "ptr(i64)"
-                ai.has_result = true
-                b.instructions.push(ai)
-                let sid = id + 1
-                let mut si = ir_inst_new(sid, OP_STORE())
-                si.store_ptr = ir_val_inst(id)
-                si.store_val = ir_val_int(init.int_val)
-                si.has_result = false
-                b.instructions.push(si)
-                g.builder.next_id = sid + 1
-                let lid = g.builder.next_id
-                let mut li = ir_inst_new(lid, OP_LOAD())
-                li.load_ptr = ir_val_inst(id)
-                li.load_type = "i64"
-                li.result_type = "i64"
-                li.has_result = true
-                b.instructions.push(li)
-                g.builder.next_id = lid + 1
-                return expr_result(g, b, lid)
-            }
-            if init.kind == VAL_CONST_FLOAT() {
-                let id = g.builder.next_id
-                let mut ai = ir_inst_new(id, OP_ALLOCA())
-                ai.alloc_type = "f64"
-                ai.result_type = "ptr(f64)"
-                ai.has_result = true
-                b.instructions.push(ai)
-                let sid = id + 1
-                let mut si = ir_inst_new(sid, OP_STORE())
-                si.store_ptr = ir_val_inst(id)
-                si.store_val = ir_val_float(init.float_val)
-                si.has_result = false
-                b.instructions.push(si)
-                g.builder.next_id = sid + 1
-                let lid = g.builder.next_id
-                let mut li = ir_inst_new(lid, OP_LOAD())
-                li.load_ptr = ir_val_inst(id)
-                li.load_type = "f64"
-                li.result_type = "f64"
-                li.has_result = true
-                b.instructions.push(li)
-                g.builder.next_id = lid + 1
-                return expr_result(g, b, lid)
-            }
-            if init.kind == VAL_CONST_BOOL() {
-                let id = g.builder.next_id
-                let mut ai = ir_inst_new(id, OP_ALLOCA())
-                ai.alloc_type = "bool"
-                ai.result_type = "ptr(bool)"
-                ai.has_result = true
-                b.instructions.push(ai)
-                let sid = id + 1
-                let mut si = ir_inst_new(sid, OP_STORE())
-                si.store_ptr = ir_val_inst(id)
-                si.store_val = ir_val_bool(init.bool_val)
-                si.has_result = false
-                b.instructions.push(si)
-                g.builder.next_id = sid + 1
-                let lid = g.builder.next_id
-                let mut li = ir_inst_new(lid, OP_LOAD())
-                li.load_ptr = ir_val_inst(id)
-                li.load_type = "bool"
-                li.result_type = "bool"
-                li.has_result = true
-                b.instructions.push(li)
-                g.builder.next_id = lid + 1
-                return expr_result(g, b, lid)
-            }
-            if init.kind == VAL_CONST_STRING() {
-                let id = g.builder.next_id
-                let mut ai = ir_inst_new(id, OP_ALLOCA())
-                ai.alloc_type = "string"
-                ai.result_type = "ptr(string)"
-                ai.has_result = true
-                b.instructions.push(ai)
-                let sid = id + 1
-                let mut si = ir_inst_new(sid, OP_STORE())
-                si.store_ptr = ir_val_inst(id)
-                si.store_val = ir_val_string(init.str_val)
-                si.has_result = false
-                b.instructions.push(si)
-                g.builder.next_id = sid + 1
-                let lid = g.builder.next_id
-                let mut li = ir_inst_new(lid, OP_LOAD())
-                li.load_ptr = ir_val_inst(id)
-                li.load_type = "string"
-                li.result_type = "string"
-                li.has_result = true
-                b.instructions.push(li)
-                g.builder.next_id = lid + 1
-                return expr_result(g, b, lid)
-            }
-        }
-        gi = gi + 1
-    }
-
-    -- Check if the identifier is a known function name (function pointer reference)
-    let mut fi = 0
-    while fi < g.ir_mod.functions.len() {
-        let func = g.ir_mod.functions[fi]
-        if func.name == name {
-            -- Return a global reference to the function
-            let ref_id = g.builder.next_id
-            let mut ref_inst = ir_inst_new(ref_id, OP_ALLOCA())
-            ref_inst.alloc_type = "ptr"
-            ref_inst.result_type = "ptr(ptr)"
-            ref_inst.has_result = true
-            b.instructions.push(ref_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut store_ref = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_ref.store_ptr = ir_val_inst(ref_id)
-            store_ref.store_val = ir_val_global(name)
-            store_ref.has_result = false
-            b.instructions.push(store_ref)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let load_id = g.builder.next_id
-            let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-            load_inst.load_ptr = ir_val_inst(ref_id)
-            load_inst.load_type = "ptr"
-            load_inst.result_type = "ptr"
-            load_inst.has_result = true
-            b.instructions.push(load_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            return expr_result(g, b, load_id)
-        }
-        fi = fi + 1
     }
 
     -- Unknown identifier - return undef
@@ -7970,24 +7562,6 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         if gen.variable_types.contains(name) {
             return gen.variable_types.get(name)
         }
-        -- Check global constants for their type
-        let mut gi_ty = 0
-        while gi_ty < gen.ir_mod.globals.len() {
-            let gl_ty = gen.ir_mod.globals[gi_ty]
-            if gl_ty.name == name and gl_ty.has_init {
-                if gl_ty.init_value.kind == VAL_CONST_STRING() {
-                    return "string"
-                }
-                if gl_ty.init_value.kind == VAL_CONST_FLOAT() {
-                    return "f64"
-                }
-                if gl_ty.init_value.kind == VAL_CONST_BOOL() {
-                    return "bool"
-                }
-                return "i64"
-            }
-            gi_ty = gi_ty + 1
-        }
         return "i64"
     }
     if expr.kind == EXPR_BINARY() {
@@ -8014,6 +7588,49 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         if expr.op == UNOP_NOT() {
             return "bool"
         }
+        if expr.op == UNOP_DEREF() {
+            -- Dereference: look up the Box inner type
+            let operand = *expr.operand
+            if operand.kind == EXPR_IDENTIFIER() {
+                if gen.box_inner_types.contains(operand.name) {
+                    return gen.box_inner_types.get(operand.name)
+                }
+            }
+            -- For field access, resolve the field's Box[T] type to get T
+            if operand.kind == EXPR_FIELD_ACCESS() {
+                -- Use the recursive field access inference to get the field type
+                -- The field type should be "ptr" (from parse_type_to_ir("Box[T]")),
+                -- but we need the original type to extract the inner type
+                let fa_obj = *operand.object
+                let mut sname = ""
+                if fa_obj.kind == EXPR_IDENTIFIER() {
+                    if gen.var_struct_types.contains(fa_obj.name) {
+                        sname = gen.var_struct_types.get(fa_obj.name)
+                    }
+                }
+                if sname == "" {
+                    let obj_type = infer_expr_type(gen, fa_obj)
+                    if gen.struct_defs.contains(obj_type) {
+                        sname = obj_type
+                    }
+                }
+                if sname != "" and gen.struct_defs.contains(sname) {
+                    let sinfo = gen.struct_defs.get(sname)
+                    let fname = operand.field
+                    let mut fi = 0
+                    while fi < sinfo.field_names.len() {
+                        if sinfo.field_names[fi] == fname {
+                            let ftype = sinfo.field_types[fi]
+                            if starts_with(ftype, "Box[") {
+                                return extract_inner_type(ftype, "Box[")
+                            }
+                        }
+                        fi = fi + 1
+                    }
+                }
+            }
+            return "i64"
+        }
         -- Negation preserves the operand type
         return infer_expr_type(gen, *expr.operand)
     }
@@ -8028,136 +7645,91 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
             if is_builtin_fn(fn_name) {
                 return builtin_return_type(fn_name)
             }
-            -- SIMD builtins: infer return type from function name or argument types
-            if is_simd_builtin(fn_name) {
-                if starts_with(fn_name, "simd_splat_") or starts_with(fn_name, "simd_set_") {
-                    return parse_simd_type_from_name(fn_name)
-                }
-                if fn_name == "simd_add" or fn_name == "simd_sub" or fn_name == "simd_mul" or fn_name == "simd_div" {
-                    -- Return type is the same as the first argument's vector type
-                    if expr.args.len() > 0 {
-                        return infer_expr_type(gen, expr.args[0])
-                    }
-                    return "f32x4"
-                }
-                if fn_name == "simd_extract" {
-                    -- Return dAImond-native type (f64 for float vectors, i64 for int vectors)
-                    if expr.args.len() > 0 {
-                        let vec_ty = infer_expr_type(gen, expr.args[0])
-                        if is_simd_float_type(vec_ty) {
-                            return "f64"
-                        }
-                        return "i64"
-                    }
-                    return "f64"
-                }
-            }
-            -- Look up user-defined function return types
-            let mut fi = 0
-            while fi < gen.ir_mod.functions.len() {
-                let func = gen.ir_mod.functions[fi]
-                if func.name == fn_name {
-                    return func.return_type
-                }
-                fi = fi + 1
-            }
-            -- Check for generic function declarations
-            if gen.generic_fn_decls.contains(fn_name) {
-                let decl_idx = gen.generic_fn_decls.get(fn_name)
-                if decl_idx >= 0 and decl_idx < gen.declarations.len() {
-                    let decl = gen.declarations[decl_idx]
-                    if decl.kind == DECL_FUNCTION() {
-                        let fd = *decl.func_decl
-                        let ret_type = fd.return_type
-                        -- If return type is a generic param, resolve from args
-                        if fd.generic_params.len() > 0 {
-                            let mut pi = 0
-                            while pi < fd.generic_params.len() {
-                                if fd.generic_params[pi] == ret_type {
-                                    -- Infer from corresponding argument
-                                    if pi < expr.args.len() {
-                                        return infer_expr_type(gen, expr.args[pi])
-                                    }
-                                }
-                                pi = pi + 1
-                            }
-                            -- Also check explicit type args
-                            if expr.generic_args.len() > 0 {
-                                let mut gi = 0
-                                while gi < fd.generic_params.len() {
-                                    if fd.generic_params[gi] == ret_type and gi < expr.generic_args.len() {
-                                        return map_type_name(expr.generic_args[gi])
-                                    }
-                                    gi = gi + 1
-                                }
-                            }
-                        }
-                        return map_type_name(ret_type)
-                    }
-                }
-            }
-            -- Check if callee is a lambda/fn-ptr variable: look up actual function
-            if gen.fn_ptr_vars.contains(fn_name) {
-                let lambda_fn_name = gen.fn_ptr_vars.get(fn_name)
-                let mut lfi = 0
-                while lfi < gen.ir_mod.functions.len() {
-                    if gen.ir_mod.functions[lfi].name == lambda_fn_name {
-                        return gen.ir_mod.functions[lfi].return_type
-                    }
-                    lfi = lfi + 1
-                }
-            }
-            -- Check if callee is a function-pointer-typed variable: parse return type
-            if gen.variable_types.contains(fn_name) {
-                let vtype = gen.variable_types.get(fn_name)
-                if starts_with(vtype, "fn(") {
-                    let arrow_pos = string_find(vtype, " -> ")
-                    if arrow_pos >= 0 {
-                        let ret_str = substr(vtype, arrow_pos + 4, len(vtype) - arrow_pos - 4)
-                        return map_type_name(ret_str)
-                    }
-                }
+            -- Check user-defined function return types
+            if gen.fn_return_types.contains(fn_name) {
+                return gen.fn_return_types.get(fn_name)
             }
         }
         return "i64"
     }
-    if expr.kind == EXPR_STRING_INTERP() {
-        return "string"
-    }
-    if expr.kind == EXPR_GROUPED() {
-        return infer_expr_type(gen, *expr.operand)
-    }
-    if expr.kind == EXPR_PIPELINE() {
-        -- Pipeline: a |> f — return type of function f
-        let rhs = *expr.pipe_right
-        if rhs.kind == EXPR_FUNCTION_CALL() {
-            let callee = *rhs.callee
-            if callee.kind == EXPR_IDENTIFIER() {
-                let fn_name = callee.name
-                if is_builtin_fn(fn_name) {
-                    return builtin_return_type(fn_name)
+    if expr.kind == EXPR_METHOD_CALL() {
+        -- Try to determine the struct type for the method
+        let method_name = expr.method
+        let obj = *expr.object
+        if obj.kind == EXPR_IDENTIFIER() {
+            -- Static method: Point.new(...) -> look up Point_new
+            let full_name = obj.name + "_" + method_name
+            if gen.fn_return_types.contains(full_name) {
+                return gen.fn_return_types.get(full_name)
+            }
+            -- Instance method: p.distance(...) -> look up <struct>_distance
+            if gen.var_struct_types.contains(obj.name) {
+                let stype = gen.var_struct_types.get(obj.name)
+                let inst_name = stype + "_" + method_name
+                if gen.fn_return_types.contains(inst_name) {
+                    return gen.fn_return_types.get(inst_name)
                 }
+            }
+            -- Map/List methods on variables with type annotations
+            if gen.var_type_annotations.contains(obj.name) {
+                let ann = gen.var_type_annotations.get(obj.name)
+                let coll_result = infer_collection_method_type(gen, ann, method_name)
+                if coll_result != "" {
+                    return coll_result
+                }
+            }
+            -- List methods on tracked list variables
+            if gen.variable_types.contains(obj.name) and gen.variable_types.get(obj.name) == "list" {
+                if method_name == "len" { return "i64" }
+                if method_name == "pop" {
+                    if gen.list_elem_types.contains(obj.name) {
+                        return map_type_name(gen.list_elem_types.get(obj.name))
+                    }
+                    if gen.list_elem_kinds.contains(obj.name) {
+                        let k = gen.list_elem_kinds.get(obj.name)
+                        if k == LIST_ELEM_STRING() { return "string" }
+                        if k == LIST_ELEM_FLOAT() { return "f64" }
+                    }
+                    return "i64"
+                }
+            }
+        }
+        -- Compound object (field access): resolve field type for Map/List methods
+        if obj.kind == EXPR_FIELD_ACCESS() {
+            let fa_obj = *obj.object
+            let fa_field = obj.field
+            let mut sname = ""
+            if fa_obj.kind == EXPR_IDENTIFIER() {
+                if gen.var_struct_types.contains(fa_obj.name) {
+                    sname = gen.var_struct_types.get(fa_obj.name)
+                }
+            }
+            if sname == "" {
+                let fa_obj_type = infer_expr_type(gen, fa_obj)
+                if gen.struct_defs.contains(fa_obj_type) {
+                    sname = fa_obj_type
+                }
+            }
+            if sname != "" and gen.struct_defs.contains(sname) {
+                let sinfo = gen.struct_defs.get(sname)
                 let mut fi = 0
-                while fi < gen.ir_mod.functions.len() {
-                    let func = gen.ir_mod.functions[fi]
-                    if func.name == fn_name {
-                        return func.return_type
+                while fi < sinfo.field_names.len() {
+                    if sinfo.field_names[fi] == fa_field {
+                        let ftype = sinfo.field_types[fi]
+                        let coll_result = infer_collection_method_type(gen, ftype, method_name)
+                        if coll_result != "" {
+                            return coll_result
+                        }
+                        -- Instance method on a struct-typed field
+                        if gen.struct_defs.contains(ftype) {
+                            let inst_name = ftype + "_" + method_name
+                            if gen.fn_return_types.contains(inst_name) {
+                                return gen.fn_return_types.get(inst_name)
+                            }
+                        }
                     }
                     fi = fi + 1
                 }
-            }
-        } else if rhs.kind == EXPR_IDENTIFIER() {
-            let fn_name = rhs.name
-            if is_builtin_fn(fn_name) {
-                return builtin_return_type(fn_name)
-            }
-            let mut fi = 0
-            while fi < gen.ir_mod.functions.len() {
-                let func = gen.ir_mod.functions[fi]
-                if func.name == fn_name {
-                    return func.return_type
-                }
-                fi = fi + 1
             }
         }
         return "i64"
@@ -8165,226 +7737,100 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
     if expr.kind == EXPR_STRUCT_LITERAL() {
         return expr.type_name
     }
-    if expr.kind == EXPR_ENUM_LITERAL() {
-        return expr.enum_name
+    if expr.kind == EXPR_STRING_INTERP() {
+        return "string"
+    }
+    if expr.kind == EXPR_GROUPED() {
+        return infer_expr_type(gen, *expr.operand)
     }
     if expr.kind == EXPR_IF() {
-        -- Return type of then branch (then_branch is Box[Expr] to EXPR_BLOCK)
-        let tb = *expr.then_branch
-        if tb.kind == EXPR_BLOCK() and tb.stmts.len() > 0 {
-            let last = tb.stmts[tb.stmts.len() - 1]
-            if last.kind == STMT_EXPRESSION() {
-                return infer_expr_type(gen, *last.expr)
-            }
-        }
-        return "void"
+        -- Infer type from the then branch
+        return infer_expr_type(gen, *expr.then_branch)
     }
-    if expr.kind == EXPR_MATCH() {
-        -- Return type of first arm
-        if expr.match_arms.len() > 0 {
-            let arm = expr.match_arms[0]
-            if arm.is_expr_body {
-                return infer_expr_type(gen, *arm.body_expr)
-            }
+    if expr.kind == EXPR_BLOCK() {
+        -- Infer type from the result expression if present
+        if expr.has_result {
+            return infer_expr_type(gen, *expr.result)
         }
-        return "void"
+        return "i64"
+    }
+    if expr.kind == EXPR_AWAIT() {
+        -- Await returns the type of the inner expression
+        return infer_expr_type(gen, *expr.operand)
     }
     if expr.kind == EXPR_FIELD_ACCESS() {
-        -- Look up struct field type
         let obj = *expr.object
-        let obj_type = infer_expr_type(gen, obj)
-        if gen.struct_defs.contains(obj_type) {
-            let si = gen.struct_defs.get(obj_type)
+        let field = expr.field
+        let mut sname = ""
+        -- Try identifier lookup first
+        if obj.kind == EXPR_IDENTIFIER() {
+            if gen.var_struct_types.contains(obj.name) {
+                sname = gen.var_struct_types.get(obj.name)
+            }
+        }
+        -- For compound expressions, recursively infer the object type
+        if sname == "" {
+            let obj_type = infer_expr_type(gen, obj)
+            if gen.struct_defs.contains(obj_type) {
+                sname = obj_type
+            }
+        }
+        if sname != "" and gen.struct_defs.contains(sname) {
+            let sinfo = gen.struct_defs.get(sname)
             let mut fi = 0
-            while fi < si.field_names.len() {
-                if si.field_names[fi] == expr.field {
-                    return si.field_types[fi]
+            while fi < sinfo.field_names.len() {
+                if sinfo.field_names[fi] == field {
+                    let ftype = sinfo.field_types[fi]
+                    return parse_type_to_ir(ftype)
                 }
                 fi = fi + 1
-            }
-        }
-        -- Check variable's struct type
-        if obj.kind == EXPR_IDENTIFIER() and gen.var_struct_types.contains(obj.name) {
-            let sname = gen.var_struct_types.get(obj.name)
-            if gen.struct_defs.contains(sname) {
-                let si = gen.struct_defs.get(sname)
-                let mut fi = 0
-                while fi < si.field_names.len() {
-                    if si.field_names[fi] == expr.field {
-                        return si.field_types[fi]
-                    }
-                    fi = fi + 1
-                }
-            }
-        }
-        -- Check Option[T] / Result[T, E] types for field access
-        if obj.kind == EXPR_IDENTIFIER() and gen.variable_types.contains(obj.name) {
-            let fa_vtype = gen.variable_types.get(obj.name)
-            if starts_with(fa_vtype, "Option[") {
-                let fa_inner = substr(fa_vtype, 7, len(fa_vtype) - 8)
-                if expr.field == "value" {
-                    return map_type_name(fa_inner)
-                }
-                if expr.field == "has_value" {
-                    return "i32"
-                }
-            }
-            if starts_with(fa_vtype, "Result[") {
-                let fa_inner_str = substr(fa_vtype, 7, len(fa_vtype) - 8)
-                let mut fa_comma = 0
-                let mut fa_ci = 0
-                while fa_ci < len(fa_inner_str) {
-                    if char_at(fa_inner_str, fa_ci) == "," {
-                        fa_comma = fa_ci
-                    }
-                    fa_ci = fa_ci + 1
-                }
-                let fa_ok_type = string_trim(substr(fa_inner_str, 0, fa_comma))
-                let fa_err_type = string_trim(substr(fa_inner_str, fa_comma + 1, len(fa_inner_str) - fa_comma - 1))
-                if expr.field == "ok" or expr.field == "value" {
-                    return map_type_name(fa_ok_type)
-                }
-                if expr.field == "err" or expr.field == "error" {
-                    return map_type_name(fa_err_type)
-                }
-                if expr.field == "is_ok" {
-                    return "bool"
-                }
             }
         }
         return "i64"
     }
     if expr.kind == EXPR_INDEX_ACCESS() {
         let obj = *expr.object
+        -- Try identifier lookup first
         if obj.kind == EXPR_IDENTIFIER() {
-            let name = obj.name
-            -- String indexing returns a string (char_at)
-            if gen.variable_types.contains(name) {
-                let idx_vtype = gen.variable_types.get(name)
-                if idx_vtype == "string" {
-                    return "string"
+            if gen.list_elem_types.contains(obj.name) {
+                let elem_type = gen.list_elem_types.get(obj.name)
+                return map_type_name(elem_type)
+            }
+            if gen.list_elem_kinds.contains(obj.name) {
+                let kind = gen.list_elem_kinds.get(obj.name)
+                if kind == LIST_ELEM_STRING() { return "string" }
+                if kind == LIST_ELEM_FLOAT() { return "f64" }
+            }
+        }
+        -- For field access as the list, use field_list_elem_types/kinds
+        if obj.kind == EXPR_FIELD_ACCESS() {
+            let fa_obj = *obj.object
+            let mut fa_sname = ""
+            if fa_obj.kind == EXPR_IDENTIFIER() {
+                if gen.var_struct_types.contains(fa_obj.name) {
+                    fa_sname = gen.var_struct_types.get(fa_obj.name)
                 }
             }
-            if gen.list_elem_kinds.contains(name) {
-                let ek = gen.list_elem_kinds.get(name)
-                if ek == LIST_ELEM_INT() { return "i64" }
-                if ek == LIST_ELEM_FLOAT() { return "f64" }
-                if ek == LIST_ELEM_STRING() { return "string" }
-                if ek == LIST_ELEM_OTHER() and gen.list_elem_types.contains(name) {
-                    return gen.list_elem_types.get(name)
+            if fa_sname == "" {
+                let fa_obj_type = infer_expr_type(gen, fa_obj)
+                if gen.struct_defs.contains(fa_obj_type) {
+                    fa_sname = fa_obj_type
                 }
             }
-            -- Map index access
-            if gen.map_var_kinds.contains(name) {
-                let idx_mk = gen.map_var_kinds.get(name)
-                if idx_mk == MAP_KIND_STRING_INT() { return "i64" }
-                if idx_mk == MAP_KIND_INT_STRING() { return "string" }
+            if fa_sname != "" {
+                let flek = fa_sname + "." + obj.field
+                if gen.field_list_elem_types.contains(flek) {
+                    let elem_type = gen.field_list_elem_types.get(flek)
+                    return map_type_name(elem_type)
+                }
+                if gen.field_list_elem_kinds.contains(flek) {
+                    let fek = gen.field_list_elem_kinds.get(flek)
+                    if fek == LIST_ELEM_STRING() { return "string" }
+                    if fek == LIST_ELEM_FLOAT() { return "f64" }
+                }
             }
         }
         return "i64"
-    }
-    if expr.kind == EXPR_METHOD_CALL() {
-        let method = expr.method
-        if method == "len" { return "i64" }
-        if method == "pop" { return "i64" }
-        if method == "get" {
-            -- Check if object is a map variable to determine get return type
-            let get_obj = *expr.object
-            if get_obj.kind == EXPR_IDENTIFIER() {
-                let get_var = get_obj.name
-                if gen.map_var_kinds.contains(get_var) {
-                    let mk = gen.map_var_kinds.get(get_var)
-                    if mk == MAP_KIND_INT_STRING() {
-                        return "string"
-                    }
-                }
-            }
-            return "i64"
-        }
-        if method == "contains" { return "bool" }
-        -- Check for struct method calls (regular and generic impl)
-        if gen.method_struct_map.contains(method) {
-            let struct_type = gen.method_struct_map.get(method)
-            let mangled = struct_type + "_" + method
-            -- Check generic impl method
-            if gen.generic_fn_decls.contains(mangled) {
-                let decl_idx = gen.generic_fn_decls.get(mangled)
-                if decl_idx >= 0 and decl_idx < gen.declarations.len() {
-                    let decl = gen.declarations[decl_idx]
-                    if decl.kind == DECL_FUNCTION() {
-                        let fd = *decl.func_decl
-                        -- Check if method takes self
-                        let mut has_self = false
-                        if fd.params.len() > 0 {
-                            has_self = fd.params[0].name == "self"
-                        }
-                        -- Build effective args
-                        let mut effective_args: List[Expr] = []
-                        if has_self {
-                            effective_args.push(*expr.object)
-                        }
-                        let mut ai = 0
-                        while ai < expr.args.len() {
-                            effective_args.push(expr.args[ai])
-                            ai = ai + 1
-                        }
-                        -- Infer type args
-                        let mut temp_subs: Map[string, string] = Map_new()
-                        let mut pi = 0
-                        while pi < fd.generic_params.len() {
-                            let gp = fd.generic_params[pi]
-                            let mut inferred = "i64"
-                            let mut mi = 0
-                            while mi < fd.params.len() and mi < effective_args.len() {
-                                if fd.params[mi].type_name == gp {
-                                    inferred = infer_arg_type(gen, effective_args[mi])
-                                }
-                                mi = mi + 1
-                            }
-                            temp_subs.insert(gp, inferred)
-                            pi = pi + 1
-                        }
-                        -- Resolve return type
-                        let ret = fd.return_type
-                        if temp_subs.contains(ret) {
-                            return map_type_name(temp_subs.get(ret))
-                        }
-                        -- Handle complex return types like Pair[A, B]
-                        let bracket_idx = string_find(ret, "[")
-                        if bracket_idx > 0 {
-                            let base = substr(ret, 0, bracket_idx)
-                            let inner = substr(ret, bracket_idx + 1, len(ret) - bracket_idx - 2)
-                            let comma_idx = string_find(inner, ", ")
-                            if comma_idx >= 0 {
-                                let first_t = substr(inner, 0, comma_idx)
-                                let second_t = substr(inner, comma_idx + 2, len(inner) - comma_idx - 2)
-                                let r1 = if temp_subs.contains(first_t) { map_type_name(temp_subs.get(first_t)) } else { map_type_name(first_t) }
-                                let r2 = if temp_subs.contains(second_t) { map_type_name(temp_subs.get(second_t)) } else { map_type_name(second_t) }
-                                return base + "_" + r1 + "_" + r2
-                            } else {
-                                let r1 = if temp_subs.contains(inner) { map_type_name(temp_subs.get(inner)) } else { map_type_name(inner) }
-                                return base + "_" + r1
-                            }
-                        }
-                        return map_type_name(ret)
-                    }
-                }
-            }
-            -- Non-generic struct method: look up return type from IR functions
-            let ret_type = infer_call_return_type(gen, mangled)
-            return ret_type
-        }
-        return "i64"
-    }
-    if expr.kind == EXPR_COMPTIME() {
-        return infer_expr_type(gen, *expr.operand)
-    }
-    if expr.kind == EXPR_ARRAY_LITERAL() {
-        return "i64"
-    }
-    if expr.kind == EXPR_AWAIT() {
-        -- Await returns the type of the inner expression
-        return infer_expr_type(gen, *expr.operand)
     }
     -- Default fallback
     return "i64"
@@ -8555,75 +8001,6 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         g.builder.next_id = g.builder.next_id + 1
 
         return expr_result(g, join_block, load_id)
-    }
-
-    -- --------------------------------------------------------
-    -- OPERATOR OVERLOADING: check if left operand is a struct
-    -- with an impl method for this operator
-    -- --------------------------------------------------------
-    let mut overload_method = ""
-    if op == BINOP_ADD() { overload_method = "add" }
-    if op == BINOP_SUB() { overload_method = "sub" }
-    if op == BINOP_MUL() { overload_method = "mul" }
-    if op == BINOP_DIV() { overload_method = "div" }
-    if op == BINOP_EQ() { overload_method = "eq" }
-    if op == BINOP_NE() { overload_method = "ne" }
-    if op == BINOP_LT() { overload_method = "lt" }
-    if op == BINOP_GT() { overload_method = "gt" }
-    if op == BINOP_LE() { overload_method = "le" }
-    if op == BINOP_GE() { overload_method = "ge" }
-
-    if len(overload_method) > 0 {
-        let left_expr = *expr.left
-        let mut left_struct_name = ""
-        if left_expr.kind == EXPR_IDENTIFIER() {
-            if g.var_struct_types.contains(left_expr.name) {
-                left_struct_name = g.var_struct_types.get(left_expr.name)
-            }
-        }
-        if left_struct_name == "" and left_expr.kind == EXPR_IDENTIFIER() {
-            let ltype = infer_expr_type(g, left_expr)
-            if g.struct_defs.contains(ltype) {
-                left_struct_name = ltype
-            }
-        }
-
-        if len(left_struct_name) > 0 {
-            let mangled = left_struct_name + "_" + overload_method
-            -- Check if method exists (declared or generic)
-            let mut method_exists = false
-            let mut fci = 0
-            while fci < g.ir_mod.functions.len() {
-                if g.ir_mod.functions[fci].name == mangled {
-                    method_exists = true
-                }
-                fci = fci + 1
-            }
-            if method_exists == false and g.generic_fn_decls.contains(mangled) {
-                method_exists = true
-            }
-            -- Also check pending declarations
-            if method_exists == false {
-                let mut dci = 0
-                while dci < g.declarations.len() {
-                    let decl = g.declarations[dci]
-                    if decl.kind == DECL_FUNCTION() {
-                        let fd = *decl.func_decl
-                        if fd.name == mangled {
-                            method_exists = true
-                        }
-                    }
-                    dci = dci + 1
-                }
-            }
-
-            if method_exists {
-                -- Call the overloaded operator method: struct_method(left, right)
-                let mut op_args: List[Expr] = []
-                op_args.push(*expr.right)
-                return generate_struct_method_call(g, b, left_struct_name, left_expr, overload_method, op_args)
-            }
-        }
     }
 
     -- --------------------------------------------------------
@@ -8886,63 +8263,6 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     -- --------------------------------------------------------
     -- COMPARISON OPERATORS (==, !=, <, <=, >, >=)
     -- --------------------------------------------------------
-
-    -- Check if this is an enum comparison (need to extract tags first)
-    let mut is_enum_cmp = false
-    let left_expr = *expr.left
-    if left_expr.kind == EXPR_IDENTIFIER() {
-        if g.var_enum_types.contains(left_expr.name) {
-            is_enum_cmp = true
-        }
-    }
-    if left_expr.kind == EXPR_ENUM_LITERAL() {
-        is_enum_cmp = true
-    }
-    -- Also check right side for enum literal like Color.Red
-    let right_expr = *expr.right
-    if right_expr.kind == EXPR_ENUM_LITERAL() {
-        is_enum_cmp = true
-    }
-    if right_expr.kind == EXPR_IDENTIFIER() {
-        if g.var_enum_types.contains(right_expr.name) {
-            is_enum_cmp = true
-        }
-    }
-
-    if is_enum_cmp and (op == BINOP_EQ() or op == BINOP_NE()) {
-        -- Extract tag (field 0) from both enum values
-        let lhs_tag_id = g.builder.next_id
-        let mut lhs_tag = ir_inst_new(lhs_tag_id, OP_EXTRACT_FIELD())
-        lhs_tag.field_base = ir_val_inst(lhs_id)
-        lhs_tag.field_index = 0
-        lhs_tag.field_type = "i32"
-        lhs_tag.result_type = "i32"
-        lhs_tag.has_result = true
-        b.instructions.push(lhs_tag)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let rhs_tag_id = g.builder.next_id
-        let mut rhs_tag = ir_inst_new(rhs_tag_id, OP_EXTRACT_FIELD())
-        rhs_tag.field_base = ir_val_inst(rhs_id)
-        rhs_tag.field_index = 0
-        rhs_tag.field_type = "i32"
-        rhs_tag.result_type = "i32"
-        rhs_tag.has_result = true
-        b.instructions.push(rhs_tag)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let cmp_op = if op == BINOP_EQ() { OP_EQ() } else { OP_NE() }
-        let cmp_id = g.builder.next_id
-        let mut cmp_inst = ir_inst_new(cmp_id, cmp_op)
-        cmp_inst.lhs = ir_val_inst(lhs_tag_id)
-        cmp_inst.rhs = ir_val_inst(rhs_tag_id)
-        cmp_inst.result_type = "bool"
-        cmp_inst.has_result = true
-        b.instructions.push(cmp_inst)
-        g.builder.next_id = cmp_id + 1
-        return expr_result(g, b, cmp_id)
-    }
-
     if op == BINOP_EQ() {
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_EQ())
@@ -9142,6 +8462,46 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
         return expr_result(g, b, id)
     }
 
+    if expr.op == UNOP_DEREF() {
+        -- Dereference Box[T]: load the struct value from the pointer
+        -- Try to determine the Box inner type from tracked info
+        let mut inner_type = "i64"
+
+        -- Check if operand is a variable with known Box inner type
+        let operand_expr = *expr.operand
+        if operand_expr.kind == EXPR_IDENTIFIER() {
+            if g.box_inner_types.contains(operand_expr.name) {
+                inner_type = g.box_inner_types.get(operand_expr.name)
+            }
+        }
+
+        -- Check if operand was a field access that produced a Box value
+        let inst_key = "_inst_" + int_to_string(operand_id)
+        if g.box_inner_types.contains(inst_key) {
+            inner_type = g.box_inner_types.get(inst_key)
+        }
+
+        -- Map the inner type to IR type
+        let load_type = map_type_name(inner_type)
+
+        let id = g.builder.next_id
+        let mut inst = ir_inst_new(id, OP_LOAD())
+        inst.load_ptr = ir_val_inst(operand_id)
+        inst.load_type = load_type
+        inst.result_type = load_type
+        inst.has_result = true
+        b.instructions.push(inst)
+        g.builder.next_id = id + 1
+
+        -- If inner type is a struct, track the result for subsequent field access
+        if g.struct_defs.contains(inner_type) {
+            let result_var = "_deref_" + int_to_string(id)
+            g.var_struct_types.insert(result_var, inner_type)
+        }
+
+        return expr_result(g, b, id)
+    }
+
     -- Unknown unary operator, return operand unchanged
     return expr_result(g, b, operand_id)
 }
@@ -9284,14 +8644,6 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return generate_lambda_indirect_call(g, b, fn_name, expr.args)
     }
 
-    -- Indirect call via function-pointer-typed parameter: f: fn(int) -> int
-    if g.variable_types.contains(fn_name) {
-        let vtype = g.variable_types.get(fn_name)
-        if starts_with(vtype, "fn(") {
-            return generate_fn_ptr_param_call(g, b, fn_name, vtype, expr.args)
-        }
-    }
-
     -- len() on a list variable: dispatch to typed list_len runtime function
     if fn_name == "len" and expr.args.len() > 0 {
         let first_arg = expr.args[0]
@@ -9324,12 +8676,6 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     -- Builtin function (println, len, int_to_string, etc.)
     if is_builtin_fn(fn_name) {
         return generate_builtin_call(g, b, fn_name, expr.args)
-    }
-
-    -- Check if function is defined
-    if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false {
-        eprintln("Error: undefined function '" + fn_name + "'")
-        exit(1)
     }
 
     -- --------------------------------------------------------
@@ -9377,14 +8723,8 @@ fn generate_normal_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
             -- Pass the alloca pointer directly (pass-by-reference) for mut params
             let arg_name = args[i].name
             if g.variable_map.contains(arg_name) {
-                -- If the arg is itself a mut param, forward the param pointer
-                if g.param_ptr_map.contains(arg_name) {
-                    let pidx = g.param_ptr_map.get(arg_name)
-                    call_args.push(ir_val_param(pidx))
-                } else {
-                    let ptr_id = g.variable_map.get(arg_name)
-                    call_args.push(ir_val_inst(ptr_id))
-                }
+                let ptr_id = g.variable_map.get(arg_name)
+                call_args.push(ir_val_inst(ptr_id))
             } else {
                 -- Fallback: evaluate normally
                 let arg_result = generate_expr(g, b, args[i])
@@ -9433,6 +8773,11 @@ fn infer_call_return_type(gen: IRGenerator, fn_name: string) -> string {
     -- Check builtins first
     if is_builtin_fn(fn_name) {
         return builtin_return_type(fn_name)
+    }
+
+    -- Check prescanned function return types
+    if gen.fn_return_types.contains(fn_name) {
+        return gen.fn_return_types.get(fn_name)
     }
 
     -- Search module functions for the declared return type
@@ -9525,61 +8870,6 @@ fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name
 }
 
 -- ============================================================
--- FUNCTION POINTER PARAMETER INDIRECT CALL
--- Handles calling through function-pointer-typed parameters:
---   fn apply(f: fn(int) -> int, x: int) -> int { return f(x) }
--- ============================================================
-
-fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, var_type: string, args: List[Expr]) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Load the function pointer value from the parameter's alloca
-    let alloca_id = g.variable_map.get(var_name)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(alloca_id)
-    load_inst.load_type = "ptr"
-    load_inst.result_type = "ptr"
-    load_inst.has_result = true
-    b.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Generate arguments
-    let mut call_args: List[IRValue] = []
-    let mut i = 0
-    while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
-        g = arg_result.gen
-        b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
-        i = i + 1
-    }
-
-    -- Parse return type from "fn(int, int) -> int"
-    let arrow_pos = string_find(var_type, " -> ")
-    let ret_type_str = if arrow_pos >= 0 {
-        substr(var_type, arrow_pos + 4, len(var_type) - arrow_pos - 4)
-    } else {
-        "void"
-    }
-    let ret_type = map_type_name(ret_type_str)
-    let has_result = ret_type != "void"
-
-    -- Emit OP_CALL_PTR instruction
-    let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL_PTR())
-    inst.callee_val = ir_val_inst(load_id)
-    inst.call_args = call_args
-    inst.result_type = ret_type
-    inst.has_result = has_result
-    b.instructions.push(inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, b, id)
-}
-
--- ============================================================
 -- SOME CALL: Option constructor
 -- Some(value) -> Option { has_value: 1, value: payload }
 -- ============================================================
@@ -9597,25 +8887,14 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -
     g = val_result.gen
     b = val_result.block
 
-    -- Use full Option[T] type from current function return type, or infer from arg type
-    let mut opt_type = g.current_return_type
-    if starts_with(opt_type, "Option[") == false {
-        -- current_return_type isn't an Option (e.g., we're in main/void function).
-        -- Infer Option type from the argument expression type.
-        let arg_type = infer_expr_type(g, args[0])
-        opt_type = "Option[" + arg_type + "]"
-    }
-
     -- Build the Option struct: { has_value: 1, value: payload }
-    -- Use undef as the base (not alloca), since insertvalue works on values not pointers
-
     -- Store has_value = 1 (field index 0)
     let insert1_id = g.builder.next_id
     let mut insert1 = ir_inst_new(insert1_id, OP_INSERT_FIELD())
     insert1.field_base = ir_val_undef()
     insert1.field_value = ir_val_int(1)
     insert1.field_index = 0
-    insert1.result_type = opt_type
+    insert1.result_type = "option"
     insert1.has_result = true
     b.instructions.push(insert1)
     g.builder.next_id = g.builder.next_id + 1
@@ -9626,7 +8905,7 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -
     insert2.field_base = ir_val_inst(insert1_id)
     insert2.field_value = ir_val_inst(val_result.val_id)
     insert2.field_index = 1
-    insert2.result_type = opt_type
+    insert2.result_type = "option"
     insert2.has_result = true
     b.instructions.push(insert2)
     g.builder.next_id = g.builder.next_id + 1
@@ -9652,19 +8931,14 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
     g = val_result.gen
     b = val_result.block
 
-    -- Use full Result[T, E] type from current function return type for correct LLVM struct layout
-    let res_type = g.current_return_type
-
     -- Build the Result struct: { tag: 0, ok_val: payload, err_val: undef }
-    -- Use undef as the base (not alloca), since insertvalue works on values not pointers
-
     -- tag = 0 (Ok) at field index 0
     let insert_tag_id = g.builder.next_id
     let mut insert_tag = ir_inst_new(insert_tag_id, OP_INSERT_FIELD())
     insert_tag.field_base = ir_val_undef()
     insert_tag.field_value = ir_val_int(0)
     insert_tag.field_index = 0
-    insert_tag.result_type = res_type
+    insert_tag.result_type = "result"
     insert_tag.has_result = true
     b.instructions.push(insert_tag)
     g.builder.next_id = g.builder.next_id + 1
@@ -9675,7 +8949,7 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
     insert_ok.field_base = ir_val_inst(insert_tag_id)
     insert_ok.field_value = ir_val_inst(val_result.val_id)
     insert_ok.field_index = 1
-    insert_ok.result_type = res_type
+    insert_ok.result_type = "result"
     insert_ok.has_result = true
     b.instructions.push(insert_ok)
     g.builder.next_id = g.builder.next_id + 1
@@ -9686,7 +8960,7 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
     insert_err.field_base = ir_val_inst(insert_ok_id)
     insert_err.field_value = ir_val_undef()
     insert_err.field_index = 2
-    insert_err.result_type = res_type
+    insert_err.result_type = "result"
     insert_err.has_result = true
     b.instructions.push(insert_err)
     g.builder.next_id = g.builder.next_id + 1
@@ -9712,19 +8986,14 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
     g = val_result.gen
     b = val_result.block
 
-    -- Use full Result[T, E] type from current function return type for correct LLVM struct layout
-    let res_type = g.current_return_type
-
     -- Build the Result struct: { tag: 1, ok_val: undef, err_val: payload }
-    -- Use undef as the base (not alloca), since insertvalue works on values not pointers
-
     -- tag = 1 (Err) at field index 0
     let insert_tag_id = g.builder.next_id
     let mut insert_tag = ir_inst_new(insert_tag_id, OP_INSERT_FIELD())
     insert_tag.field_base = ir_val_undef()
     insert_tag.field_value = ir_val_int(1)
     insert_tag.field_index = 0
-    insert_tag.result_type = res_type
+    insert_tag.result_type = "result"
     insert_tag.has_result = true
     b.instructions.push(insert_tag)
     g.builder.next_id = g.builder.next_id + 1
@@ -9735,7 +9004,7 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
     insert_ok.field_base = ir_val_inst(insert_tag_id)
     insert_ok.field_value = ir_val_undef()
     insert_ok.field_index = 1
-    insert_ok.result_type = res_type
+    insert_ok.result_type = "result"
     insert_ok.has_result = true
     b.instructions.push(insert_ok)
     g.builder.next_id = g.builder.next_id + 1
@@ -9746,7 +9015,7 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
     insert_err.field_base = ir_val_inst(insert_ok_id)
     insert_err.field_value = ir_val_inst(val_result.val_id)
     insert_err.field_index = 2
-    insert_err.result_type = res_type
+    insert_err.result_type = "result"
     insert_err.has_result = true
     b.instructions.push(insert_err)
     g.builder.next_id = g.builder.next_id + 1
@@ -9825,8 +9094,6 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     let saved_list_elem_types = g.list_elem_types
                     let saved_return_type = g.current_return_type
                     let saved_type_subs = g.type_substitutions
-                    let saved_completed_blocks = g.completed_blocks
-                    let saved_next_id = g.builder.next_id
 
                     -- Set up fresh maps for the monomorphized function
                     g.variable_map = Map_new()
@@ -9872,8 +9139,6 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     g.list_elem_types = saved_list_elem_types
                     g.current_return_type = saved_return_type
                     g.type_substitutions = saved_type_subs
-                    g.completed_blocks = saved_completed_blocks
-                    g.builder.next_id = saved_next_id
                 }
             }
         }
@@ -9911,20 +9176,6 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
 -- the current type_substitutions map.
 -- ============================================================
 
--- Helper: join type names with "_" for mangled names
-fn join_types(types: List[string]) -> string {
-    let mut result = ""
-    let mut i = 0
-    while i < types.len() {
-        if i > 0 {
-            result = result + "_"
-        }
-        result = result + map_type_name(types[i])
-        i = i + 1
-    }
-    return result
-}
-
 fn resolve_type_substitution(gen: IRGenerator, type_name: string) -> string {
     -- Direct substitution
     if gen.type_substitutions.contains(type_name) {
@@ -9957,26 +9208,6 @@ fn resolve_type_substitution(gen: IRGenerator, type_name: string) -> string {
             let resolved_ok = resolve_type_substitution(gen, ok_type)
             let resolved_err = resolve_type_substitution(gen, err_type)
             return "Result[" + resolved_ok + ", " + resolved_err + "]"
-        }
-    }
-
-    -- Handle arbitrary user-defined generic types: Pair[A, B] etc.
-    -- Look for Name[...] pattern where Name is not a known builtin container
-    let bracket_idx = string_find(type_name, "[")
-    if bracket_idx > 0 {
-        let base = substr(type_name, 0, bracket_idx)
-        let inner = substr(type_name, bracket_idx + 1, len(type_name) - bracket_idx - 2)
-        -- Resolve each comma-separated type arg
-        let comma_idx = string_find(inner, ", ")
-        if comma_idx >= 0 {
-            let first_type = substr(inner, 0, comma_idx)
-            let second_type = substr(inner, comma_idx + 2, len(inner) - comma_idx - 2)
-            let resolved_first = resolve_type_substitution(gen, first_type)
-            let resolved_second = resolve_type_substitution(gen, second_type)
-            return base + "_" + map_type_name(resolved_first) + "_" + map_type_name(resolved_second)
-        } else {
-            let resolved_inner = resolve_type_substitution(gen, inner)
-            return base + "_" + map_type_name(resolved_inner)
         }
     }
 
@@ -10073,15 +9304,8 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     -- --------------------------------------------------------
     if len(obj_var_name) > 0 and g.list_elem_kinds.contains(obj_var_name) {
         let ek = g.list_elem_kinds.get(obj_var_name)
-        let raw_list_ptr = g.variable_map.get(obj_var_name)
-        -- For mut params (negative sentinel), generate expr to get the actual pointer
-        if raw_list_ptr < 0 and g.param_ptr_map.contains(obj_var_name) {
-            let obj_result = generate_expr(g, b, obj_expr)
-            g = obj_result.gen
-            b = obj_result.block
-            return generate_list_method_call(g, b, ek, obj_result.val_id, obj_var_name, method_name, args)
-        }
-        return generate_list_method_call(g, b, ek, raw_list_ptr, obj_var_name, method_name, args)
+        let list_ptr = g.variable_map.get(obj_var_name)
+        return generate_list_method_call(g, b, ek, list_ptr, obj_var_name, method_name, args)
     }
 
     -- --------------------------------------------------------
@@ -10105,6 +9329,32 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
                 b = obj_result.block
                 let list_ptr = obj_result.val_id
                 return generate_list_method_call(g, b, ek, list_ptr, "", method_name, args)
+            }
+        }
+    }
+
+    -- --------------------------------------------------------
+    -- Map method calls on struct field access (e.g., g.struct_defs.contains(name))
+    -- --------------------------------------------------------
+    if obj_expr.kind == EXPR_FIELD_ACCESS() {
+        let fa_obj = *obj_expr.object
+        let fa_field = obj_expr.field
+        let mut fa_struct_name = ""
+        if fa_obj.kind == EXPR_IDENTIFIER() {
+            if g.var_struct_types.contains(fa_obj.name) {
+                fa_struct_name = g.var_struct_types.get(fa_obj.name)
+            }
+        }
+        if len(fa_struct_name) > 0 {
+            let fa_key = fa_struct_name + "." + fa_field
+            if g.field_map_kinds.contains(fa_key) {
+                let mk = g.field_map_kinds.get(fa_key)
+                -- Generate the field access to get the map pointer
+                let map_result = generate_expr(g, b, obj_expr)
+                g = map_result.gen
+                b = map_result.block
+                let map_ptr = map_result.val_id
+                return generate_map_method_call(g, b, mk, map_ptr, method_name, args)
             }
         }
     }
@@ -10291,41 +9541,20 @@ fn generate_dyn_dispatch_call(gen: IRGenerator, block: IRBasicBlock, obj_name: s
     let concrete_type = g.dyn_var_concrete.get(obj_name)
     let mangled = concrete_type + "_" + method_name
 
+    -- Load the data pointer from the dyn variable's alloca
     let alloca_id = g.variable_map.get(obj_name)
+    let load_id = g.builder.next_id
+    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+    load_inst.load_ptr = ir_val_inst(alloca_id)
+    load_inst.load_type = "ptr"
+    load_inst.result_type = "ptr"
+    load_inst.has_result = true
+    b.instructions.push(load_inst)
+    g.builder.next_id = g.builder.next_id + 1
 
-    -- Determine if this is a direct struct param or an indirect let-binding
-    -- For function params, the alloca holds the struct directly (load as struct type)
-    -- For let-bindings, the alloca holds a ptr to heap data (load as ptr)
-    let is_direct_struct = g.var_struct_types.contains(obj_name) and g.variable_types.contains(obj_name) and g.variable_types.get(obj_name) != "ptr"
-
-    let mut self_val_id = 0
-    if is_direct_struct {
-        -- Load the struct value directly from the alloca
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(alloca_id)
-        load_inst.load_type = concrete_type
-        load_inst.result_type = concrete_type
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
-        g.builder.next_id = g.builder.next_id + 1
-        self_val_id = load_id
-    } else {
-        -- Load the data pointer from the dyn variable's alloca (indirect)
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(alloca_id)
-        load_inst.load_type = "ptr"
-        load_inst.result_type = "ptr"
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
-        g.builder.next_id = g.builder.next_id + 1
-        self_val_id = load_id
-    }
-
-    -- Build args: self value, then method arguments
+    -- Build args: data_ptr (as self), then method arguments
     let mut call_args: List[IRValue] = []
-    call_args.push(ir_val_inst(self_val_id))
+    call_args.push(ir_val_inst(load_id))
 
     let mut i = 0
     while i < args.len() {
@@ -10636,7 +9865,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
             } else {
                 "i64"
             }
-            let elem_size = estimate_type_size_gen(g, elem_type_name)
+            let elem_size = estimate_type_size(elem_type_name)
 
             -- Alloca temp for the value
             let temp_alloca_id = g.builder.next_id
@@ -10673,7 +9902,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 
         let push_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_push" }
         else if ek == LIST_ELEM_FLOAT() { "dm_list_double_push" }
-        else { "dm_list_string_push" }
+        else { "dm_list_dm_string_push" }
 
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_CALL())
@@ -10777,185 +10006,15 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
 
     let mangled = struct_type + "_" + method_name
 
-    -- --------------------------------------------------------
-    -- GENERIC IMPL METHOD: monomorphize on demand
-    -- --------------------------------------------------------
-    if g.generic_fn_decls.contains(mangled) {
-        let decl_idx = g.generic_fn_decls.get(mangled)
-        if decl_idx >= 0 and decl_idx < g.declarations.len() {
-            let decl = g.declarations[decl_idx]
-            if decl.kind == DECL_FUNCTION() {
-                let fd = *decl.func_decl
-
-                -- Check if this method takes self (first param named "self")
-                let mut has_self = false
-                if fd.params.len() > 0 {
-                    has_self = fd.params[0].name == "self"
-                }
-
-                -- Build the effective argument list for type inference
-                -- If method takes self, include obj_expr; otherwise, just args
-                let mut effective_args: List[Expr] = []
-                if has_self {
-                    effective_args.push(obj_expr)
-                }
-                let mut ai = 0
-                while ai < args.len() {
-                    effective_args.push(args[ai])
-                    ai = ai + 1
-                }
-
-                -- Infer type arguments from effective args
-                let mut type_args: List[string] = []
-                let mut pi = 0
-                while pi < fd.generic_params.len() {
-                    let gp = fd.generic_params[pi]
-                    -- Try to infer this generic param from matching param types
-                    let mut inferred = "i64"
-                    let mut mi = 0
-                    while mi < fd.params.len() and mi < effective_args.len() {
-                        if fd.params[mi].type_name == gp {
-                            inferred = infer_arg_type(g, effective_args[mi])
-                        }
-                        mi = mi + 1
-                    }
-                    type_args.push(inferred)
-                    pi = pi + 1
-                }
-
-                -- Build monomorphized name
-                let mut mono_name = mangled
-                let mut ti = 0
-                while ti < type_args.len() {
-                    mono_name = mono_name + "_" + map_type_name(type_args[ti])
-                    ti = ti + 1
-                }
-
-                -- Monomorphize if not already done
-                if g.mono_generated.contains(mono_name) == false {
-                    g.mono_generated.insert(mono_name, true)
-
-                    -- Save current state
-                    let saved_variable_map = g.variable_map
-                    let saved_variable_types = g.variable_types
-                    let saved_list_elem_kinds = g.list_elem_kinds
-                    let saved_list_elem_types = g.list_elem_types
-                    let saved_return_type = g.current_return_type
-                    let saved_type_subs = g.type_substitutions
-                    let saved_completed_blocks = g.completed_blocks
-                    let saved_next_id = g.builder.next_id
-                    let saved_impl_type = g.current_impl_type
-                    let saved_has_impl = g.has_impl_type
-
-                    g.variable_map = Map_new()
-                    g.variable_types = Map_new()
-
-                    -- Set up type substitutions
-                    g.type_substitutions = Map_new()
-                    let mut si = 0
-                    while si < fd.generic_params.len() and si < type_args.len() {
-                        g.type_substitutions.insert(fd.generic_params[si], type_args[si])
-                        si = si + 1
-                    }
-
-                    -- Set impl type context for Self resolution
-                    g.current_impl_type = struct_type
-                    g.has_impl_type = true
-
-                    -- Create monomorphized FunctionDecl
-                    let mut mono_fd = fd
-                    let empty_gp: List[string] = []
-                    mono_fd.generic_params = empty_gp
-
-                    -- Resolve param types
-                    let mut mono_params: List[FuncParam] = []
-                    let mut mpi = 0
-                    while mpi < fd.params.len() {
-                        let p = fd.params[mpi]
-                        let resolved = resolve_type_substitution(g, p.type_name)
-                        let mut mp = func_param_new(p.name, resolved)
-                        mp.is_mut = p.is_mut
-                        mono_params.push(mp)
-                        mpi = mpi + 1
-                    }
-                    mono_fd.params = mono_params
-
-                    -- Resolve return type
-                    let resolved_ret = resolve_type_substitution(g, fd.return_type)
-                    mono_fd.return_type = resolved_ret
-
-                    -- Also register the monomorphized struct type if needed
-                    -- e.g., Pair[A,B] with A=int, B=string → register Pair_i64_string struct
-                    let mono_struct = struct_type + "_" + join_types(type_args)
-                    if g.struct_defs.contains(struct_type) and g.struct_defs.contains(mono_struct) == false {
-                        let base_info = g.struct_defs.get(struct_type)
-                        let mut mono_info = struct_info_new(mono_struct)
-                        let mut mono_fields: List[IRField] = []
-                        let mut fi = 0
-                        while fi < base_info.field_names.len() {
-                            let fname = base_info.field_names[fi]
-                            let ftype = resolve_type_substitution(g, base_info.field_types[fi])
-                            mono_info.field_names.push(fname)
-                            mono_info.field_types.push(map_type_name(ftype))
-                            mono_fields.push(ir_field_new(fname, map_type_name(ftype)))
-                            fi = fi + 1
-                        }
-                        g.struct_defs.insert(mono_struct, mono_info)
-                        let mut ir_ty = ir_type_named(IR_TYPE_STRUCT(), mono_struct)
-                        ir_ty.fields = mono_fields
-                        g.ir_mod.struct_defs.insert(mono_struct, ir_ty)
-                    }
-
-                    -- Map the base struct name to monomorphized name for struct literals
-                    g.type_substitutions.insert(struct_type, mono_struct)
-
-                    g = declare_function(g, mono_fd, mono_name)
-                    g = generate_function_body(g, mono_fd, mono_name)
-
-                    -- Restore state
-                    g.variable_map = saved_variable_map
-                    g.variable_types = saved_variable_types
-                    g.list_elem_kinds = saved_list_elem_kinds
-                    g.list_elem_types = saved_list_elem_types
-                    g.current_return_type = saved_return_type
-                    g.type_substitutions = saved_type_subs
-                    g.completed_blocks = saved_completed_blocks
-                    g.builder.next_id = saved_next_id
-                    g.current_impl_type = saved_impl_type
-                    g.has_impl_type = saved_has_impl
-                }
-
-                -- Generate the call to monomorphized function
-                let mut call_args: List[IRValue] = []
-                let mut ci = 0
-                while ci < effective_args.len() {
-                    let arg_result = generate_expr(g, b, effective_args[ci])
-                    g = arg_result.gen
-                    b = arg_result.block
-                    call_args.push(ir_val_inst(arg_result.val_id))
-                    ci = ci + 1
-                }
-
-                let ret_type = infer_call_return_type(g, mono_name)
-                let has_result = ret_type != "void"
-
-                let id = g.builder.next_id
-                let mut call_inst = ir_inst_new(id, OP_CALL())
-                call_inst.callee = mono_name
-                call_inst.call_args = call_args
-                call_inst.result_type = ret_type
-                call_inst.has_result = has_result
-                b.instructions.push(call_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                return expr_result(g, b, id)
-            }
+    -- Detect static method call: obj_expr is a type name, not a variable
+    -- e.g., Point.new(x, y) where "Point" is a struct name, not a variable
+    let mut is_static = false
+    if obj_expr.kind == EXPR_IDENTIFIER() {
+        let obj_name = obj_expr.name
+        if g.struct_defs.contains(obj_name) and g.variable_map.contains(obj_name) == false {
+            is_static = true
         }
     }
-
-    -- --------------------------------------------------------
-    -- NON-GENERIC IMPL METHOD: direct call
-    -- --------------------------------------------------------
 
     -- Check if this method takes a mut self parameter (pass-by-pointer)
     let mut takes_mut_self = false
@@ -10966,30 +10025,27 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
 
     let mut call_args: List[IRValue] = []
 
-    if takes_mut_self and obj_expr.kind == EXPR_IDENTIFIER() {
-        -- Pass the alloca pointer directly for mut self
-        let obj_name = obj_expr.name
-        if g.variable_map.contains(obj_name) {
-            -- If the object is itself a mut param, forward the param pointer
-            if g.param_ptr_map.contains(obj_name) {
-                let pidx = g.param_ptr_map.get(obj_name)
-                call_args.push(ir_val_param(pidx))
-            } else {
+    -- Only pass self for instance methods
+    if is_static == false {
+        if takes_mut_self and obj_expr.kind == EXPR_IDENTIFIER() {
+            -- Pass the alloca pointer directly for mut self
+            let obj_name = obj_expr.name
+            if g.variable_map.contains(obj_name) {
                 let ptr_id = g.variable_map.get(obj_name)
                 call_args.push(ir_val_inst(ptr_id))
+            } else {
+                let obj_result = generate_expr(g, b, obj_expr)
+                g = obj_result.gen
+                b = obj_result.block
+                call_args.push(ir_val_inst(obj_result.val_id))
             }
         } else {
+            -- Pass the object value (self by value)
             let obj_result = generate_expr(g, b, obj_expr)
             g = obj_result.gen
             b = obj_result.block
             call_args.push(ir_val_inst(obj_result.val_id))
         }
-    } else {
-        -- Pass the object value (self by value)
-        let obj_result = generate_expr(g, b, obj_expr)
-        g = obj_result.gen
-        b = obj_result.block
-        call_args.push(ir_val_inst(obj_result.val_id))
     }
 
     -- Generate remaining arguments
@@ -11052,135 +10108,6 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         }
     }
 
-    -- Check for list index result struct type (e.g., points[0].x)
-    if struct_name == "" {
-        let listget_key = "_listget_" + int_to_string(obj_id)
-        if g.var_struct_types.contains(listget_key) {
-            struct_name = g.var_struct_types.get(listget_key)
-        }
-    }
-
-    -- Check for chained field access struct type (e.g., a.b.x)
-    if struct_name == "" {
-        let field_key = "_field_" + int_to_string(obj_id)
-        if g.var_struct_types.contains(field_key) {
-            struct_name = g.var_struct_types.get(field_key)
-        }
-    }
-
-    -- Check for Box[T] field access: dereference pointer then access struct field
-    if struct_name == "" and object.kind == EXPR_IDENTIFIER() {
-        let var_name = object.name
-        if g.box_inner_types.contains(var_name) {
-            let inner_type = g.box_inner_types.get(var_name)
-            if g.struct_defs.contains(inner_type) {
-                let info = g.struct_defs.get(inner_type)
-                -- Load the struct from the box pointer
-                let load_id = g.builder.next_id
-                let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-                load_inst.load_ptr = ir_val_inst(obj_id)
-                load_inst.load_type = inner_type
-                load_inst.result_type = inner_type
-                load_inst.has_result = true
-                b.instructions.push(load_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                -- Find the field index by name
-                let mut fidx = 0
-                let mut field_type_s = "i64"
-                let mut ffi = 0
-                while ffi < info.field_names.len() {
-                    if info.field_names[ffi] == field_name {
-                        fidx = ffi
-                        field_type_s = info.field_types[ffi]
-                    }
-                    ffi = ffi + 1
-                }
-                let ir_type = map_type_name(field_type_s)
-
-                -- Extract field from loaded struct
-                let extract_id = g.builder.next_id
-                let mut extract_inst = ir_inst_new(extract_id, OP_EXTRACT_FIELD())
-                extract_inst.field_base = ir_val_inst(load_id)
-                extract_inst.field_index = fidx
-                extract_inst.field_type = ir_type
-                extract_inst.result_type = ir_type
-                extract_inst.has_result = true
-                b.instructions.push(extract_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                -- Track struct result for chained access
-                if g.struct_defs.contains(field_type_s) {
-                    let result_var = "_field_" + int_to_string(extract_id)
-                    g.var_struct_types.insert(result_var, field_type_s)
-                }
-                -- Track Box[T] result for chained box access
-                if starts_with(field_type_s, "Box[") {
-                    let box_inner = extract_inner_type(field_type_s, "Box[")
-                    let result_var = "_field_" + int_to_string(extract_id)
-                    g.box_inner_types.insert(result_var, box_inner)
-                }
-
-                return expr_result(g, b, extract_id)
-            }
-        }
-    }
-
-    -- Check for Box field access from chained field access (non-identifier objects)
-    -- e.g., o.inner.value where inner: Box[Inner] — obj_id is the result of extracting inner
-    if struct_name == "" {
-        let box_key = "_field_" + int_to_string(obj_id)
-        if g.box_inner_types.contains(box_key) {
-            let inner_type = g.box_inner_types.get(box_key)
-            if g.struct_defs.contains(inner_type) {
-                let info = g.struct_defs.get(inner_type)
-                -- Load the struct from the box pointer
-                let load_id = g.builder.next_id
-                let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-                load_inst.load_ptr = ir_val_inst(obj_id)
-                load_inst.load_type = inner_type
-                load_inst.result_type = inner_type
-                load_inst.has_result = true
-                b.instructions.push(load_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                let mut fidx = 0
-                let mut field_type_s = "i64"
-                let mut ffi = 0
-                while ffi < info.field_names.len() {
-                    if info.field_names[ffi] == field_name {
-                        fidx = ffi
-                        field_type_s = info.field_types[ffi]
-                    }
-                    ffi = ffi + 1
-                }
-                let ir_type = map_type_name(field_type_s)
-
-                let extract_id = g.builder.next_id
-                let mut extract_inst = ir_inst_new(extract_id, OP_EXTRACT_FIELD())
-                extract_inst.field_base = ir_val_inst(load_id)
-                extract_inst.field_index = fidx
-                extract_inst.field_type = ir_type
-                extract_inst.result_type = ir_type
-                extract_inst.has_result = true
-                b.instructions.push(extract_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                if g.struct_defs.contains(field_type_s) {
-                    let result_var = "_field_" + int_to_string(extract_id)
-                    g.var_struct_types.insert(result_var, field_type_s)
-                }
-                if starts_with(field_type_s, "Box[") {
-                    let box_inner = extract_inner_type(field_type_s, "Box[")
-                    let result_var = "_field_" + int_to_string(extract_id)
-                    g.box_inner_types.insert(result_var, box_inner)
-                }
-
-                return expr_result(g, b, extract_id)
-            }
-        }
-    }
-
     -- If we could not resolve from a direct identifier, try from the
     -- variable_types map (e.g., for chained field access results)
     if struct_name == "" {
@@ -11196,93 +10123,17 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         }
     }
 
-    -- Check for Option/Result types before falling back
-    if struct_name == "" and object.kind == EXPR_IDENTIFIER() {
-        let var_name = object.name
-        if g.variable_types.contains(var_name) {
-            let vtype = g.variable_types.get(var_name)
-            if starts_with(vtype, "Option[") {
-                -- Option[T] = { i32 has_value, T value }
-                let inner = substr(vtype, 7, len(vtype) - 8)
-                let inner_ir = map_type_name(inner)
-                let mut fidx = 0
-                let mut ftype = "i32"
-                if field_name == "value" {
-                    fidx = 1
-                    ftype = inner_ir
-                }
-                let id = g.builder.next_id
-                let mut inst = ir_inst_new(id, OP_EXTRACT_FIELD())
-                inst.field_base = ir_val_inst(obj_id)
-                inst.field_index = fidx
-                inst.field_type = ftype
-                inst.result_type = ftype
-                inst.has_result = true
-                b.instructions.push(inst)
-                g.builder.next_id = id + 1
-                return expr_result(g, b, id)
-            }
-            if starts_with(vtype, "Result[") {
-                -- Result[T, E] = { i32 tag, T ok_val, E err_val }
-                let inner_str = substr(vtype, 7, len(vtype) - 8)
-                -- Parse "T, E" from inner_str
-                let mut comma_pos = 0
-                let mut ci = 0
-                while ci < len(inner_str) {
-                    if char_at(inner_str, ci) == "," {
-                        comma_pos = ci
-                    }
-                    ci = ci + 1
-                }
-                let ok_type = string_trim(substr(inner_str, 0, comma_pos))
-                let err_type = string_trim(substr(inner_str, comma_pos + 1, len(inner_str) - comma_pos - 1))
-                let ok_ir = map_type_name(ok_type)
-                let err_ir = map_type_name(err_type)
-                if field_name == "is_ok" {
-                    -- Extract tag (field 0) and compare with 0 to get boolean
-                    -- is_ok should be true when tag == 0 (Ok), false when tag == 1 (Err)
-                    let tag_id = g.builder.next_id
-                    let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
-                    tag_inst.field_base = ir_val_inst(obj_id)
-                    tag_inst.field_index = 0
-                    tag_inst.field_type = "i32"
-                    tag_inst.result_type = "i32"
-                    tag_inst.has_result = true
-                    b.instructions.push(tag_inst)
-                    g.builder.next_id = g.builder.next_id + 1
-
-                    let cmp_id = g.builder.next_id
-                    let mut cmp_inst = ir_inst_new(cmp_id, OP_EQ())
-                    cmp_inst.lhs = ir_val_inst(tag_id)
-                    cmp_inst.rhs = ir_val_int(0)
-                    cmp_inst.result_type = "bool"
-                    cmp_inst.has_result = true
-                    b.instructions.push(cmp_inst)
-                    g.builder.next_id = g.builder.next_id + 1
-
-                    return expr_result(g, b, cmp_id)
-                }
-                let mut fidx = 0
-                let mut ftype = "i32"
-                if field_name == "ok" or field_name == "value" {
-                    fidx = 1
-                    ftype = ok_ir
-                }
-                if field_name == "err" or field_name == "error" {
-                    fidx = 2
-                    ftype = err_ir
-                }
-                let id = g.builder.next_id
-                let mut inst = ir_inst_new(id, OP_EXTRACT_FIELD())
-                inst.field_base = ir_val_inst(obj_id)
-                inst.field_index = fidx
-                inst.field_type = ftype
-                inst.result_type = ftype
-                inst.has_result = true
-                b.instructions.push(inst)
-                g.builder.next_id = id + 1
-                return expr_result(g, b, id)
-            }
+    -- Try to resolve from instruction ID (for deref results, chained field access)
+    if struct_name == "" {
+        let deref_key = "_deref_" + int_to_string(obj_id)
+        if g.var_struct_types.contains(deref_key) {
+            struct_name = g.var_struct_types.get(deref_key)
+        }
+    }
+    if struct_name == "" {
+        let field_key = "_field_" + int_to_string(obj_id)
+        if g.var_struct_types.contains(field_key) {
+            struct_name = g.var_struct_types.get(field_key)
         }
     }
 
@@ -11319,7 +10170,21 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     }
 
     -- Map the dAImond type name to an IR type string
-    let ir_type = map_type_name(field_type_str)
+    let mut ir_type = map_type_name(field_type_str)
+    -- For List/Map fields, use concrete runtime struct type names
+    if starts_with(field_type_str, "List[") {
+        let inner_ft = extract_inner_type(field_type_str, "List[")
+        let ek_ft = classify_list_elem(inner_ft)
+        if ek_ft == LIST_ELEM_INT() { ir_type = "dm_list_int64" }
+        else if ek_ft == LIST_ELEM_FLOAT() { ir_type = "dm_list_double" }
+        else if ek_ft == LIST_ELEM_STRING() { ir_type = "dm_list_dm_string" }
+        else { ir_type = "dm_list_generic" }
+    }
+    if starts_with(field_type_str, "Map[") {
+        let minner_ft = extract_inner_type(field_type_str, "Map[")
+        if starts_with(minner_ft, "string") { ir_type = "dm_map_string_int" }
+        else { ir_type = "dm_map_int_string" }
+    }
 
     -- Emit OP_EXTRACT_FIELD instruction
     let id = g.builder.next_id
@@ -11355,11 +10220,11 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         g.var_struct_types.insert(result_var, field_type_str)
     }
 
-    -- If the field type is Box[T], track for chained box access
+    -- If the field type is Box[T], track the inner type for later dereference
     if starts_with(field_type_str, "Box[") {
-        let box_inner = extract_inner_type(field_type_str, "Box[")
-        let result_var = "_field_" + int_to_string(id)
-        g.box_inner_types.insert(result_var, box_inner)
+        let inner = extract_inner_type(field_type_str, "Box[")
+        let box_key = "_inst_" + int_to_string(id)
+        g.box_inner_types.insert(box_key, inner)
     }
 
     return expr_result(g, b, id)
@@ -11388,28 +10253,6 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     b = idx_result.block
     let idx_id = idx_result.val_id
 
-    -- Check if the object is a string variable (s[i] -> char_at)
-    if object.kind == EXPR_IDENTIFIER() {
-        let str_var_name = object.name
-        if g.variable_types.contains(str_var_name) {
-            let vtype = g.variable_types.get(str_var_name)
-            if vtype == "string" {
-                let id = g.builder.next_id
-                let mut inst = ir_inst_new(id, OP_CALL())
-                inst.callee = "dm_char_at"
-                let mut call_args: List[IRValue] = []
-                call_args.push(ir_val_inst(obj_id))
-                call_args.push(ir_val_inst(idx_id))
-                inst.call_args = call_args
-                inst.result_type = "string"
-                inst.has_result = true
-                b.instructions.push(inst)
-                g.builder.next_id = id + 1
-                return expr_result(g, b, id)
-            }
-        }
-    }
-
     -- Check if the object is a known list variable
     if object.kind == EXPR_IDENTIFIER() {
         let var_name = object.name
@@ -11430,49 +10273,6 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                 if g.list_elem_types.contains(var_name) {
                     elem_type = g.list_elem_types.get(var_name)
                 }
-            }
-
-            if elem_kind == LIST_ELEM_OTHER() {
-                -- Generic list get: alloca temp, call dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
-                let elem_size = estimate_type_size_gen(g, elem_type)
-                let temp_alloca_id = g.builder.next_id
-                let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
-                temp_inst.alloc_type = elem_type
-                temp_inst.result_type = "ptr(" + elem_type + ")"
-                temp_inst.has_result = true
-                b.instructions.push(temp_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                let id = g.builder.next_id
-                let mut inst = ir_inst_new(id, OP_CALL())
-                inst.callee = "dm_list_generic_get"
-                let mut call_args: List[IRValue] = []
-                call_args.push(ir_val_inst(temp_alloca_id))
-                call_args.push(ir_val_inst(obj_id))
-                call_args.push(ir_val_inst(idx_id))
-                call_args.push(ir_val_int(elem_size))
-                inst.call_args = call_args
-                inst.result_type = "void"
-                inst.has_result = false
-                b.instructions.push(inst)
-                g.builder.next_id = id + 1
-
-                -- Load the struct from temp alloca
-                let load_id = g.builder.next_id
-                let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-                load_inst.load_ptr = ir_val_inst(temp_alloca_id)
-                load_inst.load_type = elem_type
-                load_inst.result_type = elem_type
-                load_inst.has_result = true
-                b.instructions.push(load_inst)
-                g.builder.next_id = load_id + 1
-
-                -- Track struct type for subsequent field access
-                if g.struct_defs.contains(elem_type) {
-                    g.var_struct_types.insert("_listget_" + int_to_string(load_id), elem_type)
-                }
-
-                return expr_result(g, b, load_id)
             }
 
             let id = g.builder.next_id
@@ -11520,36 +10320,45 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         let field_obj = *object.object
         let field_name = object.field
 
+        -- Resolve the parent struct type (handles identifiers and compound expressions)
+        let mut parent_struct = ""
         if field_obj.kind == EXPR_IDENTIFIER() {
-            let parent_var = field_obj.name
-            if g.var_struct_types.contains(parent_var) {
-                let parent_struct = g.var_struct_types.get(parent_var)
-                let key = parent_struct + "." + field_name
-                if g.field_list_elem_kinds.contains(key) {
-                    let elem_kind = g.field_list_elem_kinds.get(key)
-                    let mut elem_type = "i64"
-                    if elem_kind == LIST_ELEM_INT() {
-                        elem_type = "i64"
-                    } else if elem_kind == LIST_ELEM_FLOAT() {
-                        elem_type = "f64"
-                    } else if elem_kind == LIST_ELEM_STRING() {
-                        elem_type = "string"
-                    } else if elem_kind == LIST_ELEM_OTHER() {
-                        if g.field_list_elem_types.contains(key) {
-                            elem_type = g.field_list_elem_types.get(key)
-                        }
+            if g.var_struct_types.contains(field_obj.name) {
+                parent_struct = g.var_struct_types.get(field_obj.name)
+            }
+        }
+        if parent_struct == "" {
+            let obj_type = infer_expr_type(g, field_obj)
+            if g.struct_defs.contains(obj_type) {
+                parent_struct = obj_type
+            }
+        }
+        if parent_struct != "" {
+            let key = parent_struct + "." + field_name
+            if g.field_list_elem_kinds.contains(key) {
+                let elem_kind = g.field_list_elem_kinds.get(key)
+                let mut elem_type = "i64"
+                if elem_kind == LIST_ELEM_INT() {
+                    elem_type = "i64"
+                } else if elem_kind == LIST_ELEM_FLOAT() {
+                    elem_type = "f64"
+                } else if elem_kind == LIST_ELEM_STRING() {
+                    elem_type = "string"
+                } else if elem_kind == LIST_ELEM_OTHER() {
+                    if g.field_list_elem_types.contains(key) {
+                        elem_type = g.field_list_elem_types.get(key)
                     }
-
-                    let id = g.builder.next_id
-                    let mut inst = ir_inst_new(id, OP_LIST_GET())
-                    inst.lhs = ir_val_inst(obj_id)
-                    inst.rhs = ir_val_inst(idx_id)
-                    inst.result_type = map_type_name(elem_type)
-                    inst.has_result = true
-                    b.instructions.push(inst)
-                    g.builder.next_id = id + 1
-                    return expr_result(g, b, id)
                 }
+
+                let id = g.builder.next_id
+                let mut inst = ir_inst_new(id, OP_LIST_GET())
+                inst.lhs = ir_val_inst(obj_id)
+                inst.rhs = ir_val_inst(idx_id)
+                inst.result_type = map_type_name(elem_type)
+                inst.has_result = true
+                b.instructions.push(inst)
+                g.builder.next_id = id + 1
+                return expr_result(g, b, id)
             }
         }
     }
@@ -11574,8 +10383,7 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
     let mut g = gen
     let mut b = block
 
-    -- Resolve the struct type through type_substitutions for monomorphization
-    let type_name = resolve_type_substitution(g, expr.type_name)
+    let type_name = expr.type_name
 
     -- Look up the struct definition
     if g.struct_defs.contains(type_name) == false {
@@ -11621,6 +10429,25 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
             fi = fi + 1
         }
 
+        -- Determine field type for list/map handling in LLVM gen
+        let mut insert_field_type = ""
+        if field_idx < info.field_types.len() {
+            let orig_ftype = info.field_types[field_idx]
+            if starts_with(orig_ftype, "List[") {
+                let inner_ift = extract_inner_type(orig_ftype, "List[")
+                let ek_ift = classify_list_elem(inner_ift)
+                if ek_ift == LIST_ELEM_INT() { insert_field_type = "dm_list_int64" }
+                else if ek_ift == LIST_ELEM_FLOAT() { insert_field_type = "dm_list_double" }
+                else if ek_ift == LIST_ELEM_STRING() { insert_field_type = "dm_list_dm_string" }
+                else { insert_field_type = "dm_list_generic" }
+            }
+            if starts_with(orig_ftype, "Map[") {
+                let minner_ift = extract_inner_type(orig_ftype, "Map[")
+                if starts_with(minner_ift, "string") { insert_field_type = "dm_map_string_int" }
+                else { insert_field_type = "dm_map_int_string" }
+            }
+        }
+
         -- Emit OP_INSERT_FIELD
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_INSERT_FIELD())
@@ -11634,6 +10461,7 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
 
         inst.field_value = ir_val_inst(val_id)
         inst.field_index = field_idx
+        inst.field_type = insert_field_type
         inst.result_type = type_name
         inst.has_result = true
         b.instructions.push(inst)
@@ -11803,56 +10631,32 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         i = i + 1
     }
 
-    -- Infer element type from the first element
-    let elem_ir_type = infer_expr_type(g, elements[0])
+    -- Create a new list via OP_LIST_NEW
+    let list_id = g.builder.next_id
+    let mut list_inst = ir_inst_new(list_id, OP_LIST_NEW())
+    list_inst.result_type = "list"
+    list_inst.has_result = true
+    b.instructions.push(list_inst)
+    g.builder.next_id = list_id + 1
 
-    -- Determine which list new/push functions to use
-    let mut new_fn = "dm_list_int64_new"
-    let mut push_fn = "dm_list_int64_push"
-    if elem_ir_type == "f64" or elem_ir_type == "float" {
-        new_fn = "dm_list_double_new"
-        push_fn = "dm_list_double_push"
-    } else if elem_ir_type == "string" {
-        new_fn = "dm_list_string_new"
-        push_fn = "llvm_dm_list_string_push"
-    }
-
-    -- Create list alloca and call new function (sret pattern)
-    let alloca_id = g.builder.next_id
-    let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
-    alloca_inst.alloc_type = "list"
-    alloca_inst.result_type = "ptr(list)"
-    alloca_inst.has_result = true
-    b.instructions.push(alloca_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    let mut call_new = ir_inst_new(g.builder.next_id, OP_CALL())
-    call_new.callee = new_fn
-    let mut new_args: List[IRValue] = []
-    new_args.push(ir_val_inst(alloca_id))
-    call_new.call_args = new_args
-    call_new.result_type = "void"
-    call_new.has_result = false
-    b.instructions.push(call_new)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Push each element into the list
+    -- Push each element into the list via OP_LIST_PUSH
+    let mut current_list_id = list_id
     let mut pi = 0
     while pi < num_elements {
-        let mut push_call = ir_inst_new(g.builder.next_id, OP_CALL())
-        push_call.callee = push_fn
-        let mut push_args: List[IRValue] = []
-        push_args.push(ir_val_inst(alloca_id))
-        push_args.push(ir_val_inst(elem_ids[pi]))
-        push_call.call_args = push_args
-        push_call.result_type = "void"
-        push_call.has_result = false
-        b.instructions.push(push_call)
-        g.builder.next_id = g.builder.next_id + 1
+        let push_id = g.builder.next_id
+        let mut push_inst = ir_inst_new(push_id, OP_LIST_PUSH())
+        push_inst.lhs = ir_val_inst(current_list_id)
+        push_inst.rhs = ir_val_inst(elem_ids[pi])
+        push_inst.result_type = "list"
+        push_inst.has_result = true
+        b.instructions.push(push_inst)
+        g.builder.next_id = push_id + 1
+
+        current_list_id = push_id
         pi = pi + 1
     }
 
-    return expr_result(g, b, alloca_id)
+    return expr_result(g, b, current_list_id)
 }
 
 -- ============================================================
@@ -11885,10 +10689,9 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
     let join_label = gen_next_label(g, "if_join")
     g = gen_advance_label(g)
 
-    -- Infer result type from then-branch expression
-    let if_result_type = infer_expr_type(g, *expr.then_branch)
-
     -- Allocate a result slot before branching so both branches can store into it
+    -- Infer the result type from the then branch
+    let if_result_type = infer_expr_type(g, *expr.then_branch)
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
     result_alloca.alloc_type = if_result_type
@@ -11928,6 +10731,7 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
         then_block.has_terminator = true
     }
     g.completed_blocks.push(then_block)
+
     -- Generate else block
     let mut else_block = ir_block_new(else_label)
     if expr.has_else {
@@ -12011,23 +10815,10 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         if first_pat.kind == PAT_ENUM_VARIANT() {
             let variant = first_pat.variant
             if variant == "Ok" or variant == "Err" {
-                -- Determine the Result type for correct field types
-                let mut result_type_name = ""
-                if scrut_expr.kind == EXPR_IDENTIFIER() {
-                    if g.variable_types.contains(scrut_expr.name) {
-                        result_type_name = g.variable_types.get(scrut_expr.name)
-                    }
-                }
-                return generate_result_match(g, b, expr, scrut_id, result_type_name)
+                return generate_result_match(g, b, expr, scrut_id, scrut_expr)
             }
             if variant == "Some" or variant == "None" {
-                let mut option_type_name = ""
-                if scrut_expr.kind == EXPR_IDENTIFIER() {
-                    if g.variable_types.contains(scrut_expr.name) {
-                        option_type_name = g.variable_types.get(scrut_expr.name)
-                    }
-                }
-                return generate_option_match(g, b, expr, scrut_id, option_type_name)
+                return generate_option_match(g, b, expr, scrut_id, scrut_expr)
             }
             -- General enum variant pattern with known type
             if len(first_pat.enum_type) > 0 {
@@ -12041,22 +10832,6 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 }
 
 -- ============================================================
--- MATCH RESULT TYPE INFERENCE
--- ============================================================
-
-fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
-    -- Check the first arm's body to infer result type
-    if arms.len() == 0 {
-        return "i64"
-    }
-    let arm = arms[0]
-    if arm.is_expr_body {
-        return infer_expr_type(gen, *arm.body_expr)
-    }
-    return "i64"
-}
-
--- ============================================================
 -- LITERAL MATCH (int, string, bool, wildcard)
 -- ============================================================
 
@@ -12064,14 +10839,11 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
     let mut g = gen
     let mut b = block
 
-    -- Infer the match result type from arm bodies
-    let match_type = infer_match_result_type(g, expr.match_arms)
-
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = match_type
-    result_alloca.result_type = "ptr(" + match_type + ")"
+    result_alloca.alloc_type = "i64"
+    result_alloca.result_type = "ptr(i64)"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -12091,6 +10863,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
         g = gen_advance_label(g)
 
         if pat.kind == PAT_WILDCARD() or pat.kind == PAT_IDENTIFIER() {
+            -- Wildcard or identifier always matches
             -- Bind identifier if needed
             if pat.kind == PAT_IDENTIFIER() {
                 -- Bind the scrutinee value to the pattern name
@@ -12113,74 +10886,31 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 g.variable_types.insert(pat.name, "i64")
             }
 
-            -- If there is a guard condition, evaluate it and branch
-            if arm.has_guard {
-                let guard_result = generate_expr(g, b, *arm.guard)
-                g = guard_result.gen
-                b = guard_result.block
+            -- Generate arm body directly in current block
+            if arm.is_expr_body {
+                let body_result = generate_expr(g, b, *arm.body_expr)
+                g = body_result.gen
+                b = body_result.block
 
-                -- Branch: if guard is true, execute arm body; else go to next arm
-                b.terminator = Box_new(term_br_cond(ir_val_inst(guard_result.val_id), arm_label, next_label))
-                b.has_terminator = true
-                g.completed_blocks.push(b)
-
-                -- Generate arm body in arm_block
-                let mut arm_block = ir_block_new(arm_label)
-                if arm.is_expr_body {
-                    let body_result = generate_expr(g, arm_block, *arm.body_expr)
-                    g = body_result.gen
-                    arm_block = body_result.block
-
-                    let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                    store_result.store_ptr = ir_val_inst(result_alloca_id)
-                    store_result.store_val = ir_val_inst(body_result.val_id)
-                    store_result.has_result = false
-                    arm_block.instructions.push(store_result)
-                    g.builder.next_id = g.builder.next_id + 1
-                } else {
-                    let body_gen = generate_block_stmts(g, arm_block, arm.body)
-                    g = body_gen.gen
-                    arm_block = body_gen.block
-                }
-
-                if arm_block.has_terminator == false {
-                    arm_block.terminator = Box_new(term_br(join_label))
-                    arm_block.has_terminator = true
-                }
-                g.completed_blocks.push(arm_block)
-
-                -- Continue to next arm (set up next block)
-                b = ir_block_new(next_label)
-                arm_idx = arm_idx + 1
+                let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
+                store_result.store_ptr = ir_val_inst(result_alloca_id)
+                store_result.store_val = ir_val_inst(body_result.val_id)
+                store_result.has_result = false
+                b.instructions.push(store_result)
+                g.builder.next_id = g.builder.next_id + 1
             } else {
-                -- No guard: always matches (catch-all)
-                -- Generate arm body directly in current block
-                if arm.is_expr_body {
-                    let body_result = generate_expr(g, b, *arm.body_expr)
-                    g = body_result.gen
-                    b = body_result.block
-
-                    let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                    store_result.store_ptr = ir_val_inst(result_alloca_id)
-                    store_result.store_val = ir_val_inst(body_result.val_id)
-                    store_result.has_result = false
-                    b.instructions.push(store_result)
-                    g.builder.next_id = g.builder.next_id + 1
-                } else {
-                    let body_gen = generate_block_stmts(g, b, arm.body)
-                    g = body_gen.gen
-                    b = body_gen.block
-                }
-
-                if b.has_terminator == false {
-                    b.terminator = Box_new(term_br(join_label))
-                    b.has_terminator = true
-                }
-                g.completed_blocks.push(b)
-
-                -- Wildcard/identifier without guard is the catch-all, break out of loop
-                arm_idx = expr.match_arms.len()
+                let body_gen = generate_block_stmts(g, b, arm.body)
+                g = body_gen.gen
+                b = body_gen.block
             }
+
+            if b.has_terminator == false {
+                b.terminator = Box_new(term_br(join_label))
+                b.has_terminator = true
+            }
+
+            -- Wildcard/identifier is the catch-all, break out of loop
+            arm_idx = expr.match_arms.len()
         } else if pat.kind == PAT_LITERAL() {
             -- Generate comparison of scrutinee with literal
             let lit_expr = *pat.literal_expr
@@ -12220,7 +10950,6 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 b.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), arm_label, next_label))
                 b.has_terminator = true
             }
-            g.completed_blocks.push(b)
 
             -- Generate arm body in arm_block
             let mut arm_block = ir_block_new(arm_label)
@@ -12245,7 +10974,6 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 arm_block.terminator = Box_new(term_br(join_label))
                 arm_block.has_terminator = true
             }
-            g.completed_blocks.push(arm_block)
 
             -- Continue with next_label as the new current block
             b = ir_block_new(next_label)
@@ -12261,15 +10989,14 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
-    g.completed_blocks.push(b)
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = match_type
-    load_inst.result_type = match_type
+    load_inst.load_type = "i64"
+    load_inst.result_type = "i64"
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -12291,14 +11018,11 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     }
     let enum_info = g.enum_defs.get(enum_type)
 
-    -- Infer match result type from arm bodies
-    let ematch_type = infer_match_result_type(g, expr.match_arms)
-
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = ematch_type
-    result_alloca.result_type = "ptr(" + ematch_type + ")"
+    result_alloca.alloc_type = "i64"
+    result_alloca.result_type = "ptr(i64)"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -12372,7 +11096,6 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 b.terminator = Box_new(term_br(join_label))
                 b.has_terminator = true
             }
-            g.completed_blocks.push(b)
             arm_idx = expr.match_arms.len()
         } else if pat.kind == PAT_ENUM_VARIANT() {
             -- Find variant tag value from enum definition
@@ -12398,32 +11121,17 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
 
             b.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), arm_label, next_label))
             b.has_terminator = true
-            g.completed_blocks.push(b)
 
             -- Generate arm body in arm_block
             let mut arm_block = ir_block_new(arm_label)
 
             -- Bind payload variables if present
             if pat.bindings.len() > 0 {
-                -- Compute field offset: skip tag (1) + count prior payload variants
-                let mut payload_field_offset = 1
-                let mut pvi2 = 0
-                while pvi2 < enum_info.variant_names.len() {
-                    if enum_info.variant_names[pvi2] == variant_name {
-                        pvi2 = enum_info.variant_names.len()
-                    } else {
-                        if enum_info.variant_has_payload[pvi2] {
-                            payload_field_offset = payload_field_offset + 1
-                        }
-                        pvi2 = pvi2 + 1
-                    }
-                }
-
-                -- Extract payload from scrutinee at computed field offset
+                -- Extract payload from scrutinee (field 1 for first payload)
                 let payload_id = g.builder.next_id
                 let mut payload_inst = ir_inst_new(payload_id, OP_EXTRACT_FIELD())
                 payload_inst.field_base = ir_val_inst(scrut_id)
-                payload_inst.field_index = payload_field_offset
+                payload_inst.field_index = 1
                 payload_inst.field_type = "i64"
                 payload_inst.result_type = "i64"
                 payload_inst.has_result = true
@@ -12472,7 +11180,6 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 arm_block.terminator = Box_new(term_br(join_label))
                 arm_block.has_terminator = true
             }
-            g.completed_blocks.push(arm_block)
 
             -- Move to next arm's block
             b = ir_block_new(next_label)
@@ -12487,15 +11194,14 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
-    g.completed_blocks.push(b)
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = ematch_type
-    load_inst.result_type = ematch_type
+    load_inst.load_type = "i64"
+    load_inst.result_type = "i64"
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -12507,37 +11213,14 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
 -- RESULT MATCH (Ok/Err patterns)
 -- ============================================================
 
-fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, result_type_name: string) -> ExprResult {
+fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, scrut_expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Parse Result[T, E] to get ok_type and err_type
-    let mut ok_field_type = "i64"
-    let mut err_field_type = "i64"
-    if starts_with(result_type_name, "Result[") {
-        let inner = substr(result_type_name, 7, len(result_type_name) - 8)
-        let mut comma_pos = 0 - 1
-        let mut depth = 0
-        let mut ci = 0
-        while ci < len(inner) {
-            let ch = char_at(inner, ci)
-            if ch == "[" { depth = depth + 1 }
-            if ch == "]" { depth = depth - 1 }
-            if ch == "," and depth == 0 {
-                comma_pos = ci
-                ci = len(inner)
-            }
-            ci = ci + 1
-        }
-        if comma_pos >= 0 {
-            ok_field_type = map_type_name(substr(inner, 0, comma_pos))
-            let mut err_start = comma_pos + 1
-            if err_start < len(inner) and char_at(inner, err_start) == " " {
-                err_start = err_start + 1
-            }
-            err_field_type = map_type_name(substr(inner, err_start, len(inner) - err_start))
-        }
-    }
+    -- Look up the full type annotation to determine Ok and Err types
+    let type_ann = get_scrutinee_type_annotation(g, scrut_expr)
+    let ok_field_type = if len(type_ann) > 0 { parse_result_ok_type(type_ann) } else { "i64" }
+    let err_field_type = if len(type_ann) > 0 { parse_result_err_type(type_ann) } else { "i64" }
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
@@ -12553,8 +11236,8 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
     tag_inst.field_base = ir_val_inst(scrut_id)
     tag_inst.field_index = 0
-    tag_inst.field_type = "i32"
-    tag_inst.result_type = "i32"
+    tag_inst.field_type = "i64"
+    tag_inst.result_type = "i64"
     tag_inst.has_result = true
     b.instructions.push(tag_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -12613,7 +11296,7 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             ok_extract.field_base = ir_val_inst(scrut_id)
             ok_extract.field_index = 1
             ok_extract.field_type = ok_field_type
-            ok_extract.result_type = ok_field_type
+            ok_extract.result_type = "i64"
             ok_extract.has_result = true
             ok_block.instructions.push(ok_extract)
             g.builder.next_id = g.builder.next_id + 1
@@ -12674,7 +11357,7 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             err_extract.field_base = ir_val_inst(scrut_id)
             err_extract.field_index = 2
             err_extract.field_type = err_field_type
-            err_extract.result_type = err_field_type
+            err_extract.result_type = "i64"
             err_extract.has_result = true
             err_block.instructions.push(err_extract)
             g.builder.next_id = g.builder.next_id + 1
@@ -12759,16 +11442,13 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 -- OPTION MATCH (Some/None patterns)
 -- ============================================================
 
-fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, option_type_name: string) -> ExprResult {
+fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, scrut_expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Parse Option[T] to get the inner type
-    let mut some_field_type = "i64"
-    if starts_with(option_type_name, "Option[") {
-        let inner = substr(option_type_name, 7, len(option_type_name) - 8)
-        some_field_type = map_type_name(inner)
-    }
+    -- Look up the full type annotation to determine the value type
+    let type_ann = get_scrutinee_type_annotation(g, scrut_expr)
+    let some_field_type = if len(type_ann) > 0 { parse_option_value_type(type_ann) } else { "i64" }
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
@@ -12779,22 +11459,22 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Extract tag (field 0: 1=Some/has_value, 0=None)
+    -- Extract tag (field 0: 0=Some, 1=None)
     let tag_id = g.builder.next_id
     let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
     tag_inst.field_base = ir_val_inst(scrut_id)
     tag_inst.field_index = 0
-    tag_inst.field_type = "i32"
-    tag_inst.result_type = "i32"
+    tag_inst.field_type = "i64"
+    tag_inst.result_type = "i64"
     tag_inst.has_result = true
     b.instructions.push(tag_inst)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Compare tag to 1 (Some = has_value = 1)
+    -- Compare tag to 0 (Some)
     let is_some_id = g.builder.next_id
     let mut is_some_cmp = ir_inst_new(is_some_id, OP_EQ())
     is_some_cmp.lhs = ir_val_inst(tag_id)
-    is_some_cmp.rhs = ir_val_int(1)
+    is_some_cmp.rhs = ir_val_int(0)
     is_some_cmp.result_type = "bool"
     is_some_cmp.has_result = true
     b.instructions.push(is_some_cmp)
@@ -12844,7 +11524,7 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             some_extract.field_base = ir_val_inst(scrut_id)
             some_extract.field_index = 1
             some_extract.field_type = some_field_type
-            some_extract.result_type = some_field_type
+            some_extract.result_type = "i64"
             some_extract.has_result = true
             some_block.instructions.push(some_extract)
             g.builder.next_id = g.builder.next_id + 1
@@ -12964,11 +11644,6 @@ fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
     let stmts_result = generate_block_stmts(g, b, expr.stmts)
     g = stmts_result.gen
     b = stmts_result.block
-
-    -- If the block already has a terminator (e.g., from a return statement), just return
-    if b.has_terminator {
-        return expr_result(g, b, g.builder.next_id - 1)
-    }
 
     -- If the block has a result expression, generate it and return its value
     if expr.has_result {
@@ -13344,38 +12019,6 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let mut g = gen
     let mut b = block
 
-    -- Infer operand type to get correct Ok/Err field types
-    let operand_type = infer_expr_type(g, *expr.operand)
-    let mut ok_field_type = "i64"
-    let mut err_field_type = "i64"
-    if starts_with(operand_type, "Result[") {
-        let inner = substr(operand_type, 7, len(operand_type) - 8)
-        let mut comma_pos = 0 - 1
-        let mut depth = 0
-        let mut ci = 0
-        while ci < len(inner) {
-            let ch = char_at(inner, ci)
-            if ch == "[" { depth = depth + 1 }
-            if ch == "]" { depth = depth - 1 }
-            if ch == "," and depth == 0 {
-                comma_pos = ci
-                ci = len(inner)
-            }
-            ci = ci + 1
-        }
-        if comma_pos >= 0 {
-            ok_field_type = map_type_name(substr(inner, 0, comma_pos))
-            let mut err_start = comma_pos + 1
-            if err_start < len(inner) and char_at(inner, err_start) == " " {
-                err_start = err_start + 1
-            }
-            err_field_type = map_type_name(substr(inner, err_start, len(inner) - err_start))
-        }
-    } else if starts_with(operand_type, "Option[") {
-        let inner = substr(operand_type, 7, len(operand_type) - 8)
-        ok_field_type = map_type_name(inner)
-    }
-
     -- Generate the operand (the Result/Option expression)
     let operand_result = generate_expr(g, b, *expr.operand)
     g = operand_result.gen
@@ -13387,8 +12030,8 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
     tag_inst.field_base = ir_val_inst(operand_id)
     tag_inst.field_index = 0
-    tag_inst.field_type = "i32"
-    tag_inst.result_type = "i32"
+    tag_inst.field_type = "i64"
+    tag_inst.result_type = "i64"
     tag_inst.has_result = true
     b.instructions.push(tag_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -13411,19 +12054,11 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let cont_label = gen_next_label(g, "prop_cont")
     g = gen_advance_label(g)
 
-    -- Pre-allocate storage for the Ok value (must be in current block, before the branch)
-    let ok_alloca_id = g.builder.next_id
-    let mut ok_alloca = ir_inst_new(ok_alloca_id, OP_ALLOCA())
-    ok_alloca.alloc_type = ok_field_type
-    ok_alloca.result_type = "ptr(" + ok_field_type + ")"
-    ok_alloca.has_result = true
-    b.instructions.push(ok_alloca)
-    g.builder.next_id = g.builder.next_id + 1
-
     -- Branch: if tag == 0 go to ok, else go to err
     b.terminator = Box_new(term_br_cond(ir_val_inst(is_ok_id), ok_label, err_label))
     b.has_terminator = true
     g.completed_blocks.push(b)
+
     -- Err path: extract error value and early-return it from the function
     let mut err_block = ir_block_new(err_label)
 
@@ -13432,29 +12067,41 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let mut err_extract = ir_inst_new(err_val_id, OP_EXTRACT_FIELD())
     err_extract.field_base = ir_val_inst(operand_id)
     err_extract.field_index = 2
-    err_extract.field_type = err_field_type
-    err_extract.result_type = err_field_type
+    err_extract.field_type = "i64"
+    err_extract.result_type = "i64"
     err_extract.has_result = true
     err_block.instructions.push(err_extract)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Return the operand directly (it already has the Err tag).
+    -- Build an error return value: construct a Result/Option with error tag
+    -- For simplicity, we reconstruct a tagged struct {tag=1, payload=0, error=err_val}
+    -- and return it. The LLVM backend will handle struct construction.
+    -- Here we return the operand directly (it already has the Err tag).
     err_block.terminator = Box_new(term_ret(ir_val_inst(operand_id)))
     err_block.has_terminator = true
     g.completed_blocks.push(err_block)
+
     -- Ok path: extract the Ok/Some value (field 1)
     let mut ok_block = ir_block_new(ok_label)
     let ok_val_id = g.builder.next_id
     let mut ok_extract = ir_inst_new(ok_val_id, OP_EXTRACT_FIELD())
     ok_extract.field_base = ir_val_inst(operand_id)
     ok_extract.field_index = 1
-    ok_extract.field_type = ok_field_type
-    ok_extract.result_type = ok_field_type
+    ok_extract.field_type = "i64"
+    ok_extract.result_type = "i64"
     ok_extract.has_result = true
     ok_block.instructions.push(ok_extract)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Store ok value into the pre-allocated alloca
+    -- Store ok value so it can be used after the branch
+    let ok_alloca_id = g.builder.next_id
+    let mut ok_alloca = ir_inst_new(ok_alloca_id, OP_ALLOCA())
+    ok_alloca.alloc_type = "i64"
+    ok_alloca.result_type = "ptr(i64)"
+    ok_alloca.has_result = true
+    ok_block.instructions.push(ok_alloca)
+    g.builder.next_id = g.builder.next_id + 1
+
     let mut ok_store = ir_inst_new(g.builder.next_id, OP_STORE())
     ok_store.store_ptr = ir_val_inst(ok_alloca_id)
     ok_store.store_val = ir_val_inst(ok_val_id)
@@ -13465,13 +12112,14 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     ok_block.terminator = Box_new(term_br(cont_label))
     ok_block.has_terminator = true
     g.completed_blocks.push(ok_block)
+
     -- Continue block: load the ok value
     let mut cont_block = ir_block_new(cont_label)
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(ok_alloca_id)
-    load_inst.load_type = ok_field_type
-    load_inst.result_type = ok_field_type
+    load_inst.load_type = "i64"
+    load_inst.result_type = "i64"
     load_inst.has_result = true
     cont_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -13927,7 +12575,6 @@ fn generate_simd_binary(gen: IRGenerator, block: IRBasicBlock, op: int, args: Li
     let mut inst = ir_inst_new(id, op)
     inst.lhs = ir_val_inst(lhs_result.val_id)
     inst.rhs = ir_val_inst(rhs_result.val_id)
-    inst.simd_vec_type = vec_type
     inst.result_type = vec_type
     inst.has_result = true
     b.instructions.push(inst)
@@ -13961,8 +12608,7 @@ fn generate_simd_extract(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 
     -- Infer the vector type from the first argument
     let vec_type = infer_simd_arg_type(g, args[0])
-    -- Use dAImond-native types (f64 for float vectors, i64 for int vectors)
-    let scalar_type = if is_simd_float_type(vec_type) { "f64" } else { "i64" }
+    let scalar_type = simd_extract_scalar_type(vec_type)
 
     -- Emit OP_SIMD_EXTRACT instruction
     let id = g.builder.next_id
@@ -14034,9 +12680,6 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
     let c_name = map_builtin_name(fn_name)
     let ret_type = builtin_return_type(fn_name)
 
-    -- Auto-convert print/println/eprint/eprintln args to string
-    let is_print_fn = fn_name == "println" or fn_name == "print" or fn_name == "eprintln" or fn_name == "eprint"
-
     -- Generate all argument expressions
     let mut call_args: List[IRValue] = []
     let mut i = 0
@@ -14044,54 +12687,7 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
         let arg_result = generate_expr(g, b, args[i])
         g = arg_result.gen
         b = arg_result.block
-
-        if is_print_fn {
-            let arg_type = infer_expr_type(g, args[i])
-            if arg_type == "i64" or arg_type == "i32" or arg_type == "i16" or arg_type == "i8" or arg_type == "u64" or arg_type == "u32" or arg_type == "u16" or arg_type == "u8" or arg_type == "int" {
-                -- Wrap with int_to_string
-                let conv_id = g.builder.next_id
-                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
-                conv_inst.callee = "dm_int_to_string"
-                let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(arg_result.val_id))
-                conv_inst.call_args = conv_args
-                conv_inst.result_type = "string"
-                conv_inst.has_result = true
-                b.instructions.push(conv_inst)
-                g.builder.next_id = g.builder.next_id + 1
-                call_args.push(ir_val_inst(conv_id))
-            } else if arg_type == "f64" or arg_type == "f32" or arg_type == "float" {
-                -- Wrap with float_to_string
-                let conv_id = g.builder.next_id
-                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
-                conv_inst.callee = "dm_float_to_string"
-                let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(arg_result.val_id))
-                conv_inst.call_args = conv_args
-                conv_inst.result_type = "string"
-                conv_inst.has_result = true
-                b.instructions.push(conv_inst)
-                g.builder.next_id = g.builder.next_id + 1
-                call_args.push(ir_val_inst(conv_id))
-            } else if arg_type == "bool" {
-                -- Wrap with bool_to_string
-                let conv_id = g.builder.next_id
-                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
-                conv_inst.callee = "dm_bool_to_string"
-                let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(arg_result.val_id))
-                conv_inst.call_args = conv_args
-                conv_inst.result_type = "string"
-                conv_inst.has_result = true
-                b.instructions.push(conv_inst)
-                g.builder.next_id = g.builder.next_id + 1
-                call_args.push(ir_val_inst(conv_id))
-            } else {
-                call_args.push(ir_val_inst(arg_result.val_id))
-            }
-        } else {
-            call_args.push(ir_val_inst(arg_result.val_id))
-        }
+        call_args.push(ir_val_inst(arg_result.val_id))
         i = i + 1
     }
 
@@ -14220,22 +12816,9 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     g = val_result.gen
     b = val_result.block
 
-    -- Compute allocation size based on the value being boxed
-    let mut size = 8  -- default pointer-sized allocation
-    let arg0 = args[0]
-    if arg0.kind == EXPR_STRUCT_LITERAL() {
-        let sname = arg0.type_name
-        if g.struct_defs.contains(sname) {
-            let sinfo = g.struct_defs.get(sname)
-            -- Each field is 8 bytes (i64/f64/ptr)
-            size = sinfo.field_names.len() * 8
-            if size < 8 {
-                size = 8
-            }
-        }
-    }
-
     -- Allocate memory via malloc
+    let val_type = infer_expr_type(g, args[0])
+    let size = estimate_type_size(val_type)
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
     malloc_inst.callee = "malloc"
@@ -14259,17 +12842,18 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 }
 
 -- Generate a Box_null() call.
--- Returns a null pointer constant via inttoptr(0).
+-- Returns a null pointer constant.
 fn generate_box_null_call(gen: IRGenerator, block: IRBasicBlock) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Emit inttoptr(i64 0) to produce a true null pointer
+    -- Emit an alloca with null value (pointer set to 0)
     let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CAST())
-    inst.cast_val = ir_val_int(0)
-    inst.cast_from = "i64"
-    inst.cast_to = "ptr"
+    let mut inst = ir_inst_new(id, OP_CALL())
+    inst.callee = "malloc"
+    let mut margs: List[IRValue] = []
+    margs.push(ir_val_int(0))
+    inst.call_args = margs
     inst.result_type = "ptr"
     inst.has_result = true
     b.instructions.push(inst)
@@ -14346,10 +12930,6 @@ fn COMPTIME_MAX_DEPTH() -> int { return 64 }
 -- Evaluate an expression at compile time, returning an IRValue.
 -- Returns ir_val_int(0) for unsupported expression kinds.
 fn eval_comptime_expr(gen: IRGenerator, e: Expr) -> IRValue {
-    return eval_comptime_expr_d(gen, e, 0)
-}
-
-fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
     -- Integer literal
     if e.kind == EXPR_LITERAL_INT() {
         return ir_val_int(e.int_val)
@@ -14372,9 +12952,7 @@ fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
 
     -- Binary expression
     if e.kind == EXPR_BINARY() {
-        let lv = eval_comptime_expr_d(gen, *e.left, depth)
-        let rv = eval_comptime_expr_d(gen, *e.right, depth)
-        return eval_binary_comptime_vals(gen, e.op, lv, rv)
+        return eval_binary_comptime(gen, e)
     }
 
     -- Unary expression
@@ -14382,31 +12960,24 @@ fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
         return eval_unary_comptime(gen, e)
     }
 
-    -- Identifier: look up in module globals (reverse search for correct scoping)
+    -- Identifier: look up in module globals
     if e.kind == EXPR_IDENTIFIER() {
         return eval_identifier_comptime(gen, e.name)
     }
 
     -- If expression
     if e.kind == EXPR_IF() {
-        let cond = eval_comptime_expr_d(gen, *e.condition, depth)
-        if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
-            return eval_comptime_expr_d(gen, *e.then_branch, depth)
-        }
-        if e.has_else {
-            return eval_comptime_expr_d(gen, *e.else_branch, depth)
-        }
-        return ir_val_int(0)
+        return eval_if_comptime(gen, e)
     }
 
     -- Block expression
     if e.kind == EXPR_BLOCK() {
-        return eval_block_comptime_d(gen, e, depth)
+        return eval_block_comptime(gen, e)
     }
 
     -- Function call
     if e.kind == EXPR_FUNCTION_CALL() {
-        return eval_call_comptime(gen, e, depth)
+        return eval_call_comptime(gen, e, 0)
     }
 
     -- Match expression
@@ -14417,56 +12988,13 @@ fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
     -- Grouped expression (parenthesized)
     if e.kind == EXPR_GROUPED() {
         let inner = *e.operand
-        return eval_comptime_expr_d(gen, inner, depth)
+        return eval_comptime_expr(gen, inner)
     }
 
     -- Comptime expression wrapper (e.g., `comptime expr`)
     if e.kind == EXPR_COMPTIME() {
         let inner = *e.operand
-        return eval_comptime_expr_d(gen, inner, depth)
-    }
-
-    -- Array literal: store elements as indexed globals (arr__0, arr__1, ..., arr__len)
-    if e.kind == EXPR_ARRAY_LITERAL() {
-        let arr_name = "__ct_arr_" + int_to_string(gen.builder.next_id)
-        let mut g = gen
-        let mut ei = 0
-        while ei < e.elements.len() {
-            let elem_val = eval_comptime_expr_d(g, e.elements[ei], depth)
-            let elem_name = arr_name + "__" + int_to_string(ei)
-            let mut gl = ir_global_new(elem_name, "i64")
-            gl.init_value = elem_val
-            gl.has_init = true
-            gl.is_const = true
-            g.ir_mod.globals.push(gl)
-            ei = ei + 1
-        }
-        -- Store array length
-        let len_name = arr_name + "__len"
-        let mut len_gl = ir_global_new(len_name, "i64")
-        len_gl.init_value = ir_val_int(e.elements.len())
-        len_gl.has_init = true
-        len_gl.is_const = true
-        g.ir_mod.globals.push(len_gl)
-        -- Store the array name marker so identifier lookup can find it
-        let mut marker = ir_global_new(arr_name, "i64")
-        marker.init_value = ir_val_string(arr_name)
-        marker.has_init = true
-        marker.is_const = true
-        g.ir_mod.globals.push(marker)
-        return ir_val_string(arr_name)
-    }
-
-    -- Index access: load from a comptime array at constant index
-    if e.kind == EXPR_INDEX_ACCESS() {
-        let obj_val = eval_comptime_expr_d(gen, *e.object, depth)
-        let idx_val = eval_comptime_expr_d(gen, *e.index, depth)
-        if obj_val.kind == VAL_CONST_STRING() and idx_val.kind == VAL_CONST_INT() {
-            -- obj_val.str_val is the array name, look up element
-            let elem_name = obj_val.str_val + "__" + int_to_string(idx_val.int_val)
-            return eval_identifier_comptime(gen, elem_name)
-        }
-        return ir_val_int(0)
+        return eval_comptime_expr(gen, inner)
     }
 
     -- Unsupported expression kind
@@ -14479,14 +13007,13 @@ fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
 
 -- Look up an identifier in the module's global constants.
 fn eval_identifier_comptime(gen: IRGenerator, name: string) -> IRValue {
-    -- Search in reverse order so innermost bindings (e.g. recursive call params) shadow outer ones
-    let mut i = gen.ir_mod.globals.len() - 1
-    while i >= 0 {
+    let mut i = 0
+    while i < gen.ir_mod.globals.len() {
         let gl = gen.ir_mod.globals[i]
         if gl.name == name and gl.has_init {
             return gl.init_value
         }
-        i = i - 1
+        i = i + 1
     }
     return ir_val_int(0)
 }
@@ -14595,51 +13122,6 @@ fn eval_binary_comptime(gen: IRGenerator, e: Expr) -> IRValue {
     return ir_val_int(0)
 }
 
--- Binary comptime with pre-evaluated values
-fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
-    if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
-        let a = lhs.int_val
-        let b = rhs.int_val
-        if op == BINOP_ADD() { return ir_val_int(a + b) }
-        if op == BINOP_SUB() { return ir_val_int(a - b) }
-        if op == BINOP_MUL() { return ir_val_int(a * b) }
-        if op == BINOP_DIV() { if b != 0 { return ir_val_int(a / b) } return ir_val_int(0) }
-        if op == BINOP_MOD() { if b != 0 { return ir_val_int(a % b) } return ir_val_int(0) }
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-        if op == BINOP_LT() { return ir_val_bool(a < b) }
-        if op == BINOP_LE() { return ir_val_bool(a <= b) }
-        if op == BINOP_GT() { return ir_val_bool(a > b) }
-        if op == BINOP_GE() { return ir_val_bool(a >= b) }
-    }
-    if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_FLOAT() {
-        let a = lhs.float_val
-        let b = rhs.float_val
-        if op == BINOP_ADD() { return ir_val_float(a + b) }
-        if op == BINOP_SUB() { return ir_val_float(a - b) }
-        if op == BINOP_MUL() { return ir_val_float(a * b) }
-        if op == BINOP_DIV() { return ir_val_float(a / b) }
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-        if op == BINOP_LT() { return ir_val_bool(a < b) }
-        if op == BINOP_LE() { return ir_val_bool(a <= b) }
-        if op == BINOP_GT() { return ir_val_bool(a > b) }
-        if op == BINOP_GE() { return ir_val_bool(a >= b) }
-    }
-    if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
-        if op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
-        if op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
-        if op == BINOP_EQ() { return ir_val_bool(lhs.bool_val == rhs.bool_val) }
-        if op == BINOP_NE() { return ir_val_bool(lhs.bool_val != rhs.bool_val) }
-    }
-    if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
-        if op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
-        if op == BINOP_EQ() { return ir_val_bool(lhs.str_val == rhs.str_val) }
-        if op == BINOP_NE() { return ir_val_bool(lhs.str_val != rhs.str_val) }
-    }
-    return ir_val_int(0)
-}
-
 -- ============================================================
 -- UNARY EXPRESSION EVALUATION
 -- ============================================================
@@ -14707,237 +13189,17 @@ fn eval_if_comptime(gen: IRGenerator, e: Expr) -> IRValue {
 -- ============================================================
 
 -- Evaluate a block expression at compile time.
--- Processes statements in order (let bindings, returns, expressions).
--- The last expression-statement's value is the block result.
+-- This is simplified: we skip statement evaluation and only
+-- evaluate the result expression if present.
+-- For full comptime block evaluation, local variable tracking
+-- would need to be implemented.
 fn eval_block_comptime(gen: IRGenerator, e: Expr) -> IRValue {
-    return eval_block_comptime_d(gen, e, 0)
-}
-
-fn eval_block_comptime_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
-    -- Process statements in the block first
-    let mut g = gen
-    let mut last_val = ir_val_int(0)
-    let mut i = 0
-    while i < e.stmts.len() {
-        let stmt = e.stmts[i]
-
-        -- Handle return statements - return immediately
-        if stmt.kind == STMT_RETURN() and stmt.has_ret_value {
-            return eval_comptime_expr_d(g, *stmt.ret_value, depth)
-        }
-
-        -- Handle let bindings - store in globals for subsequent lookups
-        if stmt.kind == STMT_LET() {
-            let val_expr = *stmt.let_value
-            if val_expr.kind != EXPR_LITERAL_NULL() {
-                -- Array literal: inline element global creation on g directly
-                -- to avoid losing them in a by-value function call copy.
-                if val_expr.kind == EXPR_ARRAY_LITERAL() {
-                    let arr_name = "__ct_arr_" + int_to_string(g.builder.next_id)
-                    let mut ei = 0
-                    while ei < val_expr.elements.len() {
-                        let elem_val = eval_comptime_expr_d(g, val_expr.elements[ei], depth)
-                        let elem_name = arr_name + "__" + int_to_string(ei)
-                        let mut elem_gl = ir_global_new(elem_name, "i64")
-                        elem_gl.init_value = elem_val
-                        elem_gl.has_init = true
-                        elem_gl.is_const = true
-                        g.ir_mod.globals.push(elem_gl)
-                        ei = ei + 1
-                    }
-                    let len_name = arr_name + "__len"
-                    let mut len_gl = ir_global_new(len_name, "i64")
-                    len_gl.init_value = ir_val_int(val_expr.elements.len())
-                    len_gl.has_init = true
-                    len_gl.is_const = true
-                    g.ir_mod.globals.push(len_gl)
-                    let mut marker = ir_global_new(arr_name, "i64")
-                    marker.init_value = ir_val_string(arr_name)
-                    marker.has_init = true
-                    marker.is_const = true
-                    g.ir_mod.globals.push(marker)
-                    let mut global = ir_global_new(stmt.let_name, "i64")
-                    global.init_value = ir_val_string(arr_name)
-                    global.has_init = true
-                    global.is_const = true
-                    g.ir_mod.globals.push(global)
-                } else {
-                    let val = eval_comptime_expr_d(g, val_expr, depth)
-                    let mut global = ir_global_new(stmt.let_name, "i64")
-                    global.init_value = val
-                    global.has_init = true
-                    global.is_const = true
-                    g.ir_mod.globals.push(global)
-                }
-            }
-        }
-
-        -- Handle expression statements - last one is the block result
-        if stmt.kind == STMT_EXPRESSION() {
-            last_val = eval_comptime_expr_d(g, *stmt.expr, depth)
-        }
-
-        -- Handle assignment statements
-        if stmt.kind == STMT_ASSIGNMENT() {
-            let val = eval_comptime_expr_d(g, *stmt.assign_value, depth)
-            let target_expr = *stmt.assign_target
-            if target_expr.kind == EXPR_IDENTIFIER() {
-                let target_name = target_expr.name
-                let mut gi = g.ir_mod.globals.len() - 1
-                while gi >= 0 {
-                    if g.ir_mod.globals[gi].name == target_name {
-                        let mut glob = g.ir_mod.globals[gi]
-                        glob.init_value = val
-                        g.ir_mod.globals[gi] = glob
-                        gi = -1
-                    } else {
-                        gi = gi - 1
-                    }
-                }
-            }
-        }
-
-        -- Handle while loops
-        if stmt.kind == STMT_WHILE() {
-            let mut loop_count = 0
-            let mut looping = true
-            while looping and loop_count < 10000 {
-                let cond = eval_comptime_expr_d(g, *stmt.while_cond, depth)
-                let mut cond_true = false
-                if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
-                    cond_true = true
-                }
-                if cond.kind == VAL_CONST_INT() and cond.int_val != 0 {
-                    cond_true = true
-                }
-                if cond_true == false {
-                    looping = false
-                } else {
-                    let body_val = eval_comptime_stmts(g, stmt.while_body, depth + 1)
-                    if body_val.kind == VAL_BREAK_SENTINEL() {
-                        looping = false
-                    } else if body_val.kind != VAL_UNDEF() {
-                        return body_val
-                    }
-                    loop_count = loop_count + 1
-                }
-            }
-        }
-
-        -- Handle for loops (range-based and array-based)
-        if stmt.kind == STMT_FOR() {
-            let iter_expr = *stmt.for_iter
-            if iter_expr.kind == EXPR_RANGE() {
-                -- Range for loop: for v in start..end
-                let start_val = eval_comptime_expr_d(g, *iter_expr.left, depth)
-                let end_val = eval_comptime_expr_d(g, *iter_expr.right, depth)
-                if start_val.kind == VAL_CONST_INT() and end_val.kind == VAL_CONST_INT() {
-                    let mut fi = start_val.int_val
-                    while fi < end_val.int_val {
-                        let mut loop_var = ir_global_new(stmt.for_var, "i64")
-                        loop_var.init_value = ir_val_int(fi)
-                        loop_var.has_init = true
-                        loop_var.is_const = true
-                        g.ir_mod.globals.push(loop_var)
-                        let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
-                        if body_val.kind == VAL_BREAK_SENTINEL() {
-                            fi = end_val.int_val
-                        } else if body_val.kind != VAL_UNDEF() {
-                            return body_val
-                        }
-                        fi = fi + 1
-                    }
-                }
-            } else {
-                -- Array for loop: for v in arr
-                let arr_val = eval_comptime_expr_d(g, iter_expr, depth)
-                if arr_val.kind == VAL_CONST_STRING() {
-                    let arr_name = arr_val.str_val
-                    let len_val = eval_identifier_comptime(g, arr_name + "__len")
-                    if len_val.kind == VAL_CONST_INT() {
-                        let mut fi = 0
-                        while fi < len_val.int_val {
-                            let elem_val = eval_identifier_comptime(g, arr_name + "__" + int_to_string(fi))
-                            let mut loop_var = ir_global_new(stmt.for_var, "i64")
-                            loop_var.init_value = elem_val
-                            loop_var.has_init = true
-                            loop_var.is_const = true
-                            g.ir_mod.globals.push(loop_var)
-                            let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
-                            if body_val.kind == VAL_BREAK_SENTINEL() {
-                                fi = len_val.int_val
-                            } else if body_val.kind != VAL_UNDEF() {
-                                return body_val
-                            }
-                            fi = fi + 1
-                        }
-                    }
-                }
-            }
-        }
-
-        -- Handle match statements
-        if stmt.kind == STMT_MATCH() {
-            -- The parser stores the full EXPR_MATCH in stmt.match_expr
-            -- (match_stmt_arms is always empty). Evaluate the match expression
-            -- directly, which delegates to eval_match_comptime for correct
-            -- scrutinee/arm resolution.
-            let match_val = eval_comptime_expr_d(g, *stmt.match_expr, depth)
-            last_val = match_val
-        }
-
-        -- Handle if statements with potential returns
-        if stmt.kind == STMT_IF() {
-            let cond = eval_comptime_expr_d(g, *stmt.if_cond, depth)
-            if cond.kind == VAL_CONST_BOOL() {
-                if cond.bool_val {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                }
-            }
-            if cond.kind == VAL_CONST_INT() {
-                if cond.int_val != 0 {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                }
-            }
-        }
-
-        i = i + 1
-    }
-
-    -- If the block has a result expression, evaluate it after processing statements
+    -- If the block has a result expression, evaluate it
     if e.has_result {
-        return eval_comptime_expr_d(g, *e.result, depth)
+        return eval_comptime_expr(gen, *e.result)
     }
 
-    return last_val
+    return ir_val_int(0)
 }
 
 -- ============================================================
@@ -14965,18 +13227,9 @@ fn eval_call_comptime(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
     let mut arg_values: List[IRValue] = []
     let mut i = 0
     while i < e.args.len() {
-        let val = eval_comptime_expr_d(gen, e.args[i], depth)
+        let val = eval_comptime_expr(gen, e.args[i])
         arg_values.push(val)
         i = i + 1
-    }
-
-    -- Handle builtin functions
-    if fn_name == "len" and arg_values.len() == 1 {
-        let arg = arg_values[0]
-        if arg.kind == VAL_CONST_STRING() {
-            return ir_val_int(len(arg.str_val))
-        }
-        return ir_val_int(0)
     }
 
     -- Look up the function declaration in source
@@ -15001,6 +13254,7 @@ fn eval_call_comptime(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
     let fd = *decl.func_decl
 
     -- Simple case: function with a single return statement
+    -- For more complex functions, we would need a full comptime interpreter
     if fd.body.len() == 1 {
         let stmt = fd.body[0]
         if stmt.kind == STMT_RETURN() and stmt.has_ret_value {
@@ -15016,11 +13270,13 @@ fn eval_call_comptime(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
                 g.ir_mod.globals.push(global)
                 i = i + 1
             }
-            return eval_comptime_expr_d(g, *stmt.ret_value, depth + 1)
+            let result = eval_comptime_expr(g, *stmt.ret_value)
+            return result
         }
     }
 
     -- Multi-statement function: evaluate sequentially
+    -- Track local comptime variables via temporary globals
     let mut g = gen
 
     -- Bind parameters as globals
@@ -15042,14 +13298,14 @@ fn eval_call_comptime(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
 
         -- Handle return statements
         if stmt.kind == STMT_RETURN() and stmt.has_ret_value {
-            return eval_comptime_expr_d(g, *stmt.ret_value, depth + 1)
+            return eval_comptime_expr(g, *stmt.ret_value)
         }
 
         -- Handle let bindings (add to globals for subsequent expressions)
         if stmt.kind == STMT_LET() {
             let val_expr = *stmt.let_value
             if val_expr.kind != EXPR_LITERAL_NULL() {
-                let val = eval_comptime_expr_d(g, val_expr, depth + 1)
+                let val = eval_comptime_expr(g, val_expr)
                 let mut global = ir_global_new(stmt.let_name, "i64")
                 global.init_value = val
                 global.has_init = true
@@ -15060,90 +13316,18 @@ fn eval_call_comptime(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
 
         -- Handle if statements with returns
         if stmt.kind == STMT_IF() {
-            let cond = eval_comptime_expr_d(g, *stmt.if_cond, depth + 1)
+            let cond = eval_comptime_expr(g, *stmt.if_cond)
             if cond.kind == VAL_CONST_BOOL() {
                 if cond.bool_val {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
+                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
                     if branch_val.kind != VAL_UNDEF() {
                         return branch_val
                     }
                 } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
+                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
                     if branch_val.kind != VAL_UNDEF() {
                         return branch_val
                     }
-                }
-            }
-            if cond.kind == VAL_CONST_INT() {
-                if cond.int_val != 0 {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                }
-            }
-        }
-
-        -- Handle assignment statements
-        if stmt.kind == STMT_ASSIGNMENT() {
-            let val = eval_comptime_expr_d(g, *stmt.assign_value, depth + 1)
-            let target_expr = *stmt.assign_target
-            if target_expr.kind == EXPR_IDENTIFIER() {
-                let target_name = target_expr.name
-                let mut gi = g.ir_mod.globals.len() - 1
-                while gi >= 0 {
-                    if g.ir_mod.globals[gi].name == target_name {
-                        let mut glob = g.ir_mod.globals[gi]
-                        glob.init_value = val
-                        g.ir_mod.globals[gi] = glob
-                        gi = -1
-                    } else {
-                        gi = gi - 1
-                    }
-                }
-            }
-        }
-
-        -- Handle while loops
-        if stmt.kind == STMT_WHILE() {
-            let mut loop_count = 0
-            let mut looping = true
-            while looping and loop_count < 10000 {
-                let cond = eval_comptime_expr_d(g, *stmt.while_cond, depth + 1)
-                let mut cond_true = false
-                if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
-                    cond_true = true
-                }
-                if cond.kind == VAL_CONST_INT() and cond.int_val != 0 {
-                    cond_true = true
-                }
-                if cond_true == false {
-                    looping = false
-                } else {
-                    let body_val = eval_comptime_stmts(g, stmt.while_body, depth + 1)
-                    if body_val.kind == VAL_BREAK_SENTINEL() {
-                        looping = false
-                    } else if body_val.kind != VAL_UNDEF() {
-                        return body_val
-                    }
-                    loop_count = loop_count + 1
                 }
             }
         }
@@ -15163,23 +13347,17 @@ fn eval_call_comptime(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
 fn eval_comptime_stmts(gen: IRGenerator, stmts: List[Stmt], depth: int) -> IRValue {
     let mut g = gen
     let mut i = 0
-    let mut last_val = ir_val_undef()
     while i < stmts.len() {
         let stmt = stmts[i]
 
         if stmt.kind == STMT_RETURN() and stmt.has_ret_value {
-            return eval_comptime_expr_d(g, *stmt.ret_value, depth)
-        }
-
-        -- Handle break statements - return break sentinel
-        if stmt.kind == STMT_BREAK() {
-            return ir_val_break()
+            return eval_comptime_expr(g, *stmt.ret_value)
         }
 
         if stmt.kind == STMT_LET() {
             let val_expr = *stmt.let_value
             if val_expr.kind != EXPR_LITERAL_NULL() {
-                let val = eval_comptime_expr_d(g, val_expr, depth)
+                let val = eval_comptime_expr(g, val_expr)
                 let mut global = ir_global_new(stmt.let_name, "i64")
                 global.init_value = val
                 global.has_init = true
@@ -15188,178 +13366,9 @@ fn eval_comptime_stmts(gen: IRGenerator, stmts: List[Stmt], depth: int) -> IRVal
             }
         }
 
-        if stmt.kind == STMT_EXPRESSION() {
-            last_val = eval_comptime_expr_d(g, *stmt.expr, depth)
-        }
-
-        -- Handle assignment (for loop variables etc)
-        if stmt.kind == STMT_ASSIGNMENT() {
-            let val = eval_comptime_expr_d(g, *stmt.assign_value, depth)
-            -- Update the global with the new value
-            let target_expr = *stmt.assign_target
-            if target_expr.kind == EXPR_IDENTIFIER() {
-                let target_name = target_expr.name
-                let mut gi = g.ir_mod.globals.len() - 1
-                while gi >= 0 {
-                    if g.ir_mod.globals[gi].name == target_name {
-                        let mut glob = g.ir_mod.globals[gi]
-                        glob.init_value = val
-                        g.ir_mod.globals[gi] = glob
-                        gi = -1
-                    } else {
-                        gi = gi - 1
-                    }
-                }
-            }
-        }
-
-        -- Handle if statements
-        if stmt.kind == STMT_IF() {
-            let cond = eval_comptime_expr_d(g, *stmt.if_cond, depth)
-            if cond.kind == VAL_CONST_BOOL() {
-                if cond.bool_val {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                }
-            }
-            if cond.kind == VAL_CONST_INT() {
-                if cond.int_val != 0 {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth + 1)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                }
-            }
-        }
-
-        -- Handle while loops
-        if stmt.kind == STMT_WHILE() {
-            let mut loop_count = 0
-            let mut looping = true
-            while looping and loop_count < 10000 {
-                let cond = eval_comptime_expr_d(g, *stmt.while_cond, depth)
-                let mut cond_true = false
-                if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
-                    cond_true = true
-                }
-                if cond.kind == VAL_CONST_INT() and cond.int_val != 0 {
-                    cond_true = true
-                }
-                if cond_true == false {
-                    looping = false
-                } else {
-                    let body_val = eval_comptime_stmts(g, stmt.while_body, depth + 1)
-                    if body_val.kind == VAL_BREAK_SENTINEL() {
-                        looping = false
-                    } else if body_val.kind != VAL_UNDEF() {
-                        return body_val
-                    }
-                    loop_count = loop_count + 1
-                }
-            }
-        }
-
-        -- Handle for loops (range-based and array-based)
-        if stmt.kind == STMT_FOR() {
-            let iter_expr = *stmt.for_iter
-            if iter_expr.kind == EXPR_RANGE() {
-                let start_val = eval_comptime_expr_d(g, *iter_expr.left, depth)
-                let end_val = eval_comptime_expr_d(g, *iter_expr.right, depth)
-                if start_val.kind == VAL_CONST_INT() and end_val.kind == VAL_CONST_INT() {
-                    let mut fi = start_val.int_val
-                    while fi < end_val.int_val {
-                        let mut loop_var = ir_global_new(stmt.for_var, "i64")
-                        loop_var.init_value = ir_val_int(fi)
-                        loop_var.has_init = true
-                        loop_var.is_const = true
-                        g.ir_mod.globals.push(loop_var)
-                        let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
-                        if body_val.kind == VAL_BREAK_SENTINEL() {
-                            fi = end_val.int_val
-                        } else if body_val.kind != VAL_UNDEF() {
-                            return body_val
-                        }
-                        fi = fi + 1
-                    }
-                }
-            } else {
-                let arr_val = eval_comptime_expr_d(g, iter_expr, depth)
-                if arr_val.kind == VAL_CONST_STRING() {
-                    let arr_name = arr_val.str_val
-                    let len_val = eval_identifier_comptime(g, arr_name + "__len")
-                    if len_val.kind == VAL_CONST_INT() {
-                        let mut fi = 0
-                        while fi < len_val.int_val {
-                            let elem_val = eval_identifier_comptime(g, arr_name + "__" + int_to_string(fi))
-                            let mut loop_var = ir_global_new(stmt.for_var, "i64")
-                            loop_var.init_value = elem_val
-                            loop_var.has_init = true
-                            loop_var.is_const = true
-                            g.ir_mod.globals.push(loop_var)
-                            let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
-                            if body_val.kind == VAL_BREAK_SENTINEL() {
-                                fi = len_val.int_val
-                            } else if body_val.kind != VAL_UNDEF() {
-                                return body_val
-                            }
-                            fi = fi + 1
-                        }
-                    }
-                }
-            }
-        }
-
-        -- Handle match statements
-        if stmt.kind == STMT_MATCH() {
-            let scrutinee_val = eval_comptime_expr_d(g, *stmt.match_expr, depth)
-            let mut mi = 0
-            let mut matched = false
-            while mi < stmt.match_stmt_arms.len() and matched == false {
-                let arm = stmt.match_stmt_arms[mi]
-                let pat = arm.pattern
-                let matches = comptime_pattern_matches(scrutinee_val, pat)
-                if matches {
-                    matched = true
-                    if arm.is_expr_body {
-                        last_val = eval_comptime_expr_d(g, *arm.body_expr, depth)
-                    } else {
-                        let body_val = eval_comptime_stmts(g, arm.body, depth + 1)
-                        if body_val.kind != VAL_UNDEF() {
-                            return body_val
-                        }
-                    }
-                }
-                mi = mi + 1
-            }
-        }
-
         i = i + 1
     }
-    return last_val
+    return ir_val_undef()
 }
 
 -- ============================================================
@@ -15552,8 +13561,6 @@ struct LLVMGenerator {
     wrapper_returns_string: Map[string, bool],
     -- Track which functions have wrappers
     has_wrapper: Map[string, bool],
-    -- Track which functions use sret return convention (result/option types)
-    returns_sret: Map[string, bool],
     -- Reference to IR module for type lookups
     ir_module: IRModule,
     -- Current function being generated (for param lookups)
@@ -15585,7 +13592,6 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
         string_ptrs: Map_new(),
         wrapper_returns_string: Map_new(),
         has_wrapper: Map_new(),
-        returns_sret: Map_new(),
         ir_module: ir_mod,
         current_func_name: ""
     }
@@ -15683,69 +13689,7 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     if type_name == "ptr" { return dm_llvm_pointer_type(ctx) }
     -- Pointer types: ptr(...)
     if starts_with(type_name, "ptr(") { return dm_llvm_pointer_type(ctx) }
-    -- List types: use dm_string type {ptr, i64, i64} since lists share the same layout
-    if starts_with(type_name, "dm_list_") or starts_with(type_name, "list") or type_name == "list" or starts_with(type_name, "List[") {
-        if gen.has_dm_string_type { return gen.dm_string_type }
-        return dm_llvm_pointer_type(ctx)
-    }
-    -- Map types: use [64 x i8] to ensure enough space for runtime map struct
-    if starts_with(type_name, "dm_map_") or starts_with(type_name, "map") or type_name == "map" or starts_with(type_name, "Map[") {
-        return dm_llvm_array_type(dm_llvm_int8_type(ctx), 64)
-    }
-    -- Result type: { i32 tag, ok_type, err_type }
-    -- Parse inner types from Result[T, E] for correct LLVM struct layout
-    if type_name == "result" or starts_with(type_name, "Result[") or starts_with(type_name, "result_") {
-        let i32_ty = dm_llvm_int32_type(ctx)
-        let mut ok_ty = dm_llvm_int64_type(ctx)
-        let mut err_ty = dm_llvm_int64_type(ctx)
-        if starts_with(type_name, "Result[") {
-            -- Parse Result[T, E] -> extract T and E
-            let inner = substr(type_name, 7, len(type_name) - 8)
-            -- Find comma separating T and E, respecting nested brackets
-            let mut comma_pos = 0 - 1
-            let mut depth = 0
-            let mut ci = 0
-            while ci < len(inner) {
-                let ch = char_at(inner, ci)
-                if ch == "[" { depth = depth + 1 }
-                if ch == "]" { depth = depth - 1 }
-                if ch == "," and depth == 0 {
-                    comma_pos = ci
-                    ci = len(inner)
-                }
-                ci = ci + 1
-            }
-            if comma_pos >= 0 {
-                let ok_str = substr(inner, 0, comma_pos)
-                let mut err_start = comma_pos + 1
-                if err_start < len(inner) and char_at(inner, err_start) == " " {
-                    err_start = err_start + 1
-                }
-                let err_str = substr(inner, err_start, len(inner) - err_start)
-                ok_ty = map_ir_type_to_llvm(gen, ok_str)
-                err_ty = map_ir_type_to_llvm(gen, err_str)
-            }
-        }
-        dm_llvm_buf_clear()
-        dm_llvm_buf_push(i32_ty)
-        dm_llvm_buf_push(ok_ty)
-        dm_llvm_buf_push(err_ty)
-        return dm_llvm_struct_type_buf(ctx, 3, 0)
-    }
-    -- Option type: { i32 has_value, inner_type }
-    -- Parse inner type from Option[T] for correct LLVM struct layout
-    if type_name == "option" or starts_with(type_name, "Option[") or starts_with(type_name, "option_") {
-        let i32_ty = dm_llvm_int32_type(ctx)
-        let mut inner_ty = dm_llvm_int64_type(ctx)
-        if starts_with(type_name, "Option[") {
-            let inner = substr(type_name, 7, len(type_name) - 8)
-            inner_ty = map_ir_type_to_llvm(gen, inner)
-        }
-        dm_llvm_buf_clear()
-        dm_llvm_buf_push(i32_ty)
-        dm_llvm_buf_push(inner_ty)
-        return dm_llvm_struct_type_buf(ctx, 2, 0)
-    }
+    -- List and Map types (found via struct_type_map registered in register_builtin_struct_types)
     -- SIMD vector types
     if lg_is_simd_type(type_name) {
         return get_simd_llvm_type(gen, type_name)
@@ -15753,6 +13697,14 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     -- Struct types: look up in struct_type_map
     if gen.struct_type_map.contains(type_name) {
         return gen.struct_type_map.get(type_name)
+    }
+    -- Strip generic parameters: "Option[int]" -> "Option"
+    let bracket_pos = string_find(type_name, "[")
+    if bracket_pos >= 0 {
+        let base_name = substr(type_name, 0, bracket_pos)
+        if gen.struct_type_map.contains(base_name) {
+            return gen.struct_type_map.get(base_name)
+        }
     }
     -- Struct names prefixed with "struct "
     if starts_with(type_name, "struct ") {
@@ -15768,6 +13720,64 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
 -- ============================================================
 -- STRUCT TYPE DECLARATION
 -- ============================================================
+
+fn register_builtin_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
+    let mut g = gen
+    let ctx = g.context
+
+    -- Register Result type: { i64 tag, i64 ok_val, i64 err_val }
+    -- All fields are i64 for uniform insertvalue/extractvalue (avoids i32/i64 mismatch)
+    if g.struct_type_map.contains("result") == false {
+        let result_struct = dm_llvm_struct_create_named(ctx, "result")
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_struct_set_body_buf(result_struct, 0)
+        g.struct_type_map.insert("result", result_struct)
+        g.struct_type_map.insert("Result", result_struct)
+    }
+
+    -- Register Option type: { i64 has_value, i64 value }
+    if g.struct_type_map.contains("option") == false {
+        let option_struct = dm_llvm_struct_create_named(ctx, "option")
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_struct_set_body_buf(option_struct, 0)
+        g.struct_type_map.insert("option", option_struct)
+        g.struct_type_map.insert("Option", option_struct)
+    }
+
+    -- Register list and map runtime struct types: { ptr, i64, i64 }
+    -- All list types share one LLVM named struct, same for all map types.
+    -- This avoids type mismatches when list values move between contexts.
+    let list_struct = dm_llvm_struct_create_named(ctx, "dm_list")
+    dm_llvm_buf_clear()
+    dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_struct_set_body_buf(list_struct, 0)
+    g.struct_type_map.insert("dm_list", list_struct)
+    g.struct_type_map.insert("dm_list_int64", list_struct)
+    g.struct_type_map.insert("dm_list_double", list_struct)
+    g.struct_type_map.insert("dm_list_dm_string", list_struct)
+    g.struct_type_map.insert("dm_list_generic", list_struct)
+    g.struct_type_map.insert("list", list_struct)
+
+    let map_struct = dm_llvm_struct_create_named(ctx, "dm_map")
+    dm_llvm_buf_clear()
+    dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_struct_set_body_buf(map_struct, 0)
+    g.struct_type_map.insert("dm_map", map_struct)
+    g.struct_type_map.insert("dm_map_string_int", map_struct)
+    g.struct_type_map.insert("dm_map_int_string", map_struct)
+    g.struct_type_map.insert("map", map_struct)
+
+    return g
+}
 
 fn declare_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
     let mut g = gen
@@ -15796,21 +13806,16 @@ fn declare_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
             let sname = ir_ty.name
             if sname != "" and g.struct_type_map.contains(sname) {
                 let llvm_struct = g.struct_type_map.get(sname)
-                -- Collect field types into list first (avoid buffer clobbering)
-                let mut field_types: List[int] = []
+                dm_llvm_buf_clear()
                 let mut fi = 0
+                let mut field_count = 0
                 while fi < ir_ty.fields.len() {
                     let field = ir_ty.fields[fi]
-                    field_types.push(map_ir_type_to_llvm(g, field.type_id))
+                    dm_llvm_buf_push(map_ir_type_to_llvm(g, field.type_id))
+                    field_count = field_count + 1
                     fi = fi + 1
                 }
-                if field_types.len() > 0 {
-                    dm_llvm_buf_clear()
-                    fi = 0
-                    while fi < field_types.len() {
-                        dm_llvm_buf_push(field_types[fi])
-                        fi = fi + 1
-                    }
+                if field_count > 0 {
                     dm_llvm_struct_set_body_buf(llvm_struct, 0)
                 }
             }
@@ -15829,16 +13834,6 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
     let mut i = 0
     while i < g.ir_module.globals.len() {
         let global = g.ir_module.globals[i]
-        -- Skip comptime bookkeeping globals (array elements, markers)
-        if starts_with(global.name, "__ct_arr_") {
-            i = i + 1
-            continue
-        }
-        -- Skip string-type globals (they are resolved inline by generate_identifier)
-        if global.has_init and global.init_value.kind == VAL_CONST_STRING() {
-            i = i + 1
-            continue
-        }
         let llvm_ty = map_ir_type_to_llvm(g, global.type_id)
         let gvar = dm_llvm_module_add_global(g.llvm_module, llvm_ty, global.name)
         -- Set initializer
@@ -15849,8 +13844,8 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
             } else if init.kind == VAL_CONST_FLOAT() {
                 dm_llvm_set_initializer(gvar, dm_llvm_const_real(llvm_ty, init.float_val))
             } else if init.kind == VAL_CONST_BOOL() {
-                let mut bval = 0
-                if init.bool_val { bval = 1 }
+                let bval = 0
+                if init.bool_val { let bval = 1 }
                 dm_llvm_set_initializer(gvar, dm_llvm_const_int(llvm_ty, bval, 0))
             } else {
                 dm_llvm_set_initializer(gvar, dm_llvm_const_null(llvm_ty))
@@ -15871,22 +13866,6 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- FUNCTION DECLARATION
 -- ============================================================
 
--- Check if a return type needs sret (struct return) convention.
--- Result ({i32, i64, i64} = 20 bytes) and Option ({i32, i64} = 12 bytes)
--- are too large for register return on x86_64 and cause LLVM errors.
-fn is_sret_return_type(ret_type: string) -> bool {
-    if ret_type == "string" {
-        return true
-    }
-    if ret_type == "result" or starts_with(ret_type, "Result[") or starts_with(ret_type, "result_") {
-        return true
-    }
-    if ret_type == "option" or starts_with(ret_type, "Option[") or starts_with(ret_type, "option_") {
-        return true
-    }
-    return false
-}
-
 -- Check if an IR function involves dm_string in params or return type
 fn func_needs_wrapper(func: IRFunction) -> bool {
     if func.is_extern == false { return false }
@@ -15905,35 +13884,29 @@ fn declare_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     let returns_string = func.return_type == "string"
     let ptr_ty = dm_llvm_pointer_type(ctx)
     let void_ty = dm_llvm_void_type(ctx)
-    -- Compute return type BEFORE using buffer (map_ir_type_to_llvm may use buffer internally)
-    let mut ret_ty = 0
+    -- Build wrapper parameter types
+    dm_llvm_buf_clear()
+    -- If returns string: prepend sret output pointer
     if returns_string {
-        ret_ty = void_ty
-    } else {
-        ret_ty = map_ir_type_to_llvm(g, func.return_type)
+        dm_llvm_buf_push(ptr_ty)
     }
-    -- Collect param types into a list first (avoid buffer clobbering)
-    let mut param_types: List[int] = []
-    if returns_string {
-        param_types.push(ptr_ty)
-    }
+    -- Transform params: string -> ptr, others -> normal mapping
     let mut i = 0
     while i < func.params.len() {
         let p = func.params[i]
         if p.type_id == "string" {
-            param_types.push(ptr_ty)
+            dm_llvm_buf_push(ptr_ty)
         } else {
-            param_types.push(map_ir_type_to_llvm(g, p.type_id))
+            dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
         }
         i = i + 1
     }
-    -- Push all to shared buffer at once and create function type
-    dm_llvm_buf_clear()
-    i = 0
-    while i < param_types.len() {
-        dm_llvm_buf_push(param_types[i])
-        i = i + 1
+    -- Return type: void if returns_string, else mapped type
+    let mut ret_ty = map_ir_type_to_llvm(g, func.return_type)
+    if returns_string {
+        ret_ty = void_ty
     }
+    -- Create function type
     let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
     -- Wrapper name: "llvm_" + original name
     let wrapper_name = "llvm_" + func.name
@@ -15946,135 +13919,6 @@ fn declare_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     return g
 }
 
--- Declare and generate a wrapper for a user-declared extern function that uses dm_string.
--- For `extern fn getenv(name: string) -> string`:
--- 1. Declare the real C function `getenv` as `ptr getenv(ptr)`
--- 2. Generate a wrapper `llvm_getenv` that converts dm_string <-> char*
-fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
-    let mut g = gen
-    let ctx = g.context
-    let returns_string = func.return_type == "string"
-    let ptr_ty = dm_llvm_pointer_type(ctx)
-    let void_ty = dm_llvm_void_type(ctx)
-
-    -- Step 1: Declare the real C function with C types
-    let mut c_param_count = 0
-    dm_llvm_buf_clear()
-    let mut ci = 0
-    while ci < func.params.len() {
-        let p = func.params[ci]
-        if p.type_id == "string" {
-            dm_llvm_buf_push(ptr_ty)
-        } else {
-            dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
-        }
-        c_param_count = c_param_count + 1
-        ci = ci + 1
-    }
-    let c_ret_ty = if returns_string { ptr_ty } else { map_ir_type_to_llvm(g, func.return_type) }
-    let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
-    let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
-
-    -- Step 2: Declare the wrapper function with dm_string-based API
-    let mut w_param_count = 0
-    dm_llvm_buf_clear()
-    if returns_string {
-        dm_llvm_buf_push(ptr_ty)
-        w_param_count = w_param_count + 1
-    }
-    ci = 0
-    while ci < func.params.len() {
-        dm_llvm_buf_push(ptr_ty)
-        w_param_count = w_param_count + 1
-        ci = ci + 1
-    }
-    let w_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
-    let w_fn_ty = dm_llvm_function_type_buf(w_ret_ty, 0)
-    let wrapper_name = "llvm_" + func.name
-    let wrapper_fn = dm_llvm_module_add_function(g.llvm_module, wrapper_name, w_fn_ty)
-
-    -- Step 3: Generate the wrapper body
-    let saved_bb = dm_llvm_get_insert_block(g.builder)
-    let entry_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "entry")
-    dm_llvm_position_at_end(g.builder, entry_bb)
-
-    -- Convert string params: extract data field (field 0) from dm_string*
-    g = get_dm_string_type(g)
-    let mut w_param_idx = 0
-    if returns_string { w_param_idx = 1 }
-
-    dm_llvm_buf_clear()
-    ci = 0
-    while ci < func.params.len() {
-        let p = func.params[ci]
-        let wrapper_param = dm_llvm_get_param(wrapper_fn, w_param_idx)
-        if p.type_id == "string" {
-            let data_ptr = dm_llvm_build_struct_gep2(g.builder, g.dm_string_type, wrapper_param, 0, "data_ptr")
-            let data = dm_llvm_build_load2(g.builder, ptr_ty, data_ptr, "data")
-            dm_llvm_buf_push(data)
-        } else {
-            dm_llvm_buf_push(wrapper_param)
-        }
-        w_param_idx = w_param_idx + 1
-        ci = ci + 1
-    }
-    let call_name = if returns_string { "c_result" } else { "" }
-    let c_result = dm_llvm_build_call2_buf(g.builder, c_fn_ty, real_fn, call_name)
-
-    if returns_string {
-        let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)
-        -- Handle NULL return: call dm_string_new with empty string if NULL
-        let null_val = dm_llvm_const_null(ptr_ty)
-        let is_null = dm_llvm_build_icmp(g.builder, dm_llvm_int_eq(), c_result, null_val, "is_null")
-        let then_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "then_null")
-        let else_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "else_nonnull")
-        let merge_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "merge")
-        dm_llvm_build_cond_br(g.builder, is_null, then_bb, else_bb)
-
-        -- Null case: create empty string
-        dm_llvm_position_at_end(g.builder, then_bb)
-        let empty_str = dm_llvm_build_global_string_ptr(g.builder, "", "empty_str")
-        if g.function_map.contains("dm_string_new") {
-            let sn_fn = g.function_map.get("dm_string_new")
-            let sn_ty = g.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret_ptr)
-            dm_llvm_buf_push(empty_str)
-            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-        }
-        dm_llvm_build_br(g.builder, merge_bb)
-
-        -- Non-null case: create string from C result
-        dm_llvm_position_at_end(g.builder, else_bb)
-        if g.function_map.contains("dm_string_new") {
-            let sn_fn = g.function_map.get("dm_string_new")
-            let sn_ty = g.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret_ptr)
-            dm_llvm_buf_push(c_result)
-            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-        }
-        dm_llvm_build_br(g.builder, merge_bb)
-
-        dm_llvm_position_at_end(g.builder, merge_bb)
-        dm_llvm_build_ret_void(g.builder)
-    } else {
-        dm_llvm_build_ret(g.builder, c_result)
-    }
-
-    -- Restore builder position
-    if saved_bb != 0 {
-        dm_llvm_position_at_end(g.builder, saved_bb)
-    }
-
-    -- Store under ORIGINAL name for call resolution
-    g.function_map.insert(func.name, wrapper_fn)
-    g.fn_type_map.insert(func.name, w_fn_ty)
-    g.has_wrapper.insert(func.name, true)
-    g.wrapper_returns_string.insert(func.name, returns_string)
-    return g
-}
-
 fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     let mut g = gen
     let ctx = g.context
@@ -16082,71 +13926,38 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     if func_needs_wrapper(func) {
         -- Check if this is a user extern function
         if g.ir_module.user_extern_fns.contains(func.name) {
-            g = declare_user_extern_wrapper(g, func)
+            -- TODO: user extern wrapper generation
+            g = declare_wrapper(g, func)
             return g
         }
         g = declare_wrapper(g, func)
         return g
     }
     -- Regular function declaration
-    -- Check if function returns result/option (needs sret convention)
-    let needs_sret = is_sret_return_type(func.return_type) and func.name != "main"
-    let is_main = func.name == "main"
-    -- IMPORTANT: Compute return type and collect param types BEFORE using the shared
-    -- buffer, because map_ir_type_to_llvm may use dm_llvm_buf internally for struct types
-    let mut ret_ty = 0
-    if is_main {
-        ret_ty = dm_llvm_int32_type(ctx)
-    } else if needs_sret {
-        ret_ty = dm_llvm_void_type(ctx)
-    } else {
-        ret_ty = map_ir_type_to_llvm(g, func.return_type)
-    }
-    -- Collect all param types into a list first (avoid buffer clobbering)
-    let mut param_types: List[int] = []
-    if needs_sret {
-        param_types.push(dm_llvm_pointer_type(ctx))
-    }
+    dm_llvm_buf_clear()
     let mut i = 0
     while i < func.params.len() {
-        param_types.push(map_ir_type_to_llvm(g, func.params[i].type_id))
+        dm_llvm_buf_push(map_ir_type_to_llvm(g, func.params[i].type_id))
         i = i + 1
     }
+    -- C ABI: main returns i32 and takes (i32 argc, i8** argv)
+    let is_main = func.name == "main"
+    let mut ret_ty = map_ir_type_to_llvm(g, func.return_type)
     if is_main {
-        param_types.push(dm_llvm_int32_type(ctx))
-        param_types.push(dm_llvm_pointer_type(ctx))
-    }
-    -- Now push all to shared buffer at once and create function type
-    dm_llvm_buf_clear()
-    i = 0
-    while i < param_types.len() {
-        dm_llvm_buf_push(param_types[i])
-        i = i + 1
+        ret_ty = dm_llvm_int32_type(ctx)
+        dm_llvm_buf_push(dm_llvm_int32_type(ctx))
+        dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
     }
     let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
     let llvm_fn = dm_llvm_module_add_function(g.llvm_module, func.name, fn_ty)
     g.function_map.insert(func.name, llvm_fn)
     g.fn_type_map.insert(func.name, fn_ty)
-    -- Track sret functions
-    if needs_sret {
-        g.returns_sret.insert(func.name, true)
-    }
-    -- Name parameters (offset by 1 for sret functions since param 0 is the sret ptr)
+    -- Name parameters
     i = 0
-    if needs_sret {
-        let sret_param = dm_llvm_get_param(llvm_fn, 0)
-        dm_llvm_set_value_name(sret_param, "sret.out")
-        while i < func.params.len() {
-            let param_val = dm_llvm_get_param(llvm_fn, i + 1)
-            dm_llvm_set_value_name(param_val, func.params[i].name)
-            i = i + 1
-        }
-    } else {
-        while i < func.params.len() {
-            let param_val = dm_llvm_get_param(llvm_fn, i)
-            dm_llvm_set_value_name(param_val, func.params[i].name)
-            i = i + 1
-        }
+    while i < func.params.len() {
+        let param_val = dm_llvm_get_param(llvm_fn, i)
+        dm_llvm_set_value_name(param_val, func.params[i].name)
+        i = i + 1
     }
     return g
 }
@@ -16174,131 +13985,42 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     -- Clear value_map and string_ptrs for this function
     g.value_map = Map_new()
     g.string_ptrs = Map_new()
-    -- ALLOCA HOISTING: Generate all allocas in the entry block first.
-    -- This ensures all allocas are available regardless of block processing order.
-    -- Standard LLVM practice: all allocas belong in the entry block.
-    if func.blocks.len() > 0 {
-        let entry_label = func.blocks[0].label
-        if g.block_map.contains(entry_label) {
-            let entry_bb = g.block_map.get(entry_label)
-            dm_llvm_position_at_end(g.builder, entry_bb)
-            -- Pre-generate argc/argv for main
-            if func.name == "main" {
+    -- Generate instructions and terminators for each block
+    let mut is_first = true
+    bi = 0
+    while bi < func.blocks.len() {
+        let block = func.blocks[bi]
+        if g.block_map.contains(block.label) {
+            let bb = g.block_map.get(block.label)
+            dm_llvm_position_at_end(g.builder, bb)
+            -- At start of main(): store argc/argv to globals
+            if is_first and func.name == "main" {
                 let i32_ty = dm_llvm_int32_type(ctx)
                 let ptr_ty = dm_llvm_pointer_type(ctx)
                 let argc_global = dm_llvm_module_add_global(g.llvm_module, i32_ty, "dm_argc")
                 dm_llvm_set_linkage(argc_global, dm_llvm_external_linkage())
                 let argv_global = dm_llvm_module_add_global(g.llvm_module, ptr_ty, "dm_argv")
                 dm_llvm_set_linkage(argv_global, dm_llvm_external_linkage())
+                -- Store main's argc/argv params
                 let argc_param = dm_llvm_get_param(llvm_fn, func.params.len())
                 let argv_param = dm_llvm_get_param(llvm_fn, func.params.len() + 1)
                 dm_llvm_build_store(g.builder, argc_param, argc_global)
                 dm_llvm_build_store(g.builder, argv_param, argv_global)
             }
-            -- Scan ALL blocks for OP_ALLOCA and generate them in entry block
-            bi = 0
-            while bi < func.blocks.len() {
-                let scan_block = func.blocks[bi]
-                let mut si = 0
-                while si < scan_block.instructions.len() {
-                    let scan_inst = scan_block.instructions[si]
-                    if scan_inst.op == OP_ALLOCA() {
-                        g = generate_instruction(g, scan_inst)
-                    }
-                    si = si + 1
-                }
-                bi = bi + 1
+            is_first = false
+            -- Generate instructions
+            let mut ii = 0
+            while ii < block.instructions.len() {
+                g = generate_instruction(g, block.instructions[ii])
+                ii = ii + 1
+            }
+            -- Generate terminator
+            if block.has_terminator {
+                let term = *block.terminator
+                g = generate_terminator(g, term, func)
             }
         }
-    }
-    -- Build BFS-ordered block list for correct processing order.
-    -- Blocks must be processed in dominator order so that value_map is populated
-    -- before any instruction references a value from an earlier block.
-    let mut bfs_order: List[string] = []
-    let mut bfs_visited: Map[string, bool] = Map_new()
-    if func.blocks.len() > 0 {
-        -- Start BFS from entry block
-        let mut bfs_queue: List[string] = []
-        bfs_queue.push(func.blocks[0].label)
-        bfs_visited.insert(func.blocks[0].label, true)
-        while bfs_queue.len() > 0 {
-            let cur_label = bfs_queue[0]
-            -- Shift: manual removal of first element by rebuilding
-            let mut new_queue: List[string] = []
-            let mut qi = 1
-            while qi < bfs_queue.len() {
-                new_queue.push(bfs_queue[qi])
-                qi = qi + 1
-            }
-            bfs_queue = new_queue
-            bfs_order.push(cur_label)
-            -- Find this block and get its terminator targets
-            let mut fi = 0
-            while fi < func.blocks.len() {
-                if func.blocks[fi].label == cur_label {
-                    let cur_block = func.blocks[fi]
-                    if cur_block.has_terminator {
-                        let t = *cur_block.terminator
-                        if t.kind == TERM_BR() {
-                            if bfs_visited.contains(t.target) == false {
-                                bfs_visited.insert(t.target, true)
-                                bfs_queue.push(t.target)
-                            }
-                        }
-                        if t.kind == TERM_BR_COND() {
-                            if bfs_visited.contains(t.true_label) == false {
-                                bfs_visited.insert(t.true_label, true)
-                                bfs_queue.push(t.true_label)
-                            }
-                            if bfs_visited.contains(t.false_label) == false {
-                                bfs_visited.insert(t.false_label, true)
-                                bfs_queue.push(t.false_label)
-                            }
-                        }
-                    }
-                }
-                fi = fi + 1
-            }
-        }
-        -- Add any blocks not reachable from entry (safety: shouldn't happen)
-        bi = 0
-        while bi < func.blocks.len() {
-            if bfs_visited.contains(func.blocks[bi].label) == false {
-                bfs_order.push(func.blocks[bi].label)
-            }
-            bi = bi + 1
-        }
-    }
-    -- Generate instructions and terminators for each block in BFS order (skip allocas)
-    let mut bfs_i = 0
-    while bfs_i < bfs_order.len() {
-        let bfs_label = bfs_order[bfs_i]
-        -- Find the block with this label
-        let mut found_bi = 0
-        while found_bi < func.blocks.len() {
-            if func.blocks[found_bi].label == bfs_label {
-                let block = func.blocks[found_bi]
-                if g.block_map.contains(block.label) {
-                    let bb = g.block_map.get(block.label)
-                    dm_llvm_position_at_end(g.builder, bb)
-                    -- Generate non-alloca instructions
-                    let mut ii = 0
-                    while ii < block.instructions.len() {
-                        if block.instructions[ii].op != OP_ALLOCA() {
-                            g = generate_instruction(g, block.instructions[ii])
-                        }
-                        ii = ii + 1
-                    }
-                    -- Generate terminator
-                    if block.has_terminator {
-                        let term = *block.terminator
-                        g = generate_terminator(g, term, func)
-                    }
-                }
-            }
-            found_bi = found_bi + 1
-        }
-        bfs_i = bfs_i + 1
+        bi = bi + 1
     }
     return g
 }
@@ -16336,12 +14058,7 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
     if val.kind == VAL_PARAM_REF() {
         if gen.function_map.contains(gen.current_func_name) {
             let llvm_fn = gen.function_map.get(gen.current_func_name)
-            -- For sret functions, LLVM param 0 is the sret pointer, so user params start at index 1
-            let mut param_offset = 0
-            if gen.returns_sret.contains(gen.current_func_name) {
-                param_offset = 1
-            }
-            return dm_llvm_get_param(llvm_fn, val.ref_id + param_offset)
+            return dm_llvm_get_param(llvm_fn, val.ref_id)
         }
         return dm_llvm_const_null(dm_llvm_int64_type(ctx))
     }
@@ -16477,28 +14194,10 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     }
     -- Comparison
     if op == OP_EQ() {
-        let mut lhs = resolve_value(g, inst.lhs)
-        let mut rhs = resolve_value(g, inst.rhs)
+        let lhs = resolve_value(g, inst.lhs)
+        let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
-        -- Fix i32 vs i64 type mismatch for icmp (e.g., enum/option/result tag comparisons)
-        let lhs_ty = dm_llvm_type_of(lhs)
-        let rhs_ty = dm_llvm_type_of(rhs)
-        if lhs_ty != rhs_ty {
-            let lhs_kind = dm_llvm_get_type_kind(lhs_ty)
-            let rhs_kind = dm_llvm_get_type_kind(rhs_ty)
-            -- type kind 8 = LLVMIntegerTypeKind
-            if lhs_kind == 8 and rhs_kind == 8 {
-                let lw = dm_llvm_get_int_type_width(lhs_ty)
-                let rw = dm_llvm_get_int_type_width(rhs_ty)
-                if lw < rw {
-                    rhs = dm_llvm_build_trunc(b, rhs, lhs_ty, "trunc")
-                }
-                if rw < lw {
-                    lhs = dm_llvm_build_trunc(b, lhs, rhs_ty, "trunc")
-                }
-            }
-        }
         let mut result = 0
         if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
             result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), lhs, rhs, "feq")
@@ -16509,27 +14208,10 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         return g
     }
     if op == OP_NE() {
-        let mut lhs = resolve_value(g, inst.lhs)
-        let mut rhs = resolve_value(g, inst.rhs)
+        let lhs = resolve_value(g, inst.lhs)
+        let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
-        -- Fix i32 vs i64 type mismatch for icmp
-        let lhs_ty = dm_llvm_type_of(lhs)
-        let rhs_ty = dm_llvm_type_of(rhs)
-        if lhs_ty != rhs_ty {
-            let lhs_kind = dm_llvm_get_type_kind(lhs_ty)
-            let rhs_kind = dm_llvm_get_type_kind(rhs_ty)
-            if lhs_kind == 8 and rhs_kind == 8 {
-                let lw = dm_llvm_get_int_type_width(lhs_ty)
-                let rw = dm_llvm_get_int_type_width(rhs_ty)
-                if lw < rw {
-                    rhs = dm_llvm_build_trunc(b, rhs, lhs_ty, "trunc")
-                }
-                if rw < lw {
-                    lhs = dm_llvm_build_trunc(b, lhs, rhs_ty, "trunc")
-                }
-            }
-        }
         let mut result = 0
         if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
             result = dm_llvm_build_fcmp(b, dm_llvm_real_one(), lhs, rhs, "fne")
@@ -16628,10 +14310,6 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if inst.alloc_type == "string" {
             g.string_ptrs.insert(id_key, true)
         }
-        -- List and map types are also aggregate pointers (pass by pointer, not value)
-        if starts_with(inst.alloc_type, "dm_list_") or starts_with(inst.alloc_type, "dm_map_") or starts_with(inst.alloc_type, "List[") or starts_with(inst.alloc_type, "Map[") {
-            g.string_ptrs.insert(id_key, true)
-        }
         if inst.has_result { g.value_map.insert(id_key, result) }
         return g
     }
@@ -16645,11 +14323,10 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, ptr_val) }
             return g
         }
-        -- List/map loads return the pointer itself (aggregate types, always by pointer)
-        if starts_with(inst.load_type, "dm_list_") or starts_with(inst.load_type, "dm_map_") or inst.load_type == "list" or inst.load_type == "map" or starts_with(inst.load_type, "List[") or starts_with(inst.load_type, "Map[") {
+        -- List/Map loads return the pointer itself (runtime funcs always take pointers)
+        if starts_with(inst.load_type, "dm_list") or starts_with(inst.load_type, "dm_map") or inst.load_type == "list" or inst.load_type == "map" {
             let ptr_val = resolve_value(g, inst.load_ptr)
             g = resolve_value_with_counter(g, inst.load_ptr)
-            g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, ptr_val) }
             return g
         }
@@ -16700,10 +14377,27 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let result = dm_llvm_build_extract_value(b, base, inst.field_index, "field")
         -- If extracted field is dm_string, store to alloca and track
         if inst.field_type == "string" {
+            if inst.result_type == "i64" {
+                -- Result/Option case: string was stored via ptrtoint, extractvalue returns i64
+                -- Convert i64 back to ptr (the original dm_string pointer)
+                let ptr_val = dm_llvm_build_int_to_ptr(b, result, dm_llvm_pointer_type(g.context), "i2p.str")
+                g.string_ptrs.insert(id_key, true)
+                if inst.has_result { g.value_map.insert(id_key, ptr_val) }
+                return g
+            }
+            -- Normal struct: extractvalue returns dm_string struct, store to alloca
             let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.extract")
             dm_llvm_build_store(b, result, str_alloca)
             g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, str_alloca) }
+            return g
+        }
+        -- If extracted field is a list/map, store to alloca (runtime funcs need pointers)
+        if starts_with(inst.field_type, "dm_list") or starts_with(inst.field_type, "dm_map") or inst.field_type == "list" or inst.field_type == "map" {
+            let lm_ty = map_ir_type_to_llvm(g, inst.field_type)
+            let lm_alloca = dm_llvm_build_alloca(b, lm_ty, "lm.extract")
+            dm_llvm_build_store(b, result, lm_alloca)
+            if inst.has_result { g.value_map.insert(id_key, lm_alloca) }
             return g
         }
         if inst.has_result { g.value_map.insert(id_key, result) }
@@ -16722,32 +14416,19 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         let mut val = resolve_value(g, inst.field_value)
         g = resolve_value_with_counter(g, inst.field_value)
-        -- Fix type mismatch: ir_val_int creates i64 constants, but some struct fields
-        -- (e.g., Result/Option/Enum tag at index 0) are i32. Look up the actual field
-        -- type from the IR struct definition and re-create the constant if needed.
-        if inst.field_value.kind == VAL_CONST_INT() {
-            let mut field_needs_i32 = false
-            -- Check result/option types (inline struct, not in struct_defs)
-            if is_sret_return_type(inst.result_type) and inst.field_index == 0 {
-                field_needs_i32 = true
-            }
-            -- Check named struct types (enums have i32 tag at field 0)
-            if g.ir_module.struct_defs.contains(inst.result_type) {
-                let ir_struct = g.ir_module.struct_defs.get(inst.result_type)
-                if inst.field_index < ir_struct.fields.len() {
-                    let ft = ir_struct.fields[inst.field_index].type_id
-                    if ft == "i32" or ft == "u32" {
-                        field_needs_i32 = true
-                    }
-                }
-            }
-            if field_needs_i32 {
-                val = dm_llvm_const_int(dm_llvm_int32_type(g.context), inst.field_value.int_val, 1)
+        -- If inserting a string value (pointer to dm_string), load the actual struct
+        -- But for result/option types, convert pointer to i64 instead
+        if is_string_ptr(g, inst.field_value) {
+            if inst.result_type == "result" or inst.result_type == "option" {
+                val = dm_llvm_build_ptr_to_int(b, val, dm_llvm_int64_type(g.context), "ptr2int")
+            } else {
+                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
             }
         }
-        -- If inserting a string value (pointer to dm_string), load the actual struct
-        if is_string_ptr(g, inst.field_value) {
-            val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
+        -- If inserting a list/map value, load the struct from the alloca pointer
+        if starts_with(inst.field_type, "dm_list") or starts_with(inst.field_type, "dm_map") or inst.field_type == "list" or inst.field_type == "map" {
+            let lm_ty = map_ir_type_to_llvm(g, inst.field_type)
+            val = dm_llvm_build_load2(b, lm_ty, val, "lm.load")
         }
         let result = dm_llvm_build_insert_value(b, base_val, val, inst.field_index, "insert")
         if inst.has_result { g.value_map.insert(id_key, result) }
@@ -16864,8 +14545,8 @@ fn generate_cast(gen: LLVMGenerator, val: int, from: string, to: string) -> int 
     -- Int to int: truncate or sign/zero-extend
     if from_is_int and to_is_int {
         let dest_ty = map_ir_type_to_llvm(gen, to)
-        let mut is_signed = 1
-        if lg_is_unsigned_type(from) { is_signed = 0 }
+        let is_signed = 1
+        if lg_is_unsigned_type(from) { let is_signed = 0 }
         return dm_llvm_build_int_cast2(b, val, dest_ty, is_signed, "cast")
     }
     -- Int to float
@@ -16885,11 +14566,6 @@ fn generate_cast(gen: LLVMGenerator, val: int, from: string, to: string) -> int 
     if from_is_float and to_is_float {
         let dest_ty = map_ir_type_to_llvm(gen, to)
         return dm_llvm_build_fp_cast(b, val, dest_ty, "cast")
-    }
-    -- Int to pointer (inttoptr)
-    if from_is_int and to == "ptr" {
-        let dest_ty = dm_llvm_pointer_type(gen.context)
-        return dm_llvm_build_int_to_ptr(b, val, dest_ty, "cast")
     }
     -- Fallback: return value unchanged
     return val
@@ -16990,14 +14666,18 @@ fn create_dm_string(gen: LLVMGenerator, raw_str: int) -> int {
 fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let mut g = gen
     let id_key = int_to_string(inst.id)
-    -- Call dm_list_new() runtime function
-    if g.function_map.contains("dm_list_new") {
-        let func = g.function_map.get("dm_list_new")
-        let fn_ty = g.fn_type_map.get("dm_list_new")
+    -- Allocate an int64 list on stack and initialize
+    let list_ty = map_ir_type_to_llvm(g, "dm_list_int64")
+    let alloca_val = dm_llvm_build_alloca(g.builder, list_ty, "list")
+    let fn_name = "dm_list_int64_new"
+    if g.function_map.contains(fn_name) {
+        let func = g.function_map.get(fn_name)
+        let fn_ty = g.fn_type_map.get(fn_name)
         dm_llvm_buf_clear()
-        let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "list")
-        if inst.has_result { g.value_map.insert(id_key, result) }
+        dm_llvm_buf_push(alloca_val)
+        dm_llvm_build_call2_buf(g.builder, fn_ty, func, "")
     }
+    if inst.has_result { g.value_map.insert(id_key, alloca_val) }
     return g
 }
 
@@ -17008,13 +14688,7 @@ fn generate_list_push(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let elem_val = resolve_value(g, inst.rhs)
     g = resolve_value_with_counter(g, inst.lhs)
     g = resolve_value_with_counter(g, inst.rhs)
-    -- Pick the correct runtime function based on element type
-    let mut fn_name = "dm_list_int64_push"
-    if inst.callee == "dm_list_double_push" or inst.result_type == "f64" {
-        fn_name = "dm_list_double_push"
-    } else if inst.callee == "dm_list_string_push" or inst.callee == "llvm_dm_list_string_push" or inst.result_type == "string" {
-        fn_name = "dm_list_string_push"
-    }
+    let fn_name = "dm_list_int64_push"
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -17034,33 +14708,79 @@ fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let idx_val = resolve_value(g, inst.rhs)
     g = resolve_value_with_counter(g, inst.lhs)
     g = resolve_value_with_counter(g, inst.rhs)
-    -- Pick the correct runtime function based on element type
-    let mut fn_name = "dm_list_int64_get"
-    if inst.result_type == "f64" {
-        fn_name = "dm_list_double_get"
-    } else if inst.result_type == "string" {
-        fn_name = "dm_list_string_get"
-    }
-    if g.function_map.contains(fn_name) {
-        let func = g.function_map.get(fn_name)
-        let fn_ty = g.fn_type_map.get(fn_name)
-        if fn_name == "dm_list_string_get" {
-            -- String list get uses sret pattern
-            g = get_dm_string_type(g)
-            let sret = dm_llvm_build_alloca(b, g.dm_string_type, "listget_sret")
+
+    let rtype = inst.result_type
+
+    -- String elements: call dm_list_string_get (wrapper uses sret)
+    if rtype == "string" {
+        let fn_name = "dm_list_string_get"
+        if g.function_map.contains(fn_name) {
+            let func = g.function_map.get(fn_name)
+            let fn_ty = g.fn_type_map.get(fn_name)
+            -- Allocate sret buffer for the returned dm_string
+            let sret_name = "sret." + int_to_string(g.sret_counter)
+            g.sret_counter = g.sret_counter + 1
+            let sret = dm_llvm_build_alloca(b, g.dm_string_type, sret_name)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(sret)
             dm_llvm_buf_push(list_val)
             dm_llvm_buf_push(idx_val)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
+            g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, sret) }
-        } else {
+        }
+        return g
+    }
+
+    -- Float elements: call dm_list_double_get
+    if rtype == "f64" {
+        let fn_name = "dm_list_double_get"
+        if g.function_map.contains(fn_name) {
+            let func = g.function_map.get(fn_name)
+            let fn_ty = g.fn_type_map.get(fn_name)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(list_val)
             dm_llvm_buf_push(idx_val)
             let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
+        return g
+    }
+
+    -- Struct elements: call dm_list_generic_get with buffer
+    if g.struct_type_map.contains(rtype) {
+        let fn_name = "dm_list_generic_get"
+        if g.function_map.contains(fn_name) {
+            let struct_ty = g.struct_type_map.get(rtype)
+            -- Allocate buffer for the struct
+            let buf_alloca = dm_llvm_build_alloca(b, struct_ty, "listbuf")
+            -- Get sizeof the struct type
+            let size_val = dm_llvm_sizeof_type(struct_ty)
+            let func = g.function_map.get(fn_name)
+            let fn_ty = g.fn_type_map.get(fn_name)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(list_val)
+            dm_llvm_buf_push(buf_alloca)
+            dm_llvm_buf_push(idx_val)
+            dm_llvm_buf_push(size_val)
+            dm_llvm_build_call2_buf(b, fn_ty, func, "")
+            -- Load the struct from the buffer
+            let result = dm_llvm_build_load2(b, struct_ty, buf_alloca, "listget")
+            if inst.has_result { g.value_map.insert(id_key, result) }
+        }
+        return g
+    }
+
+    -- Default: int elements, call dm_list_int64_get
+    let fn_name = "dm_list_int64_get"
+    if g.function_map.contains(fn_name) {
+        let func = g.function_map.get(fn_name)
+        let fn_ty = g.fn_type_map.get(fn_name)
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(list_val)
+        dm_llvm_buf_push(idx_val)
+        let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
+        if inst.has_result { g.value_map.insert(id_key, result) }
     }
     return g
 }
@@ -17071,15 +14791,7 @@ fn generate_list_len(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let id_key = int_to_string(inst.id)
     let list_val = resolve_value(g, inst.operand)
     g = resolve_value_with_counter(g, inst.operand)
-    -- Use type-specific len function (all return i64)
-    let mut fn_name = "dm_list_int64_len"
-    if inst.result_type == "f64" or inst.callee == "dm_list_double_len" {
-        fn_name = "dm_list_double_len"
-    } else if inst.result_type == "string" or inst.callee == "dm_list_string_len" {
-        fn_name = "dm_list_string_len"
-    } else if inst.callee == "dm_list_generic_len" {
-        fn_name = "dm_list_generic_len"
-    }
+    let fn_name = "dm_list_len"
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -17097,7 +14809,7 @@ fn generate_list_pop(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let id_key = int_to_string(inst.id)
     let list_val = resolve_value(g, inst.operand)
     g = resolve_value_with_counter(g, inst.operand)
-    let fn_name = "dm_list_int64_pop"
+    let fn_name = "dm_list_pop_int64"
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -17248,18 +14960,6 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
             -- main() always returns i32 0
             let ret_val = dm_llvm_const_int(dm_llvm_int32_type(ctx), 0, 0)
             dm_llvm_build_ret(b, ret_val)
-        } else if g.returns_sret.contains(func.name) {
-            -- sret convention: store return value to the sret output pointer (param 0), then ret void
-            let mut ret_val = resolve_value(g, term.ret_val)
-            g = resolve_value_with_counter(g, term.ret_val)
-            -- If returning a string pointer, load the struct before storing to sret
-            if func.return_type == "string" and is_string_ptr(g, term.ret_val) {
-                ret_val = dm_llvm_build_load2(b, g.dm_string_type, ret_val, "sret.str")
-            }
-            let llvm_fn = g.function_map.get(func.name)
-            let sret_ptr = dm_llvm_get_param(llvm_fn, 0)
-            dm_llvm_build_store(b, ret_val, sret_ptr)
-            dm_llvm_build_ret_void(b)
         } else {
             -- If returning string pointer, load the struct first
             if func.return_type == "string" and is_string_ptr(g, term.ret_val) {
@@ -17302,6 +15002,8 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = get_dm_string_type(g)
     -- Phase 1: Declare struct types
     g = declare_struct_types(g)
+    -- Phase 1.5: Register built-in Result/Option struct types
+    g = register_builtin_struct_types(g)
     -- Phase 2: Generate global variables
     g = generate_globals(g)
     -- Phase 3: Declare all functions
@@ -17394,11 +15096,6 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     -- Check if this function has a wrapper (string ABI)
     if g.has_wrapper.contains(callee_name) {
         g = generate_wrapper_call(g, inst, callee, fn_ty, callee_name)
-        return g
-    }
-    -- Check if callee uses sret return convention (result/option types)
-    if g.returns_sret.contains(callee_name) {
-        g = generate_sret_call(g, inst, callee, fn_ty, callee_name)
         return g
     }
     -- Regular (non-wrapper) call
@@ -17517,61 +15214,6 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
     }
     let result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
     if inst.has_result { g.value_map.insert(id_key, result) }
-    return g
-}
-
--- ============================================================
--- SRET CALL (result/option return via output pointer)
--- ============================================================
-
-fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
-    let mut g = gen
-    let b = g.builder
-    let id_key = int_to_string(inst.id)
-    -- Allocate stack space for the result struct (sret pattern)
-    let sret_name = "sret." + int_to_string(g.sret_counter)
-    g.sret_counter = g.sret_counter + 1
-    -- Look up the IR function to get its return type for correct alloca sizing
-    let ir_func = find_ir_function(g, callee_name)
-    let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
-    let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
-    -- Build args: sret pointer first, then resolved args
-    let mut args: List[int] = []
-    args.push(sret)
-    let mut ai = 0
-    while ai < inst.call_args.len() {
-        let arg = inst.call_args[ai]
-        let mut val = resolve_value(g, arg)
-        g = resolve_value_with_counter(g, arg)
-        -- If arg is a string pointer and target function expects dm_string by value, load it
-        if is_string_ptr(g, arg) {
-            let expects_string = callee_param_is_string(g, callee_name, ai)
-            if expects_string {
-                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
-            }
-        }
-        args.push(val)
-        ai = ai + 1
-    }
-    -- Call function (returns void, result written to sret pointer)
-    dm_llvm_buf_clear()
-    let mut argi = 0
-    while argi < args.len() {
-        dm_llvm_buf_push(args[argi])
-        argi = argi + 1
-    }
-    dm_llvm_build_call2_buf(b, fn_ty, callee, "")
-    -- Load the result from the sret alloca
-    if inst.has_result {
-        -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
-        if ir_func.return_type == "string" {
-            g.string_ptrs.insert(id_key, true)
-            g.value_map.insert(id_key, sret)
-        } else {
-            let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
-            g.value_map.insert(id_key, loaded)
-        }
-    }
     return g
 }
 
@@ -17816,9 +15458,9 @@ fn coerce_simd_scalar(gen: LLVMGenerator, val: int, vec_type: string) -> int {
     let b = gen.builder
     let ctx = gen.context
     let val_ty_kind = dm_llvm_get_type_kind(dm_llvm_type_of(val))
-    -- Type kind constants from LLVM-C Core.h:
-    -- 8 = LLVMIntegerTypeKind, 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
-    let is_int_val = val_ty_kind == 8
+    -- Type kind constants from LLVM:
+    -- 10 = LLVMIntegerTypeKind, 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
+    let is_int_val = val_ty_kind == 10
     let is_float_val = val_ty_kind == 2
     let is_double_val = val_ty_kind == 3
     if starts_with(vec_type, "f32") {
@@ -18014,25 +15656,14 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     g = resolve_value_with_counter(g, inst.simd_index)
     -- LLVM extractelement needs an i32 index
     let idx_ty_kind = dm_llvm_get_type_kind(dm_llvm_type_of(idx))
-    if idx_ty_kind == 8 {
-        -- Integer type (LLVMIntegerTypeKind = 8): check width
+    if idx_ty_kind == 10 {
+        -- Integer type: check width
         let idx_width = dm_llvm_get_int_type_width(dm_llvm_type_of(idx))
         if idx_width != 32 {
             idx = dm_llvm_build_int_cast2(b, idx, dm_llvm_int32_type(ctx), 1, "idx.cast")
         }
     }
-    let mut result = dm_llvm_build_extract_element(b, vec, idx, "extract")
-    -- Coerce extracted value to dAImond-native type:
-    -- f32 -> f64 (fpext), i32 -> i64 (sext) so downstream code sees native types
-    let vec_type = inst.simd_vec_type
-    if vec_type == "f32x4" or vec_type == "f32x8" {
-        -- float -> double
-        result = dm_llvm_build_fp_cast(b, result, dm_llvm_double_type(ctx), "ext.f64")
-    }
-    if vec_type == "i32x4" or vec_type == "i32x8" {
-        -- i32 -> i64
-        result = dm_llvm_build_int_cast2(b, result, dm_llvm_int64_type(ctx), 1, "ext.i64")
-    }
+    let result = dm_llvm_build_extract_element(b, vec, idx, "extract")
     if inst.has_result { g.value_map.insert(id_key, result) }
     return g
 }
@@ -18070,6 +15701,7 @@ fn print_usage() {
     println("  -O3           Aggressive optimization")
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
+    println("  --link-llvm   Link LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
     println("  --version     Show version")
@@ -18085,6 +15717,7 @@ struct CLIArgs {
     opt_level: int,
     emit_ir: bool,
     emit_llvm: bool,
+    link_llvm: bool,
     verbose: bool,
     show_help: bool,
     show_version: bool,
@@ -18099,6 +15732,7 @@ fn parse_cli_args() -> CLIArgs {
         opt_level: 0,
         emit_ir: false,
         emit_llvm: false,
+        link_llvm: false,
         verbose: false,
         show_help: false,
         show_version: false,
@@ -18144,6 +15778,8 @@ fn parse_cli_args() -> CLIArgs {
             args.emit_ir = true
         } else if arg == "--emit-llvm" {
             args.emit_llvm = true
+        } else if arg == "--link-llvm" {
+            args.link_llvm = true
         } else if arg == "-v" or arg == "--verbose" {
             args.verbose = true
         } else if starts_with(arg, "-") {
@@ -18232,32 +15868,29 @@ fn find_runtime_dir(input_dir: string) -> string {
     return "../stage0/runtime"
 }
 
--- Find the LLVM wrappers (llvm_wrappers.c) directory
--- Prefers stage4/runtime over stage3/runtime since Stage 4 has the full builtin set
+-- Find the Stage 3 runtime (llvm_wrappers.c) directory
 fn find_wrappers_dir(input_dir: string) -> string {
-    -- Strategy 1: Go up from input file dir (prefer stage4 first)
-    let try1b = input_dir + "/../stage4/runtime"
-    if file_exists(try1b + "/llvm_wrappers.c") {
-        return try1b
-    }
-
+    -- Strategy 1: Go up from input file dir
     let try1 = input_dir + "/../stage3/runtime"
     if file_exists(try1 + "/llvm_wrappers.c") {
         return try1
     }
 
-    -- Strategy 2: Relative (assume running from stage4/ or stage0/)
+    -- Also check stage4/runtime which may have its own copy
+    let try1b = input_dir + "/../stage4/runtime"
+    if file_exists(try1b + "/llvm_wrappers.c") {
+        return try1b
+    }
+
+    -- Strategy 2: Relative (assume running from stage4/)
     if file_exists("runtime/llvm_wrappers.c") {
         return "runtime"
-    }
-    if file_exists("../stage4/runtime/llvm_wrappers.c") {
-        return "../stage4/runtime"
     }
     if file_exists("../stage3/runtime/llvm_wrappers.c") {
         return "../stage3/runtime"
     }
 
-    -- Strategy 3: From project root (prefer stage4 first)
+    -- Strategy 3: From project root
     if file_exists("stage4/runtime/llvm_wrappers.c") {
         return "stage4/runtime"
     }
@@ -18267,6 +15900,32 @@ fn find_wrappers_dir(input_dir: string) -> string {
 
     -- Fallback
     return "runtime"
+}
+
+-- Find llvm_bridge.c for self-compilation (--link-llvm)
+fn find_bridge_file(input_dir: string) -> string {
+    -- Strategy 1: Same directory as input file
+    let try1 = input_dir + "/llvm_bridge.c"
+    if file_exists(try1) {
+        return try1
+    }
+
+    -- Strategy 2: src/ relative paths
+    if file_exists("src/llvm_bridge.c") {
+        return "src/llvm_bridge.c"
+    }
+
+    -- Strategy 3: stage4/ relative paths
+    if file_exists("stage4/llvm_bridge.c") {
+        return "stage4/llvm_bridge.c"
+    }
+
+    -- Strategy 4: Relative (assume running from stage4/)
+    if file_exists("llvm_bridge.c") {
+        return "llvm_bridge.c"
+    }
+
+    return ""
 }
 
 -- ============================================================
@@ -18367,160 +16026,6 @@ fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], 
 }
 
 -- ============================================================
--- POST-PARSE VALIDATION
--- ============================================================
-
-fn validate_source_file(sf: SourceFile) -> List[string] {
-    let mut errors: List[string] = []
-    let mut i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            -- Check for params with empty type (sign of a parse error)
-            let mut pi = 0
-            while pi < fd.params.len() {
-                let param = fd.params[pi]
-                if param.name != "self" and param.name != "mut self" and len(param.type_name) == 0 {
-                    errors.push("Error: parameter '" + param.name + "' in function '" + fd.name + "' has no type")
-                }
-                pi = pi + 1
-            }
-        }
-        i = i + 1
-    }
-    return errors
-}
-
--- ============================================================
--- EFFECT SYSTEM ENFORCEMENT
--- ============================================================
-
-fn builtin_required_effect(name: string) -> string {
-    if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
-    if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
-    if name == "args_get" or name == "args_len" { return "IO" }
-    if name == "system" or name == "exit" { return "Process" }
-    if name == "flush" or name == "read_key" or name == "read_key_nb" { return "Console" }
-    if name == "time_ms" or name == "sleep_ms" { return "IO" }
-    if name == "term_width" or name == "term_height" { return "Console" }
-    return ""
-}
-
-fn collect_call_names_from_expr(e: Expr) -> List[string] {
-    let mut names: List[string] = []
-    if e.kind == EXPR_FUNCTION_CALL() {
-        let callee_expr = *e.callee
-        if len(callee_expr.name) > 0 {
-            names.push(callee_expr.name)
-        }
-    }
-    return names
-}
-
-fn collect_call_names_from_stmts(stmts: List[Stmt]) -> List[string] {
-    let mut names: List[string] = []
-    let mut i = 0
-    while i < stmts.len() {
-        let s = stmts[i]
-        if s.kind == STMT_EXPRESSION() {
-            let e = *s.expr
-            let sub = collect_call_names_from_expr(e)
-            let mut j = 0
-            while j < sub.len() {
-                names.push(sub[j])
-                j = j + 1
-            }
-        } else if s.kind == STMT_RETURN() {
-            if s.has_ret_value {
-                let e = *s.ret_value
-                let sub = collect_call_names_from_expr(e)
-                let mut j = 0
-                while j < sub.len() {
-                    names.push(sub[j])
-                    j = j + 1
-                }
-            }
-        } else if s.kind == STMT_LET() {
-            let e = *s.let_value
-            let sub = collect_call_names_from_expr(e)
-            let mut j = 0
-            while j < sub.len() {
-                names.push(sub[j])
-                j = j + 1
-            }
-        }
-        i = i + 1
-    }
-    return names
-}
-
-fn list_contains_str(lst: List[string], val: string) -> bool {
-    let mut i = 0
-    while i < lst.len() {
-        if lst[i] == val { return true }
-        i = i + 1
-    }
-    return false
-}
-
-fn validate_effects(sf: SourceFile) -> List[string] {
-    let mut errors: List[string] = []
-    -- Build map: function name -> declared effects
-    let mut fn_effects: Map[string, List[string]] = Map_new()
-    let mut i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            if fd.effects.len() > 0 {
-                fn_effects.insert(fd.name, fd.effects)
-            }
-        }
-        i = i + 1
-    }
-
-    -- For each function with effects, check its calls
-    i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            if fd.effects.len() > 0 {
-                let caller_effects = fd.effects
-                let call_names = collect_call_names_from_stmts(fd.body)
-                let mut ci = 0
-                while ci < call_names.len() {
-                    let callee = call_names[ci]
-                    -- Check builtin required effects
-                    let req = builtin_required_effect(callee)
-                    if len(req) > 0 {
-                        if list_contains_str(caller_effects, req) == false {
-                            errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
-                        }
-                    }
-                    -- Check callee's declared effects are subset of caller's
-                    if fn_effects.contains(callee) {
-                        let callee_effects = fn_effects.get(callee)
-                        let mut ei = 0
-                        while ei < callee_effects.len() {
-                            let eff = callee_effects[ei]
-                            if list_contains_str(caller_effects, eff) == false {
-                                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
-                            }
-                            ei = ei + 1
-                        }
-                    }
-                    ci = ci + 1
-                }
-            }
-        }
-        i = i + 1
-    }
-    return errors
-}
-
--- ============================================================
 -- COMPILATION PIPELINE
 -- ============================================================
 
@@ -18564,18 +16069,7 @@ fn compile(cli: CLIArgs) -> int {
             eprintln(p.errors[ei])
             ei = ei + 1
         }
-        exit(1)
-    }
-
-    -- Post-parse validation
-    let validation_errors = validate_source_file(sf)
-    if validation_errors.len() > 0 {
-        let mut vi = 0
-        while vi < validation_errors.len() {
-            eprintln(validation_errors[vi])
-            vi = vi + 1
-        }
-        exit(1)
+        return 1
     }
 
     -- Phase 3.5: Resolve imports
@@ -18583,17 +16077,6 @@ fn compile(cli: CLIArgs) -> int {
         if verbose { println("  [3.5/6] Resolving imports...") }
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
-    }
-
-    -- Effect system enforcement
-    let effect_errors = validate_effects(sf)
-    if effect_errors.len() > 0 {
-        let mut ei2 = 0
-        while ei2 < effect_errors.len() {
-            eprintln(effect_errors[ei2])
-            ei2 = ei2 + 1
-        }
-        exit(1)
     }
 
     -- Phase 4: Generate IR
@@ -18638,7 +16121,13 @@ fn compile(cli: CLIArgs) -> int {
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
     lg = lg_generate_module(lg)
 
-    -- If --emit-llvm, emit LLVM IR file BEFORE verification (for debugging)
+    -- Verify LLVM module (non-fatal: type mismatches in Result/Option are acceptable)
+    let verify_result = verify_module(lg)
+    if verify_result != 0 {
+        eprintln("Warning: LLVM module verification had issues (continuing)")
+    }
+
+    -- If --emit-llvm, emit LLVM IR file and exit
     if cli.emit_llvm {
         let ll_file = output_file + ".ll"
         let ir_result = emit_to_ir_file(lg, ll_file)
@@ -18705,6 +16194,29 @@ fn compile(cli: CLIArgs) -> int {
     -- Link system libraries
     link_cmd = link_cmd + " -lm -lpthread"
 
+    -- If --link-llvm, add llvm_bridge.c and LLVM libraries
+    if cli.link_llvm {
+        let bridge_file = find_bridge_file(input_dir)
+        if bridge_file != "" {
+            -- Compile bridge with LLVM cflags via a temp object
+            let bridge_obj = output_file + "_bridge.o"
+            let bridge_cmd = "cc -c " + bridge_file + " -o " + bridge_obj + " $(llvm-config --cflags) -I" + runtime_h_dir
+            if verbose {
+                println("  Bridge: " + bridge_cmd)
+            }
+            let bridge_result = system(bridge_cmd)
+            if bridge_result != 0 {
+                eprintln("Error: failed to compile llvm_bridge.c")
+                return 1
+            }
+            link_cmd = link_cmd + " " + bridge_obj
+        } else {
+            eprintln("Warning: llvm_bridge.c not found, LLVM functions will be unresolved")
+        }
+        -- Add LLVM link flags
+        link_cmd = link_cmd + " $(llvm-config --libs --ldflags --system-libs)"
+    }
+
     if verbose {
         println("  Link: " + link_cmd)
     }
@@ -18717,8 +16229,11 @@ fn compile(cli: CLIArgs) -> int {
         return 1
     }
 
-    -- Clean up temporary object file
+    -- Clean up temporary object file(s)
     system("rm -f " + obj_file)
+    if cli.link_llvm {
+        system("rm -f " + output_file + "_bridge.o")
+    }
 
     if verbose {
         println("Successfully compiled: " + output_file)

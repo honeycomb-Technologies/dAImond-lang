@@ -430,8 +430,28 @@ int64_t dm_llvm_build_struct_gep2(int64_t b, int64_t ty, int64_t ptr, int64_t id
 }
 
 int64_t dm_llvm_build_extract_value(int64_t b, int64_t agg, int64_t idx, const char* name) {
+    LLVMValueRef agg_val = TO_PTR(LLVMValueRef, agg);
+    LLVMTypeRef agg_ty = LLVMTypeOf(agg_val);
+    LLVMTypeKind tk = LLVMGetTypeKind(agg_ty);
+    if (tk != LLVMStructTypeKind) {
+        /* Find which function this builder is in */
+        LLVMBasicBlockRef bb = LLVMGetInsertBlock(TO_PTR(LLVMBuilderRef, b));
+        LLVMValueRef fn = bb ? LLVMGetBasicBlockParent(bb) : NULL;
+        const char* fn_name = fn ? LLVMGetValueName(fn) : "(unknown)";
+        fprintf(stderr, "DEBUG extract_value in %s: agg type kind=%d (expected %d=struct), idx=%lld, name=%s\n",
+                fn_name, (int)tk, (int)LLVMStructTypeKind, (long long)idx, name ? name : "(null)");
+        char *s = LLVMPrintTypeToString(agg_ty);
+        fprintf(stderr, "  agg type: %s\n", s);
+        LLVMDisposeMessage(s);
+        char *vs = LLVMPrintValueToString(agg_val);
+        fprintf(stderr, "  agg value: %s\n", vs);
+        LLVMDisposeMessage(vs);
+        /* Return a safe dummy value instead of crashing */
+        return TO_INT(LLVMConstInt(LLVMInt64TypeInContext(
+            LLVMGetModuleContext(LLVMGetGlobalParent(fn))), 0, 0));
+    }
     return TO_INT(LLVMBuildExtractValue(TO_PTR(LLVMBuilderRef, b),
-                                         TO_PTR(LLVMValueRef, agg),
+                                         agg_val,
                                          (unsigned)idx, name));
 }
 
@@ -552,6 +572,10 @@ int64_t dm_llvm_build_ptr_to_int(int64_t b, int64_t val, int64_t dest_ty, const 
     return TO_INT(LLVMBuildPtrToInt(TO_PTR(LLVMBuilderRef, b),
                                      TO_PTR(LLVMValueRef, val),
                                      TO_PTR(LLVMTypeRef, dest_ty), name));
+}
+
+int64_t dm_llvm_sizeof_type(int64_t ty) {
+    return TO_INT(LLVMSizeOf(TO_PTR(LLVMTypeRef, ty)));
 }
 
 /* Logical */

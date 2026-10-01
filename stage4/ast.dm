@@ -90,6 +90,7 @@ fn BINOP_SHR() -> int { return 34 }
 fn UNOP_NEG() -> int { return 1 }
 fn UNOP_NOT() -> int { return 2 }
 fn UNOP_BIT_NOT() -> int { return 3 }
+fn UNOP_DEREF() -> int { return 4 }
 
 -- ============================================================
 -- ASSIGNMENT OPERATOR KINDS
