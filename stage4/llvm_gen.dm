@@ -181,6 +181,8 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     if type_name == "ptr" { return dm_llvm_pointer_type(ctx) }
     -- Pointer types: ptr(...)
     if starts_with(type_name, "ptr(") { return dm_llvm_pointer_type(ctx) }
+    -- Box types are heap pointers
+    if starts_with(type_name, "Box[") { return dm_llvm_pointer_type(ctx) }
     -- List types: use dm_string type {ptr, i64, i64} since lists share the same layout
     if starts_with(type_name, "dm_list_") or starts_with(type_name, "list") or type_name == "list" or starts_with(type_name, "List[") {
         if gen.has_dm_string_type { return gen.dm_string_type }
@@ -801,6 +803,59 @@ fn is_string_ptr(gen: LLVMGenerator, val: IRValue) -> bool {
     return false
 }
 
+-- Expected IR type of field `idx` of aggregate type `type_name`, or "".
+fn expected_field_ir_type(gen: LLVMGenerator, type_name: string, idx: int) -> string {
+    if gen.ir_module.struct_defs.contains(type_name) {
+        let ir_struct = gen.ir_module.struct_defs.get(type_name)
+        if idx < ir_struct.fields.len() {
+            return ir_struct.fields[idx].type_id
+        }
+        return ""
+    }
+    if idx == 0 and (type_name == "result" or type_name == "option" or starts_with(type_name, "Result[") or starts_with(type_name, "Option[") or starts_with(type_name, "result_") or starts_with(type_name, "option_")) {
+        return "i32"
+    }
+    if starts_with(type_name, "Result[") {
+        let inner = substr(type_name, 7, len(type_name) - 8)
+        let mut comma_pos = 0 - 1
+        let mut depth = 0
+        let mut ci = 0
+        while ci < len(inner) {
+            let ch = char_at(inner, ci)
+            if ch == "[" { depth = depth + 1 }
+            if ch == "]" { depth = depth - 1 }
+            if ch == "," and depth == 0 {
+                comma_pos = ci
+                ci = len(inner)
+            }
+            ci = ci + 1
+        }
+        if comma_pos >= 0 {
+            if idx == 1 {
+                return substr(inner, 0, comma_pos)
+            }
+            if idx == 2 {
+                let mut err_start = comma_pos + 1
+                if err_start < len(inner) and char_at(inner, err_start) == " " {
+                    err_start = err_start + 1
+                }
+                return substr(inner, err_start, len(inner) - err_start)
+            }
+        }
+        return "i64"
+    }
+    if starts_with(type_name, "Option[") {
+        if idx == 1 {
+            return substr(type_name, 7, len(type_name) - 8)
+        }
+        return "i64"
+    }
+    if type_name == "result" or type_name == "option" {
+        return "i64"
+    }
+    return ""
+}
+
 -- ============================================================
 -- INSTRUCTION GENERATION
 -- ============================================================
@@ -917,9 +972,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 }
             }
         }
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), lhs, rhs, "feq")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), fl, fr, "feq")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_eq(), lhs, rhs, "eq")
         }
@@ -948,9 +1010,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 }
             }
         }
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_one(), lhs, rhs, "fne")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_one(), fl, fr, "fne")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_ne(), lhs, rhs, "ne")
         }
@@ -962,9 +1031,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_olt(), lhs, rhs, "flt")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_olt(), fl, fr, "flt")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_slt(), lhs, rhs, "lt")
         }
@@ -976,9 +1052,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_ole(), lhs, rhs, "fle")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_ole(), fl, fr, "fle")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_sle(), lhs, rhs, "le")
         }
@@ -990,9 +1073,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_ogt(), lhs, rhs, "fgt")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_ogt(), fl, fr, "fgt")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_sgt(), lhs, rhs, "gt")
         }
@@ -1004,9 +1094,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_oge(), lhs, rhs, "fge")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_oge(), fl, fr, "fge")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_sge(), lhs, rhs, "ge")
         }
@@ -1140,27 +1237,39 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         let mut val = resolve_value(g, inst.field_value)
         g = resolve_value_with_counter(g, inst.field_value)
-        -- Fix type mismatch: ir_val_int creates i64 constants, but some struct fields
-        -- (e.g., Result/Option/Enum tag at index 0) are i32. Look up the actual field
-        -- type from the IR struct definition and re-create the constant if needed.
-        if inst.field_value.kind == VAL_CONST_INT() {
-            let mut field_needs_i32 = false
-            -- Check result/option types (inline struct, not in struct_defs)
-            if is_sret_return_type(inst.result_type) and inst.field_index == 0 {
-                field_needs_i32 = true
-            }
-            -- Check named struct types (enums have i32 tag at field 0)
-            if g.ir_module.struct_defs.contains(inst.result_type) {
-                let ir_struct = g.ir_module.struct_defs.get(inst.result_type)
-                if inst.field_index < ir_struct.fields.len() {
-                    let ft = ir_struct.fields[inst.field_index].type_id
-                    if ft == "i32" or ft == "u32" {
-                        field_needs_i32 = true
+        -- Coerce the inserted value to the aggregate field's LLVM type.
+        -- IR emits i64 constants as placeholders for fields of other types
+        -- (i32 tags, the unused Result payload, Box ptr fields, ...).
+        let exp_ir_ty = expected_field_ir_type(g, inst.result_type, inst.field_index)
+        if exp_ir_ty != "" {
+            let exp_ty = map_ir_type_to_llvm(g, exp_ir_ty)
+            let val_ty = dm_llvm_type_of(val)
+            if val_ty != exp_ty {
+                let ek = dm_llvm_get_type_kind(exp_ty)
+                let vk = dm_llvm_get_type_kind(val_ty)
+                if inst.field_value.kind == VAL_CONST_INT() {
+                    if ek == 8 {
+                        val = dm_llvm_const_int(exp_ty, inst.field_value.int_val, 1)
+                    } else if ek == 2 or ek == 3 {
+                        val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+                    } else {
+                        val = dm_llvm_const_null(exp_ty)
                     }
+                } else if ek == 8 and vk == 8 {
+                    if dm_llvm_get_int_type_width(val_ty) < dm_llvm_get_int_type_width(exp_ty) {
+                        val = dm_llvm_build_sext(b, val, exp_ty, "sext")
+                    } else {
+                        val = dm_llvm_build_trunc(b, val, exp_ty, "trunc")
+                    }
+                } else if (ek == 2 or ek == 3) and vk == 8 {
+                    val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+                } else if ek == 8 and (vk == 2 or vk == 3) {
+                    val = dm_llvm_build_fp_to_si(b, val, exp_ty, "ftoi")
+                } else if ek == 12 and vk == 8 {
+                    val = dm_llvm_build_int_to_ptr(b, val, exp_ty, "itop")
+                } else if ek == 8 and vk == 12 {
+                    val = dm_llvm_build_ptr_to_int(b, val, exp_ty, "ptoi")
                 }
-            }
-            if field_needs_i32 {
-                val = dm_llvm_const_int(dm_llvm_int32_type(g.context), inst.field_value.int_val, 1)
             }
         }
         -- If inserting a string value (pointer to dm_string), load the actual struct
@@ -1650,8 +1759,20 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
         return g
     }
     if term.kind == TERM_BR_COND() {
-        let cond = resolve_value(g, term.cond)
+        let mut cond = resolve_value(g, term.cond)
         g = resolve_value_with_counter(g, term.cond)
+        -- Coerce non-i1 conditions (e.g. Option/Result/Enum i32 tags) to i1
+        let cond_ty = dm_llvm_type_of(cond)
+        let cond_kind = dm_llvm_get_type_kind(cond_ty)
+        if cond_kind == 8 and dm_llvm_get_int_type_width(cond_ty) != 1 {
+            cond = dm_llvm_build_icmp(b, dm_llvm_int_ne(), cond, dm_llvm_const_int(cond_ty, 0, 0), "tobool")
+        }
+        if cond_kind == 2 or cond_kind == 3 {
+            cond = dm_llvm_build_fcmp(b, dm_llvm_real_one(), cond, dm_llvm_const_real(cond_ty, 0.0), "tobool")
+        }
+        if cond_kind == 12 {
+            cond = dm_llvm_build_icmp(b, dm_llvm_int_ne(), cond, dm_llvm_const_null(cond_ty), "tobool")
+        }
         if g.block_map.contains(term.true_label) and g.block_map.contains(term.false_label) {
             let true_bb = g.block_map.get(term.true_label)
             let false_bb = g.block_map.get(term.false_label)
