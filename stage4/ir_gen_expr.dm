@@ -367,22 +367,21 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 
     -- Check for "None" (Option None)
     if name == "None" {
-        -- Build Option { has_value: 0, value: undef }
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_ALLOCA())
-        inst.alloc_type = "i64"
-        inst.result_type = "ptr(i64)"
-        inst.has_result = true
-        b.instructions.push(inst)
-        g.builder.next_id = id + 1
-
-        let mut store = ir_inst_new(g.builder.next_id, OP_STORE())
-        store.store_ptr = ir_val_inst(id)
-        store.store_val = ir_val_int(0)
-        store.has_result = false
-        b.instructions.push(store)
+        -- Build Option { has_value: 0, value: undef } as an aggregate value
+        let mut opt_type = g.current_return_type
+        if starts_with(opt_type, "Option[") == false {
+            opt_type = "Option[i64]"
+        }
+        let insert_id = g.builder.next_id
+        let mut insert_tag = ir_inst_new(insert_id, OP_INSERT_FIELD())
+        insert_tag.field_base = ir_val_undef()
+        insert_tag.field_value = ir_val_int(0)
+        insert_tag.field_index = 0
+        insert_tag.result_type = opt_type
+        insert_tag.has_result = true
+        b.instructions.push(insert_tag)
         g.builder.next_id = g.builder.next_id + 1
-        return expr_result(g, b, id)
+        return expr_result(g, b, insert_id)
     }
 
     -- Look up variable in scope

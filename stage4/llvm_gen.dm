@@ -1247,7 +1247,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if val_ty != exp_ty {
                 let ek = dm_llvm_get_type_kind(exp_ty)
                 let vk = dm_llvm_get_type_kind(val_ty)
-                if inst.field_value.kind == VAL_CONST_INT() {
+                if inst.field_value.kind == VAL_UNDEF() {
+                    val = dm_llvm_get_undef(exp_ty)
+                } else if inst.field_value.kind == VAL_CONST_INT() {
                     if ek == 8 {
                         val = dm_llvm_const_int(exp_ty, inst.field_value.int_val, 1)
                     } else if ek == 2 or ek == 3 {
