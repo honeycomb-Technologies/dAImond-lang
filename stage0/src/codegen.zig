@@ -2831,6 +2831,53 @@ pub const CodeGenerator = struct {
         try w.blankLine();
     }
 
+    /// True for C types that are COW containers (monomorphized List/Map
+    /// structs with _retain/_cow helpers). The *_void placeholders have
+    /// no helpers and are excluded.
+    fn isCowContainerCType(c_type: []const u8) bool {
+        if (std.mem.eql(u8, c_type, "dm_list_void") or std.mem.eql(u8, c_type, "dm_map_void")) return false;
+        return std.mem.startsWith(u8, c_type, "dm_list_") or std.mem.startsWith(u8, c_type, "dm_map_");
+    }
+
+    /// Generate an expression in a copy position (let init, assignment
+    /// value, call argument, return value, struct field). List/Map
+    /// values are wrapped in _retain so the new header copy is counted
+    /// as an alias; mutators then copy-on-write instead of mutating a
+    /// shared buffer. `hint` is the statically known C type of the
+    /// copy destination when available.
+    fn generateRetainedExpr(self: *Self, expr: *Expr, hint: ?[]const u8) anyerror!void {
+        // Multi-statement block expressions emit statements before their
+        // result; wrapping them in a call would produce invalid C.
+        if (expr.kind == .block and expr.kind.block.statements.len > 0) {
+            try self.generateExpr(expr);
+            return;
+        }
+        const own = self.inferCTypeFromExpr(expr);
+        var chosen: ?[]const u8 = null;
+        if (isCowContainerCType(own)) {
+            chosen = own;
+        } else if (hint) |h| {
+            // Destination-typed copy whose value type is unknown to
+            // inference (e.g. generic call result). Fresh constructors
+            // (List_new/Map_new/[]) need no retain and may emit bare
+            // brace initializers that cannot be call arguments.
+            const is_fresh_ctor = expr.kind == .array_literal or
+                (expr.kind == .function_call and expr.kind.function_call.function.kind == .identifier and
+                    (std.mem.eql(u8, expr.kind.function_call.function.kind.identifier.name, "List_new") or
+                        std.mem.eql(u8, expr.kind.function_call.function.kind.identifier.name, "Map_new")));
+            if (isCowContainerCType(h) and std.mem.eql(u8, own, "void*") and !is_fresh_ctor) {
+                chosen = h;
+            }
+        }
+        if (chosen) |c_type| {
+            try self.writer.print("{s}_retain(", .{c_type});
+            try self.generateExpr(expr);
+            try self.writer.write(")");
+            return;
+        }
+        try self.generateExpr(expr);
+    }
+
     /// Generate List type name and emit monomorphized struct + helpers if not already done
     fn generateListType(self: *Self, elem: *TypeExpr) CodeGenError![]const u8 {
         const elem_name = try self.mapType(elem);
@@ -2854,6 +2901,9 @@ pub const CodeGenerator = struct {
         try sw.printLine("{s}* data;", .{elem_type});
         try sw.writeLine("size_t len;");
         try sw.writeLine("size_t capacity;");
+        // COW refcount cell shared by header copies (NULL when no buffer).
+        // Only triggers copy-on-write; buffers are never freed (leak discipline).
+        try sw.writeLine("size_t* rc;");
         sw.dedent();
         try sw.printLine("}} {s};", .{list_type_name});
         try sw.blankLine();
@@ -2864,24 +2914,72 @@ pub const CodeGenerator = struct {
         // _new constructor
         try w.printLine("static inline {s} {s}_new(void) {{", .{ list_type_name, list_type_name });
         w.indent();
-        try w.printLine("return ({s}){{ .data = NULL, .len = 0, .capacity = 0 }};", .{list_type_name});
+        try w.printLine("return ({s}){{ .data = NULL, .len = 0, .capacity = 0, .rc = NULL }};", .{list_type_name});
         w.dedent();
         try w.writeLine("}");
         try w.blankLine();
 
-        // _push
+        // _retain: mark a header copy as another alias of the buffer
+        try w.printLine("static inline {s} {s}_retain({s} list) {{", .{ list_type_name, list_type_name, list_type_name });
+        w.indent();
+        try w.writeLine("if (list.rc) (*list.rc)++;");
+        try w.writeLine("return list;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _cow: if the buffer is shared (rc > 1), duplicate it so this
+        // header privately owns its buffer before any mutation.
+        try w.printLine("static inline void {s}_cow({s}* list) {{", .{ list_type_name, list_type_name });
+        w.indent();
+        try w.writeLine("if (list->rc && *list->rc > 1) {");
+        w.indent();
+        try w.writeLine("(*list->rc)--;");
+        try w.printLine("{s}* new_data = NULL;", .{elem_type});
+        try w.writeLine("if (list->capacity > 0) {");
+        w.indent();
+        try w.printLine("new_data = ({s}*)malloc(list->capacity * sizeof({s}));", .{ elem_type, elem_type });
+        try w.writeLine("if (!new_data) dm_panic(\"list copy-on-write: out of memory\");");
+        try w.printLine("memcpy(new_data, list->data, list->len * sizeof({s}));", .{elem_type});
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"list copy-on-write: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
+        try w.writeLine("list->data = new_data;");
+        try w.writeLine("list->rc = new_rc;");
+        w.dedent();
+        try w.writeLine("}");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _push. Growth never uses realloc/free: the old buffer is leaked
+        // on purpose, because untracked header copies may still alias it.
+        // Tracked aliases (rc > 1) are split off by _cow first.
         try w.printLine("static inline void {s}_push({s}* list, {s} value) {{", .{ list_type_name, list_type_name, elem_type });
         w.indent();
+        try w.printLine("{s}_cow(list);", .{list_type_name});
         try w.writeLine("if (list->len >= list->capacity) {");
         w.indent();
         try w.writeLine("size_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;");
-        try w.printLine("{s}* new_data = ({s}*)realloc(list->data, new_cap * sizeof({s}));", .{ elem_type, elem_type, elem_type });
+        try w.printLine("{s}* new_data = ({s}*)malloc(new_cap * sizeof({s}));", .{ elem_type, elem_type, elem_type });
         try w.writeLine("if (!new_data) dm_panic(\"list push: out of memory\");");
+        try w.printLine("if (list->data) memcpy(new_data, list->data, list->len * sizeof({s}));", .{elem_type});
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"list push: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
         try w.writeLine("list->data = new_data;");
         try w.writeLine("list->capacity = new_cap;");
+        try w.writeLine("list->rc = new_rc;");
         w.dedent();
         try w.writeLine("}");
-        try w.writeLine("list->data[list->len] = value;");
+        if (isCowContainerCType(elem_type)) {
+            // Element store is a header copy: retain nested containers.
+            try w.printLine("list->data[list->len] = {s}_retain(value);", .{elem_type});
+        } else {
+            try w.writeLine("list->data[list->len] = value;");
+        }
         try w.writeLine("list->len++;");
         w.dedent();
         try w.writeLine("}");
@@ -3048,6 +3146,8 @@ pub const CodeGenerator = struct {
         try sw.printLine("{s}_entry* entries;", .{map_type_name});
         try sw.writeLine("size_t len;");
         try sw.writeLine("size_t capacity;");
+        // COW refcount cell shared by header copies (NULL when no table).
+        try sw.writeLine("size_t* rc;");
         sw.dedent();
         try sw.printLine("}} {s};", .{map_type_name});
         try sw.blankLine();
@@ -3097,7 +3197,41 @@ pub const CodeGenerator = struct {
         // _new constructor
         try w.printLine("static inline {s} {s}_new(void) {{", .{ map_type_name, map_type_name });
         w.indent();
-        try w.printLine("return ({s}){{ .entries = NULL, .len = 0, .capacity = 0 }};", .{map_type_name});
+        try w.printLine("return ({s}){{ .entries = NULL, .len = 0, .capacity = 0, .rc = NULL }};", .{map_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _retain: mark a header copy as another alias of the table
+        try w.printLine("static inline {s} {s}_retain({s} map) {{", .{ map_type_name, map_type_name, map_type_name });
+        w.indent();
+        try w.writeLine("if (map.rc) (*map.rc)++;");
+        try w.writeLine("return map;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _cow: duplicate a shared table before mutation
+        try w.printLine("static inline void {s}_cow({s}* map) {{", .{ map_type_name, map_type_name });
+        w.indent();
+        try w.writeLine("if (map->rc && *map->rc > 1) {");
+        w.indent();
+        try w.writeLine("(*map->rc)--;");
+        try w.printLine("{s}_entry* new_entries = NULL;", .{map_type_name});
+        try w.writeLine("if (map->capacity > 0) {");
+        w.indent();
+        try w.printLine("new_entries = ({s}_entry*)malloc(map->capacity * sizeof({s}_entry));", .{ map_type_name, map_type_name });
+        try w.writeLine("if (!new_entries) dm_panic(\"map copy-on-write: out of memory\");");
+        try w.printLine("memcpy(new_entries, map->entries, map->capacity * sizeof({s}_entry));", .{map_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"map copy-on-write: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
+        try w.writeLine("map->entries = new_entries;");
+        try w.writeLine("map->rc = new_rc;");
+        w.dedent();
+        try w.writeLine("}");
         w.dedent();
         try w.writeLine("}");
         try w.blankLine();
@@ -3152,9 +3286,13 @@ pub const CodeGenerator = struct {
         try w.writeLine("}");
         w.dedent();
         try w.writeLine("}");
-        try w.writeLine("free(map->entries);");
+        // Old table intentionally leaked: untracked header copies may alias it.
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"map resize: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
         try w.writeLine("map->entries = new_entries;");
         try w.writeLine("map->capacity = new_cap;");
+        try w.writeLine("map->rc = new_rc;");
         w.dedent();
         try w.writeLine("}");
         try w.blankLine();
@@ -3162,6 +3300,7 @@ pub const CodeGenerator = struct {
         // _insert
         try w.printLine("static inline void {s}_insert({s}* map, {s} key, {s} value) {{", .{ map_type_name, map_type_name, key_type, val_type });
         w.indent();
+        try w.printLine("{s}_cow(map);", .{map_type_name});
         try w.writeLine("if (map->capacity == 0 || (map->len + 1) * 4 > map->capacity * 3) {");
         w.indent();
         try w.printLine("{s}_resize(map);", .{map_type_name});
@@ -3173,8 +3312,16 @@ pub const CodeGenerator = struct {
         try w.writeLine("map->len++;");
         w.dedent();
         try w.writeLine("}");
-        try w.writeLine("map->entries[slot].key = key;");
-        try w.writeLine("map->entries[slot].value = value;");
+        if (isCowContainerCType(key_type)) {
+            try w.printLine("map->entries[slot].key = {s}_retain(key);", .{key_type});
+        } else {
+            try w.writeLine("map->entries[slot].key = key;");
+        }
+        if (isCowContainerCType(val_type)) {
+            try w.printLine("map->entries[slot].value = {s}_retain(value);", .{val_type});
+        } else {
+            try w.writeLine("map->entries[slot].value = value;");
+        }
         try w.writeLine("map->entries[slot].state = 1;");
         w.dedent();
         try w.writeLine("}");
@@ -3204,6 +3351,7 @@ pub const CodeGenerator = struct {
         // _remove
         try w.printLine("static inline bool {s}_remove({s}* map, {s} key) {{", .{ map_type_name, map_type_name, key_type });
         w.indent();
+        try w.printLine("{s}_cow(map);", .{map_type_name});
         try w.writeLine("if (map->capacity == 0) return false;");
         try w.printLine("size_t slot = {s}_find_slot(map, key);", .{map_type_name});
         try w.writeLine("if (map->entries[slot].state != 1) return false;");
@@ -5335,7 +5483,7 @@ pub const CodeGenerator = struct {
                     try self.writer.writeLine(";");
                 } else {
                     try self.writer.print("return {s}_ready(", .{future_type});
-                    try self.generateExpr(result);
+                    try self.generateRetainedExpr(result, null);
                     try self.writer.writeLine(");");
                 }
             } else {
@@ -5350,7 +5498,7 @@ pub const CodeGenerator = struct {
                     try self.writer.writeLine(";");
                 } else {
                     try self.writer.write("return ");
-                    try self.generateExpr(result);
+                    try self.generateRetainedExpr(result, self.current_function_return_type);
                     try self.writer.writeLine(";");
                 }
             }
@@ -5506,7 +5654,7 @@ pub const CodeGenerator = struct {
                 try self.emitVarDecl(type_str, ident.name.name);
                 if (let.value) |val| {
                     try self.writer.write(" = ");
-                    try self.generateExpr(val);
+                    try self.generateRetainedExpr(val, type_str);
                 }
                 try self.writer.writeLine(";");
             },
@@ -5571,7 +5719,7 @@ pub const CodeGenerator = struct {
             if (ret.value) |val| {
                 const future_type = self.current_function_future_type.?;
                 try self.writer.print("return {s}_ready(", .{future_type});
-                try self.generateExpr(val);
+                try self.generateRetainedExpr(val, null);
                 try self.writer.writeLine(");");
             } else {
                 const future_type = self.current_function_future_type.?;
@@ -5585,7 +5733,7 @@ pub const CodeGenerator = struct {
             defer self.expected_type = prev_expected;
 
             try self.writer.write("return ");
-            try self.generateExpr(val);
+            try self.generateRetainedExpr(val, self.current_function_return_type);
             try self.writer.writeLine(";");
         } else {
             try self.writer.writeLine("return;");
@@ -5642,7 +5790,7 @@ pub const CodeGenerator = struct {
                 try self.generateIfStatementWithReturn(result.kind.if_expr);
             } else {
                 try self.writer.write("return ");
-                try self.generateExpr(result);
+                try self.generateRetainedExpr(result, self.current_function_return_type);
                 try self.writer.writeLine(";");
             }
         }
@@ -5661,7 +5809,7 @@ pub const CodeGenerator = struct {
                             try self.generateIfStatementWithReturn(result.kind.if_expr);
                         } else {
                             try self.writer.write("return ");
-                            try self.generateExpr(result);
+                            try self.generateRetainedExpr(result, self.current_function_return_type);
                             try self.writer.writeLine(";");
                         }
                     }
@@ -5695,7 +5843,7 @@ pub const CodeGenerator = struct {
                 try self.generateIfStatementWithAsyncReturn(result.kind.if_expr);
             } else {
                 try self.writer.print("return {s}_ready(", .{future_type});
-                try self.generateExpr(result);
+                try self.generateRetainedExpr(result, null);
                 try self.writer.writeLine(");");
             }
         }
@@ -5714,7 +5862,7 @@ pub const CodeGenerator = struct {
                             try self.generateIfStatementWithAsyncReturn(result.kind.if_expr);
                         } else {
                             try self.writer.print("return {s}_ready(", .{future_type});
-                            try self.generateExpr(result);
+                            try self.generateRetainedExpr(result, null);
                             try self.writer.writeLine(");");
                         }
                     }
@@ -6249,6 +6397,21 @@ pub const CodeGenerator = struct {
 
     /// Generate assignment statement
     fn generateAssignment(self: *Self, assign: *Assignment) anyerror!void {
+        // Index write into a List (a[i] = v) mutates the buffer: split a
+        // shared buffer first when the list object is addressable.
+        if (assign.target.kind == .index_access) {
+            const idx = assign.target.kind.index_access;
+            const obj_type = self.inferCTypeFromExpr(idx.object);
+            const addressable = switch (idx.object.kind) {
+                .identifier, .field_access, .index_access => true,
+                else => false,
+            };
+            if (addressable and isCowContainerCType(obj_type) and std.mem.startsWith(u8, obj_type, "dm_list_")) {
+                try self.writer.print("{s}_cow(&(", .{obj_type});
+                try self.generateExpr(idx.object);
+                try self.writer.writeLine("));");
+            }
+        }
         // Safe division/modulo for compound assignment: x /= y -> x = dm__safe_div(x, y)
         if (assign.op == .div_assign or assign.op == .mod_assign) {
             const target_type = self.inferCTypeFromExpr(assign.target);
@@ -6303,7 +6466,11 @@ pub const CodeGenerator = struct {
         }
         defer self.expected_type = prev_expected;
 
-        try self.generateExpr(assign.value);
+        if (assign.op == .assign) {
+            try self.generateRetainedExpr(assign.value, target_type);
+        } else {
+            try self.generateExpr(assign.value);
+        }
         try self.writer.writeLine(";");
     }
 
@@ -6784,7 +6951,7 @@ pub const CodeGenerator = struct {
                 try self.writer.print("{s}.vtable->{s}({s}.data", .{ obj_name, method.method.name, obj_name });
                 for (method.args) |arg| {
                     try self.writer.write(", ");
-                    try self.generateExpr(arg);
+                    try self.generateRetainedExpr(arg, null);
                 }
                 try self.writer.write(")");
                 return;
@@ -6801,7 +6968,7 @@ pub const CodeGenerator = struct {
                 try self.writer.print("{s}_{s}(", .{ mangled, method.method.name });
                 for (method.args, 0..) |arg, i| {
                     if (i > 0) try self.writer.write(", ");
-                    try self.generateExpr(arg);
+                    try self.generateRetainedExpr(arg, null);
                 }
                 try self.writer.write(")");
                 return;
@@ -6833,9 +7000,20 @@ pub const CodeGenerator = struct {
         try self.generateExpr(method.object);
         try self.writer.write(")");
 
+        // Builtin container stores (push/insert/set) retain their
+        // element argument inside the helper; retaining here too would
+        // only inflate the count. All other method arguments are copies.
+        const builtin_store = isCowContainerCType(obj_type) and
+            (std.mem.eql(u8, method.method.name, "push") or
+                std.mem.eql(u8, method.method.name, "insert") or
+                std.mem.eql(u8, method.method.name, "set"));
         for (method.args) |arg| {
             try self.writer.write(", ");
-            try self.generateExpr(arg);
+            if (builtin_store) {
+                try self.generateExpr(arg);
+            } else {
+                try self.generateRetainedExpr(arg, null);
+            }
         }
 
         try self.writer.write(")");
@@ -6858,7 +7036,7 @@ pub const CodeGenerator = struct {
                 try self.writer.print("&{s}", .{info.env_var});
                 for (call.args) |arg| {
                     try self.writer.write(", ");
-                    try self.generateExpr(arg.value);
+                    try self.generateRetainedExpr(arg.value, null);
                 }
                 try self.writer.write(")");
                 return;
@@ -6905,7 +7083,7 @@ pub const CodeGenerator = struct {
                 try self.generateExpr(arg.value);
                 try self.writer.write(")");
             } else {
-                try self.generateExpr(arg.value);
+                try self.generateRetainedExpr(arg.value, null);
             }
         }
 
@@ -7722,7 +7900,7 @@ pub const CodeGenerator = struct {
             const prev_expected = self.expected_type;
             self.expected_type = null;
             defer self.expected_type = prev_expected;
-            try self.generateExpr(field.value);
+            try self.generateRetainedExpr(field.value, null);
         }
 
         try self.writer.write(" }");
@@ -7749,13 +7927,13 @@ pub const CodeGenerator = struct {
             .tuple => |exprs| {
                 for (exprs, 0..) |expr, i| {
                     if (i > 0) try self.writer.write(", ");
-                    try self.generateExpr(expr);
+                    try self.generateRetainedExpr(expr, null);
                 }
             },
             .struct_fields => |fields| {
                 for (fields, 0..) |field, i| {
                     if (i > 0) try self.writer.write(", ");
-                    try self.generateExpr(field.value);
+                    try self.generateRetainedExpr(field.value, null);
                 }
             },
         }
