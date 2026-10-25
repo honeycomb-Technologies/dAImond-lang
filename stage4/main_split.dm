@@ -417,7 +417,18 @@ fn compile(cli: CLIArgs) -> int {
             eprintln(p.errors[ei])
             ei = ei + 1
         }
-        return 1
+        exit(1)
+    }
+
+    -- Post-parse validation
+    let validation_errors = validate_source_file(sf)
+    if validation_errors.len() > 0 {
+        let mut vi = 0
+        while vi < validation_errors.len() {
+            eprintln(validation_errors[vi])
+            vi = vi + 1
+        }
+        exit(1)
     }
 
     -- Phase 3.5: Resolve imports
@@ -425,6 +436,17 @@ fn compile(cli: CLIArgs) -> int {
         if verbose { println("  [3.5/6] Resolving imports...") }
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
+    }
+
+    -- Effect system enforcement
+    let effect_errors = validate_effects(sf)
+    if effect_errors.len() > 0 {
+        let mut ei2 = 0
+        while ei2 < effect_errors.len() {
+            eprintln(effect_errors[ei2])
+            ei2 = ei2 + 1
+        }
+        exit(1)
     }
 
     -- Phase 4: Generate IR

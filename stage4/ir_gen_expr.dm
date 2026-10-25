@@ -601,6 +601,24 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         if gen.variable_types.contains(name) {
             return gen.variable_types.get(name)
         }
+        -- Check global constants for their type
+        let mut gi_ty = 0
+        while gi_ty < gen.ir_mod.globals.len() {
+            let gl_ty = gen.ir_mod.globals[gi_ty]
+            if gl_ty.name == name and gl_ty.has_init {
+                if gl_ty.init_value.kind == VAL_CONST_STRING() {
+                    return "string"
+                }
+                if gl_ty.init_value.kind == VAL_CONST_FLOAT() {
+                    return "f64"
+                }
+                if gl_ty.init_value.kind == VAL_CONST_BOOL() {
+                    return "bool"
+                }
+                return "i64"
+            }
+            gi_ty = gi_ty + 1
+        }
         return "i64"
     }
     if expr.kind == EXPR_BINARY() {
@@ -627,49 +645,6 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         if expr.op == UNOP_NOT() {
             return "bool"
         }
-        if expr.op == UNOP_DEREF() {
-            -- Dereference: look up the Box inner type
-            let operand = *expr.operand
-            if operand.kind == EXPR_IDENTIFIER() {
-                if gen.box_inner_types.contains(operand.name) {
-                    return gen.box_inner_types.get(operand.name)
-                }
-            }
-            -- For field access, resolve the field's Box[T] type to get T
-            if operand.kind == EXPR_FIELD_ACCESS() {
-                -- Use the recursive field access inference to get the field type
-                -- The field type should be "ptr" (from parse_type_to_ir("Box[T]")),
-                -- but we need the original type to extract the inner type
-                let fa_obj = *operand.object
-                let mut sname = ""
-                if fa_obj.kind == EXPR_IDENTIFIER() {
-                    if gen.var_struct_types.contains(fa_obj.name) {
-                        sname = gen.var_struct_types.get(fa_obj.name)
-                    }
-                }
-                if sname == "" {
-                    let obj_type = infer_expr_type(gen, fa_obj)
-                    if gen.struct_defs.contains(obj_type) {
-                        sname = obj_type
-                    }
-                }
-                if sname != "" and gen.struct_defs.contains(sname) {
-                    let sinfo = gen.struct_defs.get(sname)
-                    let fname = operand.field
-                    let mut fi = 0
-                    while fi < sinfo.field_names.len() {
-                        if sinfo.field_names[fi] == fname {
-                            let ftype = sinfo.field_types[fi]
-                            if starts_with(ftype, "Box[") {
-                                return extract_inner_type(ftype, "Box[")
-                            }
-                        }
-                        fi = fi + 1
-                    }
-                }
-            }
-            return "i64"
-        }
         -- Negation preserves the operand type
         return infer_expr_type(gen, *expr.operand)
     }
@@ -684,97 +659,98 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
             if is_builtin_fn(fn_name) {
                 return builtin_return_type(fn_name)
             }
-            -- Check user-defined function return types
-            if gen.fn_return_types.contains(fn_name) {
-                return gen.fn_return_types.get(fn_name)
-            }
-        }
-        return "i64"
-    }
-    if expr.kind == EXPR_METHOD_CALL() {
-        -- Try to determine the struct type for the method
-        let method_name = expr.method
-        let obj = *expr.object
-        if obj.kind == EXPR_IDENTIFIER() {
-            -- Static method: Point.new(...) -> look up Point_new
-            let full_name = obj.name + "_" + method_name
-            if gen.fn_return_types.contains(full_name) {
-                return gen.fn_return_types.get(full_name)
-            }
-            -- Instance method: p.distance(...) -> look up <struct>_distance
-            if gen.var_struct_types.contains(obj.name) {
-                let stype = gen.var_struct_types.get(obj.name)
-                let inst_name = stype + "_" + method_name
-                if gen.fn_return_types.contains(inst_name) {
-                    return gen.fn_return_types.get(inst_name)
+            -- SIMD builtins: infer return type from function name or argument types
+            if is_simd_builtin(fn_name) {
+                if starts_with(fn_name, "simd_splat_") or starts_with(fn_name, "simd_set_") {
+                    return parse_simd_type_from_name(fn_name)
                 }
-            }
-            -- Map/List methods on variables with type annotations
-            if gen.var_type_annotations.contains(obj.name) {
-                let ann = gen.var_type_annotations.get(obj.name)
-                let coll_result = infer_collection_method_type(gen, ann, method_name)
-                if coll_result != "" {
-                    return coll_result
-                }
-            }
-            -- List methods on tracked list variables
-            if gen.variable_types.contains(obj.name) and gen.variable_types.get(obj.name) == "list" {
-                if method_name == "len" { return "i64" }
-                if method_name == "pop" {
-                    if gen.list_elem_types.contains(obj.name) {
-                        return map_type_name(gen.list_elem_types.get(obj.name))
+                if fn_name == "simd_add" or fn_name == "simd_sub" or fn_name == "simd_mul" or fn_name == "simd_div" {
+                    -- Return type is the same as the first argument's vector type
+                    if expr.args.len() > 0 {
+                        return infer_expr_type(gen, expr.args[0])
                     }
-                    if gen.list_elem_kinds.contains(obj.name) {
-                        let k = gen.list_elem_kinds.get(obj.name)
-                        if k == LIST_ELEM_STRING() { return "string" }
-                        if k == LIST_ELEM_FLOAT() { return "f64" }
-                    }
-                    return "i64"
+                    return "f32x4"
                 }
-            }
-        }
-        -- Compound object (field access): resolve field type for Map/List methods
-        if obj.kind == EXPR_FIELD_ACCESS() {
-            let fa_obj = *obj.object
-            let fa_field = obj.field
-            let mut sname = ""
-            if fa_obj.kind == EXPR_IDENTIFIER() {
-                if gen.var_struct_types.contains(fa_obj.name) {
-                    sname = gen.var_struct_types.get(fa_obj.name)
-                }
-            }
-            if sname == "" {
-                let fa_obj_type = infer_expr_type(gen, fa_obj)
-                if gen.struct_defs.contains(fa_obj_type) {
-                    sname = fa_obj_type
-                }
-            }
-            if sname != "" and gen.struct_defs.contains(sname) {
-                let sinfo = gen.struct_defs.get(sname)
-                let mut fi = 0
-                while fi < sinfo.field_names.len() {
-                    if sinfo.field_names[fi] == fa_field {
-                        let ftype = sinfo.field_types[fi]
-                        let coll_result = infer_collection_method_type(gen, ftype, method_name)
-                        if coll_result != "" {
-                            return coll_result
+                if fn_name == "simd_extract" {
+                    -- Return dAImond-native type (f64 for float vectors, i64 for int vectors)
+                    if expr.args.len() > 0 {
+                        let vec_ty = infer_expr_type(gen, expr.args[0])
+                        if is_simd_float_type(vec_ty) {
+                            return "f64"
                         }
-                        -- Instance method on a struct-typed field
-                        if gen.struct_defs.contains(ftype) {
-                            let inst_name = ftype + "_" + method_name
-                            if gen.fn_return_types.contains(inst_name) {
-                                return gen.fn_return_types.get(inst_name)
+                        return "i64"
+                    }
+                    return "f64"
+                }
+            }
+            -- Look up user-defined function return types
+            let mut fi = 0
+            while fi < gen.ir_mod.functions.len() {
+                let func = gen.ir_mod.functions[fi]
+                if func.name == fn_name {
+                    return func.return_type
+                }
+                fi = fi + 1
+            }
+            -- Check for generic function declarations
+            if gen.generic_fn_decls.contains(fn_name) {
+                let decl_idx = gen.generic_fn_decls.get(fn_name)
+                if decl_idx >= 0 and decl_idx < gen.declarations.len() {
+                    let decl = gen.declarations[decl_idx]
+                    if decl.kind == DECL_FUNCTION() {
+                        let fd = *decl.func_decl
+                        let ret_type = fd.return_type
+                        -- If return type is a generic param, resolve from args
+                        if fd.generic_params.len() > 0 {
+                            let mut pi = 0
+                            while pi < fd.generic_params.len() {
+                                if fd.generic_params[pi] == ret_type {
+                                    -- Infer from corresponding argument
+                                    if pi < expr.args.len() {
+                                        return infer_expr_type(gen, expr.args[pi])
+                                    }
+                                }
+                                pi = pi + 1
+                            }
+                            -- Also check explicit type args
+                            if expr.generic_args.len() > 0 {
+                                let mut gi = 0
+                                while gi < fd.generic_params.len() {
+                                    if fd.generic_params[gi] == ret_type and gi < expr.generic_args.len() {
+                                        return map_type_name(expr.generic_args[gi])
+                                    }
+                                    gi = gi + 1
+                                }
                             }
                         }
+                        return map_type_name(ret_type)
                     }
-                    fi = fi + 1
+                }
+            }
+            -- Check if callee is a lambda/fn-ptr variable: look up actual function
+            if gen.fn_ptr_vars.contains(fn_name) {
+                let lambda_fn_name = gen.fn_ptr_vars.get(fn_name)
+                let mut lfi = 0
+                while lfi < gen.ir_mod.functions.len() {
+                    if gen.ir_mod.functions[lfi].name == lambda_fn_name {
+                        return gen.ir_mod.functions[lfi].return_type
+                    }
+                    lfi = lfi + 1
+                }
+            }
+            -- Check if callee is a function-pointer-typed variable: parse return type
+            if gen.variable_types.contains(fn_name) {
+                let vtype = gen.variable_types.get(fn_name)
+                if starts_with(vtype, "fn(") {
+                    let arrow_pos = string_find(vtype, " -> ")
+                    if arrow_pos >= 0 {
+                        let ret_str = substr(vtype, arrow_pos + 4, len(vtype) - arrow_pos - 4)
+                        return map_type_name(ret_str)
+                    }
                 }
             }
         }
         return "i64"
-    }
-    if expr.kind == EXPR_STRUCT_LITERAL() {
-        return expr.type_name
     }
     if expr.kind == EXPR_STRING_INTERP() {
         return "string"
@@ -782,94 +758,264 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
     if expr.kind == EXPR_GROUPED() {
         return infer_expr_type(gen, *expr.operand)
     }
-    if expr.kind == EXPR_IF() {
-        -- Infer type from the then branch
-        return infer_expr_type(gen, *expr.then_branch)
-    }
-    if expr.kind == EXPR_BLOCK() {
-        -- Infer type from the result expression if present
-        if expr.has_result {
-            return infer_expr_type(gen, *expr.result)
-        }
-        return "i64"
-    }
-    if expr.kind == EXPR_AWAIT() {
-        -- Await returns the type of the inner expression
-        return infer_expr_type(gen, *expr.operand)
-    }
-    if expr.kind == EXPR_FIELD_ACCESS() {
-        let obj = *expr.object
-        let field = expr.field
-        let mut sname = ""
-        -- Try identifier lookup first
-        if obj.kind == EXPR_IDENTIFIER() {
-            if gen.var_struct_types.contains(obj.name) {
-                sname = gen.var_struct_types.get(obj.name)
+    if expr.kind == EXPR_PIPELINE() {
+        -- Pipeline: a |> f — return type of function f
+        let rhs = *expr.pipe_right
+        if rhs.kind == EXPR_FUNCTION_CALL() {
+            let callee = *rhs.callee
+            if callee.kind == EXPR_IDENTIFIER() {
+                let fn_name = callee.name
+                if is_builtin_fn(fn_name) {
+                    return builtin_return_type(fn_name)
+                }
+                let mut fi = 0
+                while fi < gen.ir_mod.functions.len() {
+                    let func = gen.ir_mod.functions[fi]
+                    if func.name == fn_name {
+                        return func.return_type
+                    }
+                    fi = fi + 1
+                }
             }
-        }
-        -- For compound expressions, recursively infer the object type
-        if sname == "" {
-            let obj_type = infer_expr_type(gen, obj)
-            if gen.struct_defs.contains(obj_type) {
-                sname = obj_type
+        } else if rhs.kind == EXPR_IDENTIFIER() {
+            let fn_name = rhs.name
+            if is_builtin_fn(fn_name) {
+                return builtin_return_type(fn_name)
             }
-        }
-        if sname != "" and gen.struct_defs.contains(sname) {
-            let sinfo = gen.struct_defs.get(sname)
             let mut fi = 0
-            while fi < sinfo.field_names.len() {
-                if sinfo.field_names[fi] == field {
-                    let ftype = sinfo.field_types[fi]
-                    return parse_type_to_ir(ftype)
+            while fi < gen.ir_mod.functions.len() {
+                let func = gen.ir_mod.functions[fi]
+                if func.name == fn_name {
+                    return func.return_type
                 }
                 fi = fi + 1
             }
         }
         return "i64"
     }
-    if expr.kind == EXPR_INDEX_ACCESS() {
-        let obj = *expr.object
-        -- Try identifier lookup first
-        if obj.kind == EXPR_IDENTIFIER() {
-            if gen.list_elem_types.contains(obj.name) {
-                let elem_type = gen.list_elem_types.get(obj.name)
-                return map_type_name(elem_type)
-            }
-            if gen.list_elem_kinds.contains(obj.name) {
-                let kind = gen.list_elem_kinds.get(obj.name)
-                if kind == LIST_ELEM_STRING() { return "string" }
-                if kind == LIST_ELEM_FLOAT() { return "f64" }
+    if expr.kind == EXPR_STRUCT_LITERAL() {
+        return expr.type_name
+    }
+    if expr.kind == EXPR_ENUM_LITERAL() {
+        return expr.enum_name
+    }
+    if expr.kind == EXPR_IF() {
+        -- Return type of then branch (then_branch is Box[Expr] to EXPR_BLOCK)
+        let tb = *expr.then_branch
+        if tb.kind == EXPR_BLOCK() and tb.stmts.len() > 0 {
+            let last = tb.stmts[tb.stmts.len() - 1]
+            if last.kind == STMT_EXPRESSION() {
+                return infer_expr_type(gen, *last.expr)
             }
         }
-        -- For field access as the list, use field_list_elem_types/kinds
-        if obj.kind == EXPR_FIELD_ACCESS() {
-            let fa_obj = *obj.object
-            let mut fa_sname = ""
-            if fa_obj.kind == EXPR_IDENTIFIER() {
-                if gen.var_struct_types.contains(fa_obj.name) {
-                    fa_sname = gen.var_struct_types.get(fa_obj.name)
+        return "void"
+    }
+    if expr.kind == EXPR_MATCH() {
+        -- Return type of first arm
+        if expr.match_arms.len() > 0 {
+            let arm = expr.match_arms[0]
+            if arm.is_expr_body {
+                return infer_expr_type(gen, *arm.body_expr)
+            }
+        }
+        return "void"
+    }
+    if expr.kind == EXPR_FIELD_ACCESS() {
+        -- Look up struct field type
+        let obj = *expr.object
+        let obj_type = infer_expr_type(gen, obj)
+        if gen.struct_defs.contains(obj_type) {
+            let si = gen.struct_defs.get(obj_type)
+            let mut fi = 0
+            while fi < si.field_names.len() {
+                if si.field_names[fi] == expr.field {
+                    return si.field_types[fi]
+                }
+                fi = fi + 1
+            }
+        }
+        -- Check variable's struct type
+        if obj.kind == EXPR_IDENTIFIER() and gen.var_struct_types.contains(obj.name) {
+            let sname = gen.var_struct_types.get(obj.name)
+            if gen.struct_defs.contains(sname) {
+                let si = gen.struct_defs.get(sname)
+                let mut fi = 0
+                while fi < si.field_names.len() {
+                    if si.field_names[fi] == expr.field {
+                        return si.field_types[fi]
+                    }
+                    fi = fi + 1
                 }
             }
-            if fa_sname == "" {
-                let fa_obj_type = infer_expr_type(gen, fa_obj)
-                if gen.struct_defs.contains(fa_obj_type) {
-                    fa_sname = fa_obj_type
+        }
+        -- Check Option[T] / Result[T, E] types for field access
+        if obj.kind == EXPR_IDENTIFIER() and gen.variable_types.contains(obj.name) {
+            let fa_vtype = gen.variable_types.get(obj.name)
+            if starts_with(fa_vtype, "Option[") {
+                let fa_inner = substr(fa_vtype, 7, len(fa_vtype) - 8)
+                if expr.field == "value" {
+                    return map_type_name(fa_inner)
+                }
+                if expr.field == "has_value" {
+                    return "i32"
                 }
             }
-            if fa_sname != "" {
-                let flek = fa_sname + "." + obj.field
-                if gen.field_list_elem_types.contains(flek) {
-                    let elem_type = gen.field_list_elem_types.get(flek)
-                    return map_type_name(elem_type)
+            if starts_with(fa_vtype, "Result[") {
+                let fa_inner_str = substr(fa_vtype, 7, len(fa_vtype) - 8)
+                let mut fa_comma = 0
+                let mut fa_ci = 0
+                while fa_ci < len(fa_inner_str) {
+                    if char_at(fa_inner_str, fa_ci) == "," {
+                        fa_comma = fa_ci
+                    }
+                    fa_ci = fa_ci + 1
                 }
-                if gen.field_list_elem_kinds.contains(flek) {
-                    let fek = gen.field_list_elem_kinds.get(flek)
-                    if fek == LIST_ELEM_STRING() { return "string" }
-                    if fek == LIST_ELEM_FLOAT() { return "f64" }
+                let fa_ok_type = string_trim(substr(fa_inner_str, 0, fa_comma))
+                let fa_err_type = string_trim(substr(fa_inner_str, fa_comma + 1, len(fa_inner_str) - fa_comma - 1))
+                if expr.field == "ok" or expr.field == "value" {
+                    return map_type_name(fa_ok_type)
+                }
+                if expr.field == "err" or expr.field == "error" {
+                    return map_type_name(fa_err_type)
+                }
+                if expr.field == "is_ok" {
+                    return "bool"
                 }
             }
         }
         return "i64"
+    }
+    if expr.kind == EXPR_INDEX_ACCESS() {
+        let obj = *expr.object
+        if obj.kind == EXPR_IDENTIFIER() {
+            let name = obj.name
+            -- String indexing returns a string (char_at)
+            if gen.variable_types.contains(name) {
+                let idx_vtype = gen.variable_types.get(name)
+                if idx_vtype == "string" {
+                    return "string"
+                }
+            }
+            if gen.list_elem_kinds.contains(name) {
+                let ek = gen.list_elem_kinds.get(name)
+                if ek == LIST_ELEM_INT() { return "i64" }
+                if ek == LIST_ELEM_FLOAT() { return "f64" }
+                if ek == LIST_ELEM_STRING() { return "string" }
+                if ek == LIST_ELEM_OTHER() and gen.list_elem_types.contains(name) {
+                    return gen.list_elem_types.get(name)
+                }
+            }
+            -- Map index access
+            if gen.map_var_kinds.contains(name) {
+                let idx_mk = gen.map_var_kinds.get(name)
+                if idx_mk == MAP_KIND_STRING_INT() { return "i64" }
+                if idx_mk == MAP_KIND_INT_STRING() { return "string" }
+            }
+        }
+        return "i64"
+    }
+    if expr.kind == EXPR_METHOD_CALL() {
+        let method = expr.method
+        if method == "len" { return "i64" }
+        if method == "pop" { return "i64" }
+        if method == "get" {
+            -- Check if object is a map variable to determine get return type
+            let get_obj = *expr.object
+            if get_obj.kind == EXPR_IDENTIFIER() {
+                let get_var = get_obj.name
+                if gen.map_var_kinds.contains(get_var) {
+                    let mk = gen.map_var_kinds.get(get_var)
+                    if mk == MAP_KIND_INT_STRING() {
+                        return "string"
+                    }
+                }
+            }
+            return "i64"
+        }
+        if method == "contains" { return "bool" }
+        -- Check for struct method calls (regular and generic impl)
+        if gen.method_struct_map.contains(method) {
+            let struct_type = gen.method_struct_map.get(method)
+            let mangled = struct_type + "_" + method
+            -- Check generic impl method
+            if gen.generic_fn_decls.contains(mangled) {
+                let decl_idx = gen.generic_fn_decls.get(mangled)
+                if decl_idx >= 0 and decl_idx < gen.declarations.len() {
+                    let decl = gen.declarations[decl_idx]
+                    if decl.kind == DECL_FUNCTION() {
+                        let fd = *decl.func_decl
+                        -- Check if method takes self
+                        let mut has_self = false
+                        if fd.params.len() > 0 {
+                            has_self = fd.params[0].name == "self"
+                        }
+                        -- Build effective args
+                        let mut effective_args: List[Expr] = []
+                        if has_self {
+                            effective_args.push(*expr.object)
+                        }
+                        let mut ai = 0
+                        while ai < expr.args.len() {
+                            effective_args.push(expr.args[ai])
+                            ai = ai + 1
+                        }
+                        -- Infer type args
+                        let mut temp_subs: Map[string, string] = Map_new()
+                        let mut pi = 0
+                        while pi < fd.generic_params.len() {
+                            let gp = fd.generic_params[pi]
+                            let mut inferred = "i64"
+                            let mut mi = 0
+                            while mi < fd.params.len() and mi < effective_args.len() {
+                                if fd.params[mi].type_name == gp {
+                                    inferred = infer_arg_type(gen, effective_args[mi])
+                                }
+                                mi = mi + 1
+                            }
+                            temp_subs.insert(gp, inferred)
+                            pi = pi + 1
+                        }
+                        -- Resolve return type
+                        let ret = fd.return_type
+                        if temp_subs.contains(ret) {
+                            return map_type_name(temp_subs.get(ret))
+                        }
+                        -- Handle complex return types like Pair[A, B]
+                        let bracket_idx = string_find(ret, "[")
+                        if bracket_idx > 0 {
+                            let base = substr(ret, 0, bracket_idx)
+                            let inner = substr(ret, bracket_idx + 1, len(ret) - bracket_idx - 2)
+                            let comma_idx = string_find(inner, ", ")
+                            if comma_idx >= 0 {
+                                let first_t = substr(inner, 0, comma_idx)
+                                let second_t = substr(inner, comma_idx + 2, len(inner) - comma_idx - 2)
+                                let r1 = if temp_subs.contains(first_t) { map_type_name(temp_subs.get(first_t)) } else { map_type_name(first_t) }
+                                let r2 = if temp_subs.contains(second_t) { map_type_name(temp_subs.get(second_t)) } else { map_type_name(second_t) }
+                                return base + "_" + r1 + "_" + r2
+                            } else {
+                                let r1 = if temp_subs.contains(inner) { map_type_name(temp_subs.get(inner)) } else { map_type_name(inner) }
+                                return base + "_" + r1
+                            }
+                        }
+                        return map_type_name(ret)
+                    }
+                }
+            }
+            -- Non-generic struct method: look up return type from IR functions
+            let ret_type = infer_call_return_type(gen, mangled)
+            return ret_type
+        }
+        return "i64"
+    }
+    if expr.kind == EXPR_COMPTIME() {
+        return infer_expr_type(gen, *expr.operand)
+    }
+    if expr.kind == EXPR_ARRAY_LITERAL() {
+        return "i64"
+    }
+    if expr.kind == EXPR_AWAIT() {
+        -- Await returns the type of the inner expression
+        return infer_expr_type(gen, *expr.operand)
     }
     -- Default fallback
     return "i64"
