@@ -4161,7 +4161,15 @@ pub const CodeGenerator = struct {
 
         for (s.fields) |field| {
             const field_type = try self.mapType(field.type_expr);
-            try self.writer.printLine("{s} {s};", .{ field_type, field.name.name });
+            // Array/function-pointer field types need the declarator split
+            // (same as emitVarDecl): "int64_t[4]" -> "int64_t name[4];"
+            if (std.mem.indexOf(u8, field_type, "(*)(")) |star_pos| {
+                try self.writer.printLine("{s}{s}{s};", .{ field_type[0 .. star_pos + 2], field.name.name, field_type[star_pos + 2 ..] });
+            } else if (std.mem.indexOf(u8, field_type, "[")) |bracket_pos| {
+                try self.writer.printLine("{s} {s}{s};", .{ field_type[0..bracket_pos], field.name.name, field_type[bracket_pos..] });
+            } else {
+                try self.writer.printLine("{s} {s};", .{ field_type, field.name.name });
+            }
             // Track field types for inference: "dm_StructName.fieldName" -> C type
             const key = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ name, field.name.name });
             try self.struct_field_types.put(key, field_type);
@@ -6695,14 +6703,28 @@ pub const CodeGenerator = struct {
         }
     }
 
+    /// Length of a fixed-size array C type ("elem[N]" or "elem[N][M]"),
+    /// or null when the length is not statically known.
+    fn fixedArrayLen(c_type: []const u8) ?usize {
+        const open = std.mem.indexOf(u8, c_type, "[") orelse return null;
+        const close = std.mem.indexOfPos(u8, c_type, open, "]") orelse return null;
+        if (close <= open + 1) return null;
+        return std.fmt.parseInt(usize, c_type[open + 1 .. close], 10) catch null;
+    }
+
     /// Generate index access
     fn generateIndexAccess(self: *Self, idx: *IndexAccess) anyerror!void {
         const obj_type = self.inferCTypeFromExpr(idx.object);
         if (std.mem.eql(u8, obj_type, "dm_string")) {
-            // dm_string is a struct: s[i] -> ((char)(s).data[i])
-            try self.writer.write("((char)(");
+            // dm_string is a struct: s[i] -> bounds-checked ((char)(s).data[i])
+            // Emit: ((char)(dm_bounds_check(i, (s).len, "string"), (s).data)[i])
+            try self.writer.write("((char)(dm_bounds_check((int64_t)(");
+            try self.generateExpr(idx.index);
+            try self.writer.write("), (int64_t)(");
             try self.generateExpr(idx.object);
-            try self.writer.write(").data[");
+            try self.writer.write(").len, \"string\"), (");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").data)[");
             try self.generateExpr(idx.index);
             try self.writer.write("])");
         } else if (std.mem.startsWith(u8, obj_type, "dm_list_")) {
@@ -6721,7 +6743,30 @@ pub const CodeGenerator = struct {
             try self.writer.write(").data)[");
             try self.generateExpr(idx.index);
             try self.writer.write("]");
+        } else if (fixedArrayLen(obj_type)) |arr_len| {
+            // Fixed-size array: bounds-checked, lvalue-preserving.
+            // Emit: (dm_bounds_check(i, N, "array"), &((obj)[0]))[i]
+            try self.writer.write("(dm_bounds_check((int64_t)(");
+            try self.generateExpr(idx.index);
+            try self.writer.print("), (int64_t){d}, \"array\"), &((", .{arr_len});
+            try self.generateExpr(idx.object);
+            try self.writer.write(")[0]))[");
+            try self.generateExpr(idx.index);
+            try self.writer.write("]");
+        } else if (std.mem.startsWith(u8, obj_type, "struct {")) {
+            // Slice (fat pointer struct { T* data; size_t len; }):
+            // bounds-checked data access.
+            try self.writer.write("(dm_bounds_check((int64_t)(");
+            try self.generateExpr(idx.index);
+            try self.writer.write("), (int64_t)(");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").len, \"array\"), (");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").data)[");
+            try self.generateExpr(idx.index);
+            try self.writer.write("]");
         } else {
+            // Length not statically known (raw pointer): unchecked.
             try self.generateExpr(idx.object);
             try self.writer.write("[");
             try self.generateExpr(idx.index);
@@ -7483,11 +7528,15 @@ pub const CodeGenerator = struct {
             }
             return true;
         } else if (std.mem.eql(u8, name, "char_at")) {
-            // char_at(s, i) -> character at index as string
+            // char_at(s, i) -> bounds-checked character at index as string
             if (call.args.len >= 2) {
-                try self.writer.write("dm_char_to_string((");
+                try self.writer.write("dm_char_to_string((dm_bounds_check((int64_t)(");
+                try self.generateExpr(call.args[1].value);
+                try self.writer.write("), (int64_t)(");
                 try self.generateExpr(call.args[0].value);
-                try self.writer.write(").data[");
+                try self.writer.write(").len, \"string\"), (");
+                try self.generateExpr(call.args[0].value);
+                try self.writer.write(").data)[");
                 try self.generateExpr(call.args[1].value);
                 try self.writer.write("])");
             }
