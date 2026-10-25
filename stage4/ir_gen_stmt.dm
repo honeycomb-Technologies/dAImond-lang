@@ -32,7 +32,9 @@ fn expr_result(g: IRGenerator, b: IRBasicBlock, v: int) -> ExprResult {
     return ExprResult { gen: g, block: b, val_id: v }
 }
 
--- Resolve the original (source-level) type of a field access expression
+-- ============================================================
+-- STATEMENT GENERATION
+-- ============================================================
 fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
     let obj = *expr.object
     let field = expr.field

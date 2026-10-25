@@ -187,11 +187,12 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_string_to_upper", "string", "string")
     g = declare_extern(g, "dm_string_to_lower", "string", "string")
 
-    -- Character classification
+    -- Character classification and conversion
     g = declare_extern(g, "dm_is_alpha", "string", "bool")
     g = declare_extern(g, "dm_is_digit", "string", "bool")
     g = declare_extern(g, "dm_is_whitespace", "string", "bool")
     g = declare_extern(g, "dm_is_alnum", "string", "bool")
+    g = declare_extern(g, "dm_char_to_string", "string", "string")
 
     -- List contains
     g = declare_extern2(g, "dm_list_int64_contains", "ptr", "i64", "bool")

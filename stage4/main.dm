@@ -3034,6 +3034,17 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
         return ParseExprResult { p: inner.p, expr: e }
     }
 
+    -- Block expression: { stmts... }
+    if tok.kind == TK_LBRACE() {
+        pp = p_advance(pp)
+        let body = parse_block_body(pp)
+        pp = body.p
+        pp = p_expect(pp, TK_RBRACE())
+        let mut e = expr_new(EXPR_BLOCK(), tok.line, tok.col)
+        e.stmts = body.stmts
+        return ParseExprResult { p: pp, expr: e }
+    }
+
     -- Identifier / function call / struct literal / enum literal
     if tok.kind == TK_IDENT() or tok.kind == TK_SELF() {
         return parse_ident_expr(pp)
@@ -3085,11 +3096,21 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         pp = p_advance(pp)
         let mut args: List[Expr] = []
         if p_peek(p_skip_newlines(pp)) != TK_RPAREN() {
+            -- Skip 'mut' keyword before argument
+            if p_peek(p_skip_newlines(pp)) == TK_MUT() {
+                pp = p_skip_newlines(pp)
+                pp = p_advance(pp)
+            }
             let arg = parse_expr(pp)
             pp = arg.p
             args.push(arg.expr)
             while p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                 pp = p_expect(pp, TK_COMMA())
+                -- Skip 'mut' keyword before argument
+                if p_peek(p_skip_newlines(pp)) == TK_MUT() {
+                    pp = p_skip_newlines(pp)
+                    pp = p_advance(pp)
+                }
                 let next_arg = parse_expr(pp)
                 pp = next_arg.p
                 args.push(next_arg.expr)
@@ -3101,7 +3122,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         return ParseExprResult { p: pp, expr: e }
     }
 
-    -- Check for struct literal: Name { field: val, ... }
+    -- Check for struct literal: Name { field: val, ... } or Name { field, ... }
     if p_peek(pp) == TK_LBRACE() {
         -- Only treat as struct literal if first char is uppercase
         if len(name) > 0 and char_at(name, 0) >= "A" and char_at(name, 0) <= "Z" {
@@ -3113,7 +3134,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                 pp = p_skip_newlines(pp)
                 let fname = p_cur(pp).value
                 pp = p_advance(pp)
-                -- Support shorthand: Point { x, y } means Point { x: x, y: y }
+                -- Support both explicit (field: expr) and shorthand (field) syntax
                 if p_peek(pp) == TK_COLON() {
                     pp = p_advance(pp)
                     let fval = parse_expr(pp)
@@ -3121,11 +3142,9 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                     field_names.push(fname)
                     field_values.push(fval.expr)
                 } else {
-                    -- Shorthand: field name = identifier with same name
+                    -- Shorthand: field name = variable name (Pair { first, second })
                     field_names.push(fname)
-                    let mut shorthand_expr = expr_new(EXPR_IDENTIFIER(), p_cur(pp).line, p_cur(pp).col)
-                    shorthand_expr.name = fname
-                    field_values.push(shorthand_expr)
+                    field_values.push(expr_ident(fname, tok.line, tok.col))
                 }
                 pp = p_skip_newlines(pp)
                 if p_peek(pp) == TK_COMMA() {
@@ -3141,8 +3160,8 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         }
     }
 
-    -- Check for enum variant: Name.Variant or Name.Variant(payload)
-    if p_peek(pp) == TK_DOT() {
+    -- Check for enum variant: Name.Variant or Name::Variant
+    if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
         let saved = pp
         pp = p_advance(pp)
         let variant_tok = p_cur(pp)
@@ -3515,8 +3534,8 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
             return ParsePatternResult { p: pp, pattern: pattern_enum_variant("", name, bindings) }
         }
 
-        if p_peek(pp) == TK_DOT() {
-            -- Qualified enum: EnumName.Variant or EnumName.Variant(bindings)
+        if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
+            -- Qualified enum: EnumName.Variant or EnumName::Variant
             pp = p_advance(pp)
             let variant_tok = p_cur(pp)
             pp = p_advance(pp)
@@ -3876,8 +3895,8 @@ fn parse_source_file(p: Parser) -> SourceFile {
         pp = p_skip_newlines(pp)
         let mut path = p_cur(pp).value
         pp = p_advance(pp)
-        -- Handle dotted paths: import std.io
-        while p_peek(pp) == TK_DOT() {
+        -- Handle dotted paths: import std.io and import foo::bar
+        while p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
             pp = p_advance(pp)
             path = path + "." + p_cur(pp).value
             pp = p_advance(pp)
@@ -5118,11 +5137,12 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_string_to_upper", "string", "string")
     g = declare_extern(g, "dm_string_to_lower", "string", "string")
 
-    -- Character classification
+    -- Character classification and conversion
     g = declare_extern(g, "dm_is_alpha", "string", "bool")
     g = declare_extern(g, "dm_is_digit", "string", "bool")
     g = declare_extern(g, "dm_is_whitespace", "string", "bool")
     g = declare_extern(g, "dm_is_alnum", "string", "bool")
+    g = declare_extern(g, "dm_char_to_string", "string", "string")
 
     -- List contains
     g = declare_extern2(g, "dm_list_int64_contains", "ptr", "i64", "bool")
@@ -5811,7 +5831,9 @@ fn expr_result(g: IRGenerator, b: IRBasicBlock, v: int) -> ExprResult {
     return ExprResult { gen: g, block: b, val_id: v }
 }
 
--- Resolve the original (source-level) type of a field access expression
+-- ============================================================
+-- STATEMENT GENERATION
+-- ============================================================
 fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
     let obj = *expr.object
     let field = expr.field
@@ -9706,8 +9728,9 @@ fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name
 }
 
 -- ============================================================
--- SOME CALL: Option constructor
--- Some(value) -> Option { has_value: 1, value: payload }
+-- FUNCTION POINTER PARAMETER INDIRECT CALL
+-- Handles calling through function-pointer-typed parameters:
+--   fn apply(f: fn(int) -> int, x: int) -> int { return f(x) }
 -- ============================================================
 
 fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
@@ -10405,20 +10428,41 @@ fn generate_dyn_dispatch_call(gen: IRGenerator, block: IRBasicBlock, obj_name: s
     let concrete_type = g.dyn_var_concrete.get(obj_name)
     let mangled = concrete_type + "_" + method_name
 
-    -- Load the data pointer from the dyn variable's alloca
     let alloca_id = g.variable_map.get(obj_name)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(alloca_id)
-    load_inst.load_type = "ptr"
-    load_inst.result_type = "ptr"
-    load_inst.has_result = true
-    b.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
 
-    -- Build args: data_ptr (as self), then method arguments
+    -- Determine if this is a direct struct param or an indirect let-binding
+    -- For function params, the alloca holds the struct directly (load as struct type)
+    -- For let-bindings, the alloca holds a ptr to heap data (load as ptr)
+    let is_direct_struct = g.var_struct_types.contains(obj_name) and g.variable_types.contains(obj_name) and g.variable_types.get(obj_name) != "ptr"
+
+    let mut self_val_id = 0
+    if is_direct_struct {
+        -- Load the struct value directly from the alloca
+        let load_id = g.builder.next_id
+        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+        load_inst.load_ptr = ir_val_inst(alloca_id)
+        load_inst.load_type = concrete_type
+        load_inst.result_type = concrete_type
+        load_inst.has_result = true
+        b.instructions.push(load_inst)
+        g.builder.next_id = g.builder.next_id + 1
+        self_val_id = load_id
+    } else {
+        -- Load the data pointer from the dyn variable's alloca (indirect)
+        let load_id = g.builder.next_id
+        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+        load_inst.load_ptr = ir_val_inst(alloca_id)
+        load_inst.load_type = "ptr"
+        load_inst.result_type = "ptr"
+        load_inst.has_result = true
+        b.instructions.push(load_inst)
+        g.builder.next_id = g.builder.next_id + 1
+        self_val_id = load_id
+    }
+
+    -- Build args: self value, then method arguments
     let mut call_args: List[IRValue] = []
-    call_args.push(ir_val_inst(load_id))
+    call_args.push(ir_val_inst(self_val_id))
 
     let mut i = 0
     while i < args.len() {
@@ -10729,7 +10773,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
             } else {
                 "i64"
             }
-            let elem_size = estimate_type_size(elem_type_name)
+            let elem_size = estimate_type_size_gen(g, elem_type_name)
 
             -- Alloca temp for the value
             let temp_alloca_id = g.builder.next_id
@@ -10766,7 +10810,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 
         let push_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_push" }
         else if ek == LIST_ELEM_FLOAT() { "dm_list_double_push" }
-        else { "dm_list_dm_string_push" }
+        else { "dm_list_string_push" }
 
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_CALL())
@@ -14135,7 +14179,8 @@ fn generate_simd_extract(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 
     -- Infer the vector type from the first argument
     let vec_type = infer_simd_arg_type(g, args[0])
-    let scalar_type = simd_extract_scalar_type(vec_type)
+    -- Use dAImond-native types (f64 for float vectors, i64 for int vectors)
+    let scalar_type = if is_simd_float_type(vec_type) { "f64" } else { "i64" }
 
     -- Emit OP_SIMD_EXTRACT instruction
     let id = g.builder.next_id
@@ -14393,9 +14438,22 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     g = val_result.gen
     b = val_result.block
 
+    -- Compute allocation size based on the value being boxed
+    let mut size = 8  -- default pointer-sized allocation
+    let arg0 = args[0]
+    if arg0.kind == EXPR_STRUCT_LITERAL() {
+        let sname = arg0.type_name
+        if g.struct_defs.contains(sname) {
+            let sinfo = g.struct_defs.get(sname)
+            -- Each field is 8 bytes (i64/f64/ptr)
+            size = sinfo.field_names.len() * 8
+            if size < 8 {
+                size = 8
+            }
+        }
+    }
+
     -- Allocate memory via malloc
-    let val_type = infer_expr_type(g, args[0])
-    let size = estimate_type_size(val_type)
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
     malloc_inst.callee = "malloc"
@@ -14419,18 +14477,17 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 }
 
 -- Generate a Box_null() call.
--- Returns a null pointer constant.
+-- Returns a null pointer constant via inttoptr(0).
 fn generate_box_null_call(gen: IRGenerator, block: IRBasicBlock) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Emit an alloca with null value (pointer set to 0)
+    -- Emit inttoptr(i64 0) to produce a true null pointer
     let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL())
-    inst.callee = "malloc"
-    let mut margs: List[IRValue] = []
-    margs.push(ir_val_int(0))
-    inst.call_args = margs
+    let mut inst = ir_inst_new(id, OP_CAST())
+    inst.cast_val = ir_val_int(0)
+    inst.cast_from = "i64"
+    inst.cast_to = "ptr"
     inst.result_type = "ptr"
     inst.has_result = true
     b.instructions.push(inst)
@@ -17927,6 +17984,24 @@ fn is_runtime_string_fn(fn_name: string) -> bool {
     if fn_name == "dm_string_new" { return true }
     return false
 }
+
+
+-- ============================================================
+-- SIMD Instruction Handling for LLVM IR Generation
+--
+-- Translates OP_SIMD_* IR instructions to LLVM vector operations.
+-- SIMD types map to LLVM fixed-width vector types:
+--   f32x4 -> <4 x float>, f32x8 -> <8 x float>
+--   f64x2 -> <2 x double>, f64x4 -> <4 x double>
+--   i32x4 -> <4 x i32>,    i32x8 -> <8 x i32>
+--   i64x2 -> <2 x i64>,    i64x4 -> <4 x i64>
+-- ============================================================
+
+-- ============================================================
+-- SIMD TYPE HELPERS
+-- ============================================================
+
+-- Get the LLVM vector type for a SIMD type name
 
 fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
     let mut g = gen

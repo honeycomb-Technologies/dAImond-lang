@@ -2196,8 +2196,9 @@ fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name
 }
 
 -- ============================================================
--- SOME CALL: Option constructor
--- Some(value) -> Option { has_value: 1, value: payload }
+-- FUNCTION POINTER PARAMETER INDIRECT CALL
+-- Handles calling through function-pointer-typed parameters:
+--   fn apply(f: fn(int) -> int, x: int) -> int { return f(x) }
 -- ============================================================
 
 fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
@@ -2895,20 +2896,41 @@ fn generate_dyn_dispatch_call(gen: IRGenerator, block: IRBasicBlock, obj_name: s
     let concrete_type = g.dyn_var_concrete.get(obj_name)
     let mangled = concrete_type + "_" + method_name
 
-    -- Load the data pointer from the dyn variable's alloca
     let alloca_id = g.variable_map.get(obj_name)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(alloca_id)
-    load_inst.load_type = "ptr"
-    load_inst.result_type = "ptr"
-    load_inst.has_result = true
-    b.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
 
-    -- Build args: data_ptr (as self), then method arguments
+    -- Determine if this is a direct struct param or an indirect let-binding
+    -- For function params, the alloca holds the struct directly (load as struct type)
+    -- For let-bindings, the alloca holds a ptr to heap data (load as ptr)
+    let is_direct_struct = g.var_struct_types.contains(obj_name) and g.variable_types.contains(obj_name) and g.variable_types.get(obj_name) != "ptr"
+
+    let mut self_val_id = 0
+    if is_direct_struct {
+        -- Load the struct value directly from the alloca
+        let load_id = g.builder.next_id
+        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+        load_inst.load_ptr = ir_val_inst(alloca_id)
+        load_inst.load_type = concrete_type
+        load_inst.result_type = concrete_type
+        load_inst.has_result = true
+        b.instructions.push(load_inst)
+        g.builder.next_id = g.builder.next_id + 1
+        self_val_id = load_id
+    } else {
+        -- Load the data pointer from the dyn variable's alloca (indirect)
+        let load_id = g.builder.next_id
+        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+        load_inst.load_ptr = ir_val_inst(alloca_id)
+        load_inst.load_type = "ptr"
+        load_inst.result_type = "ptr"
+        load_inst.has_result = true
+        b.instructions.push(load_inst)
+        g.builder.next_id = g.builder.next_id + 1
+        self_val_id = load_id
+    }
+
+    -- Build args: self value, then method arguments
     let mut call_args: List[IRValue] = []
-    call_args.push(ir_val_inst(load_id))
+    call_args.push(ir_val_inst(self_val_id))
 
     let mut i = 0
     while i < args.len() {
@@ -3219,7 +3241,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
             } else {
                 "i64"
             }
-            let elem_size = estimate_type_size(elem_type_name)
+            let elem_size = estimate_type_size_gen(g, elem_type_name)
 
             -- Alloca temp for the value
             let temp_alloca_id = g.builder.next_id
@@ -3256,7 +3278,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 
         let push_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_push" }
         else if ek == LIST_ELEM_FLOAT() { "dm_list_double_push" }
-        else { "dm_list_dm_string_push" }
+        else { "dm_list_string_push" }
 
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_CALL())

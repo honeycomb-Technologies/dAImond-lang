@@ -262,7 +262,8 @@ fn generate_simd_extract(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 
     -- Infer the vector type from the first argument
     let vec_type = infer_simd_arg_type(g, args[0])
-    let scalar_type = simd_extract_scalar_type(vec_type)
+    -- Use dAImond-native types (f64 for float vectors, i64 for int vectors)
+    let scalar_type = if is_simd_float_type(vec_type) { "f64" } else { "i64" }
 
     -- Emit OP_SIMD_EXTRACT instruction
     let id = g.builder.next_id
@@ -520,9 +521,22 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     g = val_result.gen
     b = val_result.block
 
+    -- Compute allocation size based on the value being boxed
+    let mut size = 8  -- default pointer-sized allocation
+    let arg0 = args[0]
+    if arg0.kind == EXPR_STRUCT_LITERAL() {
+        let sname = arg0.type_name
+        if g.struct_defs.contains(sname) {
+            let sinfo = g.struct_defs.get(sname)
+            -- Each field is 8 bytes (i64/f64/ptr)
+            size = sinfo.field_names.len() * 8
+            if size < 8 {
+                size = 8
+            }
+        }
+    }
+
     -- Allocate memory via malloc
-    let val_type = infer_expr_type(g, args[0])
-    let size = estimate_type_size(val_type)
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
     malloc_inst.callee = "malloc"
@@ -546,18 +560,17 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 }
 
 -- Generate a Box_null() call.
--- Returns a null pointer constant.
+-- Returns a null pointer constant via inttoptr(0).
 fn generate_box_null_call(gen: IRGenerator, block: IRBasicBlock) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Emit an alloca with null value (pointer set to 0)
+    -- Emit inttoptr(i64 0) to produce a true null pointer
     let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL())
-    inst.callee = "malloc"
-    let mut margs: List[IRValue] = []
-    margs.push(ir_val_int(0))
-    inst.call_args = margs
+    let mut inst = ir_inst_new(id, OP_CAST())
+    inst.cast_val = ir_val_int(0)
+    inst.cast_from = "i64"
+    inst.cast_to = "ptr"
     inst.result_type = "ptr"
     inst.has_result = true
     b.instructions.push(inst)

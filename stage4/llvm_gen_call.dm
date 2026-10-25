@@ -324,6 +324,24 @@ fn is_runtime_string_fn(fn_name: string) -> bool {
     return false
 }
 
+
+-- ============================================================
+-- SIMD Instruction Handling for LLVM IR Generation
+--
+-- Translates OP_SIMD_* IR instructions to LLVM vector operations.
+-- SIMD types map to LLVM fixed-width vector types:
+--   f32x4 -> <4 x float>, f32x8 -> <8 x float>
+--   f64x2 -> <2 x double>, f64x4 -> <4 x double>
+--   i32x4 -> <4 x i32>,    i32x8 -> <8 x i32>
+--   i64x2 -> <2 x i64>,    i64x4 -> <4 x i64>
+-- ============================================================
+
+-- ============================================================
+-- SIMD TYPE HELPERS
+-- ============================================================
+
+-- Get the LLVM vector type for a SIMD type name
+
 fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
     let mut g = gen
     let b = g.builder

@@ -490,6 +490,17 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
         return ParseExprResult { p: inner.p, expr: e }
     }
 
+    -- Block expression: { stmts... }
+    if tok.kind == TK_LBRACE() {
+        pp = p_advance(pp)
+        let body = parse_block_body(pp)
+        pp = body.p
+        pp = p_expect(pp, TK_RBRACE())
+        let mut e = expr_new(EXPR_BLOCK(), tok.line, tok.col)
+        e.stmts = body.stmts
+        return ParseExprResult { p: pp, expr: e }
+    }
+
     -- Identifier / function call / struct literal / enum literal
     if tok.kind == TK_IDENT() or tok.kind == TK_SELF() {
         return parse_ident_expr(pp)
@@ -541,11 +552,21 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         pp = p_advance(pp)
         let mut args: List[Expr] = []
         if p_peek(p_skip_newlines(pp)) != TK_RPAREN() {
+            -- Skip 'mut' keyword before argument
+            if p_peek(p_skip_newlines(pp)) == TK_MUT() {
+                pp = p_skip_newlines(pp)
+                pp = p_advance(pp)
+            }
             let arg = parse_expr(pp)
             pp = arg.p
             args.push(arg.expr)
             while p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                 pp = p_expect(pp, TK_COMMA())
+                -- Skip 'mut' keyword before argument
+                if p_peek(p_skip_newlines(pp)) == TK_MUT() {
+                    pp = p_skip_newlines(pp)
+                    pp = p_advance(pp)
+                }
                 let next_arg = parse_expr(pp)
                 pp = next_arg.p
                 args.push(next_arg.expr)
@@ -557,7 +578,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         return ParseExprResult { p: pp, expr: e }
     }
 
-    -- Check for struct literal: Name { field: val, ... }
+    -- Check for struct literal: Name { field: val, ... } or Name { field, ... }
     if p_peek(pp) == TK_LBRACE() {
         -- Only treat as struct literal if first char is uppercase
         if len(name) > 0 and char_at(name, 0) >= "A" and char_at(name, 0) <= "Z" {
@@ -569,7 +590,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                 pp = p_skip_newlines(pp)
                 let fname = p_cur(pp).value
                 pp = p_advance(pp)
-                -- Support shorthand: Point { x, y } means Point { x: x, y: y }
+                -- Support both explicit (field: expr) and shorthand (field) syntax
                 if p_peek(pp) == TK_COLON() {
                     pp = p_advance(pp)
                     let fval = parse_expr(pp)
@@ -577,11 +598,9 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                     field_names.push(fname)
                     field_values.push(fval.expr)
                 } else {
-                    -- Shorthand: field name = identifier with same name
+                    -- Shorthand: field name = variable name (Pair { first, second })
                     field_names.push(fname)
-                    let mut shorthand_expr = expr_new(EXPR_IDENTIFIER(), p_cur(pp).line, p_cur(pp).col)
-                    shorthand_expr.name = fname
-                    field_values.push(shorthand_expr)
+                    field_values.push(expr_ident(fname, tok.line, tok.col))
                 }
                 pp = p_skip_newlines(pp)
                 if p_peek(pp) == TK_COMMA() {
@@ -597,8 +616,8 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
         }
     }
 
-    -- Check for enum variant: Name.Variant or Name.Variant(payload)
-    if p_peek(pp) == TK_DOT() {
+    -- Check for enum variant: Name.Variant or Name::Variant
+    if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
         let saved = pp
         pp = p_advance(pp)
         let variant_tok = p_cur(pp)
@@ -971,8 +990,8 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
             return ParsePatternResult { p: pp, pattern: pattern_enum_variant("", name, bindings) }
         }
 
-        if p_peek(pp) == TK_DOT() {
-            -- Qualified enum: EnumName.Variant or EnumName.Variant(bindings)
+        if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
+            -- Qualified enum: EnumName.Variant or EnumName::Variant
             pp = p_advance(pp)
             let variant_tok = p_cur(pp)
             pp = p_advance(pp)
@@ -1332,8 +1351,8 @@ fn parse_source_file(p: Parser) -> SourceFile {
         pp = p_skip_newlines(pp)
         let mut path = p_cur(pp).value
         pp = p_advance(pp)
-        -- Handle dotted paths: import std.io
-        while p_peek(pp) == TK_DOT() {
+        -- Handle dotted paths: import std.io and import foo::bar
+        while p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
             pp = p_advance(pp)
             path = path + "." + p_cur(pp).value
             pp = p_advance(pp)
