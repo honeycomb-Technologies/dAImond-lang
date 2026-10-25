@@ -485,6 +485,24 @@ fn compile(cli: CLIArgs) -> int {
         return 0
     }
 
+    -- A binary needs an entry point
+    let mut has_main = false
+    let mut di = 0
+    while di < sf.declarations.len() {
+        let decl = sf.declarations[di]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.name == "main" {
+                has_main = true
+            }
+        }
+        di = di + 1
+    }
+    if has_main == false {
+        eprintln("Error: no main function found")
+        exit(1)
+    }
+
     -- Phase 5: Generate LLVM IR
     if verbose { println("  [5/6] Generating LLVM IR...") }
 

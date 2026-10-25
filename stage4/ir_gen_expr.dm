@@ -4668,6 +4668,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
     g = gen_advance_label(g)
 
     -- Process each arm as cascading if-else
+    let mut final_block_pushed = false
     let mut arm_idx = 0
     while arm_idx < expr.match_arms.len() {
         let arm = expr.match_arms[arm_idx]
@@ -4765,6 +4766,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                     b.has_terminator = true
                 }
                 g.completed_blocks.push(b)
+                final_block_pushed = true
 
                 -- Wildcard/identifier without guard is the catch-all, break out of loop
                 arm_idx = expr.match_arms.len()
@@ -4849,7 +4851,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
-    g.completed_blocks.push(b)
+    if final_block_pushed == false { g.completed_blocks.push(b) }
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
@@ -4906,6 +4908,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     g = gen_advance_label(g)
 
     -- Process each arm
+    let mut final_block_pushed = false
     let mut arm_idx = 0
     while arm_idx < expr.match_arms.len() {
         let arm = expr.match_arms[arm_idx]
@@ -4961,6 +4964,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 b.has_terminator = true
             }
             g.completed_blocks.push(b)
+            final_block_pushed = true
             arm_idx = expr.match_arms.len()
         } else if pat.kind == PAT_ENUM_VARIANT() {
             -- Find variant tag value from enum definition
@@ -5075,7 +5079,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
-    g.completed_blocks.push(b)
+    if final_block_pushed == false { g.completed_blocks.push(b) }
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
