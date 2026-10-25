@@ -681,6 +681,11 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
         return generate_range_for_loop(g, b, stmt, iter_expr)
     }
 
+    -- Check for string literal iteration (for c in "abc")
+    if iter_expr.kind == EXPR_LITERAL_STRING() {
+        return generate_string_for_loop(g, b, stmt, "")
+    }
+
     -- Check for string iteration (if iter is identifier and tracked as string type)
     if iter_expr.kind == EXPR_IDENTIFIER() {
         let iter_name = iter_expr.name
@@ -707,76 +712,11 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     b = iter_result.block
     let list_ptr = iter_result.val_id
 
-    -- Determine list kind from iterator expression
-    let mut list_kind = LIST_ELEM_INT()
-    let mut list_elem_type_name = ""
-    if iter_expr.kind == EXPR_IDENTIFIER() and g.list_elem_kinds.contains(iter_expr.name) {
-        list_kind = g.list_elem_kinds.get(iter_expr.name)
-        if list_kind == LIST_ELEM_OTHER() and g.list_elem_types.contains(iter_expr.name) {
-            list_elem_type_name = g.list_elem_types.get(iter_expr.name)
-        }
-    } else if iter_expr.kind == EXPR_FIELD_ACCESS() {
-        -- Handle field access iterator: obj.field
-        let fa_obj = *iter_expr.object
-        let mut fa_sname = ""
-        if fa_obj.kind == EXPR_IDENTIFIER() {
-            if g.var_struct_types.contains(fa_obj.name) {
-                fa_sname = g.var_struct_types.get(fa_obj.name)
-            }
-        }
-        if fa_sname == "" {
-            let fa_obj_type = infer_expr_type(g, fa_obj)
-            if g.struct_defs.contains(fa_obj_type) {
-                fa_sname = fa_obj_type
-            }
-        }
-        if fa_sname != "" {
-            let flek = fa_sname + "." + iter_expr.field
-            if g.field_list_elem_kinds.contains(flek) {
-                list_kind = g.field_list_elem_kinds.get(flek)
-                if list_kind == LIST_ELEM_OTHER() and g.field_list_elem_types.contains(flek) {
-                    list_elem_type_name = g.field_list_elem_types.get(flek)
-                }
-            }
-        }
-    } else if iter_expr.kind == EXPR_METHOD_CALL() {
-        -- Handle method call iterator: map.keys(), map.values(), list_returning_method()
-        let mc_obj = *iter_expr.object
-        let mc_method = iter_expr.method
-        -- Check if this is a .keys() or .values() call on a Map
-        if mc_method == "keys" or mc_method == "values" {
-            let mut mk = -1
-            -- Direct map variable: my_map.keys()
-            if mc_obj.kind == EXPR_IDENTIFIER() and g.map_var_kinds.contains(mc_obj.name) {
-                mk = g.map_var_kinds.get(mc_obj.name)
-            }
-            -- Map field access: g.variable_map.keys()
-            if mk == -1 and mc_obj.kind == EXPR_FIELD_ACCESS() {
-                let mc_fa_obj = *mc_obj.object
-                let mc_fa_field = mc_obj.field
-                let mut mc_sname = ""
-                if mc_fa_obj.kind == EXPR_IDENTIFIER() and g.var_struct_types.contains(mc_fa_obj.name) {
-                    mc_sname = g.var_struct_types.get(mc_fa_obj.name)
-                }
-                if len(mc_sname) > 0 {
-                    let mc_key = mc_sname + "." + mc_fa_field
-                    if g.field_map_kinds.contains(mc_key) {
-                        mk = g.field_map_kinds.get(mc_key)
-                    }
-                }
-            }
-            if mk >= 0 {
-                -- MAP_KIND_STRING_INT: keys=string, values=int
-                -- MAP_KIND_INT_STRING: keys=int, values=string
-                if mk == MAP_KIND_STRING_INT() {
-                    if mc_method == "keys" { list_kind = LIST_ELEM_STRING() }
-                    else { list_kind = LIST_ELEM_INT() }
-                } else {
-                    if mc_method == "keys" { list_kind = LIST_ELEM_INT() }
-                    else { list_kind = LIST_ELEM_STRING() }
-                }
-            }
-        }
+    -- Determine list kind from iterator name or default
+    let list_kind = if iter_expr.kind == EXPR_IDENTIFIER() and g.list_elem_kinds.contains(iter_expr.name) {
+        g.list_elem_kinds.get(iter_expr.name)
+    } else {
+        LIST_ELEM_INT()
     }
 
     -- Get list length
@@ -813,13 +753,14 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.builder.next_id = g.builder.next_id + 1
 
     -- Determine element type
-    let mut elem_type = "i64"
-    if list_kind == LIST_ELEM_INT() { elem_type = "i64" }
-    else if list_kind == LIST_ELEM_FLOAT() { elem_type = "f64" }
-    else if list_kind == LIST_ELEM_STRING() { elem_type = "string" }
-    else if list_kind == LIST_ELEM_OTHER() and list_elem_type_name != "" {
-        elem_type = list_elem_type_name
+    let iter_name = if iter_expr.kind == EXPR_IDENTIFIER() { iter_expr.name } else { "" }
+    let elem_type = if list_kind == LIST_ELEM_INT() { "i64" }
+    else if list_kind == LIST_ELEM_FLOAT() { "f64" }
+    else if list_kind == LIST_ELEM_STRING() { "string" }
+    else if list_kind == LIST_ELEM_OTHER() and len(iter_name) > 0 and g.list_elem_types.contains(iter_name) {
+        g.list_elem_types.get(iter_name)
     }
+    else { "i64" }
 
     -- Create element variable
     let elem_alloca_id = g.builder.next_id
@@ -832,13 +773,6 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
 
     g.variable_map.insert(var_name, elem_alloca_id)
     g.variable_types.insert(var_name, elem_type)
-    -- Track struct/enum type for element variable
-    if g.struct_defs.contains(elem_type) {
-        g.var_struct_types.insert(var_name, elem_type)
-    }
-    if g.enum_defs.contains(elem_type) {
-        g.var_enum_types.insert(var_name, elem_type)
-    }
 
     -- Labels
     let header_label = gen_next_label(g, "for_header")
@@ -897,22 +831,47 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let idx_val2_id = g.builder.next_id
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Get element from list (use OP_LIST_GET so LLVM gen handles struct elements)
-    let mut get_inst = ir_inst_new(g.builder.next_id, OP_LIST_GET())
-    get_inst.lhs = ir_val_inst(list_ptr)
-    get_inst.rhs = ir_val_inst(idx_val2_id)
-    get_inst.result_type = elem_type
-    get_inst.has_result = true
-    body_block.instructions.push(get_inst)
-    let elem_val_id = g.builder.next_id
-    g.builder.next_id = g.builder.next_id + 1
+    -- Get element from list
+    if list_kind == LIST_ELEM_OTHER() {
+        -- Generic list: dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
+        let elem_size = estimate_type_size_gen(g, elem_type)
+        let mut get_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+        get_inst.callee = "dm_list_generic_get"
+        let mut get_args: List[IRValue] = []
+        get_args.push(ir_val_inst(elem_alloca_id))
+        get_args.push(ir_val_inst(list_ptr))
+        get_args.push(ir_val_inst(idx_val2_id))
+        get_args.push(ir_val_int(elem_size))
+        get_inst.call_args = get_args
+        get_inst.result_type = "void"
+        get_inst.has_result = false
+        body_block.instructions.push(get_inst)
+        g.builder.next_id = g.builder.next_id + 1
+        -- elem_alloca is already populated by dm_list_generic_get, no store needed
+    } else {
+        let get_fn = if list_kind == LIST_ELEM_INT() { "dm_list_int64_get" }
+        else if list_kind == LIST_ELEM_FLOAT() { "dm_list_double_get" }
+        else { "dm_list_string_get" }
 
-    let mut store_elem = ir_inst_new(g.builder.next_id, OP_STORE())
-    store_elem.store_ptr = ir_val_inst(elem_alloca_id)
-    store_elem.store_val = ir_val_inst(elem_val_id)
-    store_elem.has_result = false
-    body_block.instructions.push(store_elem)
-    g.builder.next_id = g.builder.next_id + 1
+        let mut get_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+        get_inst.callee = get_fn
+        let mut get_args: List[IRValue] = []
+        get_args.push(ir_val_inst(list_ptr))
+        get_args.push(ir_val_inst(idx_val2_id))
+        get_inst.call_args = get_args
+        get_inst.result_type = elem_type
+        get_inst.has_result = true
+        body_block.instructions.push(get_inst)
+        let elem_val_id = g.builder.next_id
+        g.builder.next_id = g.builder.next_id + 1
+
+        let mut store_elem = ir_inst_new(g.builder.next_id, OP_STORE())
+        store_elem.store_ptr = ir_val_inst(elem_alloca_id)
+        store_elem.store_val = ir_val_inst(elem_val_id)
+        store_elem.has_result = false
+        body_block.instructions.push(store_elem)
+        g.builder.next_id = g.builder.next_id + 1
+    }
 
     -- Generate body
     let body_result = generate_block_stmts(g, body_block, stmt.for_body)
@@ -955,6 +914,11 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(header_block)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -1555,7 +1519,13 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             if g.variable_map.contains(target_name) {
                 let ptr = g.variable_map.get(target_name)
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                store_inst.store_ptr = ir_val_inst(ptr)
+                -- For mut params, store through the param pointer (no alloca exists)
+                if g.param_ptr_map.contains(target_name) {
+                    let pidx = g.param_ptr_map.get(target_name)
+                    store_inst.store_ptr = ir_val_param(pidx)
+                } else {
+                    store_inst.store_ptr = ir_val_inst(ptr)
+                }
                 store_inst.store_val = ir_val_inst(val_result.val_id)
                 store_inst.has_result = false
                 b.instructions.push(store_inst)
@@ -1571,9 +1541,17 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     "i64"
                 }
 
+                -- Determine the pointer value for load/store
+                -- For mut params, use the param pointer directly (no alloca exists)
+                let mut ptr_val = ir_val_inst(ptr)
+                if g.param_ptr_map.contains(target_name) {
+                    let pidx = g.param_ptr_map.get(target_name)
+                    ptr_val = ir_val_param(pidx)
+                }
+
                 -- Load current value
                 let mut load_inst = ir_inst_new(g.builder.next_id, OP_LOAD())
-                load_inst.load_ptr = ir_val_inst(ptr)
+                load_inst.load_ptr = ptr_val
                 load_inst.load_type = ty
                 load_inst.result_type = ty
                 load_inst.has_result = true
@@ -1599,7 +1577,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
 
                 -- Store new value
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                store_inst.store_ptr = ir_val_inst(ptr)
+                store_inst.store_ptr = ptr_val
                 store_inst.store_val = ir_val_inst(new_val_id)
                 store_inst.has_result = false
                 b.instructions.push(store_inst)
@@ -1630,9 +1608,18 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     fi = fi + 1
                 }
                 if field_idx >= 0 {
+                    -- Determine the struct pointer source:
+                    -- For mut pointer params (mut self): use param ref directly
+                    -- For regular vars: use the alloca instruction ref
+                    let mut load_ptr_val = ir_val_inst(ptr)
+                    if g.param_ptr_map.contains(obj.name) {
+                        let pidx = g.param_ptr_map.get(obj.name)
+                        load_ptr_val = ir_val_param(pidx)
+                    }
+
                     -- Load current struct value
                     let mut load_inst = ir_inst_new(g.builder.next_id, OP_LOAD())
-                    load_inst.load_ptr = ir_val_inst(ptr)
+                    load_inst.load_ptr = load_ptr_val
                     load_inst.load_type = struct_name
                     load_inst.result_type = struct_name
                     load_inst.has_result = true
@@ -1647,30 +1634,13 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     insert_inst.field_index = field_idx
                     insert_inst.result_type = struct_name
                     insert_inst.has_result = true
-                    -- Set field_type for list/map handling in LLVM gen
-                    if field_idx < info.field_types.len() {
-                        let assign_ftype = info.field_types[field_idx]
-                        if starts_with(assign_ftype, "List[") {
-                            let af_inner = extract_inner_type(assign_ftype, "List[")
-                            let af_ek = classify_list_elem(af_inner)
-                            if af_ek == LIST_ELEM_INT() { insert_inst.field_type = "dm_list_int64" }
-                            else if af_ek == LIST_ELEM_FLOAT() { insert_inst.field_type = "dm_list_double" }
-                            else if af_ek == LIST_ELEM_STRING() { insert_inst.field_type = "dm_list_dm_string" }
-                            else { insert_inst.field_type = "dm_list_generic" }
-                        }
-                        if starts_with(assign_ftype, "Map[") {
-                            let af_minner = extract_inner_type(assign_ftype, "Map[")
-                            if starts_with(af_minner, "string") { insert_inst.field_type = "dm_map_string_int" }
-                            else { insert_inst.field_type = "dm_map_int_string" }
-                        }
-                    }
                     b.instructions.push(insert_inst)
                     let new_struct_id = g.builder.next_id
                     g.builder.next_id = g.builder.next_id + 1
 
-                    -- Store back
+                    -- Store back through the pointer
                     let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                    store_inst.store_ptr = ir_val_inst(ptr)
+                    store_inst.store_ptr = load_ptr_val
                     store_inst.store_val = ir_val_inst(new_struct_id)
                     store_inst.has_result = false
                     b.instructions.push(store_inst)
@@ -1712,3 +1682,10 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
 
     return gen_result(g, b)
 }
+
+
+-- ============================================================
+-- EXPRESSION IR GENERATION
+-- Main dispatcher and all expression kind handlers
+-- Port of stage3/src/ir_gen.zig generateExpr
+-- ============================================================

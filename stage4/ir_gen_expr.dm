@@ -2048,8 +2048,14 @@ fn generate_normal_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
             -- Pass the alloca pointer directly (pass-by-reference) for mut params
             let arg_name = args[i].name
             if g.variable_map.contains(arg_name) {
-                let ptr_id = g.variable_map.get(arg_name)
-                call_args.push(ir_val_inst(ptr_id))
+                -- If the arg is itself a mut param, forward the param pointer
+                if g.param_ptr_map.contains(arg_name) {
+                    let pidx = g.param_ptr_map.get(arg_name)
+                    call_args.push(ir_val_param(pidx))
+                } else {
+                    let ptr_id = g.variable_map.get(arg_name)
+                    call_args.push(ir_val_inst(ptr_id))
+                }
             } else {
                 -- Fallback: evaluate normally
                 let arg_result = generate_expr(g, b, args[i])
@@ -2655,8 +2661,15 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     -- --------------------------------------------------------
     if len(obj_var_name) > 0 and g.list_elem_kinds.contains(obj_var_name) {
         let ek = g.list_elem_kinds.get(obj_var_name)
-        let list_ptr = g.variable_map.get(obj_var_name)
-        return generate_list_method_call(g, b, ek, list_ptr, obj_var_name, method_name, args)
+        let raw_list_ptr = g.variable_map.get(obj_var_name)
+        -- For mut params (negative sentinel), generate expr to get the actual pointer
+        if raw_list_ptr < 0 and g.param_ptr_map.contains(obj_var_name) {
+            let obj_result = generate_expr(g, b, obj_expr)
+            g = obj_result.gen
+            b = obj_result.block
+            return generate_list_method_call(g, b, ek, obj_result.val_id, obj_var_name, method_name, args)
+        }
+        return generate_list_method_call(g, b, ek, raw_list_ptr, obj_var_name, method_name, args)
     }
 
     -- --------------------------------------------------------
@@ -2680,32 +2693,6 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
                 b = obj_result.block
                 let list_ptr = obj_result.val_id
                 return generate_list_method_call(g, b, ek, list_ptr, "", method_name, args)
-            }
-        }
-    }
-
-    -- --------------------------------------------------------
-    -- Map method calls on struct field access (e.g., g.struct_defs.contains(name))
-    -- --------------------------------------------------------
-    if obj_expr.kind == EXPR_FIELD_ACCESS() {
-        let fa_obj = *obj_expr.object
-        let fa_field = obj_expr.field
-        let mut fa_struct_name = ""
-        if fa_obj.kind == EXPR_IDENTIFIER() {
-            if g.var_struct_types.contains(fa_obj.name) {
-                fa_struct_name = g.var_struct_types.get(fa_obj.name)
-            }
-        }
-        if len(fa_struct_name) > 0 {
-            let fa_key = fa_struct_name + "." + fa_field
-            if g.field_map_kinds.contains(fa_key) {
-                let mk = g.field_map_kinds.get(fa_key)
-                -- Generate the field access to get the map pointer
-                let map_result = generate_expr(g, b, obj_expr)
-                g = map_result.gen
-                b = map_result.block
-                let map_ptr = map_result.val_id
-                return generate_map_method_call(g, b, mk, map_ptr, method_name, args)
             }
         }
     }
@@ -3357,15 +3344,185 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
 
     let mangled = struct_type + "_" + method_name
 
-    -- Detect static method call: obj_expr is a type name, not a variable
-    -- e.g., Point.new(x, y) where "Point" is a struct name, not a variable
-    let mut is_static = false
-    if obj_expr.kind == EXPR_IDENTIFIER() {
-        let obj_name = obj_expr.name
-        if g.struct_defs.contains(obj_name) and g.variable_map.contains(obj_name) == false {
-            is_static = true
+    -- --------------------------------------------------------
+    -- GENERIC IMPL METHOD: monomorphize on demand
+    -- --------------------------------------------------------
+    if g.generic_fn_decls.contains(mangled) {
+        let decl_idx = g.generic_fn_decls.get(mangled)
+        if decl_idx >= 0 and decl_idx < g.declarations.len() {
+            let decl = g.declarations[decl_idx]
+            if decl.kind == DECL_FUNCTION() {
+                let fd = *decl.func_decl
+
+                -- Check if this method takes self (first param named "self")
+                let mut has_self = false
+                if fd.params.len() > 0 {
+                    has_self = fd.params[0].name == "self"
+                }
+
+                -- Build the effective argument list for type inference
+                -- If method takes self, include obj_expr; otherwise, just args
+                let mut effective_args: List[Expr] = []
+                if has_self {
+                    effective_args.push(obj_expr)
+                }
+                let mut ai = 0
+                while ai < args.len() {
+                    effective_args.push(args[ai])
+                    ai = ai + 1
+                }
+
+                -- Infer type arguments from effective args
+                let mut type_args: List[string] = []
+                let mut pi = 0
+                while pi < fd.generic_params.len() {
+                    let gp = fd.generic_params[pi]
+                    -- Try to infer this generic param from matching param types
+                    let mut inferred = "i64"
+                    let mut mi = 0
+                    while mi < fd.params.len() and mi < effective_args.len() {
+                        if fd.params[mi].type_name == gp {
+                            inferred = infer_arg_type(g, effective_args[mi])
+                        }
+                        mi = mi + 1
+                    }
+                    type_args.push(inferred)
+                    pi = pi + 1
+                }
+
+                -- Build monomorphized name
+                let mut mono_name = mangled
+                let mut ti = 0
+                while ti < type_args.len() {
+                    mono_name = mono_name + "_" + map_type_name(type_args[ti])
+                    ti = ti + 1
+                }
+
+                -- Monomorphize if not already done
+                if g.mono_generated.contains(mono_name) == false {
+                    g.mono_generated.insert(mono_name, true)
+
+                    -- Save current state
+                    let saved_variable_map = g.variable_map
+                    let saved_variable_types = g.variable_types
+                    let saved_list_elem_kinds = g.list_elem_kinds
+                    let saved_list_elem_types = g.list_elem_types
+                    let saved_return_type = g.current_return_type
+                    let saved_type_subs = g.type_substitutions
+                    let saved_completed_blocks = g.completed_blocks
+                    let saved_next_id = g.builder.next_id
+                    let saved_impl_type = g.current_impl_type
+                    let saved_has_impl = g.has_impl_type
+
+                    g.variable_map = Map_new()
+                    g.variable_types = Map_new()
+
+                    -- Set up type substitutions
+                    g.type_substitutions = Map_new()
+                    let mut si = 0
+                    while si < fd.generic_params.len() and si < type_args.len() {
+                        g.type_substitutions.insert(fd.generic_params[si], type_args[si])
+                        si = si + 1
+                    }
+
+                    -- Set impl type context for Self resolution
+                    g.current_impl_type = struct_type
+                    g.has_impl_type = true
+
+                    -- Create monomorphized FunctionDecl
+                    let mut mono_fd = fd
+                    let empty_gp: List[string] = []
+                    mono_fd.generic_params = empty_gp
+
+                    -- Resolve param types
+                    let mut mono_params: List[FuncParam] = []
+                    let mut mpi = 0
+                    while mpi < fd.params.len() {
+                        let p = fd.params[mpi]
+                        let resolved = resolve_type_substitution(g, p.type_name)
+                        let mut mp = func_param_new(p.name, resolved)
+                        mp.is_mut = p.is_mut
+                        mono_params.push(mp)
+                        mpi = mpi + 1
+                    }
+                    mono_fd.params = mono_params
+
+                    -- Resolve return type
+                    let resolved_ret = resolve_type_substitution(g, fd.return_type)
+                    mono_fd.return_type = resolved_ret
+
+                    -- Also register the monomorphized struct type if needed
+                    -- e.g., Pair[A,B] with A=int, B=string → register Pair_i64_string struct
+                    let mono_struct = struct_type + "_" + join_types(type_args)
+                    if g.struct_defs.contains(struct_type) and g.struct_defs.contains(mono_struct) == false {
+                        let base_info = g.struct_defs.get(struct_type)
+                        let mut mono_info = struct_info_new(mono_struct)
+                        let mut mono_fields: List[IRField] = []
+                        let mut fi = 0
+                        while fi < base_info.field_names.len() {
+                            let fname = base_info.field_names[fi]
+                            let ftype = resolve_type_substitution(g, base_info.field_types[fi])
+                            mono_info.field_names.push(fname)
+                            mono_info.field_types.push(map_type_name(ftype))
+                            mono_fields.push(ir_field_new(fname, map_type_name(ftype)))
+                            fi = fi + 1
+                        }
+                        g.struct_defs.insert(mono_struct, mono_info)
+                        let mut ir_ty = ir_type_named(IR_TYPE_STRUCT(), mono_struct)
+                        ir_ty.fields = mono_fields
+                        g.ir_mod.struct_defs.insert(mono_struct, ir_ty)
+                    }
+
+                    -- Map the base struct name to monomorphized name for struct literals
+                    g.type_substitutions.insert(struct_type, mono_struct)
+
+                    g = declare_function(g, mono_fd, mono_name)
+                    g = generate_function_body(g, mono_fd, mono_name)
+
+                    -- Restore state
+                    g.variable_map = saved_variable_map
+                    g.variable_types = saved_variable_types
+                    g.list_elem_kinds = saved_list_elem_kinds
+                    g.list_elem_types = saved_list_elem_types
+                    g.current_return_type = saved_return_type
+                    g.type_substitutions = saved_type_subs
+                    g.completed_blocks = saved_completed_blocks
+                    g.builder.next_id = saved_next_id
+                    g.current_impl_type = saved_impl_type
+                    g.has_impl_type = saved_has_impl
+                }
+
+                -- Generate the call to monomorphized function
+                let mut call_args: List[IRValue] = []
+                let mut ci = 0
+                while ci < effective_args.len() {
+                    let arg_result = generate_expr(g, b, effective_args[ci])
+                    g = arg_result.gen
+                    b = arg_result.block
+                    call_args.push(ir_val_inst(arg_result.val_id))
+                    ci = ci + 1
+                }
+
+                let ret_type = infer_call_return_type(g, mono_name)
+                let has_result = ret_type != "void"
+
+                let id = g.builder.next_id
+                let mut call_inst = ir_inst_new(id, OP_CALL())
+                call_inst.callee = mono_name
+                call_inst.call_args = call_args
+                call_inst.result_type = ret_type
+                call_inst.has_result = has_result
+                b.instructions.push(call_inst)
+                g.builder.next_id = g.builder.next_id + 1
+
+                return expr_result(g, b, id)
+            }
         }
     }
+
+    -- --------------------------------------------------------
+    -- NON-GENERIC IMPL METHOD: direct call
+    -- --------------------------------------------------------
 
     -- Check if this method takes a mut self parameter (pass-by-pointer)
     let mut takes_mut_self = false
@@ -3376,27 +3533,30 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
 
     let mut call_args: List[IRValue] = []
 
-    -- Only pass self for instance methods
-    if is_static == false {
-        if takes_mut_self and obj_expr.kind == EXPR_IDENTIFIER() {
-            -- Pass the alloca pointer directly for mut self
-            let obj_name = obj_expr.name
-            if g.variable_map.contains(obj_name) {
+    if takes_mut_self and obj_expr.kind == EXPR_IDENTIFIER() {
+        -- Pass the alloca pointer directly for mut self
+        let obj_name = obj_expr.name
+        if g.variable_map.contains(obj_name) {
+            -- If the object is itself a mut param, forward the param pointer
+            if g.param_ptr_map.contains(obj_name) {
+                let pidx = g.param_ptr_map.get(obj_name)
+                call_args.push(ir_val_param(pidx))
+            } else {
                 let ptr_id = g.variable_map.get(obj_name)
                 call_args.push(ir_val_inst(ptr_id))
-            } else {
-                let obj_result = generate_expr(g, b, obj_expr)
-                g = obj_result.gen
-                b = obj_result.block
-                call_args.push(ir_val_inst(obj_result.val_id))
             }
         } else {
-            -- Pass the object value (self by value)
             let obj_result = generate_expr(g, b, obj_expr)
             g = obj_result.gen
             b = obj_result.block
             call_args.push(ir_val_inst(obj_result.val_id))
         }
+    } else {
+        -- Pass the object value (self by value)
+        let obj_result = generate_expr(g, b, obj_expr)
+        g = obj_result.gen
+        b = obj_result.block
+        call_args.push(ir_val_inst(obj_result.val_id))
     }
 
     -- Generate remaining arguments

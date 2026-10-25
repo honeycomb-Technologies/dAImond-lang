@@ -402,7 +402,7 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     let mut g = gen
 
     let ret_type = if len(fd.return_type) > 0 {
-        parse_type_to_ir(fd.return_type)
+        map_type_name(fd.return_type)
     } else {
         "void"
     }
@@ -416,12 +416,29 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        let mut ptype_str = p.type_name
-        -- Resolve bare "self" parameter type from the current impl block
-        if pname == "self" and (len(ptype_str) == 0 or ptype_str == "self" or ptype_str == "Self") and g.has_impl_type {
-            ptype_str = g.current_impl_type
+        -- Resolve "Self" to current impl type
+        let mut ptype_str = if p.type_name == "Self" and g.has_impl_type {
+            g.current_impl_type
+        } else {
+            p.type_name
         }
-        let ptype = parse_type_to_ir(ptype_str)
+        -- Resolve dyn Trait to concrete implementor type
+        if starts_with(ptype_str, "dyn ") {
+            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
+            let impl_keys = g.trait_impl_methods.keys()
+            let mut ki = 0
+            while ki < impl_keys.len() {
+                let impl_key = impl_keys[ki]
+                if ends_with(impl_key, ":" + dyn_trait) {
+                    let colon_pos = string_find(impl_key, ":")
+                    if colon_pos > 0 {
+                        ptype_str = substr(impl_key, 0, colon_pos)
+                    }
+                }
+                ki = ki + 1
+            }
+        }
+        let ptype = map_type_name(ptype_str)
 
         let actual_type = if p.is_mut {
             "ptr"
@@ -483,15 +500,17 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
 
     -- Set current return type
     let ret_type = if len(fd.return_type) > 0 {
-        parse_type_to_ir(fd.return_type)
+        map_type_name(fd.return_type)
     } else {
         "void"
     }
     g.current_return_type = ret_type
 
-    -- Reset variable maps and completed blocks for this function
+    -- Reset variable maps for this function
     g.variable_map = Map_new()
     g.variable_types = Map_new()
+    g.mut_ptr_vars = Map_new()
+    g.param_ptr_map = Map_new()
     let empty_blocks: List[IRBasicBlock] = []
     g.completed_blocks = empty_blocks
 
@@ -504,32 +523,38 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        let mut ptype_str = p.type_name
-        -- Resolve bare "self" parameter type from the current impl block
-        if pname == "self" and (len(ptype_str) == 0 or ptype_str == "self" or ptype_str == "Self") and g.has_impl_type {
-            ptype_str = g.current_impl_type
+        -- Resolve "Self" to current impl type
+        let mut ptype_str = if p.type_name == "Self" and g.has_impl_type {
+            g.current_impl_type
+        } else {
+            p.type_name
         }
-        let ptype = parse_type_to_ir(ptype_str)
+        -- Resolve dyn Trait to concrete implementor type
+        if starts_with(ptype_str, "dyn ") {
+            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
+            let impl_keys = g.trait_impl_methods.keys()
+            let mut ki = 0
+            while ki < impl_keys.len() {
+                let impl_key = impl_keys[ki]
+                if ends_with(impl_key, ":" + dyn_trait) {
+                    let colon_pos = string_find(impl_key, ":")
+                    if colon_pos > 0 {
+                        ptype_str = substr(impl_key, 0, colon_pos)
+                    }
+                }
+                ki = ki + 1
+            }
+        }
+        let ptype = map_type_name(ptype_str)
 
         if p.is_mut {
-            -- Mut param: alloca + store from param ref (pointer semantics)
-            let alloca_id = g.builder.next_id
-            let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
-            alloca_inst.alloc_type = ptype
-            alloca_inst.result_type = "ptr(" + ptype + ")"
-            alloca_inst.has_result = true
-            blk.instructions.push(alloca_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_inst.store_ptr = ir_val_inst(alloca_id)
-            store_inst.store_val = ir_val_param(i)
-            store_inst.has_result = false
-            blk.instructions.push(store_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(pname, alloca_id)
+            -- Mut param: the caller passes a POINTER to the struct.
+            -- Do NOT create an alloca — use the param ref directly as a pointer.
+            -- Loads/stores go through the caller's memory, so mutations are visible.
+            g.variable_map.insert(pname, -(i + 1))
             g.variable_types.insert(pname, ptype)
+            g.mut_ptr_vars.insert(pname, true)
+            g.param_ptr_map.insert(pname, i)
         } else {
             -- Regular param: alloca + store
             let alloca_id = g.builder.next_id
@@ -551,6 +576,35 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             g.variable_types.insert(pname, ptype)
         }
 
+        -- Track dyn Trait parameters: resolve to concrete implementor
+        if starts_with(ptype_str, "dyn ") {
+            let dyn_trait_name = substr(ptype_str, 4, len(ptype_str) - 4)
+            -- Find a concrete type that implements this trait
+            let mut concrete_found = ""
+            let impl_keys = g.trait_impl_methods.keys()
+            let mut ki = 0
+            while ki < impl_keys.len() {
+                let impl_key = impl_keys[ki]
+                if ends_with(impl_key, ":" + dyn_trait_name) {
+                    let colon_pos = string_find(impl_key, ":")
+                    if colon_pos > 0 {
+                        concrete_found = substr(impl_key, 0, colon_pos)
+                    }
+                }
+                ki = ki + 1
+            }
+            if len(concrete_found) > 0 {
+                g.dyn_var_concrete.insert(pname, concrete_found)
+                g.dyn_var_traits.insert(pname, dyn_trait_name)
+                g.var_struct_types.insert(pname, concrete_found)
+            }
+        }
+
+        -- Track function-pointer-typed parameters for indirect calls
+        if starts_with(ptype_str, "fn(") {
+            g.variable_types.insert(pname, ptype_str)
+        }
+
         -- Track struct/enum/list/box typed parameters
         if g.struct_defs.contains(ptype_str) {
             g.var_struct_types.insert(pname, ptype_str)
@@ -569,10 +623,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         if starts_with(ptype_str, "Box[") {
             let inner = extract_inner_type(ptype_str, "Box[")
             g.box_inner_types.insert(pname, inner)
-        }
-        -- Track Map/List/Result/Option type annotations for parameters
-        if starts_with(ptype_str, "Map[") or starts_with(ptype_str, "List[") or starts_with(ptype_str, "Result[") or starts_with(ptype_str, "Option[") {
-            g.var_type_annotations.insert(pname, ptype_str)
         }
 
         i = i + 1
@@ -602,15 +652,25 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         }
     }
 
-    -- Add blocks to function
+    -- Add blocks to function in correct order (entry block must be first)
     let mut func = g.ir_mod.functions[func_idx]
-    -- First push all completed blocks (terminated blocks from control flow)
+    -- Find and push the entry block first
     i = 0
     while i < g.completed_blocks.len() {
-        func.blocks.push(g.completed_blocks[i])
+        if g.completed_blocks[i].label == "entry" {
+            func.blocks.push(g.completed_blocks[i])
+        }
         i = i + 1
     }
-    -- Then push the final block
+    -- Push remaining completed blocks (non-entry)
+    i = 0
+    while i < g.completed_blocks.len() {
+        if g.completed_blocks[i].label != "entry" {
+            func.blocks.push(g.completed_blocks[i])
+        }
+        i = i + 1
+    }
+    -- Then push the final block (if it's the entry and no blocks, push it; otherwise push as last)
     func.blocks.push(blk)
     g.ir_mod.functions[func_idx] = func
 

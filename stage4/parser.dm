@@ -248,11 +248,21 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
                     pp = p_advance(pp)
                     let mut args: List[Expr] = []
                     if p_peek(p_skip_newlines(pp)) != TK_RPAREN() {
+                        -- Skip 'mut' keyword before argument
+                        if p_peek(p_skip_newlines(pp)) == TK_MUT() {
+                            pp = p_skip_newlines(pp)
+                            pp = p_advance(pp)
+                        }
                         let arg = parse_expr(pp)
                         pp = arg.p
                         args.push(arg.expr)
                         while p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                             pp = p_expect(pp, TK_COMMA())
+                            -- Skip 'mut' keyword before argument
+                            if p_peek(p_skip_newlines(pp)) == TK_MUT() {
+                                pp = p_skip_newlines(pp)
+                                pp = p_advance(pp)
+                            }
                             let next_arg = parse_expr(pp)
                             pp = next_arg.p
                             args.push(next_arg.expr)
@@ -303,8 +313,19 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             let op_tok = p_cur(pp)
             let op_kind = p_peek(pp)
 
+            -- Range operator (.. and ..=)
+            if op_kind == TK_DOTDOT() or op_kind == TK_DOTDOTEQ() {
+                let range_op = if op_kind == TK_DOTDOTEQ() { BINOP_LE() } else { BINOP_LT() }
+                pp = p_advance(pp)
+                let right_result = parse_expr_pratt(pp, prec + 1)
+                pp = right_result.p
+                let mut e = expr_new(EXPR_RANGE(), op_tok.line, op_tok.col)
+                e.left = Box_new(left)
+                e.right = Box_new(right_result.expr)
+                e.op = range_op
+                left = e
             -- Pipeline operator
-            if op_kind == TK_PIPEGT() {
+            } else if op_kind == TK_PIPEGT() {
                 pp = p_advance(pp)
                 let right_result = parse_expr_pratt(pp, prec + 1)
                 pp = right_result.p
@@ -1412,7 +1433,9 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
             if p_peek(p_skip_newlines(next_pp)) == TK_SELF() {
                 is_mut = true
                 pp = p_skip_newlines(next_pp)
-                fd.params.push(func_param_new("self", "Self"))
+                let mut self_param = func_param_new("self", "Self")
+                self_param.is_mut = true
+                fd.params.push(self_param)
                 pp = p_advance(pp)
                 if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                     pp = p_advance(pp)
@@ -1424,8 +1447,18 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
             pp = next_pp
         }
         if p_peek(pp) == TK_SELF() {
-            fd.params.push(func_param_new("self", "Self"))
             pp = p_advance(pp)
+            -- Check if self has explicit type annotation: self: Type
+            let mut self_type = "Self"
+            if p_peek(pp) == TK_COLON() {
+                pp = p_expect(pp, TK_COLON())
+                let st = parse_type(pp)
+                pp = st.p
+                self_type = st.type_name
+            }
+            let mut self_param = func_param_new("self", self_type)
+            self_param.is_mut = is_mut
+            fd.params.push(self_param)
             if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
                 pp = p_advance(pp)
             }
@@ -1472,6 +1505,15 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
             }
         }
         pp = p_expect(pp, TK_RBRACKET())
+    }
+
+    -- Return type may also come AFTER effects: fn foo() with [...] -> T
+    if p_peek(p_skip_newlines(pp)) == TK_ARROW() {
+        pp = p_skip_newlines(pp)
+        pp = p_advance(pp)
+        let rty2 = parse_type(pp)
+        pp = rty2.p
+        fd.return_type = rty2.type_name
     }
 
     -- Body
@@ -1665,11 +1707,24 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
     pp = p_advance(pp) -- skip 'impl'
     pp = p_skip_newlines(pp)
 
-    -- Parse: impl Type { ... } or impl Trait for Type { ... }
+    -- Parse: impl Type { ... } or impl Type[A, B] { ... }
+    --    or impl Trait for Type { ... }
     let first_name = p_cur(pp).value
     pp = p_advance(pp)
 
     let mut ib = impl_block_new(first_name, tok.line, tok.col)
+
+    -- Parse optional generic params [A, B] after the type name
+    if p_peek(pp) == TK_LBRACKET() {
+        pp = p_advance(pp)
+        while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            pp = p_skip_newlines(pp)
+            ib.generic_params.push(p_cur(pp).value)
+            pp = p_advance(pp)
+            if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
+        }
+        pp = p_expect(pp, TK_RBRACKET())
+    }
 
     pp = p_skip_newlines(pp)
     if p_peek(pp) == TK_FOR() {
@@ -1680,6 +1735,17 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
         pp = p_advance(pp)
         ib.trait_name = first_name
         ib.target_type = target_name
+        -- Parse optional generic params on the target type too
+        if p_peek(pp) == TK_LBRACKET() {
+            pp = p_advance(pp)
+            while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+                pp = p_skip_newlines(pp)
+                ib.generic_params.push(p_cur(pp).value)
+                pp = p_advance(pp)
+                if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
+            }
+            pp = p_expect(pp, TK_RBRACKET())
+        }
     }
 
     pp = p_expect(pp, TK_LBRACE())
