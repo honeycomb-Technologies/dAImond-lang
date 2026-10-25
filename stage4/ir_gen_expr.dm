@@ -394,6 +394,21 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
             "i64"
         }
 
+        -- For mut pointer vars (mut self): load struct through the param pointer.
+        -- The param IS a pointer to the struct (no alloca was created).
+        if g.param_ptr_map.contains(name) {
+            let param_idx = g.param_ptr_map.get(name)
+            let load_id = g.builder.next_id
+            let mut load_struct = ir_inst_new(load_id, OP_LOAD())
+            load_struct.load_ptr = ir_val_param(param_idx)
+            load_struct.load_type = var_type
+            load_struct.result_type = var_type
+            load_struct.has_result = true
+            b.instructions.push(load_struct)
+            g.builder.next_id = g.builder.next_id + 1
+            return expr_result(g, b, load_id)
+        }
+
         let load_id = g.builder.next_id
         let mut load = ir_inst_new(load_id, OP_LOAD())
         load.load_ptr = ir_val_inst(alloca_id)
@@ -403,6 +418,147 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         b.instructions.push(load)
         g.builder.next_id = g.builder.next_id + 1
         return expr_result(g, b, load_id)
+    }
+
+    -- Check for global constants (const SIZE = 4096, etc.)
+    let mut gi = 0
+    while gi < g.ir_mod.globals.len() {
+        let glob = g.ir_mod.globals[gi]
+        if glob.name == name and glob.has_init {
+            let init = glob.init_value
+            if init.kind == VAL_CONST_INT() {
+                let id = g.builder.next_id
+                let mut ai = ir_inst_new(id, OP_ALLOCA())
+                ai.alloc_type = "i64"
+                ai.result_type = "ptr(i64)"
+                ai.has_result = true
+                b.instructions.push(ai)
+                let sid = id + 1
+                let mut si = ir_inst_new(sid, OP_STORE())
+                si.store_ptr = ir_val_inst(id)
+                si.store_val = ir_val_int(init.int_val)
+                si.has_result = false
+                b.instructions.push(si)
+                g.builder.next_id = sid + 1
+                let lid = g.builder.next_id
+                let mut li = ir_inst_new(lid, OP_LOAD())
+                li.load_ptr = ir_val_inst(id)
+                li.load_type = "i64"
+                li.result_type = "i64"
+                li.has_result = true
+                b.instructions.push(li)
+                g.builder.next_id = lid + 1
+                return expr_result(g, b, lid)
+            }
+            if init.kind == VAL_CONST_FLOAT() {
+                let id = g.builder.next_id
+                let mut ai = ir_inst_new(id, OP_ALLOCA())
+                ai.alloc_type = "f64"
+                ai.result_type = "ptr(f64)"
+                ai.has_result = true
+                b.instructions.push(ai)
+                let sid = id + 1
+                let mut si = ir_inst_new(sid, OP_STORE())
+                si.store_ptr = ir_val_inst(id)
+                si.store_val = ir_val_float(init.float_val)
+                si.has_result = false
+                b.instructions.push(si)
+                g.builder.next_id = sid + 1
+                let lid = g.builder.next_id
+                let mut li = ir_inst_new(lid, OP_LOAD())
+                li.load_ptr = ir_val_inst(id)
+                li.load_type = "f64"
+                li.result_type = "f64"
+                li.has_result = true
+                b.instructions.push(li)
+                g.builder.next_id = lid + 1
+                return expr_result(g, b, lid)
+            }
+            if init.kind == VAL_CONST_BOOL() {
+                let id = g.builder.next_id
+                let mut ai = ir_inst_new(id, OP_ALLOCA())
+                ai.alloc_type = "bool"
+                ai.result_type = "ptr(bool)"
+                ai.has_result = true
+                b.instructions.push(ai)
+                let sid = id + 1
+                let mut si = ir_inst_new(sid, OP_STORE())
+                si.store_ptr = ir_val_inst(id)
+                si.store_val = ir_val_bool(init.bool_val)
+                si.has_result = false
+                b.instructions.push(si)
+                g.builder.next_id = sid + 1
+                let lid = g.builder.next_id
+                let mut li = ir_inst_new(lid, OP_LOAD())
+                li.load_ptr = ir_val_inst(id)
+                li.load_type = "bool"
+                li.result_type = "bool"
+                li.has_result = true
+                b.instructions.push(li)
+                g.builder.next_id = lid + 1
+                return expr_result(g, b, lid)
+            }
+            if init.kind == VAL_CONST_STRING() {
+                let id = g.builder.next_id
+                let mut ai = ir_inst_new(id, OP_ALLOCA())
+                ai.alloc_type = "string"
+                ai.result_type = "ptr(string)"
+                ai.has_result = true
+                b.instructions.push(ai)
+                let sid = id + 1
+                let mut si = ir_inst_new(sid, OP_STORE())
+                si.store_ptr = ir_val_inst(id)
+                si.store_val = ir_val_string(init.str_val)
+                si.has_result = false
+                b.instructions.push(si)
+                g.builder.next_id = sid + 1
+                let lid = g.builder.next_id
+                let mut li = ir_inst_new(lid, OP_LOAD())
+                li.load_ptr = ir_val_inst(id)
+                li.load_type = "string"
+                li.result_type = "string"
+                li.has_result = true
+                b.instructions.push(li)
+                g.builder.next_id = lid + 1
+                return expr_result(g, b, lid)
+            }
+        }
+        gi = gi + 1
+    }
+
+    -- Check if the identifier is a known function name (function pointer reference)
+    let mut fi = 0
+    while fi < g.ir_mod.functions.len() {
+        let func = g.ir_mod.functions[fi]
+        if func.name == name {
+            -- Return a global reference to the function
+            let ref_id = g.builder.next_id
+            let mut ref_inst = ir_inst_new(ref_id, OP_ALLOCA())
+            ref_inst.alloc_type = "ptr"
+            ref_inst.result_type = "ptr(ptr)"
+            ref_inst.has_result = true
+            b.instructions.push(ref_inst)
+            g.builder.next_id = g.builder.next_id + 1
+
+            let mut store_ref = ir_inst_new(g.builder.next_id, OP_STORE())
+            store_ref.store_ptr = ir_val_inst(ref_id)
+            store_ref.store_val = ir_val_global(name)
+            store_ref.has_result = false
+            b.instructions.push(store_ref)
+            g.builder.next_id = g.builder.next_id + 1
+
+            let load_id = g.builder.next_id
+            let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+            load_inst.load_ptr = ir_val_inst(ref_id)
+            load_inst.load_type = "ptr"
+            load_inst.result_type = "ptr"
+            load_inst.has_result = true
+            b.instructions.push(load_inst)
+            g.builder.next_id = g.builder.next_id + 1
+
+            return expr_result(g, b, load_id)
+        }
+        fi = fi + 1
     }
 
     -- Unknown identifier - return undef
@@ -887,6 +1043,75 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     }
 
     -- --------------------------------------------------------
+    -- OPERATOR OVERLOADING: check if left operand is a struct
+    -- with an impl method for this operator
+    -- --------------------------------------------------------
+    let mut overload_method = ""
+    if op == BINOP_ADD() { overload_method = "add" }
+    if op == BINOP_SUB() { overload_method = "sub" }
+    if op == BINOP_MUL() { overload_method = "mul" }
+    if op == BINOP_DIV() { overload_method = "div" }
+    if op == BINOP_EQ() { overload_method = "eq" }
+    if op == BINOP_NE() { overload_method = "ne" }
+    if op == BINOP_LT() { overload_method = "lt" }
+    if op == BINOP_GT() { overload_method = "gt" }
+    if op == BINOP_LE() { overload_method = "le" }
+    if op == BINOP_GE() { overload_method = "ge" }
+
+    if len(overload_method) > 0 {
+        let left_expr = *expr.left
+        let mut left_struct_name = ""
+        if left_expr.kind == EXPR_IDENTIFIER() {
+            if g.var_struct_types.contains(left_expr.name) {
+                left_struct_name = g.var_struct_types.get(left_expr.name)
+            }
+        }
+        if left_struct_name == "" and left_expr.kind == EXPR_IDENTIFIER() {
+            let ltype = infer_expr_type(g, left_expr)
+            if g.struct_defs.contains(ltype) {
+                left_struct_name = ltype
+            }
+        }
+
+        if len(left_struct_name) > 0 {
+            let mangled = left_struct_name + "_" + overload_method
+            -- Check if method exists (declared or generic)
+            let mut method_exists = false
+            let mut fci = 0
+            while fci < g.ir_mod.functions.len() {
+                if g.ir_mod.functions[fci].name == mangled {
+                    method_exists = true
+                }
+                fci = fci + 1
+            }
+            if method_exists == false and g.generic_fn_decls.contains(mangled) {
+                method_exists = true
+            }
+            -- Also check pending declarations
+            if method_exists == false {
+                let mut dci = 0
+                while dci < g.declarations.len() {
+                    let decl = g.declarations[dci]
+                    if decl.kind == DECL_FUNCTION() {
+                        let fd = *decl.func_decl
+                        if fd.name == mangled {
+                            method_exists = true
+                        }
+                    }
+                    dci = dci + 1
+                }
+            }
+
+            if method_exists {
+                -- Call the overloaded operator method: struct_method(left, right)
+                let mut op_args: List[Expr] = []
+                op_args.push(*expr.right)
+                return generate_struct_method_call(g, b, left_struct_name, left_expr, overload_method, op_args)
+            }
+        }
+    }
+
+    -- --------------------------------------------------------
     -- EAGER BINARY OPERATORS (arithmetic, comparison, string)
     -- Evaluate both operands first, then emit the operation
     -- --------------------------------------------------------
@@ -1146,6 +1371,63 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     -- --------------------------------------------------------
     -- COMPARISON OPERATORS (==, !=, <, <=, >, >=)
     -- --------------------------------------------------------
+
+    -- Check if this is an enum comparison (need to extract tags first)
+    let mut is_enum_cmp = false
+    let left_expr = *expr.left
+    if left_expr.kind == EXPR_IDENTIFIER() {
+        if g.var_enum_types.contains(left_expr.name) {
+            is_enum_cmp = true
+        }
+    }
+    if left_expr.kind == EXPR_ENUM_LITERAL() {
+        is_enum_cmp = true
+    }
+    -- Also check right side for enum literal like Color.Red
+    let right_expr = *expr.right
+    if right_expr.kind == EXPR_ENUM_LITERAL() {
+        is_enum_cmp = true
+    }
+    if right_expr.kind == EXPR_IDENTIFIER() {
+        if g.var_enum_types.contains(right_expr.name) {
+            is_enum_cmp = true
+        }
+    }
+
+    if is_enum_cmp and (op == BINOP_EQ() or op == BINOP_NE()) {
+        -- Extract tag (field 0) from both enum values
+        let lhs_tag_id = g.builder.next_id
+        let mut lhs_tag = ir_inst_new(lhs_tag_id, OP_EXTRACT_FIELD())
+        lhs_tag.field_base = ir_val_inst(lhs_id)
+        lhs_tag.field_index = 0
+        lhs_tag.field_type = "i32"
+        lhs_tag.result_type = "i32"
+        lhs_tag.has_result = true
+        b.instructions.push(lhs_tag)
+        g.builder.next_id = g.builder.next_id + 1
+
+        let rhs_tag_id = g.builder.next_id
+        let mut rhs_tag = ir_inst_new(rhs_tag_id, OP_EXTRACT_FIELD())
+        rhs_tag.field_base = ir_val_inst(rhs_id)
+        rhs_tag.field_index = 0
+        rhs_tag.field_type = "i32"
+        rhs_tag.result_type = "i32"
+        rhs_tag.has_result = true
+        b.instructions.push(rhs_tag)
+        g.builder.next_id = g.builder.next_id + 1
+
+        let cmp_op = if op == BINOP_EQ() { OP_EQ() } else { OP_NE() }
+        let cmp_id = g.builder.next_id
+        let mut cmp_inst = ir_inst_new(cmp_id, cmp_op)
+        cmp_inst.lhs = ir_val_inst(lhs_tag_id)
+        cmp_inst.rhs = ir_val_inst(rhs_tag_id)
+        cmp_inst.result_type = "bool"
+        cmp_inst.has_result = true
+        b.instructions.push(cmp_inst)
+        g.builder.next_id = cmp_id + 1
+        return expr_result(g, b, cmp_id)
+    }
+
     if op == BINOP_EQ() {
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_EQ())
@@ -1527,6 +1809,14 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return generate_lambda_indirect_call(g, b, fn_name, expr.args)
     }
 
+    -- Indirect call via function-pointer-typed parameter: f: fn(int) -> int
+    if g.variable_types.contains(fn_name) {
+        let vtype = g.variable_types.get(fn_name)
+        if starts_with(vtype, "fn(") {
+            return generate_fn_ptr_param_call(g, b, fn_name, vtype, expr.args)
+        }
+    }
+
     -- len() on a list variable: dispatch to typed list_len runtime function
     if fn_name == "len" and expr.args.len() > 0 {
         let first_arg = expr.args[0]
@@ -1559,6 +1849,12 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     -- Builtin function (println, len, int_to_string, etc.)
     if is_builtin_fn(fn_name) {
         return generate_builtin_call(g, b, fn_name, expr.args)
+    }
+
+    -- Check if function is defined
+    if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false {
+        eprintln("Error: undefined function '" + fn_name + "'")
+        exit(1)
     }
 
     -- --------------------------------------------------------
@@ -1977,6 +2273,8 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     let saved_list_elem_types = g.list_elem_types
                     let saved_return_type = g.current_return_type
                     let saved_type_subs = g.type_substitutions
+                    let saved_completed_blocks = g.completed_blocks
+                    let saved_next_id = g.builder.next_id
 
                     -- Set up fresh maps for the monomorphized function
                     g.variable_map = Map_new()
@@ -2022,6 +2320,8 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     g.list_elem_types = saved_list_elem_types
                     g.current_return_type = saved_return_type
                     g.type_substitutions = saved_type_subs
+                    g.completed_blocks = saved_completed_blocks
+                    g.builder.next_id = saved_next_id
                 }
             }
         }
@@ -2059,6 +2359,8 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
 -- the current type_substitutions map.
 -- ============================================================
 
+-- Helper: join type names with "_" for mangled names
+
 fn resolve_type_substitution(gen: IRGenerator, type_name: string) -> string {
     -- Direct substitution
     if gen.type_substitutions.contains(type_name) {
@@ -2091,6 +2393,26 @@ fn resolve_type_substitution(gen: IRGenerator, type_name: string) -> string {
             let resolved_ok = resolve_type_substitution(gen, ok_type)
             let resolved_err = resolve_type_substitution(gen, err_type)
             return "Result[" + resolved_ok + ", " + resolved_err + "]"
+        }
+    }
+
+    -- Handle arbitrary user-defined generic types: Pair[A, B] etc.
+    -- Look for Name[...] pattern where Name is not a known builtin container
+    let bracket_idx = string_find(type_name, "[")
+    if bracket_idx > 0 {
+        let base = substr(type_name, 0, bracket_idx)
+        let inner = substr(type_name, bracket_idx + 1, len(type_name) - bracket_idx - 2)
+        -- Resolve each comma-separated type arg
+        let comma_idx = string_find(inner, ", ")
+        if comma_idx >= 0 {
+            let first_type = substr(inner, 0, comma_idx)
+            let second_type = substr(inner, comma_idx + 2, len(inner) - comma_idx - 2)
+            let resolved_first = resolve_type_substitution(gen, first_type)
+            let resolved_second = resolve_type_substitution(gen, second_type)
+            return base + "_" + map_type_name(resolved_first) + "_" + map_type_name(resolved_second)
+        } else {
+            let resolved_inner = resolve_type_substitution(gen, inner)
+            return base + "_" + map_type_name(resolved_inner)
         }
     }
 
@@ -4528,6 +4850,11 @@ fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
     g = stmts_result.gen
     b = stmts_result.block
 
+    -- If the block already has a terminator (e.g., from a return statement), just return
+    if b.has_terminator {
+        return expr_result(g, b, g.builder.next_id - 1)
+    }
+
     -- If the block has a result expression, generate it and return its value
     if expr.has_result {
         let result = generate_expr(g, b, *expr.result)
@@ -5233,4 +5560,87 @@ fn generate_comptime_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     g.builder.next_id = g.builder.next_id + 1
 
     return expr_result(g, b, load_id)
+}
+
+fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, var_type: string, args: List[Expr]) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+
+    -- Load the function pointer value from the parameter's alloca
+    let alloca_id = g.variable_map.get(var_name)
+    let load_id = g.builder.next_id
+    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+    load_inst.load_ptr = ir_val_inst(alloca_id)
+    load_inst.load_type = "ptr"
+    load_inst.result_type = "ptr"
+    load_inst.has_result = true
+    b.instructions.push(load_inst)
+    g.builder.next_id = g.builder.next_id + 1
+
+    -- Generate arguments
+    let mut call_args: List[IRValue] = []
+    let mut i = 0
+    while i < args.len() {
+        let arg_result = generate_expr(g, b, args[i])
+        g = arg_result.gen
+        b = arg_result.block
+        call_args.push(ir_val_inst(arg_result.val_id))
+        i = i + 1
+    }
+
+    -- Parse return type from "fn(int, int) -> int"
+    let arrow_pos = string_find(var_type, " -> ")
+    let ret_type_str = if arrow_pos >= 0 {
+        substr(var_type, arrow_pos + 4, len(var_type) - arrow_pos - 4)
+    } else {
+        "void"
+    }
+    let ret_type = map_type_name(ret_type_str)
+    let has_result = ret_type != "void"
+
+    -- Emit OP_CALL_PTR instruction
+    let id = g.builder.next_id
+    let mut inst = ir_inst_new(id, OP_CALL_PTR())
+    inst.callee_val = ir_val_inst(load_id)
+    inst.call_args = call_args
+    inst.result_type = ret_type
+    inst.has_result = has_result
+    b.instructions.push(inst)
+    g.builder.next_id = g.builder.next_id + 1
+
+    return expr_result(g, b, id)
+}
+
+-- ============================================================
+-- SOME CALL: Option constructor
+-- Some(value) -> Option { has_value: 1, value: payload }
+-- ============================================================
+
+fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
+    -- Check the first arm's body to infer result type
+    if arms.len() == 0 {
+        return "i64"
+    }
+    let arm = arms[0]
+    if arm.is_expr_body {
+        return infer_expr_type(gen, *arm.body_expr)
+    }
+    return "i64"
+}
+
+-- ============================================================
+-- LITERAL MATCH (int, string, bool, wildcard)
+-- ============================================================
+
+fn join_types(types: List[string]) -> string {
+    let mut result = ""
+    let mut i = 0
+    while i < types.len() {
+        if i > 0 {
+            result = result + "_"
+        }
+        result = result + map_type_name(types[i])
+        i = i + 1
+    }
+    return result
 }

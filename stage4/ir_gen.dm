@@ -106,6 +106,10 @@ struct IRGenerator {
     field_list_elem_types: Map[string, string],
     -- "StructName.field" -> map kind
     field_map_kinds: Map[string, int],
+    -- Variable name -> true if it's a mut pointer (e.g. mut self)
+    mut_ptr_vars: Map[string, bool],
+    -- Variable name -> param index for mut pointer params (no alloca created)
+    param_ptr_map: Map[string, int],
     -- Label counter for unique block names
     label_counter: int,
     -- Lambda counter
@@ -125,7 +129,9 @@ struct IRGenerator {
     -- Completed blocks that need to be added to the function
     completed_blocks: List[IRBasicBlock],
     -- Variable name -> full type annotation (e.g., "Result[int, string]")
-    var_type_annotations: Map[string, string]
+    var_type_annotations: Map[string, string],
+    -- Known user-defined function names (for undefined function detection)
+    known_functions: Map[string, bool]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -157,6 +163,8 @@ fn ir_generator_new() -> IRGenerator {
         field_list_elem_kinds: Map_new(),
         field_list_elem_types: Map_new(),
         field_map_kinds: Map_new(),
+        mut_ptr_vars: Map_new(),
+        param_ptr_map: Map_new(),
         label_counter: 0,
         lambda_counter: 0,
         break_target: "",
@@ -168,7 +176,8 @@ fn ir_generator_new() -> IRGenerator {
         has_impl_type: false,
         declarations: [],
         completed_blocks: [],
-        var_type_annotations: Map_new()
+        var_type_annotations: Map_new(),
+        known_functions: Map_new()
     }
 }
 
@@ -354,7 +363,7 @@ fn map_builtin_name(name: string) -> string {
     if name == "eprint" { return "dm_eprint" }
     if name == "eprintln" { return "dm_eprintln" }
     if name == "panic" { return "dm_panic" }
-    if name == "exit" { return "dm_exit" }
+    if name == "exit" { return "exit" }
     if name == "len" { return "dm_string_len" }
     if name == "char_at" { return "dm_char_at" }
     if name == "substr" { return "dm_substr" }
@@ -382,6 +391,28 @@ fn map_builtin_name(name: string) -> string {
     if name == "system" { return "dm_system" }
     if name == "assert" { return "dm_assert" }
     if name == "assert_eq" { return "dm_assert_eq" }
+    -- Character classification
+    if name == "is_alpha" { return "dm_is_alpha" }
+    if name == "is_digit" { return "dm_is_digit" }
+    if name == "is_whitespace" { return "dm_is_whitespace" }
+    if name == "is_alnum" { return "dm_is_alnum" }
+    -- Character/string conversion
+    if name == "char_to_string" { return "dm_char_to_string" }
+    if name == "string_to_int" { return "dm_parse_int" }
+    -- Path utilities
+    if name == "path_dirname" { return "dm_path_dirname" }
+    if name == "path_basename" { return "dm_path_basename" }
+    if name == "path_extension" { return "dm_path_extension" }
+    if name == "path_stem" { return "dm_path_stem" }
+    if name == "path_join" { return "dm_path_join" }
+    -- Filesystem builtins
+    if name == "fs_getcwd" { return "dm_fs_getcwd" }
+    if name == "fs_readdir" { return "dm_fs_readdir" }
+    if name == "fs_rename" { return "dm_fs_rename" }
+    if name == "fs_mkdir" { return "dm_fs_mkdir" }
+    if name == "fs_remove" { return "dm_fs_remove" }
+    -- OS builtins
+    if name == "os_getenv" { return "dm_os_getenv" }
     return name
 }
 
@@ -404,6 +435,14 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "assert" or name == "assert_eq" { return true }
     if name == "Box_new" or name == "Box_null" { return true }
     if name == "Map_new" { return true }
+    if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return true }
+    if name == "char_to_string" { return true }
+    if name == "string_to_int" { return true }
+    if name == "path_dirname" or name == "path_basename" or name == "path_extension" or name == "path_stem" { return true }
+    if name == "path_join" { return true }
+    if name == "fs_getcwd" or name == "fs_readdir" or name == "fs_rename" { return true }
+    if name == "fs_mkdir" or name == "fs_remove" { return true }
+    if name == "os_getenv" { return true }
     return false
 }
 
@@ -421,7 +460,8 @@ fn builtin_return_type(name: string) -> string {
     if name == "bool_to_string" { return "string" }
     if name == "parse_int" { return "i64" }
     if name == "parse_float" { return "f64" }
-    if name == "string_contains" or name == "string_find" { return "i64" }
+    if name == "string_contains" { return "bool" }
+    if name == "string_find" { return "i64" }
     if name == "starts_with" or name == "ends_with" { return "bool" }
     if name == "string_trim" { return "string" }
     if name == "string_replace" { return "string" }
@@ -435,6 +475,22 @@ fn builtin_return_type(name: string) -> string {
     if name == "args_get" { return "string" }
     if name == "system" { return "i64" }
     if name == "assert" or name == "assert_eq" { return "void" }
+    -- Character classification
+    if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return "bool" }
+    -- Character/string conversion
+    if name == "char_to_string" { return "string" }
+    if name == "string_to_int" { return "i64" }
+    -- Path utilities
+    if name == "path_dirname" or name == "path_basename" or name == "path_extension" or name == "path_stem" { return "string" }
+    if name == "path_join" { return "string" }
+    -- Filesystem builtins
+    if name == "fs_getcwd" { return "string" }
+    if name == "fs_readdir" { return "string" }
+    if name == "fs_rename" { return "i64" }
+    if name == "fs_mkdir" { return "i64" }
+    if name == "fs_remove" { return "i64" }
+    -- OS builtins
+    if name == "os_getenv" { return "string" }
     return "void"
 }
 
@@ -466,6 +522,7 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
         let decl = source.declarations[i]
         if decl.kind == DECL_FUNCTION() {
             let fd = *decl.func_decl
+            g.known_functions.insert(fd.name, true)
             if fd.generic_params.len() > 0 {
                 -- Store generic function for later monomorphization
                 g.generic_fn_decls.insert(fd.name, i)

@@ -328,3 +328,45 @@ fn tokenize(source: string) -> List[Token] {
 
     return tokens
 }
+
+fn unescape_string(s: string) -> string {
+    -- Quick check: if no backslashes, return as-is
+    if string_find(s, "\\") < 0 {
+        return s
+    }
+    let mut result = ""
+    let mut i = 0
+    let slen = len(s)
+    while i < slen {
+        let ch = char_at(s, i)
+        if ch == "\\" and i + 1 < slen {
+            let next = char_at(s, i + 1)
+            if next == "n" {
+                result = result + "\n"
+                i = i + 2
+            } else if next == "t" {
+                result = result + "\t"
+                i = i + 2
+            } else if next == "r" {
+                result = result + "\r"
+                i = i + 2
+            } else if next == "\\" {
+                result = result + "\\"
+                i = i + 2
+            } else if next == "\"" {
+                result = result + "\""
+                i = i + 2
+            } else if next == "'" {
+                result = result + "'"
+                i = i + 2
+            } else {
+                result = result + ch
+                i = i + 1
+            }
+        } else {
+            result = result + ch
+            i = i + 1
+        }
+    }
+    return result
+}

@@ -34,6 +34,11 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         g = generate_wrapper_call(g, inst, callee, fn_ty, callee_name)
         return g
     }
+    -- Check if callee uses sret return convention (result/option types)
+    if g.returns_sret.contains(callee_name) {
+        g = generate_sret_call(g, inst, callee, fn_ty, callee_name)
+        return g
+    }
     -- Regular (non-wrapper) call
     -- Resolve arguments, handling string pointer loads
     let mut args: List[int] = []
@@ -318,3 +323,58 @@ fn is_runtime_string_fn(fn_name: string) -> bool {
     if fn_name == "dm_string_new" { return true }
     return false
 }
+
+fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
+    let mut g = gen
+    let b = g.builder
+    let id_key = int_to_string(inst.id)
+    -- Allocate stack space for the result struct (sret pattern)
+    let sret_name = "sret." + int_to_string(g.sret_counter)
+    g.sret_counter = g.sret_counter + 1
+    -- Look up the IR function to get its return type for correct alloca sizing
+    let ir_func = find_ir_function(g, callee_name)
+    let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
+    let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
+    -- Build args: sret pointer first, then resolved args
+    let mut args: List[int] = []
+    args.push(sret)
+    let mut ai = 0
+    while ai < inst.call_args.len() {
+        let arg = inst.call_args[ai]
+        let mut val = resolve_value(g, arg)
+        g = resolve_value_with_counter(g, arg)
+        -- If arg is a string pointer and target function expects dm_string by value, load it
+        if is_string_ptr(g, arg) {
+            let expects_string = callee_param_is_string(g, callee_name, ai)
+            if expects_string {
+                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
+            }
+        }
+        args.push(val)
+        ai = ai + 1
+    }
+    -- Call function (returns void, result written to sret pointer)
+    dm_llvm_buf_clear()
+    let mut argi = 0
+    while argi < args.len() {
+        dm_llvm_buf_push(args[argi])
+        argi = argi + 1
+    }
+    dm_llvm_build_call2_buf(b, fn_ty, callee, "")
+    -- Load the result from the sret alloca
+    if inst.has_result {
+        -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
+        if ir_func.return_type == "string" {
+            g.string_ptrs.insert(id_key, true)
+            g.value_map.insert(id_key, sret)
+        } else {
+            let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
+            g.value_map.insert(id_key, loaded)
+        }
+    }
+    return g
+}
+
+-- ============================================================
+-- INDIRECT CALL (OP_CALL_PTR)
+-- ============================================================

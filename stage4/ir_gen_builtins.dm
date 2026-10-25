@@ -228,6 +228,7 @@ fn generate_simd_binary(gen: IRGenerator, block: IRBasicBlock, op: int, args: Li
     let mut inst = ir_inst_new(id, op)
     inst.lhs = ir_val_inst(lhs_result.val_id)
     inst.rhs = ir_val_inst(rhs_result.val_id)
+    inst.simd_vec_type = vec_type
     inst.result_type = vec_type
     inst.has_result = true
     b.instructions.push(inst)

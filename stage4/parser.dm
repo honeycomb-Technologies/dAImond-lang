@@ -146,6 +146,40 @@ fn parse_type(p: Parser) -> ParseTypeResult {
         return ParseTypeResult { p: pp, type_name: type_str }
     }
 
+    -- Reference type: &T or &Self
+    if tok.kind == TK_AMP() {
+        pp = p_advance(pp)
+        -- Skip 'mut' if present (&mut T)
+        if p_peek(pp) == TK_MUT() {
+            pp = p_advance(pp)
+        }
+        let inner = parse_type(pp)
+        -- For the LLVM backend, &T is treated the same as T (pass by pointer)
+        return ParseTypeResult { p: inner.p, type_name: inner.type_name }
+    }
+
+    -- Fixed-size array type: [T; N]
+    if tok.kind == TK_LBRACKET() {
+        pp = p_advance(pp)
+        let inner = parse_type(pp)
+        pp = inner.p
+        pp = p_skip_newlines(pp)
+        -- Expect semicolon separator
+        if p_peek(pp) == TK_SEMICOLON() {
+            pp = p_advance(pp)
+            pp = p_skip_newlines(pp)
+            let size_tok = p_cur(pp)
+            pp = p_advance(pp)
+            pp = p_skip_newlines(pp)
+            pp = p_expect(pp, TK_RBRACKET())
+            let type_str = "[" + inner.type_name + "; " + size_tok.value + "]"
+            return ParseTypeResult { p: pp, type_name: type_str }
+        }
+        -- Not a fixed array, might be something else - return what we can
+        pp = p_expect(pp, TK_RBRACKET())
+        return ParseTypeResult { p: pp, type_name: "[" + inner.type_name + "]" }
+    }
+
     if tok.kind != TK_IDENT() and tok.kind != TK_SELF() {
         return ParseTypeResult { p: pp, type_name: "" }
     }
@@ -296,6 +330,7 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
 }
 
 fn infix_prec(kind: int) -> int {
+    if kind == TK_DOTDOT() or kind == TK_DOTDOTEQ() { return 0 }
     if kind == TK_OR() { return 1 }
     if kind == TK_AND() { return 2 }
     if kind == TK_EQEQ() or kind == TK_BANGEQ() { return 3 }
@@ -596,6 +631,30 @@ fn parse_array_literal(p: Parser) -> ParseExprResult {
         pp = elem.p
         elems.push(elem.expr)
         pp = p_skip_newlines(pp)
+        -- Check for array repeat syntax: [value; count]
+        if p_peek(pp) == TK_SEMICOLON() and elems.len() == 1 {
+            pp = p_advance(pp) -- skip ;
+            pp = p_skip_newlines(pp)
+            let count_result = parse_expr(pp)
+            pp = count_result.p
+            pp = p_skip_newlines(pp)
+            pp = p_expect(pp, TK_RBRACKET())
+            -- Expand: repeat the element 'count' times
+            let repeat_val = elems[0]
+            let mut repeat_count = 0
+            if count_result.expr.kind == EXPR_LITERAL_INT() {
+                repeat_count = count_result.expr.int_val
+            }
+            let mut expanded: List[Expr] = []
+            let mut ri = 0
+            while ri < repeat_count {
+                expanded.push(repeat_val)
+                ri = ri + 1
+            }
+            let mut e = expr_new(EXPR_ARRAY_LITERAL(), tok.line, tok.col)
+            e.elements = expanded
+            return ParseExprResult { p: pp, expr: e }
+        }
         if p_peek(pp) == TK_COMMA() {
             pp = p_advance(pp)
         }

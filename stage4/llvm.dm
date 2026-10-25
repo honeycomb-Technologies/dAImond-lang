@@ -202,3 +202,5 @@ fn llvm_emit_object(tm: int, mod: int, filename: string) -> int {
 fn llvm_emit_asm(tm: int, mod: int, filename: string) -> int {
     return dm_llvm_target_machine_emit_to_file(tm, mod, filename, dm_llvm_assembly_file())
 }
+
+extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int

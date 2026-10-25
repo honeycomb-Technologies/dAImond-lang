@@ -50,6 +50,8 @@ struct LLVMGenerator {
     wrapper_returns_string: Map[string, bool],
     -- Track which functions have wrappers
     has_wrapper: Map[string, bool],
+    -- Track which functions use sret return convention (result/option types)
+    returns_sret: Map[string, bool],
     -- Reference to IR module for type lookups
     ir_module: IRModule,
     -- Current function being generated (for param lookups)
@@ -81,6 +83,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
         string_ptrs: Map_new(),
         wrapper_returns_string: Map_new(),
         has_wrapper: Map_new(),
+        returns_sret: Map_new(),
         ir_module: ir_mod,
         current_func_name: ""
     }
@@ -1449,6 +1452,18 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
             -- main() always returns i32 0
             let ret_val = dm_llvm_const_int(dm_llvm_int32_type(ctx), 0, 0)
             dm_llvm_build_ret(b, ret_val)
+        } else if g.returns_sret.contains(func.name) {
+            -- sret convention: store return value to the sret output pointer (param 0), then ret void
+            let mut ret_val = resolve_value(g, term.ret_val)
+            g = resolve_value_with_counter(g, term.ret_val)
+            -- If returning a string pointer, load the struct before storing to sret
+            if func.return_type == "string" and is_string_ptr(g, term.ret_val) {
+                ret_val = dm_llvm_build_load2(b, g.dm_string_type, ret_val, "sret.str")
+            }
+            let llvm_fn = g.function_map.get(func.name)
+            let sret_ptr = dm_llvm_get_param(llvm_fn, 0)
+            dm_llvm_build_store(b, ret_val, sret_ptr)
+            dm_llvm_build_ret_void(b)
         } else {
             -- If returning string pointer, load the struct first
             if func.return_type == "string" and is_string_ptr(g, term.ret_val) {
@@ -1555,3 +1570,143 @@ fn emit_to_ir_file(gen: LLVMGenerator, filename: string) -> int {
 fn verify_module(gen: LLVMGenerator) -> int {
     return dm_llvm_module_verify(gen.llvm_module)
 }
+
+fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
+    let mut g = gen
+    let ctx = g.context
+    let returns_string = func.return_type == "string"
+    let ptr_ty = dm_llvm_pointer_type(ctx)
+    let void_ty = dm_llvm_void_type(ctx)
+
+    -- Step 1: Declare the real C function with C types
+    let mut c_param_count = 0
+    dm_llvm_buf_clear()
+    let mut ci = 0
+    while ci < func.params.len() {
+        let p = func.params[ci]
+        if p.type_id == "string" {
+            dm_llvm_buf_push(ptr_ty)
+        } else {
+            dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
+        }
+        c_param_count = c_param_count + 1
+        ci = ci + 1
+    }
+    let c_ret_ty = if returns_string { ptr_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+    let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
+    let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
+
+    -- Step 2: Declare the wrapper function with dm_string-based API
+    let mut w_param_count = 0
+    dm_llvm_buf_clear()
+    if returns_string {
+        dm_llvm_buf_push(ptr_ty)
+        w_param_count = w_param_count + 1
+    }
+    ci = 0
+    while ci < func.params.len() {
+        dm_llvm_buf_push(ptr_ty)
+        w_param_count = w_param_count + 1
+        ci = ci + 1
+    }
+    let w_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+    let w_fn_ty = dm_llvm_function_type_buf(w_ret_ty, 0)
+    let wrapper_name = "llvm_" + func.name
+    let wrapper_fn = dm_llvm_module_add_function(g.llvm_module, wrapper_name, w_fn_ty)
+
+    -- Step 3: Generate the wrapper body
+    let saved_bb = dm_llvm_get_insert_block(g.builder)
+    let entry_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "entry")
+    dm_llvm_position_at_end(g.builder, entry_bb)
+
+    -- Convert string params: extract data field (field 0) from dm_string*
+    g = get_dm_string_type(g)
+    let mut w_param_idx = 0
+    if returns_string { w_param_idx = 1 }
+
+    dm_llvm_buf_clear()
+    ci = 0
+    while ci < func.params.len() {
+        let p = func.params[ci]
+        let wrapper_param = dm_llvm_get_param(wrapper_fn, w_param_idx)
+        if p.type_id == "string" {
+            let data_ptr = dm_llvm_build_struct_gep2(g.builder, g.dm_string_type, wrapper_param, 0, "data_ptr")
+            let data = dm_llvm_build_load2(g.builder, ptr_ty, data_ptr, "data")
+            dm_llvm_buf_push(data)
+        } else {
+            dm_llvm_buf_push(wrapper_param)
+        }
+        w_param_idx = w_param_idx + 1
+        ci = ci + 1
+    }
+    let call_name = if returns_string { "c_result" } else { "" }
+    let c_result = dm_llvm_build_call2_buf(g.builder, c_fn_ty, real_fn, call_name)
+
+    if returns_string {
+        let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)
+        -- Handle NULL return: call dm_string_new with empty string if NULL
+        let null_val = dm_llvm_const_null(ptr_ty)
+        let is_null = dm_llvm_build_icmp(g.builder, dm_llvm_int_eq(), c_result, null_val, "is_null")
+        let then_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "then_null")
+        let else_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "else_nonnull")
+        let merge_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "merge")
+        dm_llvm_build_cond_br(g.builder, is_null, then_bb, else_bb)
+
+        -- Null case: create empty string
+        dm_llvm_position_at_end(g.builder, then_bb)
+        let empty_str = dm_llvm_build_global_string_ptr(g.builder, "", "empty_str")
+        if g.function_map.contains("dm_string_new") {
+            let sn_fn = g.function_map.get("dm_string_new")
+            let sn_ty = g.fn_type_map.get("dm_string_new")
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(sret_ptr)
+            dm_llvm_buf_push(empty_str)
+            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
+        }
+        dm_llvm_build_br(g.builder, merge_bb)
+
+        -- Non-null case: create string from C result
+        dm_llvm_position_at_end(g.builder, else_bb)
+        if g.function_map.contains("dm_string_new") {
+            let sn_fn = g.function_map.get("dm_string_new")
+            let sn_ty = g.fn_type_map.get("dm_string_new")
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(sret_ptr)
+            dm_llvm_buf_push(c_result)
+            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
+        }
+        dm_llvm_build_br(g.builder, merge_bb)
+
+        dm_llvm_position_at_end(g.builder, merge_bb)
+        dm_llvm_build_ret_void(g.builder)
+    } else {
+        dm_llvm_build_ret(g.builder, c_result)
+    }
+
+    -- Restore builder position
+    if saved_bb != 0 {
+        dm_llvm_position_at_end(g.builder, saved_bb)
+    }
+
+    -- Store under ORIGINAL name for call resolution
+    g.function_map.insert(func.name, wrapper_fn)
+    g.fn_type_map.insert(func.name, w_fn_ty)
+    g.has_wrapper.insert(func.name, true)
+    g.wrapper_returns_string.insert(func.name, returns_string)
+    return g
+}
+
+fn is_sret_return_type(ret_type: string) -> bool {
+    if ret_type == "string" {
+        return true
+    }
+    if ret_type == "result" or starts_with(ret_type, "Result[") or starts_with(ret_type, "result_") {
+        return true
+    }
+    if ret_type == "option" or starts_with(ret_type, "Option[") or starts_with(ret_type, "option_") {
+        return true
+    }
+    return false
+}
+
+-- Check if an IR function involves dm_string in params or return type

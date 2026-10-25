@@ -604,3 +604,420 @@ fn comptime_value_type(val: IRValue) -> string {
     if val.kind == VAL_CONST_STRING() { return "string" }
     return "i64"
 }
+
+fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
+    if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
+        let a = lhs.int_val
+        let b = rhs.int_val
+        if op == BINOP_ADD() { return ir_val_int(a + b) }
+        if op == BINOP_SUB() { return ir_val_int(a - b) }
+        if op == BINOP_MUL() { return ir_val_int(a * b) }
+        if op == BINOP_DIV() { if b != 0 { return ir_val_int(a / b) } return ir_val_int(0) }
+        if op == BINOP_MOD() { if b != 0 { return ir_val_int(a % b) } return ir_val_int(0) }
+        if op == BINOP_EQ() { return ir_val_bool(a == b) }
+        if op == BINOP_NE() { return ir_val_bool(a != b) }
+        if op == BINOP_LT() { return ir_val_bool(a < b) }
+        if op == BINOP_LE() { return ir_val_bool(a <= b) }
+        if op == BINOP_GT() { return ir_val_bool(a > b) }
+        if op == BINOP_GE() { return ir_val_bool(a >= b) }
+    }
+    if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_FLOAT() {
+        let a = lhs.float_val
+        let b = rhs.float_val
+        if op == BINOP_ADD() { return ir_val_float(a + b) }
+        if op == BINOP_SUB() { return ir_val_float(a - b) }
+        if op == BINOP_MUL() { return ir_val_float(a * b) }
+        if op == BINOP_DIV() { return ir_val_float(a / b) }
+        if op == BINOP_EQ() { return ir_val_bool(a == b) }
+        if op == BINOP_NE() { return ir_val_bool(a != b) }
+        if op == BINOP_LT() { return ir_val_bool(a < b) }
+        if op == BINOP_LE() { return ir_val_bool(a <= b) }
+        if op == BINOP_GT() { return ir_val_bool(a > b) }
+        if op == BINOP_GE() { return ir_val_bool(a >= b) }
+    }
+    if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
+        if op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
+        if op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
+        if op == BINOP_EQ() { return ir_val_bool(lhs.bool_val == rhs.bool_val) }
+        if op == BINOP_NE() { return ir_val_bool(lhs.bool_val != rhs.bool_val) }
+    }
+    if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
+        if op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
+        if op == BINOP_EQ() { return ir_val_bool(lhs.str_val == rhs.str_val) }
+        if op == BINOP_NE() { return ir_val_bool(lhs.str_val != rhs.str_val) }
+    }
+    return ir_val_int(0)
+}
+
+-- ============================================================
+-- UNARY EXPRESSION EVALUATION
+-- ============================================================
+
+-- Evaluate a unary expression at compile time.
+-- Supports negation of int/float and logical not of bool.
+
+fn eval_block_comptime_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
+    -- Process statements in the block first
+    let mut g = gen
+    let mut last_val = ir_val_int(0)
+    let mut i = 0
+    while i < e.stmts.len() {
+        let stmt = e.stmts[i]
+
+        -- Handle return statements - return immediately
+        if stmt.kind == STMT_RETURN() and stmt.has_ret_value {
+            return eval_comptime_expr_d(g, *stmt.ret_value, depth)
+        }
+
+        -- Handle let bindings - store in globals for subsequent lookups
+        if stmt.kind == STMT_LET() {
+            let val_expr = *stmt.let_value
+            if val_expr.kind != EXPR_LITERAL_NULL() {
+                -- Array literal: inline element global creation on g directly
+                -- to avoid losing them in a by-value function call copy.
+                if val_expr.kind == EXPR_ARRAY_LITERAL() {
+                    let arr_name = "__ct_arr_" + int_to_string(g.builder.next_id)
+                    let mut ei = 0
+                    while ei < val_expr.elements.len() {
+                        let elem_val = eval_comptime_expr_d(g, val_expr.elements[ei], depth)
+                        let elem_name = arr_name + "__" + int_to_string(ei)
+                        let mut elem_gl = ir_global_new(elem_name, "i64")
+                        elem_gl.init_value = elem_val
+                        elem_gl.has_init = true
+                        elem_gl.is_const = true
+                        g.ir_mod.globals.push(elem_gl)
+                        ei = ei + 1
+                    }
+                    let len_name = arr_name + "__len"
+                    let mut len_gl = ir_global_new(len_name, "i64")
+                    len_gl.init_value = ir_val_int(val_expr.elements.len())
+                    len_gl.has_init = true
+                    len_gl.is_const = true
+                    g.ir_mod.globals.push(len_gl)
+                    let mut marker = ir_global_new(arr_name, "i64")
+                    marker.init_value = ir_val_string(arr_name)
+                    marker.has_init = true
+                    marker.is_const = true
+                    g.ir_mod.globals.push(marker)
+                    let mut global = ir_global_new(stmt.let_name, "i64")
+                    global.init_value = ir_val_string(arr_name)
+                    global.has_init = true
+                    global.is_const = true
+                    g.ir_mod.globals.push(global)
+                } else {
+                    let val = eval_comptime_expr_d(g, val_expr, depth)
+                    let mut global = ir_global_new(stmt.let_name, "i64")
+                    global.init_value = val
+                    global.has_init = true
+                    global.is_const = true
+                    g.ir_mod.globals.push(global)
+                }
+            }
+        }
+
+        -- Handle expression statements - last one is the block result
+        if stmt.kind == STMT_EXPRESSION() {
+            last_val = eval_comptime_expr_d(g, *stmt.expr, depth)
+        }
+
+        -- Handle assignment statements
+        if stmt.kind == STMT_ASSIGNMENT() {
+            let val = eval_comptime_expr_d(g, *stmt.assign_value, depth)
+            let target_expr = *stmt.assign_target
+            if target_expr.kind == EXPR_IDENTIFIER() {
+                let target_name = target_expr.name
+                let mut gi = g.ir_mod.globals.len() - 1
+                while gi >= 0 {
+                    if g.ir_mod.globals[gi].name == target_name {
+                        let mut glob = g.ir_mod.globals[gi]
+                        glob.init_value = val
+                        g.ir_mod.globals[gi] = glob
+                        gi = -1
+                    } else {
+                        gi = gi - 1
+                    }
+                }
+            }
+        }
+
+        -- Handle while loops
+        if stmt.kind == STMT_WHILE() {
+            let mut loop_count = 0
+            let mut looping = true
+            while looping and loop_count < 10000 {
+                let cond = eval_comptime_expr_d(g, *stmt.while_cond, depth)
+                let mut cond_true = false
+                if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
+                    cond_true = true
+                }
+                if cond.kind == VAL_CONST_INT() and cond.int_val != 0 {
+                    cond_true = true
+                }
+                if cond_true == false {
+                    looping = false
+                } else {
+                    let body_val = eval_comptime_stmts(g, stmt.while_body, depth + 1)
+                    if body_val.kind == VAL_BREAK_SENTINEL() {
+                        looping = false
+                    } else if body_val.kind != VAL_UNDEF() {
+                        return body_val
+                    }
+                    loop_count = loop_count + 1
+                }
+            }
+        }
+
+        -- Handle for loops (range-based and array-based)
+        if stmt.kind == STMT_FOR() {
+            let iter_expr = *stmt.for_iter
+            if iter_expr.kind == EXPR_RANGE() {
+                -- Range for loop: for v in start..end
+                let start_val = eval_comptime_expr_d(g, *iter_expr.left, depth)
+                let end_val = eval_comptime_expr_d(g, *iter_expr.right, depth)
+                if start_val.kind == VAL_CONST_INT() and end_val.kind == VAL_CONST_INT() {
+                    let mut fi = start_val.int_val
+                    while fi < end_val.int_val {
+                        let mut loop_var = ir_global_new(stmt.for_var, "i64")
+                        loop_var.init_value = ir_val_int(fi)
+                        loop_var.has_init = true
+                        loop_var.is_const = true
+                        g.ir_mod.globals.push(loop_var)
+                        let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
+                        if body_val.kind == VAL_BREAK_SENTINEL() {
+                            fi = end_val.int_val
+                        } else if body_val.kind != VAL_UNDEF() {
+                            return body_val
+                        }
+                        fi = fi + 1
+                    }
+                }
+            } else {
+                -- Array for loop: for v in arr
+                let arr_val = eval_comptime_expr_d(g, iter_expr, depth)
+                if arr_val.kind == VAL_CONST_STRING() {
+                    let arr_name = arr_val.str_val
+                    let len_val = eval_identifier_comptime(g, arr_name + "__len")
+                    if len_val.kind == VAL_CONST_INT() {
+                        let mut fi = 0
+                        while fi < len_val.int_val {
+                            let elem_val = eval_identifier_comptime(g, arr_name + "__" + int_to_string(fi))
+                            let mut loop_var = ir_global_new(stmt.for_var, "i64")
+                            loop_var.init_value = elem_val
+                            loop_var.has_init = true
+                            loop_var.is_const = true
+                            g.ir_mod.globals.push(loop_var)
+                            let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
+                            if body_val.kind == VAL_BREAK_SENTINEL() {
+                                fi = len_val.int_val
+                            } else if body_val.kind != VAL_UNDEF() {
+                                return body_val
+                            }
+                            fi = fi + 1
+                        }
+                    }
+                }
+            }
+        }
+
+        -- Handle match statements
+        if stmt.kind == STMT_MATCH() {
+            -- The parser stores the full EXPR_MATCH in stmt.match_expr
+            -- (match_stmt_arms is always empty). Evaluate the match expression
+            -- directly, which delegates to eval_match_comptime for correct
+            -- scrutinee/arm resolution.
+            let match_val = eval_comptime_expr_d(g, *stmt.match_expr, depth)
+            last_val = match_val
+        }
+
+        -- Handle if statements with potential returns
+        if stmt.kind == STMT_IF() {
+            let cond = eval_comptime_expr_d(g, *stmt.if_cond, depth)
+            if cond.kind == VAL_CONST_BOOL() {
+                if cond.bool_val {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                } else if stmt.has_else_branch {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                }
+            }
+            if cond.kind == VAL_CONST_INT() {
+                if cond.int_val != 0 {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                } else if stmt.has_else_branch {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    -- If the block has a result expression, evaluate it after processing statements
+    if e.has_result {
+        return eval_comptime_expr_d(g, *e.result, depth)
+    }
+
+    return last_val
+}
+
+-- ============================================================
+-- FUNCTION CALL EVALUATION
+-- ============================================================
+
+-- Evaluate a function call at compile time.
+-- Looks up the function in the generator's declaration list,
+-- substitutes parameters, and evaluates the body.
+-- Supports recursion up to COMPTIME_MAX_DEPTH.
+
+fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
+    -- Integer literal
+    if e.kind == EXPR_LITERAL_INT() {
+        return ir_val_int(e.int_val)
+    }
+
+    -- Float literal
+    if e.kind == EXPR_LITERAL_FLOAT() {
+        return ir_val_float(e.float_val)
+    }
+
+    -- Bool literal
+    if e.kind == EXPR_LITERAL_BOOL() {
+        return ir_val_bool(e.bool_val)
+    }
+
+    -- String literal
+    if e.kind == EXPR_LITERAL_STRING() {
+        return ir_val_string(e.str_val)
+    }
+
+    -- Binary expression
+    if e.kind == EXPR_BINARY() {
+        let lv = eval_comptime_expr_d(gen, *e.left, depth)
+        let rv = eval_comptime_expr_d(gen, *e.right, depth)
+        return eval_binary_comptime_vals(gen, e.op, lv, rv)
+    }
+
+    -- Unary expression
+    if e.kind == EXPR_UNARY() {
+        return eval_unary_comptime(gen, e)
+    }
+
+    -- Identifier: look up in module globals (reverse search for correct scoping)
+    if e.kind == EXPR_IDENTIFIER() {
+        return eval_identifier_comptime(gen, e.name)
+    }
+
+    -- If expression
+    if e.kind == EXPR_IF() {
+        let cond = eval_comptime_expr_d(gen, *e.condition, depth)
+        if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
+            return eval_comptime_expr_d(gen, *e.then_branch, depth)
+        }
+        if e.has_else {
+            return eval_comptime_expr_d(gen, *e.else_branch, depth)
+        }
+        return ir_val_int(0)
+    }
+
+    -- Block expression
+    if e.kind == EXPR_BLOCK() {
+        return eval_block_comptime_d(gen, e, depth)
+    }
+
+    -- Function call
+    if e.kind == EXPR_FUNCTION_CALL() {
+        return eval_call_comptime(gen, e, depth)
+    }
+
+    -- Match expression
+    if e.kind == EXPR_MATCH() {
+        return eval_match_comptime(gen, e)
+    }
+
+    -- Grouped expression (parenthesized)
+    if e.kind == EXPR_GROUPED() {
+        let inner = *e.operand
+        return eval_comptime_expr_d(gen, inner, depth)
+    }
+
+    -- Comptime expression wrapper (e.g., `comptime expr`)
+    if e.kind == EXPR_COMPTIME() {
+        let inner = *e.operand
+        return eval_comptime_expr_d(gen, inner, depth)
+    }
+
+    -- Array literal: store elements as indexed globals (arr__0, arr__1, ..., arr__len)
+    if e.kind == EXPR_ARRAY_LITERAL() {
+        let arr_name = "__ct_arr_" + int_to_string(gen.builder.next_id)
+        let mut g = gen
+        let mut ei = 0
+        while ei < e.elements.len() {
+            let elem_val = eval_comptime_expr_d(g, e.elements[ei], depth)
+            let elem_name = arr_name + "__" + int_to_string(ei)
+            let mut gl = ir_global_new(elem_name, "i64")
+            gl.init_value = elem_val
+            gl.has_init = true
+            gl.is_const = true
+            g.ir_mod.globals.push(gl)
+            ei = ei + 1
+        }
+        -- Store array length
+        let len_name = arr_name + "__len"
+        let mut len_gl = ir_global_new(len_name, "i64")
+        len_gl.init_value = ir_val_int(e.elements.len())
+        len_gl.has_init = true
+        len_gl.is_const = true
+        g.ir_mod.globals.push(len_gl)
+        -- Store the array name marker so identifier lookup can find it
+        let mut marker = ir_global_new(arr_name, "i64")
+        marker.init_value = ir_val_string(arr_name)
+        marker.has_init = true
+        marker.is_const = true
+        g.ir_mod.globals.push(marker)
+        return ir_val_string(arr_name)
+    }
+
+    -- Index access: load from a comptime array at constant index
+    if e.kind == EXPR_INDEX_ACCESS() {
+        let obj_val = eval_comptime_expr_d(gen, *e.object, depth)
+        let idx_val = eval_comptime_expr_d(gen, *e.index, depth)
+        if obj_val.kind == VAL_CONST_STRING() and idx_val.kind == VAL_CONST_INT() {
+            -- obj_val.str_val is the array name, look up element
+            let elem_name = obj_val.str_val + "__" + int_to_string(idx_val.int_val)
+            return eval_identifier_comptime(gen, elem_name)
+        }
+        return ir_val_int(0)
+    }
+
+    -- Unsupported expression kind
+    return ir_val_int(0)
+}
+
+-- ============================================================
+-- IDENTIFIER LOOKUP
+-- ============================================================
+
+-- Look up an identifier in the module's global constants.

@@ -620,3 +620,154 @@ fn main() -> int {
 
     return compile(cli)
 }
+
+fn builtin_required_effect(name: string) -> string {
+    if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
+    if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
+    if name == "args_get" or name == "args_len" { return "IO" }
+    if name == "system" or name == "exit" { return "Process" }
+    return ""
+}
+
+fn collect_call_names_from_expr(e: Expr) -> List[string] {
+    let mut names: List[string] = []
+    if e.kind == EXPR_FUNCTION_CALL() {
+        let callee_expr = *e.callee
+        if len(callee_expr.name) > 0 {
+            names.push(callee_expr.name)
+        }
+    }
+    return names
+}
+
+fn collect_call_names_from_stmts(stmts: List[Stmt]) -> List[string] {
+    let mut names: List[string] = []
+    let mut i = 0
+    while i < stmts.len() {
+        let s = stmts[i]
+        if s.kind == STMT_EXPRESSION() {
+            let e = *s.expr
+            let sub = collect_call_names_from_expr(e)
+            let mut j = 0
+            while j < sub.len() {
+                names.push(sub[j])
+                j = j + 1
+            }
+        } else if s.kind == STMT_RETURN() {
+            if s.has_ret_value {
+                let e = *s.ret_value
+                let sub = collect_call_names_from_expr(e)
+                let mut j = 0
+                while j < sub.len() {
+                    names.push(sub[j])
+                    j = j + 1
+                }
+            }
+        } else if s.kind == STMT_LET() {
+            let e = *s.let_value
+            let sub = collect_call_names_from_expr(e)
+            let mut j = 0
+            while j < sub.len() {
+                names.push(sub[j])
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+fn list_contains_str(lst: List[string], val: string) -> bool {
+    let mut i = 0
+    while i < lst.len() {
+        if lst[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn validate_effects(sf: SourceFile) -> List[string] {
+    let mut errors: List[string] = []
+    -- Build map: function name -> declared effects
+    let mut fn_effects: Map[string, List[string]] = Map_new()
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.effects.len() > 0 {
+                fn_effects.insert(fd.name, fd.effects)
+            }
+        }
+        i = i + 1
+    }
+
+    -- For each function with effects, check its calls
+    i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.effects.len() > 0 {
+                let caller_effects = fd.effects
+                let call_names = collect_call_names_from_stmts(fd.body)
+                let mut ci = 0
+                while ci < call_names.len() {
+                    let callee = call_names[ci]
+                    -- Check builtin required effects
+                    let req = builtin_required_effect(callee)
+                    if len(req) > 0 {
+                        if list_contains_str(caller_effects, req) == false {
+                            errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
+                        }
+                    }
+                    -- Check callee's declared effects are subset of caller's
+                    if fn_effects.contains(callee) {
+                        let callee_effects = fn_effects.get(callee)
+                        let mut ei = 0
+                        while ei < callee_effects.len() {
+                            let eff = callee_effects[ei]
+                            if list_contains_str(caller_effects, eff) == false {
+                                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
+                            }
+                            ei = ei + 1
+                        }
+                    }
+                    ci = ci + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return errors
+}
+
+-- ============================================================
+-- COMPILATION PIPELINE
+-- ============================================================
+
+fn validate_source_file(sf: SourceFile) -> List[string] {
+    let mut errors: List[string] = []
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            -- Check for params with empty type (sign of a parse error)
+            let mut pi = 0
+            while pi < fd.params.len() {
+                let param = fd.params[pi]
+                if param.name != "self" and param.name != "mut self" and len(param.type_name) == 0 {
+                    errors.push("Error: parameter '" + param.name + "' in function '" + fd.name + "' has no type")
+                }
+                pi = pi + 1
+            }
+        }
+        i = i + 1
+    }
+    return errors
+}
+
+-- ============================================================
+-- EFFECT SYSTEM ENFORCEMENT
+-- ============================================================

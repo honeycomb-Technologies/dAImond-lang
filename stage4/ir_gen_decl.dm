@@ -159,6 +159,20 @@ fn register_impl_methods(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
     let mut i = 0
     while i < ib.methods.len() {
         g.method_struct_map.insert(ib.methods[i].name, struct_name)
+
+        -- For generic impl blocks, register each method as a generic fn decl
+        -- so it can be monomorphized when called
+        if ib.generic_params.len() > 0 {
+            let mangled = struct_name + "_" + ib.methods[i].name
+            -- Create a modified FunctionDecl with the impl's generic params
+            let mut method_fd = ib.methods[i]
+            method_fd.generic_params = ib.generic_params
+            -- Push it as a synthetic declaration and record its index
+            let decl_idx = g.declarations.len()
+            g.declarations.push(decl_function(method_fd))
+            g.generic_fn_decls.insert(mangled, decl_idx)
+        }
+
         i = i + 1
     }
 
@@ -610,6 +624,12 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
 fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
     let mut g = gen
     let struct_name = ib.target_type
+
+    -- Skip generic impl blocks — their methods are monomorphized on demand
+    if ib.generic_params.len() > 0 {
+        return g
+    }
+
     g.current_impl_type = struct_name
     g.has_impl_type = true
 
@@ -698,8 +718,19 @@ fn eval_const_value(gen: IRGenerator, expr_box: Box[Expr]) -> IRValue {
         if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
             if e.op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
         }
+        -- Boolean AND/OR
+        if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
+            if e.op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
+            if e.op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
+        }
     }
     if e.kind == EXPR_UNARY() {
+        if e.op == UNOP_NOT() {
+            let operand_val = eval_const_value(gen, e.operand)
+            if operand_val.kind == VAL_CONST_BOOL() {
+                return ir_val_bool(operand_val.bool_val == false)
+            }
+        }
         if e.op == UNOP_NEG() {
             let operand_val = eval_const_value(gen, e.operand)
             if operand_val.kind == VAL_CONST_INT() {
@@ -737,3 +768,31 @@ fn estimate_type_size(type_name: string) -> int {
     -- Struct size: rough estimate of 8 bytes per field
     return 64
 }
+
+fn estimate_type_size_gen(gen: IRGenerator, type_name: string) -> int {
+    if type_name == "i8" or type_name == "u8" or type_name == "bool" { return 1 }
+    if type_name == "i16" or type_name == "u16" { return 2 }
+    if type_name == "i32" or type_name == "u32" or type_name == "f32" { return 4 }
+    if type_name == "i64" or type_name == "u64" or type_name == "f64" or type_name == "ptr" { return 8 }
+    if type_name == "string" { return 24 }
+    -- Look up struct definition
+    if gen.struct_defs.contains(type_name) {
+        let info = gen.struct_defs.get(type_name)
+        let mut size = 0
+        let mut fi = 0
+        while fi < info.field_names.len() {
+            let field_type = info.field_types[fi]
+            let fs = estimate_type_size(field_type)
+            let aligned = if fs < 8 { 8 } else { fs }
+            size = size + aligned
+            fi = fi + 1
+        }
+        return size
+    }
+    return 64
+}
+
+
+-- ============================================================
+-- GenResult: return both generator and current block
+-- ============================================================
