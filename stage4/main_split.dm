@@ -469,10 +469,16 @@ fn compile(cli: CLIArgs) -> int {
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
     lg = lg_generate_module(lg)
 
-    -- Verify LLVM module (non-fatal: type mismatches in Result/Option are acceptable)
+    -- Verify LLVM module (fatal: invalid IR must not produce any output;
+    -- dm_llvm_module_verify in llvm_bridge.c prints the detailed diagnostic)
     let verify_result = verify_module(lg)
     if verify_result != 0 {
-        eprintln("Warning: LLVM module verification had issues (continuing)")
+        eprintln("Error: LLVM module verification failed")
+        llvm_gen_dispose(lg)
+        -- exit(1) as well as return: the Stage 0 C wrapper discards
+        -- dm_main()'s return value, so return alone would exit 0.
+        exit(1)
+        return 1
     }
 
     -- If --emit-llvm, emit LLVM IR file and exit
