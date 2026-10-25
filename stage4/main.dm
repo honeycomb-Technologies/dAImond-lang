@@ -4595,9 +4595,10 @@ fn map_type_name(name: string) -> string {
     if name == "i32x8" { return "i32x8" }
     if name == "i64x2" { return "i64x2" }
     if name == "i64x4" { return "i64x4" }
-    -- Composite types: Result[T, E] and Option[T]
-    if starts_with(name, "Result[") { return "result" }
-    if starts_with(name, "Option[") { return "option" }
+    -- Function pointer type: fn(int, int) -> int becomes ptr
+    if starts_with(name, "fn(") {
+        return "ptr"
+    }
     -- Default: return as-is (struct name, enum name, etc.)
     return name
 }
