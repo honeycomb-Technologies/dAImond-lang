@@ -667,7 +667,6 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     b.terminator = Box_new(term_br(header_label))
     b.has_terminator = true
     g.completed_blocks.push(b)
-
     -- Header block: evaluate condition
     let mut header_block = ir_block_new(header_label)
     let cond_result = generate_expr(g, header_block, *stmt.while_cond)
@@ -677,7 +676,6 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     header_block.terminator = Box_new(term_br_cond(ir_val_inst(cond_result.val_id), body_label, exit_label))
     header_block.has_terminator = true
     g.completed_blocks.push(header_block)
-
     -- Body block
     let mut body_block = ir_block_new(body_label)
     let body_result = generate_block_stmts(g, body_block, stmt.while_body)
@@ -687,8 +685,8 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
+    -- Push completed body block (b and header_block already pushed above)
     g.completed_blocks.push(body_block)
-
     -- Restore break/continue targets
     g.break_target = prev_break
     g.continue_target = prev_continue
@@ -1017,7 +1015,6 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     -- Branch to header
     b.terminator = Box_new(term_br(header_label))
     b.has_terminator = true
-    g.completed_blocks.push(b)
 
     -- Header: check i < end (or i <= end for inclusive)
     let mut header_block = ir_block_new(header_label)
@@ -1044,7 +1041,6 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
 
     header_block.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), body_label, exit_label))
     header_block.has_terminator = true
-    g.completed_blocks.push(header_block)
 
     -- Body
     let mut body_block = ir_block_new(body_label)
@@ -1082,12 +1078,16 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
-    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(header_block)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -1252,12 +1252,16 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
-    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(header_block)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -1452,12 +1456,16 @@ fn generate_map_for_in(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, iter_n
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
-    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(header_block)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -1495,13 +1503,16 @@ fn generate_loop_stmt(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
     if body_block.has_terminator == false {
         body_block.terminator = Box_new(term_br(body_label))
         body_block.has_terminator = true
-    g.completed_blocks.push(body_block)
     }
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)

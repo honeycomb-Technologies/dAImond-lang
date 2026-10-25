@@ -4689,7 +4689,7 @@ fn extract_inner_type(type_str: string, prefix: string) -> string {
 fn classify_list_elem(elem_type: string) -> int {
     if elem_type == "int" or elem_type == "i64" { return LIST_ELEM_INT() }
     if elem_type == "float" or elem_type == "f64" { return LIST_ELEM_FLOAT() }
-    if elem_type == "string" { return LIST_ELEM_STRING() }
+    if elem_type == "string" or elem_type == "String" { return LIST_ELEM_STRING() }
     return LIST_ELEM_OTHER()
 }
 
@@ -6446,7 +6446,6 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     b.terminator = Box_new(term_br(header_label))
     b.has_terminator = true
     g.completed_blocks.push(b)
-
     -- Header block: evaluate condition
     let mut header_block = ir_block_new(header_label)
     let cond_result = generate_expr(g, header_block, *stmt.while_cond)
@@ -6456,7 +6455,6 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     header_block.terminator = Box_new(term_br_cond(ir_val_inst(cond_result.val_id), body_label, exit_label))
     header_block.has_terminator = true
     g.completed_blocks.push(header_block)
-
     -- Body block
     let mut body_block = ir_block_new(body_label)
     let body_result = generate_block_stmts(g, body_block, stmt.while_body)
@@ -6466,8 +6464,8 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
+    -- Push completed body block (b and header_block already pushed above)
     g.completed_blocks.push(body_block)
-
     -- Restore break/continue targets
     g.break_target = prev_break
     g.continue_target = prev_continue
@@ -6796,7 +6794,6 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     -- Branch to header
     b.terminator = Box_new(term_br(header_label))
     b.has_terminator = true
-    g.completed_blocks.push(b)
 
     -- Header: check i < end (or i <= end for inclusive)
     let mut header_block = ir_block_new(header_label)
@@ -6823,7 +6820,6 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
 
     header_block.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), body_label, exit_label))
     header_block.has_terminator = true
-    g.completed_blocks.push(header_block)
 
     -- Body
     let mut body_block = ir_block_new(body_label)
@@ -6861,12 +6857,16 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
-    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(header_block)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -7031,12 +7031,16 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
-    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(header_block)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -7231,12 +7235,16 @@ fn generate_map_for_in(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, iter_n
         body_block.terminator = Box_new(term_br(header_label))
         body_block.has_terminator = true
     }
-    g.completed_blocks.push(body_block)
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(header_block)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -7274,13 +7282,16 @@ fn generate_loop_stmt(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
     if body_block.has_terminator == false {
         body_block.terminator = Box_new(term_br(body_label))
         body_block.has_terminator = true
-    g.completed_blocks.push(body_block)
     }
 
     g.break_target = prev_break
     g.continue_target = prev_continue
     g.has_break_target = prev_has_break
     g.has_continue_target = prev_has_continue
+
+    -- Push completed blocks
+    g.completed_blocks.push(b)
+    g.completed_blocks.push(body_block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -13620,6 +13631,20 @@ fn generate_comptime_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     return expr_result(g, b, load_id)
 }
 
+
+-- ============================================================
+-- SIMD Builtin IR Generation
+-- Handles simd_splat_*, simd_set_*, simd_add/sub/mul/div,
+-- and simd_extract intrinsic function calls.
+-- Port of stage3/src/ir_gen.zig SIMD handling
+-- ============================================================
+
+-- ============================================================
+-- SIMD BUILTIN DETECTION
+-- ============================================================
+
+-- Returns true if the function name is a SIMD builtin intrinsic
+
 fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, var_type: string, args: List[Expr]) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -15073,6 +15098,26 @@ fn comptime_value_type(val: IRValue) -> string {
     if val.kind == VAL_CONST_STRING() { return "string" }
     return "i64"
 }
+
+
+-- ============================================================
+-- LLVM IR Generator
+-- Translates dAImond IR (from ir.dm) into LLVM IR using
+-- the LLVM-C bridge functions declared in llvm.dm.
+--
+-- Key design: All LLVM refs (context, module, builder, types,
+-- values, basic blocks) are represented as int (int64_t on C side).
+--
+-- String ABI: dm_string is { ptr, i64, i64 } (24 bytes) which
+-- exceeds the x86-64 SysV ABI 16-byte register threshold.
+-- Runtime functions using dm_string are called through thin
+-- C wrapper functions (llvm_dm_*) with pointer-based ABI:
+-- - Returns dm_string -> wrapper takes dm_string* as first param (sret)
+-- - Takes dm_string -> wrapper takes const dm_string* (pointer)
+-- String values in LLVM IR are pointers to stack-allocated dm_string structs.
+-- ============================================================
+
+-- Bridge functions declared in llvm_bridge.c but not yet in llvm.dm
 
 fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
     if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {

@@ -6120,6 +6120,20 @@ fn generate_comptime_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     return expr_result(g, b, load_id)
 }
 
+
+-- ============================================================
+-- SIMD Builtin IR Generation
+-- Handles simd_splat_*, simd_set_*, simd_add/sub/mul/div,
+-- and simd_extract intrinsic function calls.
+-- Port of stage3/src/ir_gen.zig SIMD handling
+-- ============================================================
+
+-- ============================================================
+-- SIMD BUILTIN DETECTION
+-- ============================================================
+
+-- Returns true if the function name is a SIMD builtin intrinsic
+
 fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, var_type: string, args: List[Expr]) -> ExprResult {
     let mut g = gen
     let mut b = block

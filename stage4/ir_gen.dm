@@ -348,7 +348,7 @@ fn extract_inner_type(type_str: string, prefix: string) -> string {
 fn classify_list_elem(elem_type: string) -> int {
     if elem_type == "int" or elem_type == "i64" { return LIST_ELEM_INT() }
     if elem_type == "float" or elem_type == "f64" { return LIST_ELEM_FLOAT() }
-    if elem_type == "string" { return LIST_ELEM_STRING() }
+    if elem_type == "string" or elem_type == "String" { return LIST_ELEM_STRING() }
     return LIST_ELEM_OTHER()
 }
 
