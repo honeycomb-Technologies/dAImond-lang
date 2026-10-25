@@ -20,29 +20,11 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
         let f = sd.fields[i]
         let fname = f.name
         let ftype = f.type_name
-        let mut ir_type_name = parse_type_to_ir(ftype)
+        let ir_type_name = map_type_name(ftype)
 
-        -- For List/Map fields, use concrete runtime struct type names
-        -- so LLVM struct layout matches C struct layout (embedded by value)
-        if starts_with(ftype, "List[") {
-            let inner = extract_inner_type(ftype, "List[")
-            let ek = classify_list_elem(inner)
-            if ek == LIST_ELEM_INT() { ir_type_name = "dm_list_int64" }
-            else if ek == LIST_ELEM_FLOAT() { ir_type_name = "dm_list_double" }
-            else if ek == LIST_ELEM_STRING() { ir_type_name = "dm_list_dm_string" }
-            else { ir_type_name = "dm_list_generic" }
-        }
-        if starts_with(ftype, "Map[") {
-            let minner = extract_inner_type(ftype, "Map[")
-            if starts_with(minner, "string") { ir_type_name = "dm_map_string_int" }
-            else { ir_type_name = "dm_map_int_string" }
-        }
-
-        -- Store original type for tracking (Box[T], List[T], etc.)
         info.field_names.push(fname)
-        info.field_types.push(ftype)
+        info.field_types.push(ir_type_name)
 
-        -- Use IR-mapped type for LLVM generation
         let field = ir_field_new(fname, ir_type_name)
         ir_fields.push(field)
 
@@ -55,18 +37,6 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
             if elem_kind == LIST_ELEM_OTHER() {
                 g.field_list_elem_types.insert(field_key, inner)
             }
-        }
-
-        -- Detect Map[K,V] fields for field access dispatch
-        if starts_with(ftype, "Map[") {
-            let inner = extract_inner_type(ftype, "Map[")
-            let map_kind = if starts_with(inner, "string") {
-                MAP_KIND_STRING_INT()
-            } else {
-                MAP_KIND_INT_STRING()
-            }
-            let field_key = sd.name + "." + fname
-            g.field_map_kinds.insert(field_key, map_kind)
         }
 
         i = i + 1
@@ -717,8 +687,33 @@ fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
 fn generate_constant(gen: IRGenerator, cd: ConstDecl) -> IRGenerator {
     let mut g = gen
 
+    -- Pre-grow globals list to avoid realloc during comptime evaluation.
+    -- Comptime recursion copies the generator by value, sharing the list buffer.
+    -- A realloc in a callee would free the buffer the caller is still using.
+    -- By pre-growing, we ensure enough capacity for comptime variable pushes.
+    if cd.is_comptime {
+        let mut prealloc_i = 0
+        while prealloc_i < 1024 {
+            let mut dummy = ir_global_new("__comptime_prealloc__", "i64")
+            dummy.has_init = false
+            dummy.is_const = false
+            g.ir_mod.globals.push(dummy)
+            prealloc_i = prealloc_i + 1
+        }
+        let mut pop_i = 0
+        while pop_i < 1024 {
+            g.ir_mod.globals.pop()
+            pop_i = pop_i + 1
+        }
+    }
+
     -- Try to evaluate the value at compile time
-    let val = eval_const_value(g, cd.value)
+    -- Use the full comptime evaluator for comptime expressions (blocks, fn calls, etc.)
+    let val = if cd.is_comptime {
+        eval_comptime_expr(g, *cd.value)
+    } else {
+        eval_const_value(g, cd.value)
+    }
 
     let ty = if len(cd.type_name) > 0 {
         map_type_name(cd.type_name)
