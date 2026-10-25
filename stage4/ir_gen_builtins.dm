@@ -333,6 +333,9 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
     let c_name = map_builtin_name(fn_name)
     let ret_type = builtin_return_type(fn_name)
 
+    -- Auto-convert print/println/eprint/eprintln args to string
+    let is_print_fn = fn_name == "println" or fn_name == "print" or fn_name == "eprintln" or fn_name == "eprint"
+
     -- Generate all argument expressions
     let mut call_args: List[IRValue] = []
     let mut i = 0
@@ -340,7 +343,54 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
         let arg_result = generate_expr(g, b, args[i])
         g = arg_result.gen
         b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
+
+        if is_print_fn {
+            let arg_type = infer_expr_type(g, args[i])
+            if arg_type == "i64" or arg_type == "i32" or arg_type == "i16" or arg_type == "i8" or arg_type == "u64" or arg_type == "u32" or arg_type == "u16" or arg_type == "u8" or arg_type == "int" {
+                -- Wrap with int_to_string
+                let conv_id = g.builder.next_id
+                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
+                conv_inst.callee = "dm_int_to_string"
+                let mut conv_args: List[IRValue] = []
+                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_inst.call_args = conv_args
+                conv_inst.result_type = "string"
+                conv_inst.has_result = true
+                b.instructions.push(conv_inst)
+                g.builder.next_id = g.builder.next_id + 1
+                call_args.push(ir_val_inst(conv_id))
+            } else if arg_type == "f64" or arg_type == "f32" or arg_type == "float" {
+                -- Wrap with float_to_string
+                let conv_id = g.builder.next_id
+                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
+                conv_inst.callee = "dm_float_to_string"
+                let mut conv_args: List[IRValue] = []
+                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_inst.call_args = conv_args
+                conv_inst.result_type = "string"
+                conv_inst.has_result = true
+                b.instructions.push(conv_inst)
+                g.builder.next_id = g.builder.next_id + 1
+                call_args.push(ir_val_inst(conv_id))
+            } else if arg_type == "bool" {
+                -- Wrap with bool_to_string
+                let conv_id = g.builder.next_id
+                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
+                conv_inst.callee = "dm_bool_to_string"
+                let mut conv_args: List[IRValue] = []
+                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_inst.call_args = conv_args
+                conv_inst.result_type = "string"
+                conv_inst.has_result = true
+                b.instructions.push(conv_inst)
+                g.builder.next_id = g.builder.next_id + 1
+                call_args.push(ir_val_inst(conv_id))
+            } else {
+                call_args.push(ir_val_inst(arg_result.val_id))
+            }
+        } else {
+            call_args.push(ir_val_inst(arg_result.val_id))
+        }
         i = i + 1
     }
 
