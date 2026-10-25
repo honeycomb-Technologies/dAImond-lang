@@ -458,6 +458,8 @@ pub const TypeChecker = struct {
     source_file: ?[]const u8,
     /// Names of functions that have generic parameters
     generic_function_names: std.StringHashMap(void),
+    /// Diagnostic messages allocated by this checker (freed in deinit)
+    owned_messages: std.ArrayList([]const u8),
 
     const Self = @This();
 
@@ -478,6 +480,7 @@ pub const TypeChecker = struct {
             .source = null,
             .source_file = null,
             .generic_function_names = std.StringHashMap(void).init(allocator),
+            .owned_messages = std.ArrayList([]const u8).init(allocator),
         };
 
         // Register built-in types and functions
@@ -493,6 +496,10 @@ pub const TypeChecker = struct {
         self.union_find.deinit();
         self.constraints.deinit();
         self.generic_function_names.deinit();
+        for (self.owned_messages.items) |msg| {
+            self.allocator.free(msg);
+        }
+        self.owned_messages.deinit();
         self.type_ctx.deinit();
         self.allocator.destroy(self.type_ctx);
     }
@@ -1861,9 +1868,116 @@ pub const TypeChecker = struct {
         return elem_type;
     }
 
+    fn castTypeIsUnprovable(typ: Type) bool {
+        return switch (typ) {
+            .type_var, .type_param, .error_type, .any, .unknown, .never => true,
+            else => false,
+        };
+    }
+
+    /// Human-readable type name for cast diagnostics. The returned slice is
+    /// owned by the checker (tracked in owned_messages).
+    fn castTypeName(self: *Self, type_id: TypeId) anyerror![]const u8 {
+        const resolved = self.resolveType(type_id);
+        const typ = self.type_ctx.get(resolved) orelse {
+            const msg = try self.allocator.dupe(u8, "<unknown>");
+            try self.owned_messages.append(msg);
+            return msg;
+        };
+        const msg: []const u8 = switch (typ) {
+            .int => |i| switch (i) {
+                .i64 => try self.allocator.dupe(u8, "int"),
+                .u64 => try self.allocator.dupe(u8, "uint"),
+                .u8 => try self.allocator.dupe(u8, "u8"),
+                else => try self.allocator.dupe(u8, i.name()),
+            },
+            .float => |f| switch (f) {
+                .f64 => try self.allocator.dupe(u8, "float"),
+                .f32 => try self.allocator.dupe(u8, "f32"),
+            },
+            .str => try self.allocator.dupe(u8, "string"),
+            .bool => try self.allocator.dupe(u8, "bool"),
+            .char => try self.allocator.dupe(u8, "char"),
+            .unit => try self.allocator.dupe(u8, "unit"),
+            .ref => |r| blk: {
+                const inner = try self.castTypeName(r.pointee);
+                break :blk if (r.is_mutable)
+                    try std.fmt.allocPrint(self.allocator, "&mut {s}", .{inner})
+                else
+                    try std.fmt.allocPrint(self.allocator, "&{s}", .{inner});
+            },
+            .box => |inner_id| blk: {
+                const inner = try self.castTypeName(inner_id);
+                break :blk try std.fmt.allocPrint(self.allocator, "Box[{s}]", .{inner});
+            },
+            .@"struct" => |s| try self.allocator.dupe(u8, s.name orelse "struct"),
+            .@"enum" => |e| try self.allocator.dupe(u8, e.name),
+            .array => |a| blk: {
+                const inner = try self.castTypeName(a.element_type);
+                break :blk try std.fmt.allocPrint(self.allocator, "[{s}; {d}]", .{ inner, a.size });
+            },
+            .slice => |s| blk: {
+                const inner = try self.castTypeName(s.element_type);
+                break :blk try std.fmt.allocPrint(self.allocator, "[{s}]", .{inner});
+            },
+            .option => |inner_id| blk: {
+                const inner = try self.castTypeName(inner_id);
+                break :blk try std.fmt.allocPrint(self.allocator, "Option[{s}]", .{inner});
+            },
+            .result => blk: {
+                const ok_name = try self.castTypeName(typ.result.ok_type);
+                const err_name = try self.castTypeName(typ.result.err_type);
+                break :blk try std.fmt.allocPrint(self.allocator, "Result[{s}, {s}]", .{ ok_name, err_name });
+            },
+            .future => |inner_id| blk: {
+                const inner = try self.castTypeName(inner_id);
+                break :blk try std.fmt.allocPrint(self.allocator, "Future[{s}]", .{inner});
+            },
+            .trait_object => try self.allocator.dupe(u8, "dyn Trait"),
+            .simd => |s| try self.allocator.dupe(u8, s.name()),
+            .generic_instance => try self.allocator.dupe(u8, "generic instance (List/Map/struct)"),
+            .tuple => try self.allocator.dupe(u8, "tuple"),
+            .function => try self.allocator.dupe(u8, "function"),
+            else => types.typeName(self.type_ctx, resolved, self.allocator) catch try self.allocator.dupe(u8, "<unknown>"),
+        };
+        try self.owned_messages.append(msg);
+        return msg;
+    }
+
     fn inferCast(self: *Self, cast: *const ast.CastExpr) anyerror!TypeId {
-        _ = try self.inferExpr(cast.expr);
-        return try self.resolveTypeExpr(cast.target_type);
+        const src_type = try self.inferExpr(cast.expr);
+        const dst_type = try self.resolveTypeExpr(cast.target_type);
+
+        const src = self.resolveType(src_type);
+        const dst = self.resolveType(dst_type);
+
+        // Same-type casts are no-ops.
+        if (src == dst) return dst_type;
+
+        const src_t = self.type_ctx.get(src) orelse return dst_type;
+        const dst_t = self.type_ctx.get(dst) orelse return dst_type;
+
+        // Types still under inference (generics, List/Map element vars,
+        // error recovery) cannot be proven non-numeric; let them through.
+        if (castTypeIsUnprovable(src_t) or castTypeIsUnprovable(dst_t)) return dst_type;
+
+        // `x as dyn Trait` keeps its legacy meaning (trait-object coercion).
+        if (dst_t == .trait_object) return dst_type;
+
+        // Numeric <-> numeric casts are allowed. Narrowing integer casts
+        // additionally get a runtime range check in codegen.
+        if (src_t.isNumeric() and dst_t.isNumeric()) return dst_type;
+
+        const src_name = try self.castTypeName(src);
+        const dst_name = try self.castTypeName(dst);
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "invalid cast from {s} to {s}: only numeric to numeric casts are allowed",
+            .{ src_name, dst_name },
+        );
+        try self.owned_messages.append(msg);
+        try self.reportError(.type_mismatch, msg, cast.span);
+        return dst_type;
     }
 
     fn inferTypeCheck(self: *Self, tc: *const ast.TypeCheckExpr) anyerror!TypeId {

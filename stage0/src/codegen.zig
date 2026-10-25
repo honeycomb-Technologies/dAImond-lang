@@ -1238,6 +1238,24 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
+        // Checked narrowing-cast helpers (panic if the value does not fit
+        // the destination integer type; see generateCast)
+        try self.writer.writeLine("static inline int64_t dm_cast_check_i64(int64_t v, int64_t lo, int64_t hi) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (v < lo || v > hi) dm_panic(\"integer cast out of range\");");
+        try self.writer.writeLine("return v;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline uint64_t dm_cast_check_u64(uint64_t v, uint64_t hi) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (v > hi) dm_panic(\"integer cast out of range\");");
+        try self.writer.writeLine("return v;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
         // Print functions
         try self.writer.writeLine("static inline void dm_print_str(dm_string s) {");
         self.writer.indent();
@@ -9161,8 +9179,94 @@ pub const CodeGenerator = struct {
         }
     }
 
+    const CIntInfo = struct {
+        bits: u8,
+        signed: bool,
+    };
+
+    fn cIntInfo(c_type: []const u8) ?CIntInfo {
+        if (std.mem.eql(u8, c_type, "int8_t")) return .{ .bits = 8, .signed = true };
+        if (std.mem.eql(u8, c_type, "int16_t")) return .{ .bits = 16, .signed = true };
+        if (std.mem.eql(u8, c_type, "int32_t")) return .{ .bits = 32, .signed = true };
+        if (std.mem.eql(u8, c_type, "int64_t")) return .{ .bits = 64, .signed = true };
+        if (std.mem.eql(u8, c_type, "uint8_t")) return .{ .bits = 8, .signed = false };
+        if (std.mem.eql(u8, c_type, "uint16_t")) return .{ .bits = 16, .signed = false };
+        if (std.mem.eql(u8, c_type, "uint32_t")) return .{ .bits = 32, .signed = false };
+        if (std.mem.eql(u8, c_type, "uint64_t")) return .{ .bits = 64, .signed = false };
+        if (std.mem.eql(u8, c_type, "char")) return .{ .bits = 8, .signed = true };
+        return null;
+    }
+
+    fn intCastFits(src: CIntInfo, dst: CIntInfo) bool {
+        if (src.signed == dst.signed) return dst.bits >= src.bits;
+        if (!src.signed and dst.signed) return dst.bits > src.bits;
+        return false; // signed -> unsigned never fits (negative values)
+    }
+
+    fn cIntMinLiteral(info: CIntInfo) []const u8 {
+        return switch (info.bits) {
+            8 => "-128LL",
+            16 => "-32768LL",
+            32 => "-2147483647LL - 1LL",
+            else => "-9223372036854775807LL - 1LL",
+        };
+    }
+
+    fn cIntMaxLiteral(info: CIntInfo) []const u8 {
+        if (info.signed) {
+            return switch (info.bits) {
+                8 => "127LL",
+                16 => "32767LL",
+                32 => "2147483647LL",
+                else => "9223372036854775807LL",
+            };
+        }
+        return switch (info.bits) {
+            8 => "255ULL",
+            16 => "65535ULL",
+            32 => "4294967295ULL",
+            else => "18446744073709551615ULL",
+        };
+    }
+
     fn generateCast(self: *Self, cast: *CastExpr) anyerror!void {
         const target_type = try self.mapType(cast.target_type);
+        const src_type = self.inferCTypeFromExpr(cast.expr);
+
+        // Narrowing integer casts get a runtime range check
+        // (PANIC: integer cast out of range). Float<->int and widening
+        // casts keep plain C conversion semantics.
+        if (cIntInfo(src_type)) |src_info| {
+            if (cIntInfo(target_type)) |dst_info| {
+                if (!intCastFits(src_info, dst_info)) {
+                    if (dst_info.signed and src_info.signed) {
+                        try self.writer.print("(({s})dm_cast_check_i64((int64_t)(", .{target_type});
+                        try self.generateExpr(cast.expr);
+                        try self.writer.print("), {s}, {s}))", .{ cIntMinLiteral(dst_info), cIntMaxLiteral(dst_info) });
+                        return;
+                    }
+                    if (dst_info.signed and !src_info.signed) {
+                        try self.writer.print("(({s})dm_cast_check_u64((uint64_t)(", .{target_type});
+                        try self.generateExpr(cast.expr);
+                        try self.writer.print("), {s}))", .{cIntMaxLiteral(dst_info)});
+                        return;
+                    }
+                    if (!dst_info.signed and src_info.signed) {
+                        const hi = if (dst_info.bits >= 64) "9223372036854775807LL" else cIntMaxLiteral(dst_info);
+                        try self.writer.print("(({s})dm_cast_check_i64((int64_t)(", .{target_type});
+                        try self.generateExpr(cast.expr);
+                        try self.writer.print("), 0LL, {s}))", .{hi});
+                        return;
+                    }
+                    // unsigned -> unsigned (shrinking)
+                    try self.writer.print("(({s})dm_cast_check_u64((uint64_t)(", .{target_type});
+                    try self.generateExpr(cast.expr);
+                    try self.writer.print("), {s}))", .{cIntMaxLiteral(dst_info)});
+                    return;
+                }
+            }
+        }
+
         try self.writer.print("(({s})(", .{target_type});
         try self.generateExpr(cast.expr);
         try self.writer.write("))");
