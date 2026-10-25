@@ -339,8 +339,13 @@ fn main() {
             return
         }
         println("Found " + int_to_string(test_names.len()) + " test(s)")
-        -- Compile the file normally then run it
-        -- (test functions use assert/assert_eq internally)
+        -- Compile, then rewrite the generated C like Stage 0's testFile:
+        -- (a) make dm_panic/dm_panic_cstr and the inline assert/assert_eq
+        --     failures longjmp to the runner instead of exit(1), and
+        -- (b) replace main() with a runner that calls each test_* function
+        --     under setjmp and reports real PASS/FAIL per test.
+        -- (Stage 1 assert expands inline without calling dm_panic, and its
+        -- dm_panic takes dm_string, so the needles differ from Stage 0's.)
         let mut comp = compiler_new(tokens)
         comp = compile_source(comp)
         if comp.errors.len() > 0 {
@@ -352,28 +357,76 @@ fn main() {
             }
             exit(1)
         }
-        let c_code = assemble_output(comp)
+        let mut test_code = assemble_output(comp)
+        -- (a) Test-aware panics (exact spellings from stage1/runtime.dm)
+        let panic_cstr_old = "static inline void dm_panic_cstr(const char* msg) { fprintf(stderr, \"PANIC: %s\\n\", msg); exit(1); }"
+        let panic_old = "static inline void dm_panic(dm_string msg) { fprintf(stderr, \"PANIC: \"); fwrite(msg.data, 1, msg.len, stderr); fputc('\\n', stderr); exit(1); }"
+        if string_contains(test_code, panic_cstr_old) == false or string_contains(test_code, panic_old) == false {
+            eprintln("Error: generated C has no recognizable dm_panic to rewrite for testing")
+            exit(1)
+        }
+        let mut panic_cstr_new = "#include <setjmp.h>\n"
+        panic_cstr_new = panic_cstr_new + "static jmp_buf __test_jmp;\n"
+        panic_cstr_new = panic_cstr_new + "static int __test_active = 0;\n"
+        panic_cstr_new = panic_cstr_new + "static const char* __test_fail_msg = NULL;\n"
+        panic_cstr_new = panic_cstr_new + "static char __test_fail_buf[512];\n"
+        panic_cstr_new = panic_cstr_new + "static inline void dm_panic_cstr(const char* msg) { if (__test_active) { __test_fail_msg = msg; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: %s\\n\", msg); exit(1); }"
+        test_code = string_replace(test_code, panic_cstr_old, panic_cstr_new)
+        let panic_new = "static inline void dm_panic(dm_string msg) { if (__test_active) { size_t __n = msg.len < 511 ? msg.len : 511; memcpy(__test_fail_buf, msg.data, __n); __test_fail_buf[__n] = '\\0'; __test_fail_msg = __test_fail_buf; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: \"); fwrite(msg.data, 1, msg.len, stderr); fputc('\\n', stderr); exit(1); }"
+        test_code = string_replace(test_code, panic_old, panic_new)
+        -- Inline assert/assert_eq failures (exact spellings from compile_expr.dm)
+        test_code = string_replace(test_code, "fprintf(stderr, \"PANIC: assertion failed\\n\"); exit(1);", "if (__test_active) { __test_fail_msg = \"assertion failed\"; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: assertion failed\\n\"); exit(1);")
+        test_code = string_replace(test_code, "fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1);", "if (__test_active) { __test_fail_msg = \"assert_eq failed\"; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1);")
+        -- (b) Replace main() with the test runner
+        let main_pos = string_find(test_code, "int main(int argc, char** argv)")
+        if main_pos < 0 {
+            eprintln("Error: generated C has no main() to replace with the test runner")
+            exit(1)
+        }
+        let mut runner = substr(test_code, 0, main_pos)
+        runner = runner + "int main(int argc, char** argv) {\n"
+        runner = runner + "    dm_argc = argc;\n"
+        runner = runner + "    dm_argv = argv;\n"
+        runner = runner + "    int __passed = 0, __failed = 0;\n"
+        let mut ti2 = 0
+        while ti2 < test_names.len() {
+            let tname = test_names[ti2]
+            runner = runner + "    printf(\"  test " + tname + " ... \");\n"
+            runner = runner + "    fflush(stdout);\n"
+            runner = runner + "    __test_active = 1;\n"
+            runner = runner + "    __test_fail_msg = NULL;\n"
+            runner = runner + "    if (setjmp(__test_jmp) == 0) {\n"
+            runner = runner + "        dm_" + tname + "();\n"
+            runner = runner + "        __test_active = 0;\n"
+            runner = runner + "        printf(\"PASS\\n\"); __passed++;\n"
+            runner = runner + "    } else {\n"
+            runner = runner + "        __test_active = 0;\n"
+            runner = runner + "        if (__test_fail_msg) printf(\"FAIL: %s\\n\", __test_fail_msg);\n"
+            runner = runner + "        else printf(\"FAIL\\n\");\n"
+            runner = runner + "        __failed++;\n"
+            runner = runner + "    }\n"
+            ti2 = ti2 + 1
+        }
+        runner = runner + "    printf(\"\\n%d passed, %d failed\\n\", __passed, __failed);\n"
+        runner = runner + "    return __failed > 0 ? 1 : 0;\n"
+        runner = runner + "}\n"
         let c_file = string_replace(filename, ".dm", ".c")
         let bin_file = string_replace(filename, ".dm", "")
-        file_write(c_file, c_code)
+        file_write(c_file, runner)
         let compile_cmd = "cc -o " + bin_file + " " + c_file + " -lm"
         let cc_exit = system(compile_cmd)
         if cc_exit != 0 {
             eprintln("C compilation failed")
             exit(1)
         }
-        let run_exit = system("./" + bin_file)
+        let mut run_cmd = "./" + bin_file
+        if starts_with(bin_file, "/") {
+            run_cmd = bin_file
+        }
+        let run_exit = system(run_cmd)
         if run_exit != 0 {
-            eprintln("Tests failed")
             exit(1)
         }
-        -- Print results
-        let mut ti2 = 0
-        while ti2 < test_names.len() {
-            println("  PASS: " + test_names[ti2])
-            ti2 = ti2 + 1
-        }
-        println(int_to_string(test_names.len()) + " test(s) passed")
         return
     }
 
