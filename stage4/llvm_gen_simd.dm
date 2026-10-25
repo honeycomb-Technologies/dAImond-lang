@@ -78,9 +78,9 @@ fn coerce_simd_scalar(gen: LLVMGenerator, val: int, vec_type: string) -> int {
     let b = gen.builder
     let ctx = gen.context
     let val_ty_kind = dm_llvm_get_type_kind(dm_llvm_type_of(val))
-    -- Type kind constants from LLVM:
-    -- 10 = LLVMIntegerTypeKind, 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
-    let is_int_val = val_ty_kind == 10
+    -- Type kind constants from LLVM-C Core.h:
+    -- 8 = LLVMIntegerTypeKind, 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
+    let is_int_val = val_ty_kind == 8
     let is_float_val = val_ty_kind == 2
     let is_double_val = val_ty_kind == 3
     if starts_with(vec_type, "f32") {
@@ -276,14 +276,39 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     g = resolve_value_with_counter(g, inst.simd_index)
     -- LLVM extractelement needs an i32 index
     let idx_ty_kind = dm_llvm_get_type_kind(dm_llvm_type_of(idx))
-    if idx_ty_kind == 10 {
-        -- Integer type: check width
+    if idx_ty_kind == 8 {
+        -- Integer type (LLVMIntegerTypeKind = 8): check width
         let idx_width = dm_llvm_get_int_type_width(dm_llvm_type_of(idx))
         if idx_width != 32 {
             idx = dm_llvm_build_int_cast2(b, idx, dm_llvm_int32_type(ctx), 1, "idx.cast")
         }
     }
-    let result = dm_llvm_build_extract_element(b, vec, idx, "extract")
+    let mut result = dm_llvm_build_extract_element(b, vec, idx, "extract")
+    -- Coerce extracted value to dAImond-native type:
+    -- f32 -> f64 (fpext), i32 -> i64 (sext) so downstream code sees native types
+    let vec_type = inst.simd_vec_type
+    if vec_type == "f32x4" or vec_type == "f32x8" {
+        -- float -> double
+        result = dm_llvm_build_fp_cast(b, result, dm_llvm_double_type(ctx), "ext.f64")
+    }
+    if vec_type == "i32x4" or vec_type == "i32x8" {
+        -- i32 -> i64
+        result = dm_llvm_build_int_cast2(b, result, dm_llvm_int64_type(ctx), 1, "ext.i64")
+    }
     if inst.has_result { g.value_map.insert(id_key, result) }
     return g
 }
+
+
+-- ============================================================
+-- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
+--
+-- Compiles dAImond source to native binaries via LLVM.
+-- Uses its own frontend (lexer.dm, parser.dm) instead of
+-- reusing Stage 0's Zig frontend.
+--
+-- Pipeline:
+--   Source (.dm) -> Lexer -> Tokens -> Parser -> AST
+--   -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR
+--   -> Object File -> Linker -> Native Binary
+-- ============================================================

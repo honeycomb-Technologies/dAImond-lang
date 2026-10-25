@@ -15228,7 +15228,69 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     if type_name == "ptr" { return dm_llvm_pointer_type(ctx) }
     -- Pointer types: ptr(...)
     if starts_with(type_name, "ptr(") { return dm_llvm_pointer_type(ctx) }
-    -- List and Map types (found via struct_type_map registered in register_builtin_struct_types)
+    -- List types: use dm_string type {ptr, i64, i64} since lists share the same layout
+    if starts_with(type_name, "dm_list_") or starts_with(type_name, "list") or type_name == "list" or starts_with(type_name, "List[") {
+        if gen.has_dm_string_type { return gen.dm_string_type }
+        return dm_llvm_pointer_type(ctx)
+    }
+    -- Map types: use [64 x i8] to ensure enough space for runtime map struct
+    if starts_with(type_name, "dm_map_") or starts_with(type_name, "map") or type_name == "map" or starts_with(type_name, "Map[") {
+        return dm_llvm_array_type(dm_llvm_int8_type(ctx), 64)
+    }
+    -- Result type: { i32 tag, ok_type, err_type }
+    -- Parse inner types from Result[T, E] for correct LLVM struct layout
+    if type_name == "result" or starts_with(type_name, "Result[") or starts_with(type_name, "result_") {
+        let i32_ty = dm_llvm_int32_type(ctx)
+        let mut ok_ty = dm_llvm_int64_type(ctx)
+        let mut err_ty = dm_llvm_int64_type(ctx)
+        if starts_with(type_name, "Result[") {
+            -- Parse Result[T, E] -> extract T and E
+            let inner = substr(type_name, 7, len(type_name) - 8)
+            -- Find comma separating T and E, respecting nested brackets
+            let mut comma_pos = 0 - 1
+            let mut depth = 0
+            let mut ci = 0
+            while ci < len(inner) {
+                let ch = char_at(inner, ci)
+                if ch == "[" { depth = depth + 1 }
+                if ch == "]" { depth = depth - 1 }
+                if ch == "," and depth == 0 {
+                    comma_pos = ci
+                    ci = len(inner)
+                }
+                ci = ci + 1
+            }
+            if comma_pos >= 0 {
+                let ok_str = substr(inner, 0, comma_pos)
+                let mut err_start = comma_pos + 1
+                if err_start < len(inner) and char_at(inner, err_start) == " " {
+                    err_start = err_start + 1
+                }
+                let err_str = substr(inner, err_start, len(inner) - err_start)
+                ok_ty = map_ir_type_to_llvm(gen, ok_str)
+                err_ty = map_ir_type_to_llvm(gen, err_str)
+            }
+        }
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(i32_ty)
+        dm_llvm_buf_push(ok_ty)
+        dm_llvm_buf_push(err_ty)
+        return dm_llvm_struct_type_buf(ctx, 3, 0)
+    }
+    -- Option type: { i32 has_value, inner_type }
+    -- Parse inner type from Option[T] for correct LLVM struct layout
+    if type_name == "option" or starts_with(type_name, "Option[") or starts_with(type_name, "option_") {
+        let i32_ty = dm_llvm_int32_type(ctx)
+        let mut inner_ty = dm_llvm_int64_type(ctx)
+        if starts_with(type_name, "Option[") {
+            let inner = substr(type_name, 7, len(type_name) - 8)
+            inner_ty = map_ir_type_to_llvm(gen, inner)
+        }
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(i32_ty)
+        dm_llvm_buf_push(inner_ty)
+        return dm_llvm_struct_type_buf(ctx, 2, 0)
+    }
     -- SIMD vector types
     if lg_is_simd_type(type_name) {
         return get_simd_llvm_type(gen, type_name)
@@ -15236,14 +15298,6 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     -- Struct types: look up in struct_type_map
     if gen.struct_type_map.contains(type_name) {
         return gen.struct_type_map.get(type_name)
-    }
-    -- Strip generic parameters: "Option[int]" -> "Option"
-    let bracket_pos = string_find(type_name, "[")
-    if bracket_pos >= 0 {
-        let base_name = substr(type_name, 0, bracket_pos)
-        if gen.struct_type_map.contains(base_name) {
-            return gen.struct_type_map.get(base_name)
-        }
     }
     -- Struct names prefixed with "struct "
     if starts_with(type_name, "struct ") {
@@ -15345,16 +15399,21 @@ fn declare_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
             let sname = ir_ty.name
             if sname != "" and g.struct_type_map.contains(sname) {
                 let llvm_struct = g.struct_type_map.get(sname)
-                dm_llvm_buf_clear()
+                -- Collect field types into list first (avoid buffer clobbering)
+                let mut field_types: List[int] = []
                 let mut fi = 0
-                let mut field_count = 0
                 while fi < ir_ty.fields.len() {
                     let field = ir_ty.fields[fi]
-                    dm_llvm_buf_push(map_ir_type_to_llvm(g, field.type_id))
-                    field_count = field_count + 1
+                    field_types.push(map_ir_type_to_llvm(g, field.type_id))
                     fi = fi + 1
                 }
-                if field_count > 0 {
+                if field_types.len() > 0 {
+                    dm_llvm_buf_clear()
+                    fi = 0
+                    while fi < field_types.len() {
+                        dm_llvm_buf_push(field_types[fi])
+                        fi = fi + 1
+                    }
                     dm_llvm_struct_set_body_buf(llvm_struct, 0)
                 }
             }
@@ -15373,6 +15432,16 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
     let mut i = 0
     while i < g.ir_module.globals.len() {
         let global = g.ir_module.globals[i]
+        -- Skip comptime bookkeeping globals (array elements, markers)
+        if starts_with(global.name, "__ct_arr_") {
+            i = i + 1
+            continue
+        }
+        -- Skip string-type globals (they are resolved inline by generate_identifier)
+        if global.has_init and global.init_value.kind == VAL_CONST_STRING() {
+            i = i + 1
+            continue
+        }
         let llvm_ty = map_ir_type_to_llvm(g, global.type_id)
         let gvar = dm_llvm_module_add_global(g.llvm_module, llvm_ty, global.name)
         -- Set initializer
@@ -15383,8 +15452,8 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
             } else if init.kind == VAL_CONST_FLOAT() {
                 dm_llvm_set_initializer(gvar, dm_llvm_const_real(llvm_ty, init.float_val))
             } else if init.kind == VAL_CONST_BOOL() {
-                let bval = 0
-                if init.bool_val { let bval = 1 }
+                let mut bval = 0
+                if init.bool_val { bval = 1 }
                 dm_llvm_set_initializer(gvar, dm_llvm_const_int(llvm_ty, bval, 0))
             } else {
                 dm_llvm_set_initializer(gvar, dm_llvm_const_null(llvm_ty))
@@ -15405,7 +15474,9 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- FUNCTION DECLARATION
 -- ============================================================
 
--- Check if an IR function involves dm_string in params or return type
+-- Check if a return type needs sret (struct return) convention.
+-- Result ({i32, i64, i64} = 20 bytes) and Option ({i32, i64} = 12 bytes)
+-- are too large for register return on x86_64 and cause LLVM errors.
 fn func_needs_wrapper(func: IRFunction) -> bool {
     if func.is_extern == false { return false }
     if func.return_type == "string" { return true }
@@ -15423,29 +15494,35 @@ fn declare_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     let returns_string = func.return_type == "string"
     let ptr_ty = dm_llvm_pointer_type(ctx)
     let void_ty = dm_llvm_void_type(ctx)
-    -- Build wrapper parameter types
-    dm_llvm_buf_clear()
-    -- If returns string: prepend sret output pointer
+    -- Compute return type BEFORE using buffer (map_ir_type_to_llvm may use buffer internally)
+    let mut ret_ty = 0
     if returns_string {
-        dm_llvm_buf_push(ptr_ty)
+        ret_ty = void_ty
+    } else {
+        ret_ty = map_ir_type_to_llvm(g, func.return_type)
     }
-    -- Transform params: string -> ptr, others -> normal mapping
+    -- Collect param types into a list first (avoid buffer clobbering)
+    let mut param_types: List[int] = []
+    if returns_string {
+        param_types.push(ptr_ty)
+    }
     let mut i = 0
     while i < func.params.len() {
         let p = func.params[i]
         if p.type_id == "string" {
-            dm_llvm_buf_push(ptr_ty)
+            param_types.push(ptr_ty)
         } else {
-            dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
+            param_types.push(map_ir_type_to_llvm(g, p.type_id))
         }
         i = i + 1
     }
-    -- Return type: void if returns_string, else mapped type
-    let mut ret_ty = map_ir_type_to_llvm(g, func.return_type)
-    if returns_string {
-        ret_ty = void_ty
+    -- Push all to shared buffer at once and create function type
+    dm_llvm_buf_clear()
+    i = 0
+    while i < param_types.len() {
+        dm_llvm_buf_push(param_types[i])
+        i = i + 1
     }
-    -- Create function type
     let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
     -- Wrapper name: "llvm_" + original name
     let wrapper_name = "llvm_" + func.name
@@ -15458,6 +15535,11 @@ fn declare_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     return g
 }
 
+-- Declare and generate a wrapper for a user-declared extern function that uses dm_string.
+-- For `extern fn getenv(name: string) -> string`:
+-- 1. Declare the real C function `getenv` as `ptr getenv(ptr)`
+-- 2. Generate a wrapper `llvm_getenv` that converts dm_string <-> char*
+
 fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     let mut g = gen
     let ctx = g.context
@@ -15465,38 +15547,71 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     if func_needs_wrapper(func) {
         -- Check if this is a user extern function
         if g.ir_module.user_extern_fns.contains(func.name) {
-            -- TODO: user extern wrapper generation
-            g = declare_wrapper(g, func)
+            g = declare_user_extern_wrapper(g, func)
             return g
         }
         g = declare_wrapper(g, func)
         return g
     }
     -- Regular function declaration
-    dm_llvm_buf_clear()
-    let mut i = 0
-    while i < func.params.len() {
-        dm_llvm_buf_push(map_ir_type_to_llvm(g, func.params[i].type_id))
-        i = i + 1
-    }
-    -- C ABI: main returns i32 and takes (i32 argc, i8** argv)
+    -- Check if function returns result/option (needs sret convention)
+    let needs_sret = is_sret_return_type(func.return_type) and func.name != "main"
     let is_main = func.name == "main"
-    let mut ret_ty = map_ir_type_to_llvm(g, func.return_type)
+    -- IMPORTANT: Compute return type and collect param types BEFORE using the shared
+    -- buffer, because map_ir_type_to_llvm may use dm_llvm_buf internally for struct types
+    let mut ret_ty = 0
     if is_main {
         ret_ty = dm_llvm_int32_type(ctx)
-        dm_llvm_buf_push(dm_llvm_int32_type(ctx))
-        dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
+    } else if needs_sret {
+        ret_ty = dm_llvm_void_type(ctx)
+    } else {
+        ret_ty = map_ir_type_to_llvm(g, func.return_type)
+    }
+    -- Collect all param types into a list first (avoid buffer clobbering)
+    let mut param_types: List[int] = []
+    if needs_sret {
+        param_types.push(dm_llvm_pointer_type(ctx))
+    }
+    let mut i = 0
+    while i < func.params.len() {
+        param_types.push(map_ir_type_to_llvm(g, func.params[i].type_id))
+        i = i + 1
+    }
+    if is_main {
+        param_types.push(dm_llvm_int32_type(ctx))
+        param_types.push(dm_llvm_pointer_type(ctx))
+    }
+    -- Now push all to shared buffer at once and create function type
+    dm_llvm_buf_clear()
+    i = 0
+    while i < param_types.len() {
+        dm_llvm_buf_push(param_types[i])
+        i = i + 1
     }
     let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
     let llvm_fn = dm_llvm_module_add_function(g.llvm_module, func.name, fn_ty)
     g.function_map.insert(func.name, llvm_fn)
     g.fn_type_map.insert(func.name, fn_ty)
-    -- Name parameters
+    -- Track sret functions
+    if needs_sret {
+        g.returns_sret.insert(func.name, true)
+    }
+    -- Name parameters (offset by 1 for sret functions since param 0 is the sret ptr)
     i = 0
-    while i < func.params.len() {
-        let param_val = dm_llvm_get_param(llvm_fn, i)
-        dm_llvm_set_value_name(param_val, func.params[i].name)
-        i = i + 1
+    if needs_sret {
+        let sret_param = dm_llvm_get_param(llvm_fn, 0)
+        dm_llvm_set_value_name(sret_param, "sret.out")
+        while i < func.params.len() {
+            let param_val = dm_llvm_get_param(llvm_fn, i + 1)
+            dm_llvm_set_value_name(param_val, func.params[i].name)
+            i = i + 1
+        }
+    } else {
+        while i < func.params.len() {
+            let param_val = dm_llvm_get_param(llvm_fn, i)
+            dm_llvm_set_value_name(param_val, func.params[i].name)
+            i = i + 1
+        }
     }
     return g
 }
@@ -15524,42 +15639,131 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     -- Clear value_map and string_ptrs for this function
     g.value_map = Map_new()
     g.string_ptrs = Map_new()
-    -- Generate instructions and terminators for each block
-    let mut is_first = true
-    bi = 0
-    while bi < func.blocks.len() {
-        let block = func.blocks[bi]
-        if g.block_map.contains(block.label) {
-            let bb = g.block_map.get(block.label)
-            dm_llvm_position_at_end(g.builder, bb)
-            -- At start of main(): store argc/argv to globals
-            if is_first and func.name == "main" {
+    -- ALLOCA HOISTING: Generate all allocas in the entry block first.
+    -- This ensures all allocas are available regardless of block processing order.
+    -- Standard LLVM practice: all allocas belong in the entry block.
+    if func.blocks.len() > 0 {
+        let entry_label = func.blocks[0].label
+        if g.block_map.contains(entry_label) {
+            let entry_bb = g.block_map.get(entry_label)
+            dm_llvm_position_at_end(g.builder, entry_bb)
+            -- Pre-generate argc/argv for main
+            if func.name == "main" {
                 let i32_ty = dm_llvm_int32_type(ctx)
                 let ptr_ty = dm_llvm_pointer_type(ctx)
                 let argc_global = dm_llvm_module_add_global(g.llvm_module, i32_ty, "dm_argc")
                 dm_llvm_set_linkage(argc_global, dm_llvm_external_linkage())
                 let argv_global = dm_llvm_module_add_global(g.llvm_module, ptr_ty, "dm_argv")
                 dm_llvm_set_linkage(argv_global, dm_llvm_external_linkage())
-                -- Store main's argc/argv params
                 let argc_param = dm_llvm_get_param(llvm_fn, func.params.len())
                 let argv_param = dm_llvm_get_param(llvm_fn, func.params.len() + 1)
                 dm_llvm_build_store(g.builder, argc_param, argc_global)
                 dm_llvm_build_store(g.builder, argv_param, argv_global)
             }
-            is_first = false
-            -- Generate instructions
-            let mut ii = 0
-            while ii < block.instructions.len() {
-                g = generate_instruction(g, block.instructions[ii])
-                ii = ii + 1
-            }
-            -- Generate terminator
-            if block.has_terminator {
-                let term = *block.terminator
-                g = generate_terminator(g, term, func)
+            -- Scan ALL blocks for OP_ALLOCA and generate them in entry block
+            bi = 0
+            while bi < func.blocks.len() {
+                let scan_block = func.blocks[bi]
+                let mut si = 0
+                while si < scan_block.instructions.len() {
+                    let scan_inst = scan_block.instructions[si]
+                    if scan_inst.op == OP_ALLOCA() {
+                        g = generate_instruction(g, scan_inst)
+                    }
+                    si = si + 1
+                }
+                bi = bi + 1
             }
         }
-        bi = bi + 1
+    }
+    -- Build BFS-ordered block list for correct processing order.
+    -- Blocks must be processed in dominator order so that value_map is populated
+    -- before any instruction references a value from an earlier block.
+    let mut bfs_order: List[string] = []
+    let mut bfs_visited: Map[string, bool] = Map_new()
+    if func.blocks.len() > 0 {
+        -- Start BFS from entry block
+        let mut bfs_queue: List[string] = []
+        bfs_queue.push(func.blocks[0].label)
+        bfs_visited.insert(func.blocks[0].label, true)
+        while bfs_queue.len() > 0 {
+            let cur_label = bfs_queue[0]
+            -- Shift: manual removal of first element by rebuilding
+            let mut new_queue: List[string] = []
+            let mut qi = 1
+            while qi < bfs_queue.len() {
+                new_queue.push(bfs_queue[qi])
+                qi = qi + 1
+            }
+            bfs_queue = new_queue
+            bfs_order.push(cur_label)
+            -- Find this block and get its terminator targets
+            let mut fi = 0
+            while fi < func.blocks.len() {
+                if func.blocks[fi].label == cur_label {
+                    let cur_block = func.blocks[fi]
+                    if cur_block.has_terminator {
+                        let t = *cur_block.terminator
+                        if t.kind == TERM_BR() {
+                            if bfs_visited.contains(t.target) == false {
+                                bfs_visited.insert(t.target, true)
+                                bfs_queue.push(t.target)
+                            }
+                        }
+                        if t.kind == TERM_BR_COND() {
+                            if bfs_visited.contains(t.true_label) == false {
+                                bfs_visited.insert(t.true_label, true)
+                                bfs_queue.push(t.true_label)
+                            }
+                            if bfs_visited.contains(t.false_label) == false {
+                                bfs_visited.insert(t.false_label, true)
+                                bfs_queue.push(t.false_label)
+                            }
+                        }
+                    }
+                }
+                fi = fi + 1
+            }
+        }
+        -- Add any blocks not reachable from entry (safety: shouldn't happen)
+        bi = 0
+        while bi < func.blocks.len() {
+            if bfs_visited.contains(func.blocks[bi].label) == false {
+                bfs_order.push(func.blocks[bi].label)
+            }
+            bi = bi + 1
+        }
+    }
+    -- Generate instructions and terminators for each block in BFS order (skip allocas)
+    let mut bfs_i = 0
+    while bfs_i < bfs_order.len() {
+        let bfs_label = bfs_order[bfs_i]
+        -- Find the block with this label
+        let mut found_bi = 0
+        while found_bi < func.blocks.len() {
+            if func.blocks[found_bi].label == bfs_label {
+                let block = func.blocks[found_bi]
+                if g.block_map.contains(block.label) {
+                    let bb = g.block_map.get(block.label)
+                    dm_llvm_position_at_end(g.builder, bb)
+                    -- Generate non-alloca instructions
+                    let mut ii = 0
+                    while ii < block.instructions.len() {
+                        if block.instructions[ii].op != OP_ALLOCA() {
+                            g = generate_instruction(g, block.instructions[ii])
+                        }
+                        ii = ii + 1
+                    }
+                    -- Generate terminator
+                    if block.has_terminator {
+                        let term = *block.terminator
+                        g = generate_terminator(g, term, func)
+                    }
+                }
+            }
+            found_bi = found_bi + 1
+        }
+        bfs_i = bfs_i + 1
     }
     return g
 }
@@ -15597,7 +15801,12 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
     if val.kind == VAL_PARAM_REF() {
         if gen.function_map.contains(gen.current_func_name) {
             let llvm_fn = gen.function_map.get(gen.current_func_name)
-            return dm_llvm_get_param(llvm_fn, val.ref_id)
+            -- For sret functions, LLVM param 0 is the sret pointer, so user params start at index 1
+            let mut param_offset = 0
+            if gen.returns_sret.contains(gen.current_func_name) {
+                param_offset = 1
+            }
+            return dm_llvm_get_param(llvm_fn, val.ref_id + param_offset)
         }
         return dm_llvm_const_null(dm_llvm_int64_type(ctx))
     }
@@ -15733,10 +15942,28 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     }
     -- Comparison
     if op == OP_EQ() {
-        let lhs = resolve_value(g, inst.lhs)
-        let rhs = resolve_value(g, inst.rhs)
+        let mut lhs = resolve_value(g, inst.lhs)
+        let mut rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        -- Fix i32 vs i64 type mismatch for icmp (e.g., enum/option/result tag comparisons)
+        let lhs_ty = dm_llvm_type_of(lhs)
+        let rhs_ty = dm_llvm_type_of(rhs)
+        if lhs_ty != rhs_ty {
+            let lhs_kind = dm_llvm_get_type_kind(lhs_ty)
+            let rhs_kind = dm_llvm_get_type_kind(rhs_ty)
+            -- type kind 8 = LLVMIntegerTypeKind
+            if lhs_kind == 8 and rhs_kind == 8 {
+                let lw = dm_llvm_get_int_type_width(lhs_ty)
+                let rw = dm_llvm_get_int_type_width(rhs_ty)
+                if lw < rw {
+                    rhs = dm_llvm_build_trunc(b, rhs, lhs_ty, "trunc")
+                }
+                if rw < lw {
+                    lhs = dm_llvm_build_trunc(b, lhs, rhs_ty, "trunc")
+                }
+            }
+        }
         let mut result = 0
         if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
             result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), lhs, rhs, "feq")
@@ -15747,10 +15974,27 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         return g
     }
     if op == OP_NE() {
-        let lhs = resolve_value(g, inst.lhs)
-        let rhs = resolve_value(g, inst.rhs)
+        let mut lhs = resolve_value(g, inst.lhs)
+        let mut rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        -- Fix i32 vs i64 type mismatch for icmp
+        let lhs_ty = dm_llvm_type_of(lhs)
+        let rhs_ty = dm_llvm_type_of(rhs)
+        if lhs_ty != rhs_ty {
+            let lhs_kind = dm_llvm_get_type_kind(lhs_ty)
+            let rhs_kind = dm_llvm_get_type_kind(rhs_ty)
+            if lhs_kind == 8 and rhs_kind == 8 {
+                let lw = dm_llvm_get_int_type_width(lhs_ty)
+                let rw = dm_llvm_get_int_type_width(rhs_ty)
+                if lw < rw {
+                    rhs = dm_llvm_build_trunc(b, rhs, lhs_ty, "trunc")
+                }
+                if rw < lw {
+                    lhs = dm_llvm_build_trunc(b, lhs, rhs_ty, "trunc")
+                }
+            }
+        }
         let mut result = 0
         if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
             result = dm_llvm_build_fcmp(b, dm_llvm_real_one(), lhs, rhs, "fne")
@@ -15849,6 +16093,10 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if inst.alloc_type == "string" {
             g.string_ptrs.insert(id_key, true)
         }
+        -- List and map types are also aggregate pointers (pass by pointer, not value)
+        if starts_with(inst.alloc_type, "dm_list_") or starts_with(inst.alloc_type, "dm_map_") or starts_with(inst.alloc_type, "List[") or starts_with(inst.alloc_type, "Map[") {
+            g.string_ptrs.insert(id_key, true)
+        }
         if inst.has_result { g.value_map.insert(id_key, result) }
         return g
     }
@@ -15862,10 +16110,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, ptr_val) }
             return g
         }
-        -- List/Map loads return the pointer itself (runtime funcs always take pointers)
-        if starts_with(inst.load_type, "dm_list") or starts_with(inst.load_type, "dm_map") or inst.load_type == "list" or inst.load_type == "map" {
+        -- List/map loads return the pointer itself (aggregate types, always by pointer)
+        if starts_with(inst.load_type, "dm_list_") or starts_with(inst.load_type, "dm_map_") or inst.load_type == "list" or inst.load_type == "map" or starts_with(inst.load_type, "List[") or starts_with(inst.load_type, "Map[") {
             let ptr_val = resolve_value(g, inst.load_ptr)
             g = resolve_value_with_counter(g, inst.load_ptr)
+            g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, ptr_val) }
             return g
         }
@@ -15916,27 +16165,10 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let result = dm_llvm_build_extract_value(b, base, inst.field_index, "field")
         -- If extracted field is dm_string, store to alloca and track
         if inst.field_type == "string" {
-            if inst.result_type == "i64" {
-                -- Result/Option case: string was stored via ptrtoint, extractvalue returns i64
-                -- Convert i64 back to ptr (the original dm_string pointer)
-                let ptr_val = dm_llvm_build_int_to_ptr(b, result, dm_llvm_pointer_type(g.context), "i2p.str")
-                g.string_ptrs.insert(id_key, true)
-                if inst.has_result { g.value_map.insert(id_key, ptr_val) }
-                return g
-            }
-            -- Normal struct: extractvalue returns dm_string struct, store to alloca
             let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.extract")
             dm_llvm_build_store(b, result, str_alloca)
             g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, str_alloca) }
-            return g
-        }
-        -- If extracted field is a list/map, store to alloca (runtime funcs need pointers)
-        if starts_with(inst.field_type, "dm_list") or starts_with(inst.field_type, "dm_map") or inst.field_type == "list" or inst.field_type == "map" {
-            let lm_ty = map_ir_type_to_llvm(g, inst.field_type)
-            let lm_alloca = dm_llvm_build_alloca(b, lm_ty, "lm.extract")
-            dm_llvm_build_store(b, result, lm_alloca)
-            if inst.has_result { g.value_map.insert(id_key, lm_alloca) }
             return g
         }
         if inst.has_result { g.value_map.insert(id_key, result) }
@@ -15955,19 +16187,32 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         let mut val = resolve_value(g, inst.field_value)
         g = resolve_value_with_counter(g, inst.field_value)
-        -- If inserting a string value (pointer to dm_string), load the actual struct
-        -- But for result/option types, convert pointer to i64 instead
-        if is_string_ptr(g, inst.field_value) {
-            if inst.result_type == "result" or inst.result_type == "option" {
-                val = dm_llvm_build_ptr_to_int(b, val, dm_llvm_int64_type(g.context), "ptr2int")
-            } else {
-                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
+        -- Fix type mismatch: ir_val_int creates i64 constants, but some struct fields
+        -- (e.g., Result/Option/Enum tag at index 0) are i32. Look up the actual field
+        -- type from the IR struct definition and re-create the constant if needed.
+        if inst.field_value.kind == VAL_CONST_INT() {
+            let mut field_needs_i32 = false
+            -- Check result/option types (inline struct, not in struct_defs)
+            if is_sret_return_type(inst.result_type) and inst.field_index == 0 {
+                field_needs_i32 = true
+            }
+            -- Check named struct types (enums have i32 tag at field 0)
+            if g.ir_module.struct_defs.contains(inst.result_type) {
+                let ir_struct = g.ir_module.struct_defs.get(inst.result_type)
+                if inst.field_index < ir_struct.fields.len() {
+                    let ft = ir_struct.fields[inst.field_index].type_id
+                    if ft == "i32" or ft == "u32" {
+                        field_needs_i32 = true
+                    }
+                }
+            }
+            if field_needs_i32 {
+                val = dm_llvm_const_int(dm_llvm_int32_type(g.context), inst.field_value.int_val, 1)
             }
         }
-        -- If inserting a list/map value, load the struct from the alloca pointer
-        if starts_with(inst.field_type, "dm_list") or starts_with(inst.field_type, "dm_map") or inst.field_type == "list" or inst.field_type == "map" {
-            let lm_ty = map_ir_type_to_llvm(g, inst.field_type)
-            val = dm_llvm_build_load2(b, lm_ty, val, "lm.load")
+        -- If inserting a string value (pointer to dm_string), load the actual struct
+        if is_string_ptr(g, inst.field_value) {
+            val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
         }
         let result = dm_llvm_build_insert_value(b, base_val, val, inst.field_index, "insert")
         if inst.has_result { g.value_map.insert(id_key, result) }
@@ -16084,8 +16329,8 @@ fn generate_cast(gen: LLVMGenerator, val: int, from: string, to: string) -> int 
     -- Int to int: truncate or sign/zero-extend
     if from_is_int and to_is_int {
         let dest_ty = map_ir_type_to_llvm(gen, to)
-        let is_signed = 1
-        if lg_is_unsigned_type(from) { let is_signed = 0 }
+        let mut is_signed = 1
+        if lg_is_unsigned_type(from) { is_signed = 0 }
         return dm_llvm_build_int_cast2(b, val, dest_ty, is_signed, "cast")
     }
     -- Int to float
@@ -16105,6 +16350,11 @@ fn generate_cast(gen: LLVMGenerator, val: int, from: string, to: string) -> int 
     if from_is_float and to_is_float {
         let dest_ty = map_ir_type_to_llvm(gen, to)
         return dm_llvm_build_fp_cast(b, val, dest_ty, "cast")
+    }
+    -- Int to pointer (inttoptr)
+    if from_is_int and to == "ptr" {
+        let dest_ty = dm_llvm_pointer_type(gen.context)
+        return dm_llvm_build_int_to_ptr(b, val, dest_ty, "cast")
     }
     -- Fallback: return value unchanged
     return val
@@ -16205,18 +16455,14 @@ fn create_dm_string(gen: LLVMGenerator, raw_str: int) -> int {
 fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let mut g = gen
     let id_key = int_to_string(inst.id)
-    -- Allocate an int64 list on stack and initialize
-    let list_ty = map_ir_type_to_llvm(g, "dm_list_int64")
-    let alloca_val = dm_llvm_build_alloca(g.builder, list_ty, "list")
-    let fn_name = "dm_list_int64_new"
-    if g.function_map.contains(fn_name) {
-        let func = g.function_map.get(fn_name)
-        let fn_ty = g.fn_type_map.get(fn_name)
+    -- Call dm_list_new() runtime function
+    if g.function_map.contains("dm_list_new") {
+        let func = g.function_map.get("dm_list_new")
+        let fn_ty = g.fn_type_map.get("dm_list_new")
         dm_llvm_buf_clear()
-        dm_llvm_buf_push(alloca_val)
-        dm_llvm_build_call2_buf(g.builder, fn_ty, func, "")
+        let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "list")
+        if inst.has_result { g.value_map.insert(id_key, result) }
     }
-    if inst.has_result { g.value_map.insert(id_key, alloca_val) }
     return g
 }
 
@@ -16227,7 +16473,13 @@ fn generate_list_push(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let elem_val = resolve_value(g, inst.rhs)
     g = resolve_value_with_counter(g, inst.lhs)
     g = resolve_value_with_counter(g, inst.rhs)
-    let fn_name = "dm_list_int64_push"
+    -- Pick the correct runtime function based on element type
+    let mut fn_name = "dm_list_int64_push"
+    if inst.callee == "dm_list_double_push" or inst.result_type == "f64" {
+        fn_name = "dm_list_double_push"
+    } else if inst.callee == "dm_list_string_push" or inst.callee == "llvm_dm_list_string_push" or inst.result_type == "string" {
+        fn_name = "dm_list_string_push"
+    }
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -16247,79 +16499,33 @@ fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let idx_val = resolve_value(g, inst.rhs)
     g = resolve_value_with_counter(g, inst.lhs)
     g = resolve_value_with_counter(g, inst.rhs)
-
-    let rtype = inst.result_type
-
-    -- String elements: call dm_list_string_get (wrapper uses sret)
-    if rtype == "string" {
-        let fn_name = "dm_list_string_get"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            -- Allocate sret buffer for the returned dm_string
-            let sret_name = "sret." + int_to_string(g.sret_counter)
-            g.sret_counter = g.sret_counter + 1
-            let sret = dm_llvm_build_alloca(b, g.dm_string_type, sret_name)
+    -- Pick the correct runtime function based on element type
+    let mut fn_name = "dm_list_int64_get"
+    if inst.result_type == "f64" {
+        fn_name = "dm_list_double_get"
+    } else if inst.result_type == "string" {
+        fn_name = "dm_list_string_get"
+    }
+    if g.function_map.contains(fn_name) {
+        let func = g.function_map.get(fn_name)
+        let fn_ty = g.fn_type_map.get(fn_name)
+        if fn_name == "dm_list_string_get" {
+            -- String list get uses sret pattern
+            g = get_dm_string_type(g)
+            let sret = dm_llvm_build_alloca(b, g.dm_string_type, "listget_sret")
             dm_llvm_buf_clear()
             dm_llvm_buf_push(sret)
             dm_llvm_buf_push(list_val)
             dm_llvm_buf_push(idx_val)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
-            g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, sret) }
-        }
-        return g
-    }
-
-    -- Float elements: call dm_list_double_get
-    if rtype == "f64" {
-        let fn_name = "dm_list_double_get"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
+        } else {
             dm_llvm_buf_clear()
             dm_llvm_buf_push(list_val)
             dm_llvm_buf_push(idx_val)
             let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
-        return g
-    }
-
-    -- Struct elements: call dm_list_generic_get with buffer
-    if g.struct_type_map.contains(rtype) {
-        let fn_name = "dm_list_generic_get"
-        if g.function_map.contains(fn_name) {
-            let struct_ty = g.struct_type_map.get(rtype)
-            -- Allocate buffer for the struct
-            let buf_alloca = dm_llvm_build_alloca(b, struct_ty, "listbuf")
-            -- Get sizeof the struct type
-            let size_val = dm_llvm_sizeof_type(struct_ty)
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(list_val)
-            dm_llvm_buf_push(buf_alloca)
-            dm_llvm_buf_push(idx_val)
-            dm_llvm_buf_push(size_val)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-            -- Load the struct from the buffer
-            let result = dm_llvm_build_load2(b, struct_ty, buf_alloca, "listget")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
-
-    -- Default: int elements, call dm_list_int64_get
-    let fn_name = "dm_list_int64_get"
-    if g.function_map.contains(fn_name) {
-        let func = g.function_map.get(fn_name)
-        let fn_ty = g.fn_type_map.get(fn_name)
-        dm_llvm_buf_clear()
-        dm_llvm_buf_push(list_val)
-        dm_llvm_buf_push(idx_val)
-        let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
-        if inst.has_result { g.value_map.insert(id_key, result) }
     }
     return g
 }
@@ -16330,7 +16536,15 @@ fn generate_list_len(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let id_key = int_to_string(inst.id)
     let list_val = resolve_value(g, inst.operand)
     g = resolve_value_with_counter(g, inst.operand)
-    let fn_name = "dm_list_len"
+    -- Use type-specific len function (all return i64)
+    let mut fn_name = "dm_list_int64_len"
+    if inst.result_type == "f64" or inst.callee == "dm_list_double_len" {
+        fn_name = "dm_list_double_len"
+    } else if inst.result_type == "string" or inst.callee == "dm_list_string_len" {
+        fn_name = "dm_list_string_len"
+    } else if inst.callee == "dm_list_generic_len" {
+        fn_name = "dm_list_generic_len"
+    }
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -16348,7 +16562,7 @@ fn generate_list_pop(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let id_key = int_to_string(inst.id)
     let list_val = resolve_value(g, inst.operand)
     g = resolve_value_with_counter(g, inst.operand)
-    let fn_name = "dm_list_pop_int64"
+    let fn_name = "dm_list_int64_pop"
     if g.function_map.contains(fn_name) {
         let func = g.function_map.get(fn_name)
         let fn_ty = g.fn_type_map.get(fn_name)
@@ -16553,8 +16767,6 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = get_dm_string_type(g)
     -- Phase 1: Declare struct types
     g = declare_struct_types(g)
-    -- Phase 1.5: Register built-in Result/Option struct types
-    g = register_builtin_struct_types(g)
     -- Phase 2: Generate global variables
     g = generate_globals(g)
     -- Phase 3: Declare all functions
@@ -16914,7 +17126,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
 }
 
 -- ============================================================
--- INDIRECT CALL (OP_CALL_PTR)
+-- SRET CALL (result/option return via output pointer)
 -- ============================================================
 
 fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
@@ -17209,9 +17421,9 @@ fn coerce_simd_scalar(gen: LLVMGenerator, val: int, vec_type: string) -> int {
     let b = gen.builder
     let ctx = gen.context
     let val_ty_kind = dm_llvm_get_type_kind(dm_llvm_type_of(val))
-    -- Type kind constants from LLVM:
-    -- 10 = LLVMIntegerTypeKind, 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
-    let is_int_val = val_ty_kind == 10
+    -- Type kind constants from LLVM-C Core.h:
+    -- 8 = LLVMIntegerTypeKind, 2 = LLVMFloatTypeKind, 3 = LLVMDoubleTypeKind
+    let is_int_val = val_ty_kind == 8
     let is_float_val = val_ty_kind == 2
     let is_double_val = val_ty_kind == 3
     if starts_with(vec_type, "f32") {
@@ -17407,17 +17619,42 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     g = resolve_value_with_counter(g, inst.simd_index)
     -- LLVM extractelement needs an i32 index
     let idx_ty_kind = dm_llvm_get_type_kind(dm_llvm_type_of(idx))
-    if idx_ty_kind == 10 {
-        -- Integer type: check width
+    if idx_ty_kind == 8 {
+        -- Integer type (LLVMIntegerTypeKind = 8): check width
         let idx_width = dm_llvm_get_int_type_width(dm_llvm_type_of(idx))
         if idx_width != 32 {
             idx = dm_llvm_build_int_cast2(b, idx, dm_llvm_int32_type(ctx), 1, "idx.cast")
         }
     }
-    let result = dm_llvm_build_extract_element(b, vec, idx, "extract")
+    let mut result = dm_llvm_build_extract_element(b, vec, idx, "extract")
+    -- Coerce extracted value to dAImond-native type:
+    -- f32 -> f64 (fpext), i32 -> i64 (sext) so downstream code sees native types
+    let vec_type = inst.simd_vec_type
+    if vec_type == "f32x4" or vec_type == "f32x8" {
+        -- float -> double
+        result = dm_llvm_build_fp_cast(b, result, dm_llvm_double_type(ctx), "ext.f64")
+    }
+    if vec_type == "i32x4" or vec_type == "i32x8" {
+        -- i32 -> i64
+        result = dm_llvm_build_int_cast2(b, result, dm_llvm_int64_type(ctx), 1, "ext.i64")
+    }
     if inst.has_result { g.value_map.insert(id_key, result) }
     return g
 }
+
+
+-- ============================================================
+-- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
+--
+-- Compiles dAImond source to native binaries via LLVM.
+-- Uses its own frontend (lexer.dm, parser.dm) instead of
+-- reusing Stage 0's Zig frontend.
+--
+-- Pipeline:
+--   Source (.dm) -> Lexer -> Tokens -> Parser -> AST
+--   -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR
+--   -> Object File -> Linker -> Native Binary
+-- ============================================================
 
 
 -- ============================================================

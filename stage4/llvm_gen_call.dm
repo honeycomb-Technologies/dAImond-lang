@@ -159,7 +159,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
 }
 
 -- ============================================================
--- INDIRECT CALL (OP_CALL_PTR)
+-- SRET CALL (result/option return via output pointer)
 -- ============================================================
 
 fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
