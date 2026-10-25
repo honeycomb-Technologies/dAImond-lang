@@ -764,6 +764,26 @@ fn comptime_value_type(val: IRValue) -> string {
     return "i64"
 }
 
+
+-- ============================================================
+-- LLVM IR Generator
+-- Translates dAImond IR (from ir.dm) into LLVM IR using
+-- the LLVM-C bridge functions declared in llvm.dm.
+--
+-- Key design: All LLVM refs (context, module, builder, types,
+-- values, basic blocks) are represented as int (int64_t on C side).
+--
+-- String ABI: dm_string is { ptr, i64, i64 } (24 bytes) which
+-- exceeds the x86-64 SysV ABI 16-byte register threshold.
+-- Runtime functions using dm_string are called through thin
+-- C wrapper functions (llvm_dm_*) with pointer-based ABI:
+-- - Returns dm_string -> wrapper takes dm_string* as first param (sret)
+-- - Takes dm_string -> wrapper takes const dm_string* (pointer)
+-- String values in LLVM IR are pointers to stack-allocated dm_string structs.
+-- ============================================================
+
+-- Bridge functions declared in llvm_bridge.c but not yet in llvm.dm
+
 fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
     if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
         let a = lhs.int_val

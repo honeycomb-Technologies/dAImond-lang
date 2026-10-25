@@ -618,7 +618,6 @@ fn generate_if_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> G
         then_block.has_terminator = true
     }
     g.completed_blocks.push(then_block)
-
     -- Else block (if present)
     let mut else_block = ir_block_new(else_label)
     if stmt.has_else_branch {

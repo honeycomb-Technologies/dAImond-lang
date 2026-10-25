@@ -6397,7 +6397,6 @@ fn generate_if_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> G
         then_block.has_terminator = true
     }
     g.completed_blocks.push(then_block)
-
     -- Else block (if present)
     let mut else_block = ir_block_new(else_label)
     if stmt.has_else_branch {
@@ -9617,11 +9616,6 @@ fn infer_call_return_type(gen: IRGenerator, fn_name: string) -> string {
         return builtin_return_type(fn_name)
     }
 
-    -- Check prescanned function return types
-    if gen.fn_return_types.contains(fn_name) {
-        return gen.fn_return_types.get(fn_name)
-    }
-
     -- Search module functions for the declared return type
     let mut i = 0
     while i < gen.ir_mod.functions.len() {
@@ -9729,14 +9723,25 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -
     g = val_result.gen
     b = val_result.block
 
+    -- Use full Option[T] type from current function return type, or infer from arg type
+    let mut opt_type = g.current_return_type
+    if starts_with(opt_type, "Option[") == false {
+        -- current_return_type isn't an Option (e.g., we're in main/void function).
+        -- Infer Option type from the argument expression type.
+        let arg_type = infer_expr_type(g, args[0])
+        opt_type = "Option[" + arg_type + "]"
+    }
+
     -- Build the Option struct: { has_value: 1, value: payload }
+    -- Use undef as the base (not alloca), since insertvalue works on values not pointers
+
     -- Store has_value = 1 (field index 0)
     let insert1_id = g.builder.next_id
     let mut insert1 = ir_inst_new(insert1_id, OP_INSERT_FIELD())
     insert1.field_base = ir_val_undef()
     insert1.field_value = ir_val_int(1)
     insert1.field_index = 0
-    insert1.result_type = "option"
+    insert1.result_type = opt_type
     insert1.has_result = true
     b.instructions.push(insert1)
     g.builder.next_id = g.builder.next_id + 1
@@ -9747,7 +9752,7 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -
     insert2.field_base = ir_val_inst(insert1_id)
     insert2.field_value = ir_val_inst(val_result.val_id)
     insert2.field_index = 1
-    insert2.result_type = "option"
+    insert2.result_type = opt_type
     insert2.has_result = true
     b.instructions.push(insert2)
     g.builder.next_id = g.builder.next_id + 1
@@ -9773,14 +9778,19 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
     g = val_result.gen
     b = val_result.block
 
+    -- Use full Result[T, E] type from current function return type for correct LLVM struct layout
+    let res_type = g.current_return_type
+
     -- Build the Result struct: { tag: 0, ok_val: payload, err_val: undef }
+    -- Use undef as the base (not alloca), since insertvalue works on values not pointers
+
     -- tag = 0 (Ok) at field index 0
     let insert_tag_id = g.builder.next_id
     let mut insert_tag = ir_inst_new(insert_tag_id, OP_INSERT_FIELD())
     insert_tag.field_base = ir_val_undef()
     insert_tag.field_value = ir_val_int(0)
     insert_tag.field_index = 0
-    insert_tag.result_type = "result"
+    insert_tag.result_type = res_type
     insert_tag.has_result = true
     b.instructions.push(insert_tag)
     g.builder.next_id = g.builder.next_id + 1
@@ -9791,7 +9801,7 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
     insert_ok.field_base = ir_val_inst(insert_tag_id)
     insert_ok.field_value = ir_val_inst(val_result.val_id)
     insert_ok.field_index = 1
-    insert_ok.result_type = "result"
+    insert_ok.result_type = res_type
     insert_ok.has_result = true
     b.instructions.push(insert_ok)
     g.builder.next_id = g.builder.next_id + 1
@@ -9802,7 +9812,7 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
     insert_err.field_base = ir_val_inst(insert_ok_id)
     insert_err.field_value = ir_val_undef()
     insert_err.field_index = 2
-    insert_err.result_type = "result"
+    insert_err.result_type = res_type
     insert_err.has_result = true
     b.instructions.push(insert_err)
     g.builder.next_id = g.builder.next_id + 1
@@ -9828,14 +9838,19 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
     g = val_result.gen
     b = val_result.block
 
+    -- Use full Result[T, E] type from current function return type for correct LLVM struct layout
+    let res_type = g.current_return_type
+
     -- Build the Result struct: { tag: 1, ok_val: undef, err_val: payload }
+    -- Use undef as the base (not alloca), since insertvalue works on values not pointers
+
     -- tag = 1 (Err) at field index 0
     let insert_tag_id = g.builder.next_id
     let mut insert_tag = ir_inst_new(insert_tag_id, OP_INSERT_FIELD())
     insert_tag.field_base = ir_val_undef()
     insert_tag.field_value = ir_val_int(1)
     insert_tag.field_index = 0
-    insert_tag.result_type = "result"
+    insert_tag.result_type = res_type
     insert_tag.has_result = true
     b.instructions.push(insert_tag)
     g.builder.next_id = g.builder.next_id + 1
@@ -9846,7 +9861,7 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
     insert_ok.field_base = ir_val_inst(insert_tag_id)
     insert_ok.field_value = ir_val_undef()
     insert_ok.field_index = 1
-    insert_ok.result_type = "result"
+    insert_ok.result_type = res_type
     insert_ok.has_result = true
     b.instructions.push(insert_ok)
     g.builder.next_id = g.builder.next_id + 1
@@ -9857,7 +9872,7 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
     insert_err.field_base = ir_val_inst(insert_ok_id)
     insert_err.field_value = ir_val_inst(val_result.val_id)
     insert_err.field_index = 2
-    insert_err.result_type = "result"
+    insert_err.result_type = res_type
     insert_err.has_result = true
     b.instructions.push(insert_err)
     g.builder.next_id = g.builder.next_id + 1
@@ -11963,9 +11978,10 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
     let join_label = gen_next_label(g, "if_join")
     g = gen_advance_label(g)
 
-    -- Allocate a result slot before branching so both branches can store into it
-    -- Infer the result type from the then branch
+    -- Infer result type from then-branch expression
     let if_result_type = infer_expr_type(g, *expr.then_branch)
+
+    -- Allocate a result slot before branching so both branches can store into it
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
     result_alloca.alloc_type = if_result_type
@@ -12005,7 +12021,6 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
         then_block.has_terminator = true
     }
     g.completed_blocks.push(then_block)
-
     -- Generate else block
     let mut else_block = ir_block_new(else_label)
     if expr.has_else {
@@ -12089,10 +12104,23 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         if first_pat.kind == PAT_ENUM_VARIANT() {
             let variant = first_pat.variant
             if variant == "Ok" or variant == "Err" {
-                return generate_result_match(g, b, expr, scrut_id, scrut_expr)
+                -- Determine the Result type for correct field types
+                let mut result_type_name = ""
+                if scrut_expr.kind == EXPR_IDENTIFIER() {
+                    if g.variable_types.contains(scrut_expr.name) {
+                        result_type_name = g.variable_types.get(scrut_expr.name)
+                    }
+                }
+                return generate_result_match(g, b, expr, scrut_id, result_type_name)
             }
             if variant == "Some" or variant == "None" {
-                return generate_option_match(g, b, expr, scrut_id, scrut_expr)
+                let mut option_type_name = ""
+                if scrut_expr.kind == EXPR_IDENTIFIER() {
+                    if g.variable_types.contains(scrut_expr.name) {
+                        option_type_name = g.variable_types.get(scrut_expr.name)
+                    }
+                }
+                return generate_option_match(g, b, expr, scrut_id, option_type_name)
             }
             -- General enum variant pattern with known type
             if len(first_pat.enum_type) > 0 {
@@ -12106,18 +12134,21 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 }
 
 -- ============================================================
--- LITERAL MATCH (int, string, bool, wildcard)
+-- MATCH RESULT TYPE INFERENCE
 -- ============================================================
 
 fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int) -> ExprResult {
     let mut g = gen
     let mut b = block
 
+    -- Infer the match result type from arm bodies
+    let match_type = infer_match_result_type(g, expr.match_arms)
+
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = "i64"
-    result_alloca.result_type = "ptr(i64)"
+    result_alloca.alloc_type = match_type
+    result_alloca.result_type = "ptr(" + match_type + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -12137,7 +12168,6 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
         g = gen_advance_label(g)
 
         if pat.kind == PAT_WILDCARD() or pat.kind == PAT_IDENTIFIER() {
-            -- Wildcard or identifier always matches
             -- Bind identifier if needed
             if pat.kind == PAT_IDENTIFIER() {
                 -- Bind the scrutinee value to the pattern name
@@ -12160,31 +12190,74 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 g.variable_types.insert(pat.name, "i64")
             }
 
-            -- Generate arm body directly in current block
-            if arm.is_expr_body {
-                let body_result = generate_expr(g, b, *arm.body_expr)
-                g = body_result.gen
-                b = body_result.block
+            -- If there is a guard condition, evaluate it and branch
+            if arm.has_guard {
+                let guard_result = generate_expr(g, b, *arm.guard)
+                g = guard_result.gen
+                b = guard_result.block
 
-                let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                store_result.store_ptr = ir_val_inst(result_alloca_id)
-                store_result.store_val = ir_val_inst(body_result.val_id)
-                store_result.has_result = false
-                b.instructions.push(store_result)
-                g.builder.next_id = g.builder.next_id + 1
-            } else {
-                let body_gen = generate_block_stmts(g, b, arm.body)
-                g = body_gen.gen
-                b = body_gen.block
-            }
-
-            if b.has_terminator == false {
-                b.terminator = Box_new(term_br(join_label))
+                -- Branch: if guard is true, execute arm body; else go to next arm
+                b.terminator = Box_new(term_br_cond(ir_val_inst(guard_result.val_id), arm_label, next_label))
                 b.has_terminator = true
-            }
+                g.completed_blocks.push(b)
 
-            -- Wildcard/identifier is the catch-all, break out of loop
-            arm_idx = expr.match_arms.len()
+                -- Generate arm body in arm_block
+                let mut arm_block = ir_block_new(arm_label)
+                if arm.is_expr_body {
+                    let body_result = generate_expr(g, arm_block, *arm.body_expr)
+                    g = body_result.gen
+                    arm_block = body_result.block
+
+                    let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
+                    store_result.store_ptr = ir_val_inst(result_alloca_id)
+                    store_result.store_val = ir_val_inst(body_result.val_id)
+                    store_result.has_result = false
+                    arm_block.instructions.push(store_result)
+                    g.builder.next_id = g.builder.next_id + 1
+                } else {
+                    let body_gen = generate_block_stmts(g, arm_block, arm.body)
+                    g = body_gen.gen
+                    arm_block = body_gen.block
+                }
+
+                if arm_block.has_terminator == false {
+                    arm_block.terminator = Box_new(term_br(join_label))
+                    arm_block.has_terminator = true
+                }
+                g.completed_blocks.push(arm_block)
+
+                -- Continue to next arm (set up next block)
+                b = ir_block_new(next_label)
+                arm_idx = arm_idx + 1
+            } else {
+                -- No guard: always matches (catch-all)
+                -- Generate arm body directly in current block
+                if arm.is_expr_body {
+                    let body_result = generate_expr(g, b, *arm.body_expr)
+                    g = body_result.gen
+                    b = body_result.block
+
+                    let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
+                    store_result.store_ptr = ir_val_inst(result_alloca_id)
+                    store_result.store_val = ir_val_inst(body_result.val_id)
+                    store_result.has_result = false
+                    b.instructions.push(store_result)
+                    g.builder.next_id = g.builder.next_id + 1
+                } else {
+                    let body_gen = generate_block_stmts(g, b, arm.body)
+                    g = body_gen.gen
+                    b = body_gen.block
+                }
+
+                if b.has_terminator == false {
+                    b.terminator = Box_new(term_br(join_label))
+                    b.has_terminator = true
+                }
+                g.completed_blocks.push(b)
+
+                -- Wildcard/identifier without guard is the catch-all, break out of loop
+                arm_idx = expr.match_arms.len()
+            }
         } else if pat.kind == PAT_LITERAL() {
             -- Generate comparison of scrutinee with literal
             let lit_expr = *pat.literal_expr
@@ -12224,6 +12297,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 b.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), arm_label, next_label))
                 b.has_terminator = true
             }
+            g.completed_blocks.push(b)
 
             -- Generate arm body in arm_block
             let mut arm_block = ir_block_new(arm_label)
@@ -12248,6 +12322,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 arm_block.terminator = Box_new(term_br(join_label))
                 arm_block.has_terminator = true
             }
+            g.completed_blocks.push(arm_block)
 
             -- Continue with next_label as the new current block
             b = ir_block_new(next_label)
@@ -12263,14 +12338,15 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
+    g.completed_blocks.push(b)
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = "i64"
-    load_inst.result_type = "i64"
+    load_inst.load_type = match_type
+    load_inst.result_type = match_type
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -12292,11 +12368,14 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     }
     let enum_info = g.enum_defs.get(enum_type)
 
+    -- Infer match result type from arm bodies
+    let ematch_type = infer_match_result_type(g, expr.match_arms)
+
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = "i64"
-    result_alloca.result_type = "ptr(i64)"
+    result_alloca.alloc_type = ematch_type
+    result_alloca.result_type = "ptr(" + ematch_type + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -12370,6 +12449,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 b.terminator = Box_new(term_br(join_label))
                 b.has_terminator = true
             }
+            g.completed_blocks.push(b)
             arm_idx = expr.match_arms.len()
         } else if pat.kind == PAT_ENUM_VARIANT() {
             -- Find variant tag value from enum definition
@@ -12395,17 +12475,32 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
 
             b.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), arm_label, next_label))
             b.has_terminator = true
+            g.completed_blocks.push(b)
 
             -- Generate arm body in arm_block
             let mut arm_block = ir_block_new(arm_label)
 
             -- Bind payload variables if present
             if pat.bindings.len() > 0 {
-                -- Extract payload from scrutinee (field 1 for first payload)
+                -- Compute field offset: skip tag (1) + count prior payload variants
+                let mut payload_field_offset = 1
+                let mut pvi2 = 0
+                while pvi2 < enum_info.variant_names.len() {
+                    if enum_info.variant_names[pvi2] == variant_name {
+                        pvi2 = enum_info.variant_names.len()
+                    } else {
+                        if enum_info.variant_has_payload[pvi2] {
+                            payload_field_offset = payload_field_offset + 1
+                        }
+                        pvi2 = pvi2 + 1
+                    }
+                }
+
+                -- Extract payload from scrutinee at computed field offset
                 let payload_id = g.builder.next_id
                 let mut payload_inst = ir_inst_new(payload_id, OP_EXTRACT_FIELD())
                 payload_inst.field_base = ir_val_inst(scrut_id)
-                payload_inst.field_index = 1
+                payload_inst.field_index = payload_field_offset
                 payload_inst.field_type = "i64"
                 payload_inst.result_type = "i64"
                 payload_inst.has_result = true
@@ -12454,6 +12549,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 arm_block.terminator = Box_new(term_br(join_label))
                 arm_block.has_terminator = true
             }
+            g.completed_blocks.push(arm_block)
 
             -- Move to next arm's block
             b = ir_block_new(next_label)
@@ -12468,14 +12564,15 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
+    g.completed_blocks.push(b)
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = "i64"
-    load_inst.result_type = "i64"
+    load_inst.load_type = ematch_type
+    load_inst.result_type = ematch_type
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -12487,14 +12584,37 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
 -- RESULT MATCH (Ok/Err patterns)
 -- ============================================================
 
-fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, scrut_expr: Expr) -> ExprResult {
+fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, result_type_name: string) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Look up the full type annotation to determine Ok and Err types
-    let type_ann = get_scrutinee_type_annotation(g, scrut_expr)
-    let ok_field_type = if len(type_ann) > 0 { parse_result_ok_type(type_ann) } else { "i64" }
-    let err_field_type = if len(type_ann) > 0 { parse_result_err_type(type_ann) } else { "i64" }
+    -- Parse Result[T, E] to get ok_type and err_type
+    let mut ok_field_type = "i64"
+    let mut err_field_type = "i64"
+    if starts_with(result_type_name, "Result[") {
+        let inner = substr(result_type_name, 7, len(result_type_name) - 8)
+        let mut comma_pos = 0 - 1
+        let mut depth = 0
+        let mut ci = 0
+        while ci < len(inner) {
+            let ch = char_at(inner, ci)
+            if ch == "[" { depth = depth + 1 }
+            if ch == "]" { depth = depth - 1 }
+            if ch == "," and depth == 0 {
+                comma_pos = ci
+                ci = len(inner)
+            }
+            ci = ci + 1
+        }
+        if comma_pos >= 0 {
+            ok_field_type = map_type_name(substr(inner, 0, comma_pos))
+            let mut err_start = comma_pos + 1
+            if err_start < len(inner) and char_at(inner, err_start) == " " {
+                err_start = err_start + 1
+            }
+            err_field_type = map_type_name(substr(inner, err_start, len(inner) - err_start))
+        }
+    }
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
@@ -12510,8 +12630,8 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
     tag_inst.field_base = ir_val_inst(scrut_id)
     tag_inst.field_index = 0
-    tag_inst.field_type = "i64"
-    tag_inst.result_type = "i64"
+    tag_inst.field_type = "i32"
+    tag_inst.result_type = "i32"
     tag_inst.has_result = true
     b.instructions.push(tag_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -12570,7 +12690,7 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             ok_extract.field_base = ir_val_inst(scrut_id)
             ok_extract.field_index = 1
             ok_extract.field_type = ok_field_type
-            ok_extract.result_type = "i64"
+            ok_extract.result_type = ok_field_type
             ok_extract.has_result = true
             ok_block.instructions.push(ok_extract)
             g.builder.next_id = g.builder.next_id + 1
@@ -12631,7 +12751,7 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             err_extract.field_base = ir_val_inst(scrut_id)
             err_extract.field_index = 2
             err_extract.field_type = err_field_type
-            err_extract.result_type = "i64"
+            err_extract.result_type = err_field_type
             err_extract.has_result = true
             err_block.instructions.push(err_extract)
             g.builder.next_id = g.builder.next_id + 1
@@ -12716,13 +12836,16 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 -- OPTION MATCH (Some/None patterns)
 -- ============================================================
 
-fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, scrut_expr: Expr) -> ExprResult {
+fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, option_type_name: string) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Look up the full type annotation to determine the value type
-    let type_ann = get_scrutinee_type_annotation(g, scrut_expr)
-    let some_field_type = if len(type_ann) > 0 { parse_option_value_type(type_ann) } else { "i64" }
+    -- Parse Option[T] to get the inner type
+    let mut some_field_type = "i64"
+    if starts_with(option_type_name, "Option[") {
+        let inner = substr(option_type_name, 7, len(option_type_name) - 8)
+        some_field_type = map_type_name(inner)
+    }
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
@@ -12733,22 +12856,22 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Extract tag (field 0: 0=Some, 1=None)
+    -- Extract tag (field 0: 1=Some/has_value, 0=None)
     let tag_id = g.builder.next_id
     let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
     tag_inst.field_base = ir_val_inst(scrut_id)
     tag_inst.field_index = 0
-    tag_inst.field_type = "i64"
-    tag_inst.result_type = "i64"
+    tag_inst.field_type = "i32"
+    tag_inst.result_type = "i32"
     tag_inst.has_result = true
     b.instructions.push(tag_inst)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Compare tag to 0 (Some)
+    -- Compare tag to 1 (Some = has_value = 1)
     let is_some_id = g.builder.next_id
     let mut is_some_cmp = ir_inst_new(is_some_id, OP_EQ())
     is_some_cmp.lhs = ir_val_inst(tag_id)
-    is_some_cmp.rhs = ir_val_int(0)
+    is_some_cmp.rhs = ir_val_int(1)
     is_some_cmp.result_type = "bool"
     is_some_cmp.has_result = true
     b.instructions.push(is_some_cmp)
@@ -12798,7 +12921,7 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             some_extract.field_base = ir_val_inst(scrut_id)
             some_extract.field_index = 1
             some_extract.field_type = some_field_type
-            some_extract.result_type = "i64"
+            some_extract.result_type = some_field_type
             some_extract.has_result = true
             some_block.instructions.push(some_extract)
             g.builder.next_id = g.builder.next_id + 1
@@ -13298,6 +13421,38 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let mut g = gen
     let mut b = block
 
+    -- Infer operand type to get correct Ok/Err field types
+    let operand_type = infer_expr_type(g, *expr.operand)
+    let mut ok_field_type = "i64"
+    let mut err_field_type = "i64"
+    if starts_with(operand_type, "Result[") {
+        let inner = substr(operand_type, 7, len(operand_type) - 8)
+        let mut comma_pos = 0 - 1
+        let mut depth = 0
+        let mut ci = 0
+        while ci < len(inner) {
+            let ch = char_at(inner, ci)
+            if ch == "[" { depth = depth + 1 }
+            if ch == "]" { depth = depth - 1 }
+            if ch == "," and depth == 0 {
+                comma_pos = ci
+                ci = len(inner)
+            }
+            ci = ci + 1
+        }
+        if comma_pos >= 0 {
+            ok_field_type = map_type_name(substr(inner, 0, comma_pos))
+            let mut err_start = comma_pos + 1
+            if err_start < len(inner) and char_at(inner, err_start) == " " {
+                err_start = err_start + 1
+            }
+            err_field_type = map_type_name(substr(inner, err_start, len(inner) - err_start))
+        }
+    } else if starts_with(operand_type, "Option[") {
+        let inner = substr(operand_type, 7, len(operand_type) - 8)
+        ok_field_type = map_type_name(inner)
+    }
+
     -- Generate the operand (the Result/Option expression)
     let operand_result = generate_expr(g, b, *expr.operand)
     g = operand_result.gen
@@ -13309,8 +13464,8 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
     tag_inst.field_base = ir_val_inst(operand_id)
     tag_inst.field_index = 0
-    tag_inst.field_type = "i64"
-    tag_inst.result_type = "i64"
+    tag_inst.field_type = "i32"
+    tag_inst.result_type = "i32"
     tag_inst.has_result = true
     b.instructions.push(tag_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -13333,11 +13488,19 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let cont_label = gen_next_label(g, "prop_cont")
     g = gen_advance_label(g)
 
+    -- Pre-allocate storage for the Ok value (must be in current block, before the branch)
+    let ok_alloca_id = g.builder.next_id
+    let mut ok_alloca = ir_inst_new(ok_alloca_id, OP_ALLOCA())
+    ok_alloca.alloc_type = ok_field_type
+    ok_alloca.result_type = "ptr(" + ok_field_type + ")"
+    ok_alloca.has_result = true
+    b.instructions.push(ok_alloca)
+    g.builder.next_id = g.builder.next_id + 1
+
     -- Branch: if tag == 0 go to ok, else go to err
     b.terminator = Box_new(term_br_cond(ir_val_inst(is_ok_id), ok_label, err_label))
     b.has_terminator = true
     g.completed_blocks.push(b)
-
     -- Err path: extract error value and early-return it from the function
     let mut err_block = ir_block_new(err_label)
 
@@ -13346,41 +13509,29 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     let mut err_extract = ir_inst_new(err_val_id, OP_EXTRACT_FIELD())
     err_extract.field_base = ir_val_inst(operand_id)
     err_extract.field_index = 2
-    err_extract.field_type = "i64"
-    err_extract.result_type = "i64"
+    err_extract.field_type = err_field_type
+    err_extract.result_type = err_field_type
     err_extract.has_result = true
     err_block.instructions.push(err_extract)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Build an error return value: construct a Result/Option with error tag
-    -- For simplicity, we reconstruct a tagged struct {tag=1, payload=0, error=err_val}
-    -- and return it. The LLVM backend will handle struct construction.
-    -- Here we return the operand directly (it already has the Err tag).
+    -- Return the operand directly (it already has the Err tag).
     err_block.terminator = Box_new(term_ret(ir_val_inst(operand_id)))
     err_block.has_terminator = true
     g.completed_blocks.push(err_block)
-
     -- Ok path: extract the Ok/Some value (field 1)
     let mut ok_block = ir_block_new(ok_label)
     let ok_val_id = g.builder.next_id
     let mut ok_extract = ir_inst_new(ok_val_id, OP_EXTRACT_FIELD())
     ok_extract.field_base = ir_val_inst(operand_id)
     ok_extract.field_index = 1
-    ok_extract.field_type = "i64"
-    ok_extract.result_type = "i64"
+    ok_extract.field_type = ok_field_type
+    ok_extract.result_type = ok_field_type
     ok_extract.has_result = true
     ok_block.instructions.push(ok_extract)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Store ok value so it can be used after the branch
-    let ok_alloca_id = g.builder.next_id
-    let mut ok_alloca = ir_inst_new(ok_alloca_id, OP_ALLOCA())
-    ok_alloca.alloc_type = "i64"
-    ok_alloca.result_type = "ptr(i64)"
-    ok_alloca.has_result = true
-    ok_block.instructions.push(ok_alloca)
-    g.builder.next_id = g.builder.next_id + 1
-
+    -- Store ok value into the pre-allocated alloca
     let mut ok_store = ir_inst_new(g.builder.next_id, OP_STORE())
     ok_store.store_ptr = ir_val_inst(ok_alloca_id)
     ok_store.store_val = ir_val_inst(ok_val_id)
@@ -13391,14 +13542,13 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     ok_block.terminator = Box_new(term_br(cont_label))
     ok_block.has_terminator = true
     g.completed_blocks.push(ok_block)
-
     -- Continue block: load the ok value
     let mut cont_block = ir_block_new(cont_label)
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(ok_alloca_id)
-    load_inst.load_type = "i64"
-    load_inst.result_type = "i64"
+    load_inst.load_type = ok_field_type
+    load_inst.result_type = ok_field_type
     load_inst.has_result = true
     cont_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
