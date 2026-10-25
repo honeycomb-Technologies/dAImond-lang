@@ -39,6 +39,7 @@ const LoopStmt = ast.LoopStmt;
 const BreakStmt = ast.BreakStmt;
 const ContinueStmt = ast.ContinueStmt;
 const RegionBlock = ast.RegionBlock;
+const UnsafeBlock = ast.UnsafeBlock;
 const Expr = ast.Expr;
 const Literal = ast.Literal;
 const BinaryExpr = ast.BinaryExpr;
@@ -1244,6 +1245,15 @@ pub const CodeGenerator = struct {
         self.writer.indent();
         try self.writer.writeLine("if (v < lo || v > hi) dm_panic(\"integer cast out of range\");");
         try self.writer.writeLine("return v;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Null-pointer check helper (Box field access / dereference)
+        try self.writer.writeLine("static inline void* dm_null_check_ptr(void* p) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (p == NULL) dm_panic(\"null Box dereference\");");
+        try self.writer.writeLine("return p;");
         self.writer.dedent();
         try self.writer.writeLine("}");
         try self.writer.blankLine();
@@ -3400,6 +3410,8 @@ pub const CodeGenerator = struct {
                 .for_loop => |for_stmt| try self.scanBlockForListTypes(for_stmt.body),
                 .while_loop => |while_stmt| try self.scanBlockForListTypes(while_stmt.body),
                 .loop_stmt => |loop| try self.scanBlockForListTypes(loop.body),
+                .unsafe_block => |ub| try self.scanBlockForListTypes(ub.body),
+                .region_block => |rb| try self.scanBlockForListTypes(rb.body),
                 .expression => |expr| try self.scanExprForBuiltinListTypes(expr),
                 else => {},
             }
@@ -3578,6 +3590,8 @@ pub const CodeGenerator = struct {
                 try self.scanBlockForGenericCalls(while_stmt.body);
             },
             .loop_stmt => |loop| try self.scanBlockForGenericCalls(loop.body),
+            .unsafe_block => |ub| try self.scanBlockForGenericCalls(ub.body),
+            .region_block => |rb| try self.scanBlockForGenericCalls(rb.body),
             .assignment => |asgn| {
                 try self.scanExprForGenericCalls(asgn.target);
                 try self.scanExprForGenericCalls(asgn.value);
@@ -5349,6 +5363,7 @@ pub const CodeGenerator = struct {
             .break_stmt => |brk| try self.generateBreak(brk),
             .continue_stmt => |cont| try self.generateContinue(cont),
             .region_block => |region| try self.generateRegionBlock(region),
+            .unsafe_block => |ub| try self.generateUnsafeBlock(ub),
             .expression => |expr| {
                 // If the expression is an if or match, generate as statement form
                 if (expr.kind == .if_expr) {
@@ -6216,6 +6231,14 @@ pub const CodeGenerator = struct {
         try self.writer.printLine("dm_arena_destroy({s});", .{arena_name});
     }
 
+    /// Generate unsafe block (transparent: plain braced block; the fence
+    /// itself is enforced by the type checker)
+    fn generateUnsafeBlock(self: *Self, ub: *UnsafeBlock) anyerror!void {
+        try self.writer.openBrace();
+        try self.generateBlock(ub.body);
+        try self.writer.closeBrace();
+    }
+
     /// Generate assignment statement
     fn generateAssignment(self: *Self, assign: *Assignment) anyerror!void {
         // Safe division/modulo for compound assignment: x /= y -> x = dm__safe_div(x, y)
@@ -6608,6 +6631,18 @@ pub const CodeGenerator = struct {
 
     /// Generate unary expression
     fn generateUnaryExpr(self: *Self, un: *UnaryExpr) anyerror!void {
+        // Dereference of a pointer-typed operand (Box/reference) gets a
+        // null check; * on non-pointers keeps the plain form.
+        if (un.op == .deref) {
+            const operand_type = self.inferCTypeFromExpr(un.operand);
+            if (std.mem.endsWith(u8, operand_type, "*")) {
+                try self.writer.print("*(({s})dm_null_check_ptr((void*)(", .{operand_type});
+                try self.generateExpr(un.operand);
+                try self.writer.write(")))");
+                return;
+            }
+        }
+
         const op_str: []const u8 = switch (un.op) {
             .neg => "-",
             .not => "!",
@@ -6641,14 +6676,18 @@ pub const CodeGenerator = struct {
         };
 
         if (is_pointer) {
+            // Null-check the pointer (Box may be Box_null()); the pointee
+            // member access stays an lvalue in every form below.
             if (field.object.kind == .identifier) {
-                // For identifier pointers, emit name->field directly
-                try self.writer.print("{s}->{s}", .{ field.object.kind.identifier.name, field.field.name });
+                // (dm_null_check_ptr((void*)name), name)->field
+                const name = field.object.kind.identifier.name;
+                try self.writer.print("(dm_null_check_ptr((void*)({s})), {s})->{s}", .{ name, name, field.field.name });
             } else {
-                // For complex expressions: (expr)->field
-                try self.writer.write("(");
+                // ((TYPE)dm_null_check_ptr((void*)(expr)))->field (single eval)
+                const obj_type = self.inferCTypeFromExpr(field.object);
+                try self.writer.print("(({s})dm_null_check_ptr((void*)(", .{obj_type});
                 try self.generateExpr(field.object);
-                try self.writer.print(")->{s}", .{field.field.name});
+                try self.writer.print(")))->{s}", .{field.field.name});
             }
         } else {
             try self.generateExpr(field.object);
@@ -8118,6 +8157,12 @@ pub const CodeGenerator = struct {
             .continue_stmt => {
                 return ComptimeStmtResult{ .control = .{ .continue_signal = {} } };
             },
+            .unsafe_block => |ub| {
+                return self.evalComptimeBlockFull(ub.body, env);
+            },
+            .region_block => |rb| {
+                return self.evalComptimeBlockFull(rb.body, env);
+            },
             else => return null,
         }
     }
@@ -8665,6 +8710,12 @@ pub const CodeGenerator = struct {
                 self.collectFreeVars(wl.condition, param_names, result);
                 self.collectFreeVarsBlock(wl.body, param_names, result);
             },
+            .unsafe_block => |ub| {
+                self.collectFreeVarsBlock(ub.body, param_names, result);
+            },
+            .region_block => |rb| {
+                self.collectFreeVarsBlock(rb.body, param_names, result);
+            },
             else => {},
         }
     }
@@ -8891,6 +8942,7 @@ pub const CodeGenerator = struct {
                 break :blk false;
             },
             .region_block => |rb| blockHasAwait(rb.body),
+            .unsafe_block => |ub| blockHasAwait(ub.body),
             .discard => |d| exprHasAwait(d.value),
             .break_stmt => |bs| if (bs.value) |v| exprHasAwait(v) else false,
             .continue_stmt => false,

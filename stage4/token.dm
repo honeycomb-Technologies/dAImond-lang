@@ -82,6 +82,7 @@ fn TK_FSTRING() -> int { return 100 }
 fn TK_COMPTIME() -> int { return 101 }
 fn TK_ASYNC() -> int { return 102 }
 fn TK_AWAIT() -> int { return 103 }
+fn TK_UNSAFE() -> int { return 104 }
 
 struct Token {
     kind: int,
@@ -128,6 +129,7 @@ fn keyword_lookup(name: string) -> int {
     if name == "comptime" { return TK_COMPTIME() }
     if name == "async" { return TK_ASYNC() }
     if name == "await" { return TK_AWAIT() }
+    if name == "unsafe" { return TK_UNSAFE() }
     return TK_IDENT()
 }
 
@@ -184,5 +186,6 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_COMPTIME() { return "'comptime'" }
     if kind == TK_ASYNC() { return "'async'" }
     if kind == TK_AWAIT() { return "'await'" }
+    if kind == TK_UNSAFE() { return "'unsafe'" }
     return "token(" + int_to_string(kind) + ")"
 }

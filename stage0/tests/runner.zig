@@ -3040,7 +3040,10 @@ pub const extern_tests = [_]TestCase{
             \\extern fn getenv(name: string) -> string
             \\
             \\fn main() {
-            \\    let path = getenv("PATH")
+            \\    let mut path: string = ""
+            \\    unsafe {
+            \\        path = getenv("PATH")
+            \\    }
             \\    if len(path) > 0 {
             \\        println("has path")
             \\    } else {

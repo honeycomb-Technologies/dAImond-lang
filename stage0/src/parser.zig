@@ -67,6 +67,7 @@ pub const CastExpr = ast.CastExpr;
 pub const ComptimeExpr = ast.ComptimeExpr;
 pub const StringInterpolation = ast.StringInterpolation;
 pub const RegionBlock = ast.RegionBlock;
+pub const UnsafeBlock = ast.UnsafeBlock;
 pub const Pattern = ast.Pattern;
 pub const TuplePattern = ast.TuplePattern;
 pub const StructPattern = ast.StructPattern;
@@ -1325,6 +1326,24 @@ pub const Parser = struct {
             const stmt = try self.astAllocator().create(Statement);
             stmt.* = .{
                 .kind = .{ .region_block = region },
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+            return stmt;
+        }
+
+        // Unsafe block: unsafe { ... }
+        if (self.match(.kw_unsafe)) {
+            const body = try self.parseBlockExpr();
+
+            const unsafe_blk = try self.astAllocator().create(UnsafeBlock);
+            unsafe_blk.* = .{
+                .body = body,
+                .span = makeSpan(start_loc, self.previousLocation()),
+            };
+
+            const stmt = try self.astAllocator().create(Statement);
+            stmt.* = .{
+                .kind = .{ .unsafe_block = unsafe_blk },
                 .span = makeSpan(start_loc, self.previousLocation()),
             };
             return stmt;

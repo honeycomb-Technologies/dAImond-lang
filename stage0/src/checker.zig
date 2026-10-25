@@ -460,6 +460,12 @@ pub const TypeChecker = struct {
     generic_function_names: std.StringHashMap(void),
     /// Diagnostic messages allocated by this checker (freed in deinit)
     owned_messages: std.ArrayList([]const u8),
+    /// Depth of enclosing `unsafe { }` blocks (extern-call/deref fence)
+    unsafe_depth: u32,
+    /// Names of functions declared `extern fn`
+    extern_functions: std.StringHashMap(void),
+    /// Variables holding references of extern/cast provenance (tainted)
+    tainted_vars: std.StringHashMap(void),
 
     const Self = @This();
 
@@ -481,6 +487,9 @@ pub const TypeChecker = struct {
             .source_file = null,
             .generic_function_names = std.StringHashMap(void).init(allocator),
             .owned_messages = std.ArrayList([]const u8).init(allocator),
+            .unsafe_depth = 0,
+            .extern_functions = std.StringHashMap(void).init(allocator),
+            .tainted_vars = std.StringHashMap(void).init(allocator),
         };
 
         // Register built-in types and functions
@@ -500,6 +509,8 @@ pub const TypeChecker = struct {
             self.allocator.free(msg);
         }
         self.owned_messages.deinit();
+        self.extern_functions.deinit();
+        self.tainted_vars.deinit();
         self.type_ctx.deinit();
         self.allocator.destroy(self.type_ctx);
     }
@@ -1081,6 +1092,12 @@ pub const TypeChecker = struct {
                     return try self.type_ctx.intern(.error_type);
                 };
                 if (typ == .ref) {
+                    // Unsafe fence: references of extern/cast provenance
+                    // (including &T parameters) need an unsafe block to
+                    // dereference. Box derefs stay safe (null-checked).
+                    if (self.unsafe_depth == 0 and self.exprIsTaintedRef(un.operand)) {
+                        try self.reportError(.type_mismatch, "dereference of a reference from an extern call or cast requires unsafe block", un.span);
+                    }
                     return typ.ref.pointee;
                 }
                 if (typ == .box) {
@@ -1221,6 +1238,16 @@ pub const TypeChecker = struct {
         // Special handling for built-in functions that accept any type
         if (fc.function.kind == .identifier) {
             const name = fc.function.kind.identifier.name;
+            // Unsafe fence: calling an `extern fn` requires an unsafe block.
+            if (self.extern_functions.contains(name) and self.unsafe_depth == 0) {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "extern function call '{s}' requires unsafe block",
+                    .{name},
+                );
+                try self.owned_messages.append(msg);
+                try self.reportError(.type_mismatch, msg, fc.span);
+            }
             // Builtins returning void/unit
             if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
                 std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "panic") or
@@ -2003,6 +2030,55 @@ pub const TypeChecker = struct {
     // STATEMENT CHECKING
     // ========================================================================
 
+    // ========================================================================
+    // UNSAFE FENCE PROVENANCE (simple, name-based taint tracking)
+    // ========================================================================
+
+    fn unwrapGroupedExpr(expr: *const ast.Expr) *const ast.Expr {
+        var cur = expr;
+        while (cur.kind == .grouped) {
+            cur = cur.kind.grouped;
+        }
+        return cur;
+    }
+
+    /// True if the expression directly produces a reference of untrusted
+    /// provenance: an extern function call result or a cast to a reference
+    /// type.
+    fn exprIsTaintSource(self: *Self, expr: *const ast.Expr) bool {
+        const inner = unwrapGroupedExpr(expr);
+        switch (inner.kind) {
+            .function_call => |fc| {
+                if (fc.function.kind == .identifier) {
+                    return self.extern_functions.contains(fc.function.kind.identifier.name);
+                }
+                return false;
+            },
+            .cast => |c| {
+                return c.target_type.kind == .reference or c.target_type.kind == .pointer;
+            },
+            else => return false,
+        }
+    }
+
+    /// True if the expression denotes a tainted reference value: a taint
+    /// source, a tainted variable, or a copy of one.
+    fn exprIsTaintedRef(self: *Self, expr: *const ast.Expr) bool {
+        const inner = unwrapGroupedExpr(expr);
+        if (inner.kind == .identifier) {
+            return self.tainted_vars.contains(inner.kind.identifier.name);
+        }
+        return self.exprIsTaintSource(inner);
+    }
+
+    fn updateVarTaint(self: *Self, name: []const u8, value: *const ast.Expr) !void {
+        if (self.exprIsTaintedRef(value)) {
+            try self.tainted_vars.put(name, {});
+        } else {
+            _ = self.tainted_vars.remove(name);
+        }
+    }
+
     pub fn checkStatement(self: *Self, stmt: *const ast.Statement) !void {
         switch (stmt.kind) {
             .let_binding => |lb| try self.checkLetBinding(lb),
@@ -2015,6 +2091,7 @@ pub const TypeChecker = struct {
             .break_stmt => |bs| try self.checkBreak(bs),
             .continue_stmt => |cs| try self.checkContinue(cs),
             .region_block => |rb| try self.checkRegionBlock(rb),
+            .unsafe_block => |ub| try self.checkUnsafeBlock(ub),
             .expression => |expr| _ = try self.inferExpr(expr),
             .assignment => |assign| try self.checkAssignment(assign),
             .discard => |disc| _ = try self.inferExpr(disc.value),
@@ -2051,6 +2128,14 @@ pub const TypeChecker = struct {
 
         // Bind pattern
         try self.bindPattern(lb.pattern, final_type, lb.is_mut);
+
+        // Unsafe fence provenance: extern-call / cast-to-reference
+        // initializers taint the bound variable.
+        if (lb.pattern.kind == .identifier) {
+            if (lb.value) |val| {
+                try self.updateVarTaint(lb.pattern.kind.identifier.name.name, val);
+            }
+        }
     }
 
     /// Check if an expression is an unsuffixed integer or float literal that
@@ -2180,6 +2265,12 @@ pub const TypeChecker = struct {
         _ = try self.inferBlock(rb.body);
     }
 
+    fn checkUnsafeBlock(self: *Self, ub: *const ast.UnsafeBlock) !void {
+        self.unsafe_depth += 1;
+        defer self.unsafe_depth -= 1;
+        _ = try self.inferBlock(ub.body);
+    }
+
     fn checkAssignment(self: *Self, assign: *const ast.Assignment) !void {
         const target_type = try self.inferExpr(assign.target);
         const value_type = try self.inferExpr(assign.value);
@@ -2211,6 +2302,11 @@ pub const TypeChecker = struct {
                 }
                 try self.unify(value_type, target_type, assign.span);
             },
+        }
+
+        // Unsafe fence provenance across plain assignment.
+        if (assign.op == .assign and assign.target.kind == .identifier) {
+            try self.updateVarTaint(assign.target.kind.identifier.name, assign.value);
         }
     }
 
@@ -2553,6 +2649,12 @@ pub const TypeChecker = struct {
     /// Pre-register a function's type signature without checking its body.
     /// This enables forward function references across the module.
     fn registerFunctionSignature(self: *Self, func: *const ast.FunctionDecl, is_public: bool) !void {
+        // Track extern declarations for the unsafe fence (even on the
+        // early-return path below, the name must stay fenced).
+        if (func.is_extern) {
+            try self.extern_functions.put(func.name.name, {});
+        }
+
         // Skip if already registered (e.g. duplicate function name - error reported later)
         if (self.env.lookupLocal(func.name.name)) |_| {
             return;
@@ -2687,10 +2789,17 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Define parameters in function scope
+        // Define parameters in function scope. Reference-typed parameters
+        // are tainted by default for the unsafe fence: their provenance is
+        // the (unchecked) caller. Taint state is per-function.
+        self.tainted_vars.clearRetainingCapacity();
+        self.unsafe_depth = 0;
         for (func.params) |param| {
             const param_type = try self.resolveTypeExpr(param.type_expr);
             try self.env.define(Symbol.init(param.name.name, .variable, param_type).withMutable(param.is_mut));
+            if (param.type_expr.kind == .reference or param.type_expr.kind == .pointer) {
+                try self.tainted_vars.put(param.name.name, {});
+            }
         }
 
         // For async functions, the body checks against inner_return_type (T, not Future[T])
@@ -2871,6 +2980,7 @@ pub const TypeChecker = struct {
             .loop_stmt => |ls| blockContainsAwait(ls.body),
             .match_stmt => |me| exprContainsAwait(me.scrutinee) or matchContainsAwait(me),
             .region_block => |rb| blockContainsAwait(rb.body),
+            .unsafe_block => |ub| blockContainsAwait(ub.body),
             .discard => |d| exprContainsAwait(d.value),
             .break_stmt => |bs| if (bs.value) |v| exprContainsAwait(v) else false,
             .continue_stmt => false,

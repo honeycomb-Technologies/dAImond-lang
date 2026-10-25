@@ -82,6 +82,7 @@ fn TK_FSTRING() -> int { return 100 }
 fn TK_COMPTIME() -> int { return 101 }
 fn TK_ASYNC() -> int { return 102 }
 fn TK_AWAIT() -> int { return 103 }
+fn TK_UNSAFE() -> int { return 104 }
 
 struct Token {
     kind: int,
@@ -128,6 +129,7 @@ fn keyword_lookup(name: string) -> int {
     if name == "comptime" { return TK_COMPTIME() }
     if name == "async" { return TK_ASYNC() }
     if name == "await" { return TK_AWAIT() }
+    if name == "unsafe" { return TK_UNSAFE() }
     return TK_IDENT()
 }
 
@@ -184,6 +186,7 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_COMPTIME() { return "'comptime'" }
     if kind == TK_ASYNC() { return "'async'" }
     if kind == TK_AWAIT() { return "'await'" }
+    if kind == TK_UNSAFE() { return "'unsafe'" }
     return "token(" + int_to_string(kind) + ")"
 }
 
@@ -3659,6 +3662,11 @@ fn parse_stmt(p: Parser) -> ParseStmtResult {
         return parse_region_stmt(pp)
     }
 
+    -- Unsafe block (transparent; fence lives in the Stage 0 checker)
+    if tok.kind == TK_UNSAFE() {
+        return parse_unsafe_stmt(pp)
+    }
+
     -- Expression statement (may also be assignment)
     let expr_result = parse_expr(pp)
     pp = expr_result.p
@@ -3867,6 +3875,20 @@ fn parse_region_stmt(p: Parser) -> ParseStmtResult {
     pp = p_expect(pp, TK_RBRACE())
     let mut s = stmt_new(STMT_REGION(), tok.line, tok.col)
     s.region_name = name_tok.value
+    s.region_body = body.stmts
+    return ParseStmtResult { p: pp, stmt: s }
+}
+
+fn parse_unsafe_stmt(p: Parser) -> ParseStmtResult {
+    let mut pp = p
+    let tok = p_cur(pp)
+    pp = p_advance(pp) -- skip 'unsafe'
+    pp = p_expect(pp, TK_LBRACE())
+    let body = parse_block_body(pp)
+    pp = body.p
+    pp = p_expect(pp, TK_RBRACE())
+    let mut s = stmt_new(STMT_REGION(), tok.line, tok.col)
+    s.region_name = "unsafe"
     s.region_body = body.stmts
     return ParseStmtResult { p: pp, stmt: s }
 }

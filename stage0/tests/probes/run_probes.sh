@@ -37,7 +37,21 @@
 # Exit status is nonzero if any probe FAILs.
 #
 # Unsafe fencing rules (Stage 0 checker; see checker.zig):
-#   - TODO(Session A Task 3): documented here when the fence lands.
+#   - `unsafe { ... }` is a statement block (lexer kw_unsafe, parser
+#     statement, codegen-transparent braced block).
+#   - Calling a function declared `extern fn` outside an unsafe block is a
+#     type error: "extern function call '<name>' requires unsafe block".
+#   - Dereferencing (*expr) a reference (&T) of untrusted provenance
+#     outside an unsafe block is a type error. Provenance is tracked
+#     simply, by variable name per function: a variable initialized from
+#     an extern call result or a cast to a reference type is tainted
+#     (taint propagates through plain copies/assignments), and every
+#     reference-typed function parameter is tainted by default.
+#   - Dereferencing Box[T] stays safe: codegen emits a runtime null check
+#     (PANIC: null Box dereference) on Box field access and Box deref.
+#   - The fence is checker-level: programs compiled with
+#     --skip-type-check bypass it (documented remainder; Stage 4's own
+#     bootstrap uses that flag for its dm_llvm_* extern calls).
 #
 # Per-probe intent:
 #   p01_box_null_deref    field read through Box_null()      -> PANIC (null)
