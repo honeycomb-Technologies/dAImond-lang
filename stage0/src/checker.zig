@@ -16,6 +16,7 @@ const ast = @import("ast.zig");
 const types = @import("types.zig");
 const errors = @import("errors.zig");
 const lexer = @import("lexer.zig");
+const builtins = @import("builtins.zig");
 
 // Re-export commonly used types
 pub const TypeId = types.TypeId;
@@ -1394,206 +1395,54 @@ pub const TypeChecker = struct {
                 try self.owned_messages.append(msg);
                 try self.reportError(.type_mismatch, msg, fc.span);
             }
-            // Builtins returning void/unit
-            if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
-                std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "panic") or
-                std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln") or
-                std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "file_write") or
-                std.mem.eql(u8, name, "file_append") or
-                std.mem.eql(u8, name, "tcp_close") or
-                std.mem.eql(u8, name, "thread_join") or
-                std.mem.eql(u8, name, "mutex_lock") or std.mem.eql(u8, name, "mutex_unlock") or
-                std.mem.eql(u8, name, "mutex_destroy") or
-                std.mem.eql(u8, name, "sleep_ms") or
-                std.mem.eql(u8, name, "flush") or
-                std.mem.eql(u8, name, "mem_sweep"))
-            {
+            // Free-function builtins: one registry lookup (builtins.zig
+            // is the single table; its header documents every
+            // signature). Parameter types and arity are recorded there
+            // but intentionally not enforced here, matching the
+            // historical checker behavior. Some/None/Ok/Err keep their
+            // symbol-based checking below (registered in
+            // registerBuiltins), so only their codegen lowering comes
+            // from the registry.
+            if (builtins.lookup(name)) |entry| {
+                switch (entry.lowering) {
+                    .option_some, .option_none, .result_ok, .result_err => {},
+                    else => {
+                        // Box_new historically infers only its first argument.
+                        if (entry.ret == .box_of_arg0) {
+                            if (fc.args.len > 0) {
+                                const inner_type = try self.inferExpr(fc.args[0].value);
+                                return try self.type_ctx.makeBox(inner_type);
+                            }
+                            return try self.freshTypeVar();
+                        }
+                        var first_type: ?TypeId = null;
+                        for (fc.args, 0..) |arg, i| {
+                            const t = try self.inferExpr(arg.value);
+                            if (i == 0) first_type = t;
+                        }
+                        if (entry.effects.io) self.current_effects.addBuiltin(.io);
+                        if (entry.effects.console) self.current_effects.addBuiltin(.console);
+                        if (entry.effects.file_system) self.current_effects.addBuiltin(.file_system);
+                        if (entry.effects.diverge) self.current_effects.addBuiltin(.diverge);
+                        return switch (entry.ret) {
+                            .unit => try self.type_ctx.intern(.unit),
+                            .int => try self.type_ctx.intern(.{ .int = .i64 }),
+                            .float => try self.type_ctx.intern(.{ .float = .f64 }),
+                            .string => try self.type_ctx.intern(.str),
+                            .bool => try self.type_ctx.intern(.bool),
+                            .fresh => try self.freshTypeVar(),
+                            .box_of_arg0 => unreachable,
+                            .first_arg => first_type orelse try self.freshTypeVar(),
+                        };
+                    },
+                }
+            }
+            // SIMD splat/set prefix families: simd_splat_f32x4(v) -> f32x4.
+            if (builtins.simdPrefix(name)) |simd| {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
                 }
-                // Effect tracking for builtins
-                if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
-                    std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln"))
-                {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.console);
-                } else if (std.mem.eql(u8, name, "panic") or std.mem.eql(u8, name, "exit")) {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.diverge);
-                } else if (std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_append"))
-                {
-                    self.current_effects.addBuiltin(.file_system);
-                } else if (std.mem.eql(u8, name, "sleep_ms") or std.mem.eql(u8, name, "flush")) {
-                    self.current_effects.addBuiltin(.io);
-                }
-                return try self.type_ctx.intern(.unit);
-            }
-            // Builtins returning int
-            if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "parse_int") or
-                std.mem.eql(u8, name, "string_to_int") or
-                std.mem.eql(u8, name, "string_find") or std.mem.eql(u8, name, "args_len") or
-                std.mem.eql(u8, name, "system") or
-                std.mem.eql(u8, name, "fs_mkdir") or std.mem.eql(u8, name, "fs_remove") or
-                std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir") or
-                std.mem.eql(u8, name, "tcp_listen") or std.mem.eql(u8, name, "tcp_accept") or
-                std.mem.eql(u8, name, "tcp_connect") or std.mem.eql(u8, name, "tcp_write") or
-                std.mem.eql(u8, name, "thread_spawn") or std.mem.eql(u8, name, "mutex_new") or
-                std.mem.eql(u8, name, "read_key") or std.mem.eql(u8, name, "read_key_nb") or
-                std.mem.eql(u8, name, "term_width") or std.mem.eql(u8, name, "term_height") or
-                std.mem.eql(u8, name, "time_ms") or std.mem.eql(u8, name, "mem_mark"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Effect tracking
-                if (std.mem.eql(u8, name, "system")) {
-                    self.current_effects.addBuiltin(.io);
-                } else if (std.mem.eql(u8, name, "args_len")) {
-                    self.current_effects.addBuiltin(.io);
-                } else if (std.mem.eql(u8, name, "fs_mkdir") or std.mem.eql(u8, name, "fs_remove") or
-                    std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir"))
-                {
-                    self.current_effects.addBuiltin(.file_system);
-                } else if (std.mem.eql(u8, name, "read_key") or std.mem.eql(u8, name, "read_key_nb")) {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.console);
-                } else if (std.mem.eql(u8, name, "term_width") or std.mem.eql(u8, name, "term_height") or
-                    std.mem.eql(u8, name, "time_ms"))
-                {
-                    self.current_effects.addBuiltin(.io);
-                }
-                return try self.type_ctx.intern(.{ .int = .i64 });
-            }
-            // Builtins returning float
-            if (std.mem.eql(u8, name, "parse_float"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.type_ctx.intern(.{ .float = .f64 });
-            }
-            // Builtins returning string
-            if (std.mem.eql(u8, name, "int_to_string") or std.mem.eql(u8, name, "bool_to_string") or
-                std.mem.eql(u8, name, "float_to_string") or std.mem.eql(u8, name, "substr") or
-                std.mem.eql(u8, name, "char_to_string") or std.mem.eql(u8, name, "char_at") or
-                std.mem.eql(u8, name, "file_read") or
-                std.mem.eql(u8, name, "args_get") or
-                std.mem.eql(u8, name, "string_trim") or std.mem.eql(u8, name, "string_replace") or
-                std.mem.eql(u8, name, "string_to_upper") or std.mem.eql(u8, name, "string_to_lower") or
-                std.mem.eql(u8, name, "path_dirname") or std.mem.eql(u8, name, "path_basename") or
-                std.mem.eql(u8, name, "path_extension") or std.mem.eql(u8, name, "path_stem") or
-                std.mem.eql(u8, name, "path_join") or std.mem.eql(u8, name, "read_line") or std.mem.eql(u8, name, "chr") or
-                std.mem.eql(u8, name, "fs_readdir") or std.mem.eql(u8, name, "fs_getcwd") or
-                std.mem.eql(u8, name, "env_get") or
-                std.mem.eql(u8, name, "tcp_read"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Effect tracking
-                if (std.mem.eql(u8, name, "file_read") or std.mem.eql(u8, name, "fs_readdir") or
-                    std.mem.eql(u8, name, "fs_getcwd"))
-                {
-                    self.current_effects.addBuiltin(.file_system);
-                } else if (std.mem.eql(u8, name, "env_get")) {
-                    self.current_effects.addBuiltin(.io);
-                } else if (std.mem.eql(u8, name, "read_line")) {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.console);
-                } else if (std.mem.eql(u8, name, "args_get")) {
-                    self.current_effects.addBuiltin(.io);
-                }
-                return try self.type_ctx.intern(.str);
-            }
-            // string_split returns a fresh type var (codegen handles the split_result struct)
-            if (std.mem.eql(u8, name, "string_split"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // Builtins returning bool
-            if (std.mem.eql(u8, name, "is_alpha") or std.mem.eql(u8, name, "is_digit") or
-                std.mem.eql(u8, name, "is_alnum") or std.mem.eql(u8, name, "is_whitespace") or
-                std.mem.eql(u8, name, "string_contains") or std.mem.eql(u8, name, "starts_with") or
-                std.mem.eql(u8, name, "ends_with") or std.mem.eql(u8, name, "file_exists") or
-                std.mem.eql(u8, name, "fs_exists"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Effect tracking
-                if (std.mem.eql(u8, name, "file_exists") or std.mem.eql(u8, name, "fs_exists")) {
-                    self.current_effects.addBuiltin(.file_system);
-                }
-                return try self.type_ctx.intern(.bool);
-            }
-            // List_new returns a fresh type var (its type is inferred from usage context)
-            if (std.mem.eql(u8, name, "List_new"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // Box_new(value) returns Box[T] where T is inferred from the argument
-            if (std.mem.eql(u8, name, "Box_new"))
-            {
-                if (fc.args.len > 0) {
-                    const inner_type = try self.inferExpr(fc.args[0].value);
-                    return try self.type_ctx.makeBox(inner_type);
-                }
-                return try self.freshTypeVar();
-            }
-            // Box_null() returns a fresh type var (type inferred from context)
-            if (std.mem.eql(u8, name, "Box_null"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // Map_new() returns a fresh type var (type inferred from let binding)
-            if (std.mem.eql(u8, name, "Map_new"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // SIMD arithmetic builtins: return same type as first argument
-            if (std.mem.eql(u8, name, "simd_add") or std.mem.eql(u8, name, "simd_sub") or
-                std.mem.eql(u8, name, "simd_mul") or std.mem.eql(u8, name, "simd_div"))
-            {
-                var first_type: ?TypeId = null;
-                for (fc.args, 0..) |arg, i| {
-                    const t = try self.inferExpr(arg.value);
-                    if (i == 0) first_type = t;
-                }
-                return first_type orelse try self.freshTypeVar();
-            }
-            // SIMD extract: returns scalar (use fresh type var, C handles the actual type)
-            if (std.mem.eql(u8, name, "simd_extract"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // SIMD splat/set builtins: simd_splat_f32x4(val) -> f32x4, etc.
-            if (std.mem.startsWith(u8, name, "simd_splat_") or std.mem.startsWith(u8, name, "simd_set_"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Extract the SIMD type suffix (e.g., "f32x4" from "simd_splat_f32x4")
-                const suffix = if (std.mem.startsWith(u8, name, "simd_splat_"))
-                    name[11..]
-                else
-                    name[9..];
-                // Look up the SIMD type by name
-                if (self.type_ctx.type_names.get(suffix)) |simd_type_id| {
+                if (self.type_ctx.type_names.get(simd.suffix)) |simd_type_id| {
                     return simd_type_id;
                 }
                 return try self.freshTypeVar();
@@ -2297,9 +2146,7 @@ pub const TypeChecker = struct {
             .function_call => |fc| {
                 if (fc.function.kind == .identifier) {
                     const name = fc.function.kind.identifier.name;
-                    return std.mem.eql(u8, name, "List_new") or
-                        std.mem.eql(u8, name, "Map_new") or
-                        std.mem.eql(u8, name, "Box_new");
+                    return builtins.isFreshCtor(name);
                 }
                 return false;
             },
