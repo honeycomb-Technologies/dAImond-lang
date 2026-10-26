@@ -18,6 +18,11 @@
 #   OK <exact stdout>          : compilation must succeed; the binary must
 #                                exit 0 and stdout must equal `data` exactly
 #                                ("\\n" escapes allowed).
+#   S1_COMPILE_ERROR <subs>    : like COMPILE_ERROR, but compiled with the
+#                                Stage 1 compiler binary (built by Stage 0).
+#   KNOWN_GAP <note>           : documented gap; listed as GAP in output
+#                                and counted separately in the summary,
+#                                never as PASS or FAIL.
 #
 # For every probe that produces a binary, the generated C is ALSO rebuilt
 # with `gcc -O0 -g -fsanitize=address,undefined` and re-run; sanitizer
@@ -65,6 +70,7 @@
 #   p09_string_alias      aliased string, grow original      -> OK (Session B)
 #   p10_map_alias         aliased Map, grow original         -> OK (Session B)
 #   p11_region_escape     region string escapes to outer var -> COMPILE_ERROR (Session B)
+#   p11b_region_escape_s1 same program via the Stage 1 compiler -> S1_COMPILE_ERROR
 #   p12_memsweep_uaf      concat after mem_mark, then sweep  -> OK (Session B)
 #   p13_overflow_runtime  INT64_MAX + 1 at runtime           -> PANIC (Session B)
 #   p14_overflow_comptime comptime INT64_MAX + 1             -> COMPILE_ERROR (Session B)
@@ -104,6 +110,7 @@ PROBES=(
     'p09_string_alias|OK|200\n400\nabcdefghij\n|'
     'p10_map_alias|OK|777\n|'
     'p11_region_escape|COMPILE_ERROR|escape|'
+    'p11b_region_escape_s1|S1_COMPILE_ERROR|region;;escape|'
     'p12_memsweep_uaf|OK|hello world\n|'
     'p13_overflow_runtime|PANIC|overflow|'
     'p14_overflow_comptime|COMPILE_ERROR|overflow|'
@@ -189,8 +196,28 @@ WORK="$(mktemp -d /tmp/daimond_probes.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 echo "==> Probe work dir: $WORK"
 
+# Build the Stage 1 compiler binary once if an S1_* probe is selected:
+# Stage 0 compiles stage1/main.dm (the gen_bootstrap.sh output).
+S1_BIN=""
+for row in "${PROBES[@]}"; do
+    IFS='|' read -r s1_name s1_kind _ _ <<<"$row"
+    if [ "$s1_kind" = "S1_COMPILE_ERROR" ] && want_probe "$s1_name"; then
+        mkdir -p "$WORK/s1build"
+        cp "$ROOT/stage1/main.dm" "$WORK/s1build/s1_main.dm"
+        echo "==> Building Stage 1 binary for S1 probes"
+        if (cd "$WORK/s1build" && timeout 120 "$DAIMOND" s1_main.dm -o s1 --no-cache --no-color >s1_build.log 2>&1); then
+            S1_BIN="$WORK/s1build/s1"
+        else
+            echo "error: stage1 build failed: $(tail -n 3 "$WORK/s1build/s1_build.log" | tr '\n' ' ')" >&2
+            exit 2
+        fi
+        break
+    fi
+done
+
 passed=0
 failed=0
+gaps=0
 total=0
 
 for row in "${PROBES[@]}"; do
@@ -198,10 +225,42 @@ for row in "${PROBES[@]}"; do
     if ! want_probe "$name"; then continue; fi
     total=$((total + 1))
 
+    # Documented gaps are listed, never counted as PASS or FAIL.
+    if [ "$kind" = "KNOWN_GAP" ]; then
+        echo "GAP $name: $data"
+        gaps=$((gaps + 1))
+        continue
+    fi
+
     src="$SCRIPT_DIR/$name.dm"
     dir="$WORK/$name"
     mkdir -p "$dir"
     cp "$src" "$dir/$name.dm"
+
+    # Stage 1 compiler probes: compile with the s1 binary, expect a
+    # clean compile error (no binary run / ASan phase applies).
+    if [ "$kind" = "S1_COMPILE_ERROR" ]; then
+        (cd "$dir" && timeout 120 "$S1_BIN" "$name.dm" -o bin >compile.log 2>&1)
+        s1_code=$?
+        s1_fail=""
+        if [ "$s1_code" -eq 0 ]; then
+            s1_fail="expected compile error, compilation succeeded"
+        elif [ "$s1_code" -eq 124 ]; then
+            s1_fail="expected compile error, compiler timed out"
+        elif [ "$s1_code" -ge 128 ]; then
+            s1_fail="expected clean compile error, compiler died by signal (exit $s1_code)"
+        else
+            msg="$(check_substrings "$dir/compile.log" "$data")" || s1_fail="compile error $msg"
+        fi
+        if [ -z "$s1_fail" ]; then
+            echo "PASS $name"
+            passed=$((passed + 1))
+        else
+            echo "FAIL $name: $s1_fail"
+            failed=$((failed + 1))
+        fi
+        continue
+    fi
 
     # ---- compile with stage0 daimond (C kept via --emit-c, lands in CWD) ----
     (cd "$dir" && timeout 120 "$DAIMOND" "$name.dm" -o bin --emit-c --no-cache --no-color >compile.log 2>&1)
@@ -264,7 +323,7 @@ for row in "${PROBES[@]}"; do
     fi
 done
 
-echo "Probe summary: $passed passed, $failed failed (of $total)"
+echo "Probe summary: $passed passed, $failed failed, $gaps known gaps (of $total)"
 
 if [ "$failed" -gt 0 ]; then
     exit 1

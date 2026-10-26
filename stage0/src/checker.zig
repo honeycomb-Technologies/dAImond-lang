@@ -466,6 +466,12 @@ pub const TypeChecker = struct {
     extern_functions: std.StringHashMap(void),
     /// Variables holding references of extern/cast provenance (tainted)
     tainted_vars: std.StringHashMap(void),
+    /// Depth of enclosing `region { }` blocks (region escape rule)
+    region_depth: u32,
+    /// Scope created by each enclosing region block, outermost first
+    region_scopes: std.ArrayList(*Scope),
+    /// Variables holding region-born values (name-based, per function)
+    region_born_vars: std.StringHashMap(void),
 
     const Self = @This();
 
@@ -490,6 +496,9 @@ pub const TypeChecker = struct {
             .unsafe_depth = 0,
             .extern_functions = std.StringHashMap(void).init(allocator),
             .tainted_vars = std.StringHashMap(void).init(allocator),
+            .region_depth = 0,
+            .region_scopes = std.ArrayList(*Scope).init(allocator),
+            .region_born_vars = std.StringHashMap(void).init(allocator),
         };
 
         // Register built-in types and functions
@@ -511,6 +520,8 @@ pub const TypeChecker = struct {
         self.owned_messages.deinit();
         self.extern_functions.deinit();
         self.tainted_vars.deinit();
+        self.region_scopes.deinit();
+        self.region_born_vars.deinit();
         self.type_ctx.deinit();
         self.allocator.destroy(self.type_ctx);
     }
@@ -1223,8 +1234,25 @@ pub const TypeChecker = struct {
         _ = object_type;
 
         // Infer argument types
+        var any_region_born_arg = false;
         for (mc.args) |arg| {
-            _ = try self.inferExpr(arg);
+            const arg_type = try self.inferExpr(arg);
+            if (self.exprIsRegionBorn(arg, arg_type)) any_region_born_arg = true;
+        }
+
+        // Region escape: push/insert/set store their argument into the
+        // container, so storing a region-born value into a container
+        // declared outside the region is an escape.
+        if (any_region_born_arg and
+            (std.mem.eql(u8, mc.method.name, "push") or
+                std.mem.eql(u8, mc.method.name, "insert") or
+                std.mem.eql(u8, mc.method.name, "set")))
+        {
+            if (rootIdentifierName(mc.object)) |root_name| {
+                if (self.varDeclaredOutsideInnermostRegion(root_name)) {
+                    try self.reportError(.type_mismatch, "store of region-born value into container declared outside the region (region escape)", mc.span);
+                }
+            }
         }
 
         // For now, create fresh return type
@@ -2079,6 +2107,125 @@ pub const TypeChecker = struct {
         }
     }
 
+    // ========================================================================
+    // REGION ESCAPE RULE (name-based region-born tracking, like taint)
+    // ========================================================================
+    //
+    // A region-born value is one allocated by the region: string
+    // concat/interpolation results, List/Map literals and constructors
+    // (List_new/Map_new), Box_new, and values let-bound or assigned from
+    // those inside the region. Such a value must not escape: no
+    // assignment to a variable declared outside the region, no return
+    // from the enclosing function, and no store into a field/element of
+    // a container declared outside the region.
+
+    /// True if `name` resolves to a variable whose defining scope is
+    /// outside the innermost enclosing region block.
+    fn varDeclaredOutsideInnermostRegion(self: *Self, name: []const u8) bool {
+        if (self.region_scopes.items.len == 0) return false;
+        const region_scope = self.region_scopes.items[self.region_scopes.items.len - 1];
+        var inside = true;
+        var scope: ?*Scope = self.env.current;
+        while (scope) |s| {
+            if (s.lookupLocal(name) != null) return !inside;
+            if (s == region_scope) inside = false;
+            scope = s.parent;
+        }
+        return false;
+    }
+
+    /// Base identifier of a field/index chain (a.b[i].c -> a), if any.
+    fn rootIdentifierName(expr: *const ast.Expr) ?[]const u8 {
+        var cur = unwrapGroupedExpr(expr);
+        while (true) {
+            switch (cur.kind) {
+                .identifier => |ident| return ident.name,
+                .field_access => |fa| cur = unwrapGroupedExpr(fa.object),
+                .index_access => |ia| cur = unwrapGroupedExpr(ia.object),
+                else => return null,
+            }
+        }
+    }
+
+    fn exprIsStringLiteral(expr: *const ast.Expr) bool {
+        const inner = unwrapGroupedExpr(expr);
+        return inner.kind == .literal and inner.kind.literal.kind == .string;
+    }
+
+    /// True if the expression denotes a region-born value (see block
+    /// comment above). `expr_type` is the already-inferred type of the
+    /// whole expression when the caller has it (used to recognise
+    /// string concatenation); null for subexpressions.
+    fn exprIsRegionBorn(self: *Self, expr: *const ast.Expr, expr_type: ?TypeId) bool {
+        if (self.region_depth == 0) return false;
+        const inner = unwrapGroupedExpr(expr);
+        switch (inner.kind) {
+            .identifier => |ident| {
+                return self.region_born_vars.contains(ident.name) and
+                    !self.varDeclaredOutsideInnermostRegion(ident.name);
+            },
+            .string_interpolation => return true,
+            .array_literal => return true,
+            .binary => |bin| {
+                if (bin.op != .add) return false;
+                if (expr_type) |t| {
+                    const resolved = self.resolveType(t);
+                    if (self.type_ctx.get(resolved)) |typ| {
+                        if (std.meta.activeTag(typ) == .str) return true;
+                    }
+                }
+                return self.exprIsRegionBorn(bin.left, null) or
+                    self.exprIsRegionBorn(bin.right, null) or
+                    exprIsStringLiteral(bin.left) or exprIsStringLiteral(bin.right);
+            },
+            .function_call => |fc| {
+                if (fc.function.kind == .identifier) {
+                    const name = fc.function.kind.identifier.name;
+                    return std.mem.eql(u8, name, "List_new") or
+                        std.mem.eql(u8, name, "Map_new") or
+                        std.mem.eql(u8, name, "Box_new");
+                }
+                return false;
+            },
+            .comptime_expr => |ce| return self.exprIsRegionBorn(ce.expr, null),
+            .cast => |c| return self.exprIsRegionBorn(c.expr, null),
+            .block => |blk| {
+                if (blk.result) |result| return self.exprIsRegionBorn(result, null);
+                return false;
+            },
+            .if_expr => |ie| {
+                if (ie.then_branch.result) |result| {
+                    if (self.exprIsRegionBorn(result, null)) return true;
+                }
+                if (ie.else_branch) |else_br| {
+                    switch (else_br) {
+                        .else_block => |block| {
+                            if (block.result) |result| {
+                                if (self.exprIsRegionBorn(result, null)) return true;
+                            }
+                        },
+                        .else_if => |else_if| {
+                            // Recurse via a synthetic view: check branches.
+                            if (else_if.then_branch.result) |result| {
+                                if (self.exprIsRegionBorn(result, null)) return true;
+                            }
+                        },
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn updateRegionBornVar(self: *Self, name: []const u8, value: *const ast.Expr, value_type: ?TypeId) !void {
+        if (self.exprIsRegionBorn(value, value_type)) {
+            try self.region_born_vars.put(name, {});
+        } else {
+            _ = self.region_born_vars.remove(name);
+        }
+    }
+
     pub fn checkStatement(self: *Self, stmt: *const ast.Statement) !void {
         switch (stmt.kind) {
             .let_binding => |lb| try self.checkLetBinding(lb),
@@ -2134,6 +2281,8 @@ pub const TypeChecker = struct {
         if (lb.pattern.kind == .identifier) {
             if (lb.value) |val| {
                 try self.updateVarTaint(lb.pattern.kind.identifier.name.name, val);
+                // Region escape: record region-born initializers.
+                try self.updateRegionBornVar(lb.pattern.kind.identifier.name.name, val, value_type);
             }
         }
     }
@@ -2185,6 +2334,14 @@ pub const TypeChecker = struct {
             try self.inferExpr(val)
         else
             try self.type_ctx.intern(.unit);
+
+        // Region escape: a region-born value must not be returned from
+        // the enclosing function while inside a region.
+        if (rs.value) |val| {
+            if (self.exprIsRegionBorn(val, return_type)) {
+                try self.reportError(.type_mismatch, "return of region-born value from inside a region (region escape)", rs.span);
+            }
+        }
 
         if (fn_scope.?.return_type) |expected| {
             try self.unify(return_type, expected, rs.span);
@@ -2252,6 +2409,16 @@ pub const TypeChecker = struct {
         try self.env.pushScope(.block);
         defer self.env.popScope();
 
+        // Region escape rule: remember this region's scope so
+        // assignments/returns/stores inside can tell whether their
+        // target was declared outside the region.
+        try self.region_scopes.append(self.env.current);
+        self.region_depth += 1;
+        defer {
+            _ = self.region_scopes.pop();
+            self.region_depth -= 1;
+        }
+
         // Register the region
         const region_type = try self.type_ctx.intern(.{
             .region = .{
@@ -2304,9 +2471,51 @@ pub const TypeChecker = struct {
             },
         }
 
+        // Region escape rule (see REGION ESCAPE RULE block above).
+        if (self.region_depth > 0 and assign.op == .assign and
+            self.exprIsRegionBorn(assign.value, value_type))
+        {
+            if (assign.target.kind == .identifier) {
+                const name = assign.target.kind.identifier.name;
+                if (self.varDeclaredOutsideInnermostRegion(name)) {
+                    try self.reportError(.type_mismatch, "assignment of region-born value to variable declared outside the region (region escape)", assign.span);
+                }
+            } else if (rootIdentifierName(assign.target)) |root_name| {
+                if (self.varDeclaredOutsideInnermostRegion(root_name)) {
+                    try self.reportError(.type_mismatch, "store of region-born value into container declared outside the region (region escape)", assign.span);
+                }
+            }
+        }
+        if (self.region_depth > 0 and assign.op == .add_assign) {
+            // String `s += x` is `s = s + x`: the concat result is
+            // region-born, so writing it to an outer variable/field is
+            // an escape; writing it to an inner variable makes that
+            // variable region-born.
+            const resolved_target = self.resolveType(target_type);
+            const target_is_str = if (self.type_ctx.get(resolved_target)) |typ|
+                std.meta.activeTag(typ) == .str
+            else
+                false;
+            if (target_is_str) {
+                if (assign.target.kind == .identifier) {
+                    const name = assign.target.kind.identifier.name;
+                    if (self.varDeclaredOutsideInnermostRegion(name)) {
+                        try self.reportError(.type_mismatch, "assignment of region-born value to variable declared outside the region (region escape)", assign.span);
+                    } else {
+                        try self.region_born_vars.put(name, {});
+                    }
+                } else if (rootIdentifierName(assign.target)) |root_name| {
+                    if (self.varDeclaredOutsideInnermostRegion(root_name)) {
+                        try self.reportError(.type_mismatch, "store of region-born value into container declared outside the region (region escape)", assign.span);
+                    }
+                }
+            }
+        }
+
         // Unsafe fence provenance across plain assignment.
         if (assign.op == .assign and assign.target.kind == .identifier) {
             try self.updateVarTaint(assign.target.kind.identifier.name, assign.value);
+            try self.updateRegionBornVar(assign.target.kind.identifier.name, assign.value, value_type);
         }
     }
 
@@ -2794,6 +3003,10 @@ pub const TypeChecker = struct {
         // the (unchecked) caller. Taint state is per-function.
         self.tainted_vars.clearRetainingCapacity();
         self.unsafe_depth = 0;
+        // Region-born tracking is per-function too.
+        self.region_born_vars.clearRetainingCapacity();
+        self.region_scopes.clearRetainingCapacity();
+        self.region_depth = 0;
         for (func.params) |param| {
             const param_type = try self.resolveTypeExpr(param.type_expr);
             try self.env.define(Symbol.init(param.name.name, .variable, param_type).withMutable(param.is_mut));
