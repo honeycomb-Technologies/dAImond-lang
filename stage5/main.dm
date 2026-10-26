@@ -3100,6 +3100,14 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                 generics.push(tr2.type_name)
             }
             pp = p_expect(pp, TK_RBRACKET())
+            -- A bare identifier also parses as a type name, so `a[i]` looks
+            -- like a generic arg list here. Generic args in expression
+            -- position only occur in calls `name[T](...)` and struct
+            -- literals `Name[T] { ... }`; anything else is index access.
+            if p_peek(p_skip_newlines(pp)) != TK_LPAREN() and p_peek(p_skip_newlines(pp)) != TK_LBRACE() {
+                generics = []
+                pp = saved
+            }
         } else {
             -- Not a generic arg, restore and let index access handle it
             pp = saved
