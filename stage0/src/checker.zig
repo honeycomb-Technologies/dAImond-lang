@@ -729,18 +729,24 @@ pub const TypeChecker = struct {
     // UNIFICATION
     // ========================================================================
 
-    /// Unify two types
+    /// Unify two types. Call-site convention: `a` is the actual
+    /// (inferred) type, `b` the expected (declared) type; mismatch
+    /// diagnostics report "expected b, found a".
     pub fn unify(self: *Self, a: TypeId, b: TypeId, location: ?ast.Span) !void {
         const resolved_a = self.resolveType(a);
         const resolved_b = self.resolveType(b);
 
         if (resolved_a == resolved_b) return;
 
+        // Error recovery: an error type already produced its root
+        // diagnostic; unifying against it must stay silent.
+        if (self.isErrorType(resolved_a) or self.isErrorType(resolved_b)) return;
+
         const type_a = self.type_ctx.get(resolved_a);
         const type_b = self.type_ctx.get(resolved_b);
 
         if (type_a == null or type_b == null) {
-            try self.reportTypeMismatch(resolved_a, resolved_b, location);
+            try self.reportTypeMismatch(resolved_b, resolved_a, location);
             return;
         }
 
@@ -766,19 +772,19 @@ pub const TypeChecker = struct {
             if (types.canCoerce(self.type_ctx, resolved_a, resolved_b)) {
                 return;
             }
-            try self.reportTypeMismatch(resolved_a, resolved_b, location);
+            try self.reportTypeMismatch(resolved_b, resolved_a, location);
             return;
         }
 
         switch (ta) {
             .int => |int_a| {
                 if (tb.int != int_a) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                 }
             },
             .float => |float_a| {
                 if (tb.float != float_a) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                 }
             },
             .option => |inner_a| {
@@ -790,7 +796,7 @@ pub const TypeChecker = struct {
             },
             .array => |arr_a| {
                 if (arr_a.size != tb.array.size) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                     return;
                 }
                 try self.unify(arr_a.element_type, tb.array.element_type, location);
@@ -800,7 +806,7 @@ pub const TypeChecker = struct {
             },
             .tuple => |tup_a| {
                 if (tup_a.element_types.len != tb.tuple.element_types.len) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                     return;
                 }
                 for (tup_a.element_types, tb.tuple.element_types) |elem_a, elem_b| {
@@ -809,7 +815,7 @@ pub const TypeChecker = struct {
             },
             .function => |fn_a| {
                 if (fn_a.param_types.len != tb.function.param_types.len) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                     return;
                 }
                 for (fn_a.param_types, tb.function.param_types) |param_a, param_b| {
@@ -826,7 +832,7 @@ pub const TypeChecker = struct {
             else => {
                 // For simple types, they should be equal already
                 if (resolved_a != resolved_b) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                 }
             },
         }
@@ -874,6 +880,15 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// True when a type is the error-recovery type. Error types poison
+    /// quietly: the root error was already reported, so downstream
+    /// checks against them must not emit cascade errors.
+    fn isErrorType(self: *Self, type_id: TypeId) bool {
+        const resolved = self.resolveType(type_id);
+        const typ = self.type_ctx.get(resolved) orelse return false;
+        return typ == .error_type;
+    }
+
     /// Resolve a type, following type variable bindings
     pub fn resolveType(self: *Self, type_id: TypeId) TypeId {
         const typ = self.type_ctx.get(type_id) orelse return type_id;
@@ -912,6 +927,7 @@ pub const TypeChecker = struct {
     }
 
     fn checkHasField(self: *Self, type_id: TypeId, field_name: []const u8, expected_type: TypeId, location: ?ast.Span) !void {
+        if (self.isErrorType(type_id)) return;
         const resolved = self.resolveType(type_id);
         const typ = self.type_ctx.get(resolved) orelse {
             try self.reportError(.undefined_field, "cannot access field on unknown type", location);
@@ -945,6 +961,7 @@ pub const TypeChecker = struct {
     }
 
     fn checkCallable(self: *Self, fn_type: TypeId, return_type: TypeId, location: ?ast.Span) !void {
+        if (self.isErrorType(fn_type)) return;
         const resolved = self.resolveType(fn_type);
         const typ = self.type_ctx.get(resolved) orelse {
             try self.reportError(.expected_function_type, "expected callable type", location);
@@ -1027,7 +1044,9 @@ pub const TypeChecker = struct {
             return symbol.type_id;
         }
 
-        try self.reportError(.undefined_variable, "undefined variable", span);
+        const msg = try std.fmt.allocPrint(self.allocator, "undefined variable '{s}'", .{ident.name});
+        try self.owned_messages.append(msg);
+        try self.reportError(.undefined_variable, msg, span);
         return try self.type_ctx.intern(.error_type);
     }
 
@@ -1039,7 +1058,10 @@ pub const TypeChecker = struct {
             }
         }
 
-        try self.reportError(.undefined_variable, "undefined path", path.span);
+        const first_name = if (path.segments.len > 0) path.segments[0].name else "";
+        const msg = try std.fmt.allocPrint(self.allocator, "undefined variable '{s}'", .{first_name});
+        try self.owned_messages.append(msg);
+        try self.reportError(.undefined_variable, msg, path.span);
         return try self.type_ctx.intern(.error_type);
     }
 
@@ -1050,11 +1072,22 @@ pub const TypeChecker = struct {
         return switch (bin.op) {
             // Arithmetic operators
             .add, .sub, .mul, .div, .mod => {
+                if (self.isErrorType(left_type) or self.isErrorType(right_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 const common = types.commonType(self.type_ctx, left_type, right_type);
                 if (common) |t| {
                     return t;
                 }
-                try self.reportError(.incompatible_types, "incompatible types for arithmetic operation", bin.span);
+                const left_name = try self.castTypeName(left_type);
+                const right_name = try self.castTypeName(right_type);
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "incompatible types for arithmetic operation: {s} and {s}",
+                    .{ left_name, right_name },
+                );
+                try self.owned_messages.append(msg);
+                try self.reportError(.incompatible_types, msg, bin.span);
                 return try self.type_ctx.intern(.error_type);
             },
 
@@ -1074,6 +1107,9 @@ pub const TypeChecker = struct {
 
             // Bitwise operators
             .bit_and, .bit_or, .bit_xor, .shl, .shr => {
+                if (self.isErrorType(left_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 if (!types.isIntegral(self.type_ctx, left_type)) {
                     try self.reportError(.expected_numeric_type, "bitwise operator requires integer type", bin.span);
                 }
@@ -1092,6 +1128,9 @@ pub const TypeChecker = struct {
 
         return switch (un.op) {
             .neg => {
+                if (self.isErrorType(operand_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 if (!types.isNumeric(self.type_ctx, operand_type)) {
                     try self.reportError(.expected_numeric_type, "negation requires numeric type", un.span);
                 }
@@ -1103,6 +1142,9 @@ pub const TypeChecker = struct {
                 return bool_type;
             },
             .bit_not => {
+                if (self.isErrorType(operand_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 if (!types.isIntegral(self.type_ctx, operand_type)) {
                     try self.reportError(.expected_numeric_type, "bitwise not requires integer type", un.span);
                 }
@@ -1129,6 +1171,9 @@ pub const TypeChecker = struct {
                 if (typ == .type_var) {
                     // Type variable (e.g., from generic container elements) - allow deref
                     return try self.freshTypeVar();
+                }
+                if (typ == .error_type) {
+                    return try self.type_ctx.intern(.error_type);
                 }
                 try self.reportError(.type_mismatch, "cannot dereference non-reference type", un.span);
                 return try self.type_ctx.intern(.error_type);
@@ -1205,6 +1250,9 @@ pub const TypeChecker = struct {
                 try self.reportError(.undefined_field, "Result has no such field", fa.span);
                 return try self.type_ctx.intern(.error_type);
             },
+            .error_type => {
+                return try self.type_ctx.intern(.error_type);
+            },
             else => {
                 try self.reportError(.expected_struct_type, "field access requires struct type", fa.span);
                 return try self.type_ctx.intern(.error_type);
@@ -1223,19 +1271,19 @@ pub const TypeChecker = struct {
 
         switch (typ) {
             .array => |arr| {
-                if (!types.isIntegral(self.type_ctx, index_type)) {
+                if (!self.isErrorType(index_type) and !types.isIntegral(self.type_ctx, index_type)) {
                     try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
                 }
                 return arr.element_type;
             },
             .slice => |s| {
-                if (!types.isIntegral(self.type_ctx, index_type)) {
+                if (!self.isErrorType(index_type) and !types.isIntegral(self.type_ctx, index_type)) {
                     try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
                 }
                 return s.element_type;
             },
             .str => {
-                if (!types.isIntegral(self.type_ctx, index_type)) {
+                if (!self.isErrorType(index_type) and !types.isIntegral(self.type_ctx, index_type)) {
                     try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
                 }
                 return try self.type_ctx.intern(.char);
@@ -1246,6 +1294,9 @@ pub const TypeChecker = struct {
                 // here, so the index type is left to codegen) - allow
                 // indexing.
                 return try self.freshTypeVar();
+            },
+            .error_type => {
+                return try self.type_ctx.intern(.error_type);
             },
             else => {
                 try self.reportError(.expected_array_type, "indexing requires array or slice type", ia.span);
@@ -1499,6 +1550,9 @@ pub const TypeChecker = struct {
             return try self.type_ctx.intern(.error_type);
         };
 
+        if (typ == .error_type) {
+            return try self.type_ctx.intern(.error_type);
+        }
         if (typ != .function) {
             try self.reportError(.expected_function_type, "expected function type", fc.span);
             return try self.type_ctx.intern(.error_type);
@@ -3645,7 +3699,9 @@ pub const TypeChecker = struct {
                     }
                     return symbol.type_id;
                 }
-                try self.reportError(.undefined_type, "undefined type", te.span);
+                const type_msg = try std.fmt.allocPrint(self.allocator, "undefined type '{s}'", .{name});
+                try self.owned_messages.append(type_msg);
+                try self.reportError(.undefined_type, type_msg, te.span);
                 return try self.type_ctx.intern(.error_type);
             },
             .function => |func| {
@@ -3839,9 +3895,26 @@ pub const TypeChecker = struct {
     }
 
     fn reportTypeMismatch(self: *Self, expected: TypeId, found: TypeId, span: ?ast.Span) !void {
-        _ = expected;
-        _ = found;
-        try self.reportError(.type_mismatch, "type mismatch", span);
+        // Never cascade off an error type (root error already reported).
+        if (self.isErrorType(expected) or self.isErrorType(found)) return;
+        const expected_name = self.castTypeName(expected) catch {
+            try self.reportError(.type_mismatch, "type mismatch", span);
+            return;
+        };
+        const found_name = self.castTypeName(found) catch {
+            try self.reportError(.type_mismatch, "type mismatch", span);
+            return;
+        };
+        const msg = std.fmt.allocPrint(
+            self.allocator,
+            "type mismatch: expected {s}, found {s}",
+            .{ expected_name, found_name },
+        ) catch {
+            try self.reportError(.type_mismatch, "type mismatch", span);
+            return;
+        };
+        try self.owned_messages.append(msg);
+        try self.reportError(.type_mismatch, msg, span);
     }
 
     // ========================================================================
