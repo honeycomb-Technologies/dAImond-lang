@@ -5086,6 +5086,30 @@ pub const audit_fix_tests = [_]TestCase{
         .expected_output = "before\n",
         .expected_exit_code = 1,
     },
+    .{
+        .name = "struct_field_shorthand",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\fn make(x: int, y: int) -> Point {
+            \\    return Point { x, y }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = make(3, 4)
+            \\    println(p.x + p.y)
+            \\    let x = 10
+            \\    let q = Point { x, y: 5 }
+            \\    println(q.x + q.y)
+            \\}
+        ,
+        .expected_output = "7\n15\n",
+    },
 };
 
 // Stage 0 only: one `len` — `len(x)` and `x.len()` are the same

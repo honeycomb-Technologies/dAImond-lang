@@ -2532,8 +2532,20 @@ pub const Parser = struct {
             const field_name = try self.expectIdentifier("field name");
             const field_ident = makeIdentifier(field_name, field_start);
 
-            try self.expect(.colon, "':' after field name");
-            const field_value = try self.parseExpr();
+            // Field init shorthand: `Point { x, y }` means
+            // `Point { x: x, y: y }`.
+            const field_value = if (self.match(.colon))
+                try self.parseExpr()
+            else if (self.check(.comma) or self.check(.rbrace)) blk: {
+                const value_expr = try self.astAllocator().create(Expr);
+                value_expr.* = .{
+                    .kind = .{ .identifier = field_ident },
+                    .span = makeSpan(field_start, self.previousLocation()),
+                };
+                break :blk value_expr;
+            } else {
+                return self.errorAtCurrent("Expected ':' after field name");
+            };
 
             const field_init = try self.astAllocator().create(StructLiteral.FieldInit);
             field_init.* = .{
