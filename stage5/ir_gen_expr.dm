@@ -1875,6 +1875,12 @@ fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
         return expr_result(g, b, operand_id)
     }
 
+    -- Narrowing integer casts get a runtime range check (Stage 0 matrix);
+    -- float<->int and widening casts keep plain conversion semantics.
+    if is_integer_type(from_type) and is_integer_type(to_type) and int_cast_fits(from_type, to_type) == false {
+        return emit_checked_cast(g, b, operand_id, from_type, to_type)
+    }
+
     -- Emit OP_CAST instruction
     let id = g.builder.next_id
     let mut inst = ir_inst_new(id, OP_CAST())
@@ -3987,6 +3993,90 @@ fn emit_checked_int_arith(gen: IRGenerator, block: IRBasicBlock, callee: string,
     b.instructions.push(trunc_inst)
     g.builder.next_id = trunc_id + 1
     return expr_result(g, b, trunc_id)
+}
+
+-- Stage 0 cast-fit rule: same signedness needs dst width >= src width;
+-- unsigned -> signed needs dst width > src width; signed -> unsigned
+-- never fits (negative values).
+fn int_cast_fits(from_type: string, to_type: string) -> bool {
+    let from_signed = is_unsigned_type(from_type) == false
+    let to_signed = is_unsigned_type(to_type) == false
+    if from_signed == to_signed { return type_bit_width(to_type) >= type_bit_width(from_type) }
+    if from_signed == false and to_signed { return type_bit_width(to_type) > type_bit_width(from_type) }
+    return false
+}
+
+-- Max value of the unsigned widths (u64-as-target uses INT64_MAX, as in
+-- Stage 0's signed -> unsigned rule)
+fn uint_fit_max(name: string) -> int {
+    if name == "u8" { return 255 }
+    if name == "u16" { return 65535 }
+    if name == "u32" { return 4294967295 }
+    return 9223372036854775807
+}
+
+-- Narrowing integer cast with a runtime range check, mirroring Stage 0:
+-- widen to 64 bits, dm_cast_check_* (panics out of range), then convert.
+fn emit_checked_cast(gen: IRGenerator, block: IRBasicBlock, operand_id: int, from_type: string, to_type: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let from_signed = is_unsigned_type(from_type) == false
+    let to_signed = is_unsigned_type(to_type) == false
+
+    let mut wide_id = operand_id
+    if type_bit_width(from_type) < 64 {
+        let wide_to = if from_signed { "i64" } else { "u64" }
+        let wid = g.builder.next_id
+        let mut winst = ir_inst_new(wid, OP_CAST())
+        winst.cast_val = ir_val_inst(operand_id)
+        winst.cast_from = from_type
+        winst.cast_to = wide_to
+        winst.result_type = wide_to
+        winst.has_result = true
+        b.instructions.push(winst)
+        g.builder.next_id = wid + 1
+        wide_id = wid
+    }
+
+    let chk_id = g.builder.next_id
+    let mut chk_inst = ir_inst_new(chk_id, OP_CALL())
+    let mut chk_args: List[IRValue] = []
+    chk_args.push(ir_val_inst(wide_id))
+    if from_signed and to_signed {
+        chk_inst.callee = "dm_cast_check_i64"
+        chk_args.push(ir_val_int(int_fit_min(to_type)))
+        chk_args.push(ir_val_int(int_fit_max(to_type)))
+        chk_inst.result_type = "i64"
+    } else if from_signed {
+        chk_inst.callee = "dm_cast_check_i64"
+        chk_args.push(ir_val_int(0))
+        chk_args.push(ir_val_int(uint_fit_max(to_type)))
+        chk_inst.result_type = "i64"
+    } else if to_signed {
+        chk_inst.callee = "dm_cast_check_u64"
+        chk_args.push(ir_val_int(int_fit_max(to_type)))
+        chk_inst.result_type = "u64"
+    } else {
+        chk_inst.callee = "dm_cast_check_u64"
+        chk_args.push(ir_val_int(uint_fit_max(to_type)))
+        chk_inst.result_type = "u64"
+    }
+    chk_inst.call_args = chk_args
+    chk_inst.has_result = true
+    b.instructions.push(chk_inst)
+    g.builder.next_id = chk_id + 1
+    let chk_ret_type = chk_inst.result_type
+
+    let cast_id = g.builder.next_id
+    let mut cast_inst = ir_inst_new(cast_id, OP_CAST())
+    cast_inst.cast_val = ir_val_inst(chk_id)
+    cast_inst.cast_from = chk_ret_type
+    cast_inst.cast_to = to_type
+    cast_inst.result_type = to_type
+    cast_inst.has_result = true
+    b.instructions.push(cast_inst)
+    g.builder.next_id = cast_id + 1
+    return expr_result(g, b, cast_id)
 }
 
 -- ============================================================

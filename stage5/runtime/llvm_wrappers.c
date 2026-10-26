@@ -119,6 +119,17 @@ int64_t dm_checked_range_i64(int64_t v, int64_t lo, int64_t hi) {
     return v;
 }
 
+// Checked narrowing-cast helpers, mirroring Stage 0 codegen.
+int64_t dm_cast_check_i64(int64_t v, int64_t lo, int64_t hi) {
+    if (v < lo || v > hi) { fprintf(stderr, "PANIC: integer cast out of range\n"); exit(1); }
+    return v;
+}
+
+uint64_t dm_cast_check_u64(uint64_t v, uint64_t hi) {
+    if (v > hi) { fprintf(stderr, "PANIC: integer cast out of range\n"); exit(1); }
+    return v;
+}
+
 // =====================================================================
 // String queries (take string via pointer, return scalar)
 // =====================================================================
