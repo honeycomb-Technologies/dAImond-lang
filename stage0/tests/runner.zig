@@ -5088,6 +5088,134 @@ pub const audit_fix_tests = [_]TestCase{
     },
 };
 
+// Stage 0 only: one `len` — `len(x)` and `x.len()` are the same
+// int-typed builtin for strings, Lists, and Maps (checker + codegen).
+pub const len_unified_tests = [_]TestCase{
+    .{
+        .name = "len_string_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hello"
+            \\    let a: int = len(s)
+            \\    let b: int = s.len()
+            \\    println(a)
+            \\    println(b)
+            \\    println(len("abcd"))
+            \\    println(("ab" + "cde").len())
+            \\    println(len(s) + s.len())
+            \\}
+        ,
+        .expected_output = "5\n5\n4\n5\n10\n",
+    },
+    .{
+        .name = "len_list_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\fn count_mut(mut l: List[int]) -> int {
+            \\    return l.len()
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut l: List[int] = []
+            \\    l.push(1)
+            \\    l.push(2)
+            \\    l.push(3)
+            \\    println(len(l))
+            \\    println(l.len())
+            \\    println(l.pop())
+            \\    println(len(l) + l.len())
+            \\    println(count_mut(l))
+            \\}
+        ,
+        .expected_output = "3\n3\n3\n4\n2\n",
+    },
+    .{
+        .name = "len_map_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("a", 1)
+            \\    m.insert("b", 2)
+            \\    println(len(m))
+            \\    println(m.len())
+            \\    println(m.keys().len())
+            \\    println(len(m.values()))
+            \\}
+        ,
+        .expected_output = "2\n2\n2\n2\n",
+    },
+    .{
+        .name = "len_fixed_array_and_box_string",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let arr: [int; 3] = [1, 2, 3]
+            \\    println(len(arr))
+            \\    println(arr.len())
+            \\    let bs: Box[string] = Box.new("world!")
+            \\    println(bs.len())
+            \\}
+        ,
+        .expected_output = "3\n3\n6\n",
+    },
+    .{
+        .name = "len_user_impl_method_wins",
+        .source =
+            \\module test
+            \\
+            \\struct Bag {
+            \\    n: int,
+            \\}
+            \\
+            \\impl Bag {
+            \\    fn len(self: &Self) -> int {
+            \\        return self.n
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let bag = Bag { n: 7 }
+            \\    println(bag.len())
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+    .{
+        .name = "len_method_is_int_not_string",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hi"
+            \\    let bad: string = s.len()
+            \\    println(bad)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+    .{
+        .name = "len_free_is_int_not_string",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hi"
+            \\    let bad: string = len(s)
+            \\    println(bad)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -5170,6 +5298,7 @@ pub fn main() !void {
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
         .{ .name = "Constructors", .tests = &constructor_tests },
         .{ .name = "Audit Fixes", .tests = &audit_fix_tests },
+        .{ .name = "Unified Len", .tests = &len_unified_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

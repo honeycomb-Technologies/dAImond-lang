@@ -1328,7 +1328,6 @@ pub const TypeChecker = struct {
         }
 
         const object_type = try self.inferExpr(mc.object);
-        _ = object_type;
 
         // Infer argument types
         var any_region_born_arg = false;
@@ -1349,6 +1348,28 @@ pub const TypeChecker = struct {
                 if (self.varDeclaredOutsideInnermostRegion(root_name)) {
                     try self.reportError(.type_mismatch, "store of region-born value into container declared outside the region (region escape)", mc.span);
                 }
+            }
+        }
+
+        // `x.len()` is the builtin length, identical to `len(x)`: int.
+        // Applies to strings, fixed arrays, slices, and the erased
+        // List/Map type variables. On a user struct/enum the name may
+        // be the type's own impl method, which stays unchecked here.
+        if (std.mem.eql(u8, mc.method.name, "len") and mc.args.len == 0) {
+            var resolved = self.resolveType(object_type);
+            if (self.type_ctx.get(resolved)) |t| {
+                if (t == .ref) resolved = self.resolveType(t.ref.pointee);
+                if (self.type_ctx.get(resolved)) |t2| {
+                    if (t2 == .box) resolved = self.resolveType(t2.box);
+                }
+            }
+            if (self.type_ctx.get(resolved)) |t| {
+                switch (t) {
+                    .str, .array, .slice, .type_var => return try self.type_ctx.intern(.{ .int = .i64 }),
+                    else => {},
+                }
+            } else {
+                return try self.type_ctx.intern(.{ .int = .i64 });
             }
         }
 

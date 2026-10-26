@@ -4257,6 +4257,17 @@ pub const CodeGenerator = struct {
                         if (self.lookupFunctionReturnType(assoc_key)) |ret_type| break :blk ret_type;
                     }
                 }
+                // Builtin `x.len()` has C type int64_t, like `len(x)`,
+                // unless the receiver's own type defines `fn len`.
+                if (std.mem.eql(u8, mc.method.name, "len") and mc.args.len == 0) {
+                    var len_obj_type = self.inferCTypeFromExpr(mc.object);
+                    if (std.mem.endsWith(u8, len_obj_type, "*")) len_obj_type = len_obj_type[0 .. len_obj_type.len - 1];
+                    const len_raw = if (std.mem.startsWith(u8, len_obj_type, "dm_"))
+                        len_obj_type[3..]
+                    else
+                        len_obj_type;
+                    if (!self.hasImplMethod(len_raw, "len")) break :blk "int64_t";
+                }
                 // Try to infer method return type from the method name
                 var obj_type = self.inferCTypeFromExpr(mc.object);
                 // Strip pointer for Box types
@@ -7250,6 +7261,44 @@ pub const CodeGenerator = struct {
             }
         }
 
+        // `x.len()` is the builtin length, identical to `len(x)`: an
+        // int64_t read of the .len field (strings, Lists, Maps, slices)
+        // or the static size of a fixed array. Never a helper call, so
+        // it also works on rvalues. A user `fn len` impl on the
+        // receiver's own type takes precedence (falls through).
+        if (std.mem.eql(u8, method.method.name, "len") and method.args.len == 0) {
+            const full_obj_type = self.inferCTypeFromExpr(method.object);
+            // Only true C pointers (Box receivers) need ->len: `mut`
+            // parameter identifiers already emit dereferenced, so the
+            // value form applies to them.
+            const is_ptr = std.mem.endsWith(u8, full_obj_type, "*");
+            const base_type = if (is_ptr) full_obj_type[0 .. full_obj_type.len - 1] else full_obj_type;
+            const raw_name = if (std.mem.startsWith(u8, base_type, "dm_")) base_type[3..] else base_type;
+            if (!self.hasImplMethod(raw_name, "len")) {
+                if (!is_ptr) {
+                    if (fixedArrayLen(full_obj_type)) |arr_len| {
+                        try self.writer.print("((int64_t){d})", .{arr_len});
+                        return;
+                    }
+                }
+                if (std.mem.eql(u8, base_type, "dm_string") or
+                    isCowContainerCType(base_type) or
+                    std.mem.startsWith(u8, base_type, "struct {"))
+                {
+                    if (is_ptr) {
+                        try self.writer.print("((int64_t)(({s})dm_null_check_ptr((void*)(", .{full_obj_type});
+                        try self.generateExpr(method.object);
+                        try self.writer.write(")))->len)");
+                    } else {
+                        try self.writer.write("((int64_t)(");
+                        try self.generateExpr(method.object);
+                        try self.writer.write(").len)");
+                    }
+                    return;
+                }
+            }
+        }
+
         // Convert obj.method(args) to dm_Type_method(&obj, args)
         // Infer the type name from the object expression
         var obj_type = self.inferCTypeFromExpr(method.object);
@@ -7479,11 +7528,17 @@ pub const CodeGenerator = struct {
             }
             return true;
         } else if (std.mem.eql(u8, name, "len")) {
-            // len(x) -> get length of string or array
+            // len(x) -> length of string/List/Map/slice (.len field),
+            // or the static size of a fixed-size array
             if (call.args.len > 0) {
-                try self.writer.write("((int64_t)(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(").len)");
+                const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                if (fixedArrayLen(arg_type)) |arr_len| {
+                    try self.writer.print("((int64_t){d})", .{arr_len});
+                } else {
+                    try self.writer.write("((int64_t)(");
+                    try self.generateExpr(call.args[0].value);
+                    try self.writer.write(").len)");
+                }
             }
             return true;
         } else if (std.mem.eql(u8, name, "int_to_string")) {
