@@ -5360,6 +5360,48 @@ pub const error_quality_tests = [_]TestCase{
     },
 };
 
+/// Nested-List regression tests: an index assignment to one List
+/// must not mistype indexing into an unrelated List[List[...]].
+/// Stage 0-only (stage3/stage4 enumerate their original suites).
+pub const nested_list_tests = [_]TestCase{
+    .{
+        .name = "nested_list_index_after_other_list_assign",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut a: List[int] = []
+            \\    a.push(1)
+            \\    a[0] = 5
+            \\    let mut outer: List[List[int]] = []
+            \\    let mut inner: List[int] = []
+            \\    inner.push(7)
+            \\    outer.push(inner)
+            \\    println(outer[0][0])
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+    .{
+        .name = "nested_list_index_assign_between",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut outer: List[List[int]] = []
+            \\    let mut inner: List[int] = []
+            \\    inner.push(7)
+            \\    outer.push(inner)
+            \\    let mut b: List[int] = []
+            \\    b.push(1)
+            \\    b[0] = 9
+            \\    println(outer[0][0])
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -5444,6 +5486,7 @@ pub fn main() !void {
         .{ .name = "Audit Fixes", .tests = &audit_fix_tests },
         .{ .name = "Unified Len", .tests = &len_unified_tests },
         .{ .name = "Error Quality", .tests = &error_quality_tests },
+        .{ .name = "Nested Lists", .tests = &nested_list_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

@@ -3693,6 +3693,23 @@ pub const TypeChecker = struct {
                     }
                     return try self.freshTypeVar();
                 }
+                // Erased containers (List/Vec/Map/HashMap) have no
+                // distinct checker type; codegen monomorphizes them.
+                // Each resolution must get a FRESH type variable: the
+                // registered symbol holds one shared variable, and
+                // returning it for every annotation let one List's
+                // unification (e.g. an index assignment binding its
+                // element) mistype every other List in the program.
+                if (std.mem.eql(u8, name, "List") or std.mem.eql(u8, name, "Vec") or
+                    std.mem.eql(u8, name, "Map") or std.mem.eql(u8, name, "HashMap"))
+                {
+                    if (named.generic_args) |args| {
+                        for (args) |arg| {
+                            _ = try self.resolveTypeExpr(arg);
+                        }
+                    }
+                    return try self.freshTypeVar();
+                }
                 if (self.env.lookup(name)) |symbol| {
                     if (named.generic_args) |args| {
                         return try self.instantiateGeneric(symbol.type_id, args);
