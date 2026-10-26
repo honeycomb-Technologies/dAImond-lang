@@ -17,6 +17,25 @@ import llvm_gen
 -- DIRECT CALL (OP_CALL)
 -- ============================================================
 
+-- Coerce an integer call argument to the callee's parameter width
+-- (sext when narrower, trunc when wider). Non-integer pairs and
+-- unknown callees/params pass through unchanged.
+fn coerce_int_call_arg(gen: LLVMGenerator, callee: int, fn_name: string, user_idx: int, llvm_idx: int, val: int) -> int {
+    unsafe {
+        if func_param_type_at(gen, fn_name, user_idx) == "" { return val }
+        let param = dm_llvm_get_param(callee, llvm_idx)
+        if param == 0 { return val }
+        let param_ty = dm_llvm_type_of(param)
+        let val_ty = dm_llvm_type_of(val)
+        if dm_llvm_get_type_kind(param_ty) != 8 or dm_llvm_get_type_kind(val_ty) != 8 { return val }
+        let param_w = dm_llvm_get_int_type_width(param_ty)
+        let val_w = dm_llvm_get_int_type_width(val_ty)
+        if val_w < param_w { return dm_llvm_build_sext(gen.builder, val, param_ty, "arg.sext") }
+        if val_w > param_w { return dm_llvm_build_trunc(gen.builder, val, param_ty, "arg.trunc") }
+        return val
+    }
+}
+
 fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
@@ -56,6 +75,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                     val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
                 }
             }
+            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
             args.push(val)
             ai = ai + 1
         }
@@ -115,6 +135,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                         val = create_dm_string_for_call(g, val)
                     }
                 }
+                val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
                 args.push(val)
                 ai = ai + 1
             }
@@ -145,6 +166,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                     val = create_dm_string_for_call(g, val)
                 }
             }
+            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
             args.push(val)
             ai = ai + 1
         }
@@ -377,6 +399,7 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
                     val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
                 }
             }
+            val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
             args.push(val)
             ai = ai + 1
         }

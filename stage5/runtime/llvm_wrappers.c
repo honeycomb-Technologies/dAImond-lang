@@ -94,6 +94,31 @@ void llvm_dm_panic(const dm_string* s) {
     exit(1);
 }
 
+// Checked signed arithmetic (defined integer overflow: panic), mirroring
+// Stage 0 codegen helpers. Unsigned arithmetic does not use these.
+int64_t dm_checked_add_i64(int64_t a, int64_t b) {
+    int64_t r;
+    if (__builtin_add_overflow(a, b, &r)) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
+    return r;
+}
+
+int64_t dm_checked_sub_i64(int64_t a, int64_t b) {
+    int64_t r;
+    if (__builtin_sub_overflow(a, b, &r)) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
+    return r;
+}
+
+int64_t dm_checked_mul_i64(int64_t a, int64_t b) {
+    int64_t r;
+    if (__builtin_mul_overflow(a, b, &r)) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
+    return r;
+}
+
+int64_t dm_checked_range_i64(int64_t v, int64_t lo, int64_t hi) {
+    if (v < lo || v > hi) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
+    return v;
+}
+
 // =====================================================================
 // String queries (take string via pointer, return scalar)
 // =====================================================================

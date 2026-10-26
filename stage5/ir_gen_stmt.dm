@@ -1608,21 +1608,35 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 let old_val_id = g.builder.next_id
                 g.builder.next_id = g.builder.next_id + 1
 
-                -- Compute new value
+                -- Compute new value (checked for signed int add/sub/mul)
                 let op = if assign_op == ASSIGN_ADD() { OP_ADD() }
                 else if assign_op == ASSIGN_SUB() { OP_SUB() }
                 else if assign_op == ASSIGN_MUL() { OP_MUL() }
                 else if assign_op == ASSIGN_DIV() { OP_DIV() }
                 else { OP_MOD() }
 
-                let mut arith_inst = ir_inst_new(g.builder.next_id, op)
-                arith_inst.lhs = ir_val_inst(old_val_id)
-                arith_inst.rhs = ir_val_inst(val_result.val_id)
-                arith_inst.result_type = ty
-                arith_inst.has_result = true
-                b.instructions.push(arith_inst)
-                let new_val_id = g.builder.next_id
-                g.builder.next_id = g.builder.next_id + 1
+                let mut new_val_id = 0
+                let cmp_val_type = infer_expr_type(g, *stmt.assign_value)
+                if (assign_op == ASSIGN_ADD() or assign_op == ASSIGN_SUB() or assign_op == ASSIGN_MUL()) and is_signed_int_type(ty) and is_signed_int_type(cmp_val_type) {
+                    let cmp_callee = if assign_op == ASSIGN_ADD() { "dm_checked_add_i64" }
+                    else if assign_op == ASSIGN_SUB() { "dm_checked_sub_i64" }
+                    else { "dm_checked_mul_i64" }
+                    let mut cmp_fit = ""
+                    if type_bit_width(ty) < 64 { cmp_fit = ty }
+                    let cmp_chk = emit_checked_int_arith(g, b, cmp_callee, ir_val_inst(old_val_id), ty, ir_val_inst(val_result.val_id), cmp_val_type, cmp_fit)
+                    g = cmp_chk.gen
+                    b = cmp_chk.block
+                    new_val_id = cmp_chk.val_id
+                } else {
+                    let mut arith_inst = ir_inst_new(g.builder.next_id, op)
+                    arith_inst.lhs = ir_val_inst(old_val_id)
+                    arith_inst.rhs = ir_val_inst(val_result.val_id)
+                    arith_inst.result_type = ty
+                    arith_inst.has_result = true
+                    b.instructions.push(arith_inst)
+                    new_val_id = g.builder.next_id
+                    g.builder.next_id = g.builder.next_id + 1
+                }
 
                 -- Store new value
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())

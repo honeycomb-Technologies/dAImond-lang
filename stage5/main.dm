@@ -5197,6 +5197,10 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- Process
     g = declare_extern(g, "dm_panic", "string", "void")
+    g = declare_extern2(g, "dm_checked_add_i64", "i64", "i64", "i64")
+    g = declare_extern2(g, "dm_checked_sub_i64", "i64", "i64", "i64")
+    g = declare_extern2(g, "dm_checked_mul_i64", "i64", "i64", "i64")
+    g = declare_extern3(g, "dm_checked_range_i64", "i64", "i64", "i64", "i64")
     g = declare_extern(g, "exit", "i64", "void")
 
     -- Stdin
@@ -7458,21 +7462,35 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 let old_val_id = g.builder.next_id
                 g.builder.next_id = g.builder.next_id + 1
 
-                -- Compute new value
+                -- Compute new value (checked for signed int add/sub/mul)
                 let op = if assign_op == ASSIGN_ADD() { OP_ADD() }
                 else if assign_op == ASSIGN_SUB() { OP_SUB() }
                 else if assign_op == ASSIGN_MUL() { OP_MUL() }
                 else if assign_op == ASSIGN_DIV() { OP_DIV() }
                 else { OP_MOD() }
 
-                let mut arith_inst = ir_inst_new(g.builder.next_id, op)
-                arith_inst.lhs = ir_val_inst(old_val_id)
-                arith_inst.rhs = ir_val_inst(val_result.val_id)
-                arith_inst.result_type = ty
-                arith_inst.has_result = true
-                b.instructions.push(arith_inst)
-                let new_val_id = g.builder.next_id
-                g.builder.next_id = g.builder.next_id + 1
+                let mut new_val_id = 0
+                let cmp_val_type = infer_expr_type(g, *stmt.assign_value)
+                if (assign_op == ASSIGN_ADD() or assign_op == ASSIGN_SUB() or assign_op == ASSIGN_MUL()) and is_signed_int_type(ty) and is_signed_int_type(cmp_val_type) {
+                    let cmp_callee = if assign_op == ASSIGN_ADD() { "dm_checked_add_i64" }
+                    else if assign_op == ASSIGN_SUB() { "dm_checked_sub_i64" }
+                    else { "dm_checked_mul_i64" }
+                    let mut cmp_fit = ""
+                    if type_bit_width(ty) < 64 { cmp_fit = ty }
+                    let cmp_chk = emit_checked_int_arith(g, b, cmp_callee, ir_val_inst(old_val_id), ty, ir_val_inst(val_result.val_id), cmp_val_type, cmp_fit)
+                    g = cmp_chk.gen
+                    b = cmp_chk.block
+                    new_val_id = cmp_chk.val_id
+                } else {
+                    let mut arith_inst = ir_inst_new(g.builder.next_id, op)
+                    arith_inst.lhs = ir_val_inst(old_val_id)
+                    arith_inst.rhs = ir_val_inst(val_result.val_id)
+                    arith_inst.result_type = ty
+                    arith_inst.has_result = true
+                    b.instructions.push(arith_inst)
+                    new_val_id = g.builder.next_id
+                    g.builder.next_id = g.builder.next_id + 1
+                }
 
                 -- Store new value
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
@@ -9042,6 +9060,11 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     -- ARITHMETIC OPERATORS (+, -, *, /, %)
     -- --------------------------------------------------------
     if op == BINOP_ADD() {
+        if is_signed_int_type(lhs_type) and is_signed_int_type(rhs_type) {
+            let mut fit_type = ""
+            if lhs_type == rhs_type and type_bit_width(lhs_type) < 64 { fit_type = lhs_type }
+            return emit_checked_int_arith(g, b, "dm_checked_add_i64", ir_val_inst(lhs_id), lhs_type, ir_val_inst(rhs_id), rhs_type, fit_type)
+        }
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_ADD())
         inst.lhs = ir_val_inst(lhs_id)
@@ -9054,6 +9077,11 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     }
 
     if op == BINOP_SUB() {
+        if is_signed_int_type(lhs_type) and is_signed_int_type(rhs_type) {
+            let mut fit_type = ""
+            if lhs_type == rhs_type and type_bit_width(lhs_type) < 64 { fit_type = lhs_type }
+            return emit_checked_int_arith(g, b, "dm_checked_sub_i64", ir_val_inst(lhs_id), lhs_type, ir_val_inst(rhs_id), rhs_type, fit_type)
+        }
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_SUB())
         inst.lhs = ir_val_inst(lhs_id)
@@ -9066,6 +9094,11 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     }
 
     if op == BINOP_MUL() {
+        if is_signed_int_type(lhs_type) and is_signed_int_type(rhs_type) {
+            let mut fit_type = ""
+            if lhs_type == rhs_type and type_bit_width(lhs_type) < 64 { fit_type = lhs_type }
+            return emit_checked_int_arith(g, b, "dm_checked_mul_i64", ir_val_inst(lhs_id), lhs_type, ir_val_inst(rhs_id), rhs_type, fit_type)
+        }
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_MUL())
         inst.lhs = ir_val_inst(lhs_id)
@@ -9105,7 +9138,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
         panic_inst.callee = "dm_panic"
         let mut panic_args: List[IRValue] = []
-        panic_args.push(ir_val_string("Runtime error: division by zero"))
+        panic_args.push(ir_val_string("PANIC: division by zero"))
         panic_inst.call_args = panic_args
         panic_inst.result_type = "void"
         panic_inst.has_result = false
@@ -9118,6 +9151,9 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
 
         -- OK block: perform the division
         let mut ok_block = ir_block_new(ok_label)
+        let div_chk = check_div_overflow(g, ok_block, lhs_id, rhs_id, lhs_type)
+        g = div_chk.gen
+        ok_block = div_chk.block
         let div_id = g.builder.next_id
         let mut div_inst = ir_inst_new(div_id, OP_DIV())
         div_inst.lhs = ir_val_inst(lhs_id)
@@ -9156,7 +9192,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
         panic_inst.callee = "dm_panic"
         let mut panic_args: List[IRValue] = []
-        panic_args.push(ir_val_string("Runtime error: modulo by zero"))
+        panic_args.push(ir_val_string("PANIC: modulo by zero"))
         panic_inst.call_args = panic_args
         panic_inst.result_type = "void"
         panic_inst.has_result = false
@@ -9169,6 +9205,9 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
 
         -- OK block
         let mut ok_block = ir_block_new(ok_label)
+        let mod_chk = check_div_overflow(g, ok_block, lhs_id, rhs_id, lhs_type)
+        g = mod_chk.gen
+        ok_block = mod_chk.block
         let mod_id = g.builder.next_id
         let mut mod_inst = ir_inst_new(mod_id, OP_MOD())
         mod_inst.lhs = ir_val_inst(lhs_id)
@@ -9399,6 +9438,12 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
     if expr.op == UNOP_NEG() {
         -- Negate: emit OP_NEG with operand's type
         let operand_type = infer_expr_type(g, *expr.operand)
+        -- Checked negation for signed ints: -INT_MIN overflows
+        if is_signed_int_type(operand_type) {
+            let mut fit_type = ""
+            if type_bit_width(operand_type) < 64 { fit_type = operand_type }
+            return emit_checked_int_arith(g, b, "dm_checked_sub_i64", ir_val_int(0), "i64", ir_val_inst(operand_id), operand_type, fit_type)
+        }
         let result_type = if is_float_type(operand_type) { "f64" } else { "i64" }
 
         let id = g.builder.next_id
@@ -11467,6 +11512,167 @@ fn check_index_bounds(gen: IRGenerator, block: IRBasicBlock, idx_id: int, len_va
 
     let ok_block = ir_block_new(ok_label)
     return expr_result(g, ok_block, idx_id)
+}
+
+-- Panic on INT_MIN / -1 (signed division overflow) before dividing.
+-- No-op for non-signed-int operands. Returns the block to divide in.
+fn check_div_overflow(gen: IRGenerator, block: IRBasicBlock, lhs_id: int, rhs_id: int, lhs_type: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+
+    if is_signed_int_type(lhs_type) == false {
+        return expr_result(g, b, lhs_id)
+    }
+
+    let min_id = g.builder.next_id
+    let mut min_inst = ir_inst_new(min_id, OP_EQ())
+    min_inst.lhs = ir_val_inst(lhs_id)
+    min_inst.rhs = ir_val_int(int_fit_min(lhs_type))
+    min_inst.result_type = "bool"
+    min_inst.has_result = true
+    b.instructions.push(min_inst)
+    g.builder.next_id = min_id + 1
+
+    let neg1_id = g.builder.next_id
+    let mut neg1_inst = ir_inst_new(neg1_id, OP_EQ())
+    neg1_inst.lhs = ir_val_inst(rhs_id)
+    neg1_inst.rhs = ir_val_int(-1)
+    neg1_inst.result_type = "bool"
+    neg1_inst.has_result = true
+    b.instructions.push(neg1_inst)
+    g.builder.next_id = neg1_id + 1
+
+    let both_id = g.builder.next_id
+    let mut both_inst = ir_inst_new(both_id, OP_LOGICAL_AND())
+    both_inst.lhs = ir_val_inst(min_id)
+    both_inst.rhs = ir_val_inst(neg1_id)
+    both_inst.result_type = "bool"
+    both_inst.has_result = true
+    b.instructions.push(both_inst)
+    g.builder.next_id = both_id + 1
+
+    let panic_label = gen_next_label(g, "div_ovf_panic")
+    g = gen_advance_label(g)
+    let do_label = gen_next_label(g, "div_do")
+    g = gen_advance_label(g)
+
+    b.terminator = Box_new(term_br_cond(ir_val_inst(both_id), panic_label, do_label))
+    b.has_terminator = true
+    g.completed_blocks.push(b)
+
+    let mut panic_block = ir_block_new(panic_label)
+    let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+    panic_inst.callee = "dm_panic"
+    let mut panic_args: List[IRValue] = []
+    panic_args.push(ir_val_string("PANIC: integer overflow"))
+    panic_inst.call_args = panic_args
+    panic_inst.result_type = "void"
+    panic_inst.has_result = false
+    panic_block.instructions.push(panic_inst)
+    g.builder.next_id = g.builder.next_id + 1
+    panic_block.terminator = Box_new(term_unreachable())
+    panic_block.has_terminator = true
+    g.completed_blocks.push(panic_block)
+
+    let do_block = ir_block_new(do_label)
+    return expr_result(g, do_block, lhs_id)
+}
+
+-- True for signed integer IR types (i8/i16/i32/i64)
+fn is_signed_int_type(name: string) -> bool {
+    return is_integer_type(name) and is_unsigned_type(name) == false
+}
+
+-- Range bounds for the narrow signed widths (fit targets)
+fn int_fit_min(name: string) -> int {
+    if name == "i8" { return -128 }
+    if name == "i16" { return -32768 }
+    if name == "i32" { return -2147483648 }
+    return 0 - 9223372036854775807 - 1
+}
+
+fn int_fit_max(name: string) -> int {
+    if name == "i8" { return 127 }
+    if name == "i16" { return 32767 }
+    if name == "i32" { return 2147483647 }
+    return 9223372036854775807
+}
+
+-- Checked signed arithmetic, mirroring Stage 0: widen both operands to
+-- i64, call the dm_checked_*_i64 runtime helper (panics on overflow),
+-- and range-fit the result when fit_type names a narrower signed width.
+fn emit_checked_int_arith(gen: IRGenerator, block: IRBasicBlock, callee: string, lhs_val: IRValue, lhs_type: string, rhs_val: IRValue, rhs_type: string, fit_type: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+
+    let mut lhs64 = lhs_val
+    if is_integer_type(lhs_type) and type_bit_width(lhs_type) < 64 {
+        let widen_id = g.builder.next_id
+        let mut widen_inst = ir_inst_new(widen_id, OP_CAST())
+        widen_inst.cast_val = lhs_val
+        widen_inst.cast_from = lhs_type
+        widen_inst.cast_to = "i64"
+        widen_inst.result_type = "i64"
+        widen_inst.has_result = true
+        b.instructions.push(widen_inst)
+        g.builder.next_id = widen_id + 1
+        lhs64 = ir_val_inst(widen_id)
+    }
+
+    let mut rhs64 = rhs_val
+    if is_integer_type(rhs_type) and type_bit_width(rhs_type) < 64 {
+        let widen_id = g.builder.next_id
+        let mut widen_inst = ir_inst_new(widen_id, OP_CAST())
+        widen_inst.cast_val = rhs_val
+        widen_inst.cast_from = rhs_type
+        widen_inst.cast_to = "i64"
+        widen_inst.result_type = "i64"
+        widen_inst.has_result = true
+        b.instructions.push(widen_inst)
+        g.builder.next_id = widen_id + 1
+        rhs64 = ir_val_inst(widen_id)
+    }
+
+    let call_id = g.builder.next_id
+    let mut call_inst = ir_inst_new(call_id, OP_CALL())
+    call_inst.callee = callee
+    let mut call_args: List[IRValue] = []
+    call_args.push(lhs64)
+    call_args.push(rhs64)
+    call_inst.call_args = call_args
+    call_inst.result_type = "i64"
+    call_inst.has_result = true
+    b.instructions.push(call_inst)
+    g.builder.next_id = call_id + 1
+
+    if len(fit_type) == 0 {
+        return expr_result(g, b, call_id)
+    }
+
+    -- Range-fit to the narrower signed width, then truncate back
+    let range_id = g.builder.next_id
+    let mut range_inst = ir_inst_new(range_id, OP_CALL())
+    range_inst.callee = "dm_checked_range_i64"
+    let mut range_args: List[IRValue] = []
+    range_args.push(ir_val_inst(call_id))
+    range_args.push(ir_val_int(int_fit_min(fit_type)))
+    range_args.push(ir_val_int(int_fit_max(fit_type)))
+    range_inst.call_args = range_args
+    range_inst.result_type = "i64"
+    range_inst.has_result = true
+    b.instructions.push(range_inst)
+    g.builder.next_id = range_id + 1
+
+    let trunc_id = g.builder.next_id
+    let mut trunc_inst = ir_inst_new(trunc_id, OP_CAST())
+    trunc_inst.cast_val = ir_val_inst(range_id)
+    trunc_inst.cast_from = "i64"
+    trunc_inst.cast_to = fit_type
+    trunc_inst.result_type = fit_type
+    trunc_inst.has_result = true
+    b.instructions.push(trunc_inst)
+    g.builder.next_id = trunc_id + 1
+    return expr_result(g, b, trunc_id)
 }
 
 -- ============================================================
@@ -18216,6 +18422,25 @@ fn is_sret_return_type(ret_type: string) -> bool {
 -- DIRECT CALL (OP_CALL)
 -- ============================================================
 
+-- Coerce an integer call argument to the callee's parameter width
+-- (sext when narrower, trunc when wider). Non-integer pairs and
+-- unknown callees/params pass through unchanged.
+fn coerce_int_call_arg(gen: LLVMGenerator, callee: int, fn_name: string, user_idx: int, llvm_idx: int, val: int) -> int {
+    unsafe {
+        if func_param_type_at(gen, fn_name, user_idx) == "" { return val }
+        let param = dm_llvm_get_param(callee, llvm_idx)
+        if param == 0 { return val }
+        let param_ty = dm_llvm_type_of(param)
+        let val_ty = dm_llvm_type_of(val)
+        if dm_llvm_get_type_kind(param_ty) != 8 or dm_llvm_get_type_kind(val_ty) != 8 { return val }
+        let param_w = dm_llvm_get_int_type_width(param_ty)
+        let val_w = dm_llvm_get_int_type_width(val_ty)
+        if val_w < param_w { return dm_llvm_build_sext(gen.builder, val, param_ty, "arg.sext") }
+        if val_w > param_w { return dm_llvm_build_trunc(gen.builder, val, param_ty, "arg.trunc") }
+        return val
+    }
+}
+
 fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
@@ -18255,6 +18480,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                     val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
                 }
             }
+            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
             args.push(val)
             ai = ai + 1
         }
@@ -18314,6 +18540,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                         val = create_dm_string_for_call(g, val)
                     }
                 }
+                val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
                 args.push(val)
                 ai = ai + 1
             }
@@ -18344,6 +18571,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                     val = create_dm_string_for_call(g, val)
                 }
             }
+            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
             args.push(val)
             ai = ai + 1
         }
@@ -18576,6 +18804,7 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
                     val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
                 }
             }
+            val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
             args.push(val)
             ai = ai + 1
         }
