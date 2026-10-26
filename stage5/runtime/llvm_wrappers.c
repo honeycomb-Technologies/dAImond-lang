@@ -1235,12 +1235,11 @@ int64_t dm_mem_mark(void) {
     return _dm_str_pool_len;
 }
 
-// mem_sweep(mark) -> void: free all strings allocated since mark
+// mem_sweep(mark) -> void: documented no-op (Phase 2 semantics, as in
+// Stage 0). Strings are never freed here, so values created after the
+// mark stay valid after the sweep; the pool is bookkeeping only.
 void dm_mem_sweep(int64_t mark) {
-    for (int64_t i = mark; i < _dm_str_pool_len; i++) {
-        free(_dm_str_pool[i]);
-    }
-    _dm_str_pool_len = mark;
+    (void)mark;
 }
 
 // term_width() -> int: terminal column count (default 80)

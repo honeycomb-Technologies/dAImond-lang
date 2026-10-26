@@ -215,6 +215,8 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_system", "string", "i64")
     g = declare_extern0(g, "dm_args_len", "i64")
     g = declare_extern(g, "dm_args_get", "i64", "string")
+    g = declare_extern0(g, "dm_mem_mark", "i64")
+    g = declare_extern(g, "dm_mem_sweep", "i64", "void")
 
     -- File I/O
     g = declare_extern(g, "dm_file_read", "string", "string")

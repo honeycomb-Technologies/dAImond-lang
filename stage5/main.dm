@@ -4795,6 +4795,8 @@ fn map_builtin_name(name: string) -> string {
     if name == "read_line" { return "dm_read_line" }
     if name == "args_len" { return "dm_args_len" }
     if name == "args_get" { return "dm_args_get" }
+    if name == "mem_mark" { return "dm_mem_mark" }
+    if name == "mem_sweep" { return "dm_mem_sweep" }
     if name == "system" { return "dm_system" }
     if name == "assert" { return "dm_assert" }
     if name == "assert_eq" { return "dm_assert_eq" }
@@ -4838,6 +4840,7 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return true }
     if name == "read_line" { return true }
     if name == "args_len" or name == "args_get" { return true }
+    if name == "mem_mark" or name == "mem_sweep" { return true }
     if name == "system" { return true }
     if name == "assert" or name == "assert_eq" { return true }
     if name == "Box_new" or name == "Box_null" { return true }
@@ -4880,6 +4883,8 @@ fn builtin_return_type(name: string) -> string {
     if name == "read_line" { return "string" }
     if name == "args_len" { return "i64" }
     if name == "args_get" { return "string" }
+    if name == "mem_mark" { return "i64" }
+    if name == "mem_sweep" { return "void" }
     if name == "system" { return "i64" }
     if name == "assert" or name == "assert_eq" { return "void" }
     -- Character classification
@@ -5212,6 +5217,8 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_system", "string", "i64")
     g = declare_extern0(g, "dm_args_len", "i64")
     g = declare_extern(g, "dm_args_get", "i64", "string")
+    g = declare_extern0(g, "dm_mem_mark", "i64")
+    g = declare_extern(g, "dm_mem_sweep", "i64", "void")
 
     -- File I/O
     g = declare_extern(g, "dm_file_read", "string", "string")
