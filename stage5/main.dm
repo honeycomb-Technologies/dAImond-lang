@@ -8260,7 +8260,7 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
             }
             -- Check for generic function declarations
             if gen.generic_fn_decls.contains(fn_name) {
-                let decl_idx = gen.generic_fn_decls.get(fn_name)
+                let decl_idx: int = gen.generic_fn_decls.get(fn_name)
                 if decl_idx >= 0 and decl_idx < gen.declarations.len() {
                     let decl = gen.declarations[decl_idx]
                     if decl.kind == DECL_FUNCTION() {
@@ -8505,7 +8505,7 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
             let mangled = struct_type + "_" + method
             -- Check generic impl method
             if gen.generic_fn_decls.contains(mangled) {
-                let decl_idx = gen.generic_fn_decls.get(mangled)
+                let decl_idx: int = gen.generic_fn_decls.get(mangled)
                 if decl_idx >= 0 and decl_idx < gen.declarations.len() {
                     let decl = gen.declarations[decl_idx]
                     if decl.kind == DECL_FUNCTION() {
@@ -9960,7 +9960,7 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         -- For now, use "i64" as default for each generic param
         -- (A more complete implementation would inspect arg expressions)
         if g.generic_fn_decls.contains(fn_name) {
-            let decl_idx = g.generic_fn_decls.get(fn_name)
+            let decl_idx: int = g.generic_fn_decls.get(fn_name)
             if decl_idx >= 0 and decl_idx < g.declarations.len() {
                 let decl = g.declarations[decl_idx]
                 if decl.kind == DECL_FUNCTION() {
@@ -9995,7 +9995,7 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         g.mono_generated.insert(mangled_name, true)
 
         if g.generic_fn_decls.contains(fn_name) {
-            let decl_idx = g.generic_fn_decls.get(fn_name)
+            let decl_idx: int = g.generic_fn_decls.get(fn_name)
             if decl_idx >= 0 and decl_idx < g.declarations.len() {
                 let decl = g.declarations[decl_idx]
                 if decl.kind == DECL_FUNCTION() {
@@ -10952,7 +10952,7 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
     -- GENERIC IMPL METHOD: monomorphize on demand
     -- --------------------------------------------------------
     if g.generic_fn_decls.contains(mangled) {
-        let decl_idx = g.generic_fn_decls.get(mangled)
+        let decl_idx: int = g.generic_fn_decls.get(mangled)
         if decl_idx >= 0 and decl_idx < g.declarations.len() {
             let decl = g.declarations[decl_idx]
             if decl.kind == DECL_FUNCTION() {
