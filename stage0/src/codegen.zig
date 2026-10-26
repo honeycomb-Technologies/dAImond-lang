@@ -1282,28 +1282,18 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
-        // String allocation pool for mem_mark/mem_sweep
-        try self.writer.writeLine("static char** _dm_str_pool = NULL;");
-        try self.writer.writeLine("static int64_t _dm_str_pool_len = 0;");
-        try self.writer.writeLine("static int64_t _dm_str_pool_cap = 0;");
-        try self.writer.writeLine("static inline void _dm_str_track(char* p) {");
-        self.writer.indent();
-        try self.writer.writeLine("if (_dm_str_pool_len >= _dm_str_pool_cap) {");
-        self.writer.indent();
-        try self.writer.writeLine("_dm_str_pool_cap = _dm_str_pool_cap ? _dm_str_pool_cap * 2 : 4096;");
-        try self.writer.writeLine("_dm_str_pool = (char**)realloc(_dm_str_pool, (size_t)_dm_str_pool_cap * sizeof(char*));");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        try self.writer.writeLine("_dm_str_pool[_dm_str_pool_len++] = p;");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        try self.writer.writeLine("static inline int64_t dm_mem_mark(void) { return _dm_str_pool_len; }");
-        try self.writer.writeLine("static inline void dm_mem_sweep(int64_t mark) {");
-        self.writer.indent();
-        try self.writer.writeLine("for (int64_t i = mark; i < _dm_str_pool_len; i++) free(_dm_str_pool[i]);");
-        try self.writer.writeLine("_dm_str_pool_len = mark;");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
+        // mem_mark/mem_sweep are documented no-ops. The previous string
+        // pool design freed every tracked allocation newer than a mark,
+        // including strings still referenced by live variables
+        // (use-after-free). There is no sound small way to know which
+        // tracked strings are unreferenced, so nothing is ever swept:
+        // allocations live until process exit (the runtime's leak
+        // discipline). Programs that call mem_mark/mem_sweep (e.g.
+        // snake, breakout) keep compiling and running; their per-frame
+        // sweep now simply does not reclaim memory.
+        try self.writer.writeLine("static inline void _dm_str_track(char* p) { (void)p; }");
+        try self.writer.writeLine("static inline int64_t dm_mem_mark(void) { return 0; }");
+        try self.writer.writeLine("static inline void dm_mem_sweep(int64_t mark) { (void)mark; }");
         try self.writer.blankLine();
 
         // String concatenation (tracked)
