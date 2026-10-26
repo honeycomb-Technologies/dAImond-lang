@@ -429,6 +429,14 @@ int64_t dm_list_int64_get(dm_list_int64* list, int64_t index) {
     return list->data[index];
 }
 
+void dm_list_int64_set(dm_list_int64* list, int64_t index, int64_t value) {
+    if (index < 0 || index >= list->len) {
+        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
+        exit(1);
+    }
+    list->data[index] = value;
+}
+
 int64_t dm_list_int64_len(dm_list_int64* list) {
     return list->len;
 }
@@ -482,6 +490,14 @@ void dm_list_string_get(dm_string* out, dm_list_dm_string* list, int64_t index) 
     *out = list->data[index];
 }
 
+void dm_list_string_set(dm_list_dm_string* list, int64_t index, const dm_string* value) {
+    if (index < 0 || index >= list->len) {
+        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
+        exit(1);
+    }
+    list->data[index] = *value;
+}
+
 int64_t dm_list_string_len(dm_list_dm_string* list) {
     return list->len;
 }
@@ -489,6 +505,10 @@ int64_t dm_list_string_len(dm_list_dm_string* list) {
 // LLVM ABI wrappers for string list (llvm_ prefix for string-param externs)
 void llvm_dm_list_string_push(dm_list_dm_string* list, const dm_string* value) {
     dm_list_string_push(list, value);
+}
+
+void llvm_dm_list_string_set(dm_list_dm_string* list, int64_t index, const dm_string* value) {
+    dm_list_string_set(list, index, value);
 }
 
 void llvm_dm_list_string_get(dm_string* out, dm_list_dm_string* list, int64_t index) {
@@ -544,6 +564,14 @@ double dm_list_double_get(dm_list_double* list, int64_t index) {
     return list->data[index];
 }
 
+void dm_list_double_set(dm_list_double* list, int64_t index, double value) {
+    if (index < 0 || index >= list->len) {
+        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
+        exit(1);
+    }
+    list->data[index] = value;
+}
+
 int64_t dm_list_double_len(dm_list_double* list) {
     return list->len;
 }
@@ -582,6 +610,14 @@ void dm_list_generic_get(void* out, dm_list_generic* list, int64_t index, int64_
         exit(1);
     }
     memcpy(out, (char*)list->data + index * elem_size, (size_t)elem_size);
+}
+
+void dm_list_generic_set(dm_list_generic* list, const void* value, int64_t index, int64_t elem_size) {
+    if (index < 0 || index >= list->len) {
+        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
+        exit(1);
+    }
+    memcpy((char*)list->data + index * elem_size, value, (size_t)elem_size);
 }
 
 int64_t dm_list_generic_len(dm_list_generic* list) {

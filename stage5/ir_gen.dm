@@ -131,7 +131,10 @@ struct IRGenerator {
     -- Variable name -> full type annotation (e.g., "Result[int, string]")
     var_type_annotations: Map[string, string],
     -- Known user-defined function names (for undefined function detection)
-    known_functions: Map[string, bool]
+    known_functions: Map[string, bool],
+    -- Variable name -> true if declared with a fixed-size array type [T; N]
+    -- (normalized to a runtime list; bounds panics say "(array)", not "(list)")
+    array_var_names: Map[string, bool]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -177,7 +180,8 @@ fn ir_generator_new() -> IRGenerator {
         declarations: [],
         completed_blocks: [],
         var_type_annotations: Map_new(),
-        known_functions: Map_new()
+        known_functions: Map_new(),
+        array_var_names: Map_new()
     }
 }
 

@@ -4533,7 +4533,10 @@ struct IRGenerator {
     -- Variable name -> full type annotation (e.g., "Result[int, string]")
     var_type_annotations: Map[string, string],
     -- Known user-defined function names (for undefined function detection)
-    known_functions: Map[string, bool]
+    known_functions: Map[string, bool],
+    -- Variable name -> true if declared with a fixed-size array type [T; N]
+    -- (normalized to a runtime list; bounds panics say "(array)", not "(list)")
+    array_var_names: Map[string, bool]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -4579,7 +4582,8 @@ fn ir_generator_new() -> IRGenerator {
         declarations: [],
         completed_blocks: [],
         var_type_annotations: Map_new(),
-        known_functions: Map_new()
+        known_functions: Map_new(),
+        array_var_names: Map_new()
     }
 }
 
@@ -5225,24 +5229,28 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_list_int64_push", "ptr", "i64", "void")
     g = declare_extern2(g, "dm_list_int64_get", "ptr", "i64", "i64")
     g = declare_extern(g, "dm_list_int64_len", "ptr", "i64")
+    g = declare_extern3(g, "dm_list_int64_set", "ptr", "i64", "i64", "void")
     g = declare_extern(g, "dm_list_int64_pop", "ptr", "i64")
 
     -- List operations (string)
     g = declare_extern(g, "dm_list_string_new", "ptr", "void")
     g = declare_extern2(g, "dm_list_string_push", "ptr", "string", "void")
     g = declare_extern2(g, "dm_list_string_get", "ptr", "i64", "string")
+    g = declare_extern3(g, "dm_list_string_set", "ptr", "i64", "string", "void")
     g = declare_extern(g, "dm_list_string_len", "ptr", "i64")
 
     -- List operations (double)
     g = declare_extern(g, "dm_list_double_new", "ptr", "void")
     g = declare_extern2(g, "dm_list_double_push", "ptr", "f64", "void")
     g = declare_extern2(g, "dm_list_double_get", "ptr", "i64", "f64")
+    g = declare_extern3(g, "dm_list_double_set", "ptr", "i64", "f64", "void")
     g = declare_extern(g, "dm_list_double_len", "ptr", "i64")
 
     -- List operations (generic)
     g = declare_extern(g, "dm_list_generic_new", "ptr", "void")
     g = declare_extern3(g, "dm_list_generic_push", "ptr", "ptr", "i64", "void")
     g = declare_extern4(g, "dm_list_generic_get", "ptr", "ptr", "i64", "i64", "void")
+    g = declare_extern4(g, "dm_list_generic_set", "ptr", "ptr", "i64", "i64", "void")
     g = declare_extern(g, "dm_list_generic_len", "ptr", "i64")
 
     -- Filesystem
@@ -5985,6 +5993,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         if semi_pos > 0 {
             let inner_type = string_trim(substr(type_str, 1, semi_pos - 1))
             type_str = "List[" + inner_type + "]"
+            g.array_var_names.insert(var_name, true)
         }
     }
 
@@ -7566,6 +7575,90 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 insert_inst.has_result = false
                 b.instructions.push(insert_inst)
                 g.builder.next_id = g.builder.next_id + 1
+            }
+
+            -- List/array index assignment: bounds check, then typed set
+            if g.list_elem_kinds.contains(obj_name) {
+                let ek = g.list_elem_kinds.get(obj_name)
+                let list_ptr = g.variable_map.get(obj_name)
+
+                -- Generate the index expression
+                let idx_result = generate_expr(g, b, *target.index)
+                g = idx_result.gen
+                b = idx_result.block
+
+                -- Length for the bounds check
+                let set_len_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_len" }
+                else if ek == LIST_ELEM_FLOAT() { "dm_list_double_len" }
+                else if ek == LIST_ELEM_STRING() { "dm_list_string_len" }
+                else { "dm_list_generic_len" }
+                let set_len_id = g.builder.next_id
+                let mut set_len_inst = ir_inst_new(set_len_id, OP_CALL())
+                set_len_inst.callee = set_len_fn
+                let mut set_len_args: List[IRValue] = []
+                set_len_args.push(ir_val_inst(list_ptr))
+                set_len_inst.call_args = set_len_args
+                set_len_inst.result_type = "i64"
+                set_len_inst.has_result = true
+                b.instructions.push(set_len_inst)
+                g.builder.next_id = set_len_id + 1
+
+                let set_ctx = if g.array_var_names.contains(obj_name) { "(array)" } else { "(list)" }
+                let set_chk = check_index_bounds(g, b, idx_result.val_id, ir_val_inst(set_len_id), set_ctx)
+                g = set_chk.gen
+                b = set_chk.block
+
+                if ek == LIST_ELEM_OTHER() {
+                    -- Generic set: alloca temp, store value, pass pointer + elem_size
+                    let set_elem_type = if g.list_elem_types.contains(obj_name) {
+                        g.list_elem_types.get(obj_name)
+                    } else {
+                        "i64"
+                    }
+                    let set_elem_size = estimate_type_size_gen(g, set_elem_type)
+                    let set_temp_id = g.builder.next_id
+                    let mut set_temp_inst = ir_inst_new(set_temp_id, OP_ALLOCA())
+                    set_temp_inst.alloc_type = set_elem_type
+                    set_temp_inst.result_type = "ptr(" + set_elem_type + ")"
+                    set_temp_inst.has_result = true
+                    b.instructions.push(set_temp_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+
+                    let mut set_store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+                    set_store_inst.store_ptr = ir_val_inst(set_temp_id)
+                    set_store_inst.store_val = ir_val_inst(val_result.val_id)
+                    set_store_inst.has_result = false
+                    b.instructions.push(set_store_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+
+                    let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+                    set_inst.callee = "dm_list_generic_set"
+                    let mut set_args: List[IRValue] = []
+                    set_args.push(ir_val_inst(list_ptr))
+                    set_args.push(ir_val_inst(set_temp_id))
+                    set_args.push(ir_val_inst(idx_result.val_id))
+                    set_args.push(ir_val_int(set_elem_size))
+                    set_inst.call_args = set_args
+                    set_inst.result_type = "void"
+                    set_inst.has_result = false
+                    b.instructions.push(set_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+                } else {
+                    let set_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_set" }
+                    else if ek == LIST_ELEM_FLOAT() { "dm_list_double_set" }
+                    else { "dm_list_string_set" }
+                    let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+                    set_inst.callee = set_fn
+                    let mut set_args: List[IRValue] = []
+                    set_args.push(ir_val_inst(list_ptr))
+                    set_args.push(ir_val_inst(idx_result.val_id))
+                    set_args.push(ir_val_inst(val_result.val_id))
+                    set_inst.call_args = set_args
+                    set_inst.result_type = "void"
+                    set_inst.has_result = false
+                    b.instructions.push(set_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+                }
             }
         }
     }
@@ -11254,6 +11347,128 @@ fn check_box_not_null(gen: IRGenerator, block: IRBasicBlock, ptr_id: int) -> Exp
     return expr_result(g, ok_block, ptr_id)
 }
 
+-- Panic unless 0 <= idx < len. ctx is "(array)", "(string)", or "(list)".
+-- The panic message is built in the panic block (idx and len dominate it):
+--   PANIC: index out of bounds: index <idx>, length <len> <ctx>
+fn check_index_bounds(gen: IRGenerator, block: IRBasicBlock, idx_id: int, len_val: IRValue, ctx: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+
+    -- bad_neg = idx < 0
+    let neg_id = g.builder.next_id
+    let mut neg_inst = ir_inst_new(neg_id, OP_LT())
+    neg_inst.lhs = ir_val_inst(idx_id)
+    neg_inst.rhs = ir_val_int(0)
+    neg_inst.result_type = "bool"
+    neg_inst.has_result = true
+    b.instructions.push(neg_inst)
+    g.builder.next_id = neg_id + 1
+
+    let panic_label = gen_next_label(g, "oob_panic")
+    g = gen_advance_label(g)
+    let mid_label = gen_next_label(g, "oob_check")
+    g = gen_advance_label(g)
+    let ok_label = gen_next_label(g, "oob_ok")
+    g = gen_advance_label(g)
+
+    b.terminator = Box_new(term_br_cond(ir_val_inst(neg_id), panic_label, mid_label))
+    b.has_terminator = true
+    g.completed_blocks.push(b)
+
+    -- Mid block: bad_ge = idx >= len
+    let mut mid_block = ir_block_new(mid_label)
+    let ge_id = g.builder.next_id
+    let mut ge_inst = ir_inst_new(ge_id, OP_GE())
+    ge_inst.lhs = ir_val_inst(idx_id)
+    ge_inst.rhs = len_val
+    ge_inst.result_type = "bool"
+    ge_inst.has_result = true
+    mid_block.instructions.push(ge_inst)
+    g.builder.next_id = ge_id + 1
+    mid_block.terminator = Box_new(term_br_cond(ir_val_inst(ge_id), panic_label, ok_label))
+    mid_block.has_terminator = true
+    g.completed_blocks.push(mid_block)
+
+    -- Panic block: build the message, then OP_PANIC + unreachable
+    let mut panic_block = ir_block_new(panic_label)
+
+    let idx_str_id = g.builder.next_id
+    let mut idx_str_inst = ir_inst_new(idx_str_id, OP_CALL())
+    idx_str_inst.callee = "dm_int_to_string"
+    let mut idx_args: List[IRValue] = []
+    idx_args.push(ir_val_inst(idx_id))
+    idx_str_inst.call_args = idx_args
+    idx_str_inst.result_type = "string"
+    idx_str_inst.has_result = true
+    panic_block.instructions.push(idx_str_inst)
+    g.builder.next_id = idx_str_id + 1
+
+    let len_str_id = g.builder.next_id
+    let mut len_str_inst = ir_inst_new(len_str_id, OP_CALL())
+    len_str_inst.callee = "dm_int_to_string"
+    let mut len_args: List[IRValue] = []
+    len_args.push(len_val)
+    len_str_inst.call_args = len_args
+    len_str_inst.result_type = "string"
+    len_str_inst.has_result = true
+    panic_block.instructions.push(len_str_inst)
+    g.builder.next_id = len_str_id + 1
+
+    let c1_id = g.builder.next_id
+    let mut c1 = ir_inst_new(c1_id, OP_STRING_CONCAT())
+    c1.lhs = ir_val_string("PANIC: index out of bounds: index ")
+    c1.rhs = ir_val_inst(idx_str_id)
+    c1.result_type = "string"
+    c1.has_result = true
+    panic_block.instructions.push(c1)
+    g.builder.next_id = c1_id + 1
+
+    let c2_id = g.builder.next_id
+    let mut c2 = ir_inst_new(c2_id, OP_STRING_CONCAT())
+    c2.lhs = ir_val_inst(c1_id)
+    c2.rhs = ir_val_string(", length ")
+    c2.result_type = "string"
+    c2.has_result = true
+    panic_block.instructions.push(c2)
+    g.builder.next_id = c2_id + 1
+
+    let c3_id = g.builder.next_id
+    let mut c3 = ir_inst_new(c3_id, OP_STRING_CONCAT())
+    c3.lhs = ir_val_inst(c2_id)
+    c3.rhs = ir_val_inst(len_str_id)
+    c3.result_type = "string"
+    c3.has_result = true
+    panic_block.instructions.push(c3)
+    g.builder.next_id = c3_id + 1
+
+    let c4_id = g.builder.next_id
+    let mut c4 = ir_inst_new(c4_id, OP_STRING_CONCAT())
+    c4.lhs = ir_val_inst(c3_id)
+    c4.rhs = ir_val_string(" " + ctx)
+    c4.result_type = "string"
+    c4.has_result = true
+    panic_block.instructions.push(c4)
+    g.builder.next_id = c4_id + 1
+
+    -- OP_CALL (not OP_PANIC): OP_PANIC lowering emits its own unreachable,
+    -- which would duplicate this block's terminator.
+    let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+    panic_inst.callee = "dm_panic"
+    let mut oob_panic_args: List[IRValue] = []
+    oob_panic_args.push(ir_val_inst(c4_id))
+    panic_inst.call_args = oob_panic_args
+    panic_inst.result_type = "void"
+    panic_inst.has_result = false
+    panic_block.instructions.push(panic_inst)
+    g.builder.next_id = g.builder.next_id + 1
+    panic_block.terminator = Box_new(term_unreachable())
+    panic_block.has_terminator = true
+    g.completed_blocks.push(panic_block)
+
+    let ok_block = ir_block_new(ok_label)
+    return expr_result(g, ok_block, idx_id)
+}
+
 -- ============================================================
 -- Field Access: expr.object.expr.field
 -- ============================================================
@@ -11667,6 +11882,26 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     elem_type = g.list_elem_types.get(var_name)
                 }
             }
+
+            -- Bounds check: panic unless 0 <= idx < len
+            let bounds_len_fn = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_len" }
+            else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_len" }
+            else if elem_kind == LIST_ELEM_STRING() { "dm_list_string_len" }
+            else { "dm_list_generic_len" }
+            let bounds_len_id = g.builder.next_id
+            let mut bounds_len_inst = ir_inst_new(bounds_len_id, OP_CALL())
+            bounds_len_inst.callee = bounds_len_fn
+            let mut bounds_len_args: List[IRValue] = []
+            bounds_len_args.push(ir_val_inst(obj_id))
+            bounds_len_inst.call_args = bounds_len_args
+            bounds_len_inst.result_type = "i64"
+            bounds_len_inst.has_result = true
+            b.instructions.push(bounds_len_inst)
+            g.builder.next_id = bounds_len_id + 1
+            let bounds_ctx = if g.array_var_names.contains(var_name) { "(array)" } else { "(list)" }
+            let bounds_chk = check_index_bounds(g, b, idx_id, ir_val_inst(bounds_len_id), bounds_ctx)
+            g = bounds_chk.gen
+            b = bounds_chk.block
 
             if elem_kind == LIST_ELEM_OTHER() {
                 -- Generic list get: alloca temp, call dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)

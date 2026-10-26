@@ -3679,6 +3679,128 @@ fn check_box_not_null(gen: IRGenerator, block: IRBasicBlock, ptr_id: int) -> Exp
     return expr_result(g, ok_block, ptr_id)
 }
 
+-- Panic unless 0 <= idx < len. ctx is "(array)", "(string)", or "(list)".
+-- The panic message is built in the panic block (idx and len dominate it):
+--   PANIC: index out of bounds: index <idx>, length <len> <ctx>
+fn check_index_bounds(gen: IRGenerator, block: IRBasicBlock, idx_id: int, len_val: IRValue, ctx: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+
+    -- bad_neg = idx < 0
+    let neg_id = g.builder.next_id
+    let mut neg_inst = ir_inst_new(neg_id, OP_LT())
+    neg_inst.lhs = ir_val_inst(idx_id)
+    neg_inst.rhs = ir_val_int(0)
+    neg_inst.result_type = "bool"
+    neg_inst.has_result = true
+    b.instructions.push(neg_inst)
+    g.builder.next_id = neg_id + 1
+
+    let panic_label = gen_next_label(g, "oob_panic")
+    g = gen_advance_label(g)
+    let mid_label = gen_next_label(g, "oob_check")
+    g = gen_advance_label(g)
+    let ok_label = gen_next_label(g, "oob_ok")
+    g = gen_advance_label(g)
+
+    b.terminator = Box_new(term_br_cond(ir_val_inst(neg_id), panic_label, mid_label))
+    b.has_terminator = true
+    g.completed_blocks.push(b)
+
+    -- Mid block: bad_ge = idx >= len
+    let mut mid_block = ir_block_new(mid_label)
+    let ge_id = g.builder.next_id
+    let mut ge_inst = ir_inst_new(ge_id, OP_GE())
+    ge_inst.lhs = ir_val_inst(idx_id)
+    ge_inst.rhs = len_val
+    ge_inst.result_type = "bool"
+    ge_inst.has_result = true
+    mid_block.instructions.push(ge_inst)
+    g.builder.next_id = ge_id + 1
+    mid_block.terminator = Box_new(term_br_cond(ir_val_inst(ge_id), panic_label, ok_label))
+    mid_block.has_terminator = true
+    g.completed_blocks.push(mid_block)
+
+    -- Panic block: build the message, then OP_PANIC + unreachable
+    let mut panic_block = ir_block_new(panic_label)
+
+    let idx_str_id = g.builder.next_id
+    let mut idx_str_inst = ir_inst_new(idx_str_id, OP_CALL())
+    idx_str_inst.callee = "dm_int_to_string"
+    let mut idx_args: List[IRValue] = []
+    idx_args.push(ir_val_inst(idx_id))
+    idx_str_inst.call_args = idx_args
+    idx_str_inst.result_type = "string"
+    idx_str_inst.has_result = true
+    panic_block.instructions.push(idx_str_inst)
+    g.builder.next_id = idx_str_id + 1
+
+    let len_str_id = g.builder.next_id
+    let mut len_str_inst = ir_inst_new(len_str_id, OP_CALL())
+    len_str_inst.callee = "dm_int_to_string"
+    let mut len_args: List[IRValue] = []
+    len_args.push(len_val)
+    len_str_inst.call_args = len_args
+    len_str_inst.result_type = "string"
+    len_str_inst.has_result = true
+    panic_block.instructions.push(len_str_inst)
+    g.builder.next_id = len_str_id + 1
+
+    let c1_id = g.builder.next_id
+    let mut c1 = ir_inst_new(c1_id, OP_STRING_CONCAT())
+    c1.lhs = ir_val_string("PANIC: index out of bounds: index ")
+    c1.rhs = ir_val_inst(idx_str_id)
+    c1.result_type = "string"
+    c1.has_result = true
+    panic_block.instructions.push(c1)
+    g.builder.next_id = c1_id + 1
+
+    let c2_id = g.builder.next_id
+    let mut c2 = ir_inst_new(c2_id, OP_STRING_CONCAT())
+    c2.lhs = ir_val_inst(c1_id)
+    c2.rhs = ir_val_string(", length ")
+    c2.result_type = "string"
+    c2.has_result = true
+    panic_block.instructions.push(c2)
+    g.builder.next_id = c2_id + 1
+
+    let c3_id = g.builder.next_id
+    let mut c3 = ir_inst_new(c3_id, OP_STRING_CONCAT())
+    c3.lhs = ir_val_inst(c2_id)
+    c3.rhs = ir_val_inst(len_str_id)
+    c3.result_type = "string"
+    c3.has_result = true
+    panic_block.instructions.push(c3)
+    g.builder.next_id = c3_id + 1
+
+    let c4_id = g.builder.next_id
+    let mut c4 = ir_inst_new(c4_id, OP_STRING_CONCAT())
+    c4.lhs = ir_val_inst(c3_id)
+    c4.rhs = ir_val_string(" " + ctx)
+    c4.result_type = "string"
+    c4.has_result = true
+    panic_block.instructions.push(c4)
+    g.builder.next_id = c4_id + 1
+
+    -- OP_CALL (not OP_PANIC): OP_PANIC lowering emits its own unreachable,
+    -- which would duplicate this block's terminator.
+    let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+    panic_inst.callee = "dm_panic"
+    let mut oob_panic_args: List[IRValue] = []
+    oob_panic_args.push(ir_val_inst(c4_id))
+    panic_inst.call_args = oob_panic_args
+    panic_inst.result_type = "void"
+    panic_inst.has_result = false
+    panic_block.instructions.push(panic_inst)
+    g.builder.next_id = g.builder.next_id + 1
+    panic_block.terminator = Box_new(term_unreachable())
+    panic_block.has_terminator = true
+    g.completed_blocks.push(panic_block)
+
+    let ok_block = ir_block_new(ok_label)
+    return expr_result(g, ok_block, idx_id)
+}
+
 -- ============================================================
 -- Field Access: expr.object.expr.field
 -- ============================================================
@@ -4092,6 +4214,26 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     elem_type = g.list_elem_types.get(var_name)
                 }
             }
+
+            -- Bounds check: panic unless 0 <= idx < len
+            let bounds_len_fn = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_len" }
+            else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_len" }
+            else if elem_kind == LIST_ELEM_STRING() { "dm_list_string_len" }
+            else { "dm_list_generic_len" }
+            let bounds_len_id = g.builder.next_id
+            let mut bounds_len_inst = ir_inst_new(bounds_len_id, OP_CALL())
+            bounds_len_inst.callee = bounds_len_fn
+            let mut bounds_len_args: List[IRValue] = []
+            bounds_len_args.push(ir_val_inst(obj_id))
+            bounds_len_inst.call_args = bounds_len_args
+            bounds_len_inst.result_type = "i64"
+            bounds_len_inst.has_result = true
+            b.instructions.push(bounds_len_inst)
+            g.builder.next_id = bounds_len_id + 1
+            let bounds_ctx = if g.array_var_names.contains(var_name) { "(array)" } else { "(list)" }
+            let bounds_chk = check_index_bounds(g, b, idx_id, ir_val_inst(bounds_len_id), bounds_ctx)
+            g = bounds_chk.gen
+            b = bounds_chk.block
 
             if elem_kind == LIST_ELEM_OTHER() {
                 -- Generic list get: alloca temp, call dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)

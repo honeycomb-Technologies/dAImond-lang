@@ -143,6 +143,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         if semi_pos > 0 {
             let inner_type = string_trim(substr(type_str, 1, semi_pos - 1))
             type_str = "List[" + inner_type + "]"
+            g.array_var_names.insert(var_name, true)
         }
     }
 
@@ -1724,6 +1725,90 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 insert_inst.has_result = false
                 b.instructions.push(insert_inst)
                 g.builder.next_id = g.builder.next_id + 1
+            }
+
+            -- List/array index assignment: bounds check, then typed set
+            if g.list_elem_kinds.contains(obj_name) {
+                let ek = g.list_elem_kinds.get(obj_name)
+                let list_ptr = g.variable_map.get(obj_name)
+
+                -- Generate the index expression
+                let idx_result = generate_expr(g, b, *target.index)
+                g = idx_result.gen
+                b = idx_result.block
+
+                -- Length for the bounds check
+                let set_len_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_len" }
+                else if ek == LIST_ELEM_FLOAT() { "dm_list_double_len" }
+                else if ek == LIST_ELEM_STRING() { "dm_list_string_len" }
+                else { "dm_list_generic_len" }
+                let set_len_id = g.builder.next_id
+                let mut set_len_inst = ir_inst_new(set_len_id, OP_CALL())
+                set_len_inst.callee = set_len_fn
+                let mut set_len_args: List[IRValue] = []
+                set_len_args.push(ir_val_inst(list_ptr))
+                set_len_inst.call_args = set_len_args
+                set_len_inst.result_type = "i64"
+                set_len_inst.has_result = true
+                b.instructions.push(set_len_inst)
+                g.builder.next_id = set_len_id + 1
+
+                let set_ctx = if g.array_var_names.contains(obj_name) { "(array)" } else { "(list)" }
+                let set_chk = check_index_bounds(g, b, idx_result.val_id, ir_val_inst(set_len_id), set_ctx)
+                g = set_chk.gen
+                b = set_chk.block
+
+                if ek == LIST_ELEM_OTHER() {
+                    -- Generic set: alloca temp, store value, pass pointer + elem_size
+                    let set_elem_type = if g.list_elem_types.contains(obj_name) {
+                        g.list_elem_types.get(obj_name)
+                    } else {
+                        "i64"
+                    }
+                    let set_elem_size = estimate_type_size_gen(g, set_elem_type)
+                    let set_temp_id = g.builder.next_id
+                    let mut set_temp_inst = ir_inst_new(set_temp_id, OP_ALLOCA())
+                    set_temp_inst.alloc_type = set_elem_type
+                    set_temp_inst.result_type = "ptr(" + set_elem_type + ")"
+                    set_temp_inst.has_result = true
+                    b.instructions.push(set_temp_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+
+                    let mut set_store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+                    set_store_inst.store_ptr = ir_val_inst(set_temp_id)
+                    set_store_inst.store_val = ir_val_inst(val_result.val_id)
+                    set_store_inst.has_result = false
+                    b.instructions.push(set_store_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+
+                    let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+                    set_inst.callee = "dm_list_generic_set"
+                    let mut set_args: List[IRValue] = []
+                    set_args.push(ir_val_inst(list_ptr))
+                    set_args.push(ir_val_inst(set_temp_id))
+                    set_args.push(ir_val_inst(idx_result.val_id))
+                    set_args.push(ir_val_int(set_elem_size))
+                    set_inst.call_args = set_args
+                    set_inst.result_type = "void"
+                    set_inst.has_result = false
+                    b.instructions.push(set_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+                } else {
+                    let set_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_set" }
+                    else if ek == LIST_ELEM_FLOAT() { "dm_list_double_set" }
+                    else { "dm_list_string_set" }
+                    let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+                    set_inst.callee = set_fn
+                    let mut set_args: List[IRValue] = []
+                    set_args.push(ir_val_inst(list_ptr))
+                    set_args.push(ir_val_inst(idx_result.val_id))
+                    set_args.push(ir_val_inst(val_result.val_id))
+                    set_inst.call_args = set_args
+                    set_inst.result_type = "void"
+                    set_inst.has_result = false
+                    b.instructions.push(set_inst)
+                    g.builder.next_id = g.builder.next_id + 1
+                }
             }
         }
     }
