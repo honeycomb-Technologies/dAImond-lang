@@ -393,6 +393,11 @@ pub const CodeGenerator = struct {
     // overflows; turned into a clean compile error by callers.
     comptime_overflow: bool,
 
+    // Set by the comptime evaluator when evaluation stops at a fuel
+    // limit (call depth / loop iterations); callers that fall back to
+    // runtime evaluation turn it into a compile-time note.
+    comptime_fuel_exceeded: bool,
+
     const Self = @This();
 
     const CapturedVar = struct {
@@ -506,6 +511,7 @@ pub const CodeGenerator = struct {
             .last_debug_line = 0,
             .current_source = null,
             .comptime_overflow = false,
+            .comptime_fuel_exceeded = false,
         };
     }
 
@@ -6653,6 +6659,7 @@ pub const CodeGenerator = struct {
                     // Constant overflow is a compile error, not a
                     // runtime fallback (and never a compiler crash).
                     try self.failIfComptimeOverflow();
+                    self.noteComptimeFuelFallback(comp.span);
                     // Fall back to runtime evaluation
                     try self.generateExpr(comp.expr);
                 }
@@ -8038,6 +8045,15 @@ pub const CodeGenerator = struct {
 
     /// Turn a recorded comptime integer overflow into a clean compile
     /// error (never a compiler crash/signal).
+    /// Note (once per fallen-back comptime expression) that fuel ran
+    /// out and runtime code was emitted instead of a constant.
+    fn noteComptimeFuelFallback(self: *Self, span: Span) void {
+        if (self.comptime_fuel_exceeded) {
+            std.debug.print("note: comptime evaluation exceeded fuel limits at line {d}; falling back to runtime evaluation\n", .{span.start.line});
+            self.comptime_fuel_exceeded = false;
+        }
+    }
+
     fn failIfComptimeOverflow(self: *Self) CodeGenError!void {
         if (self.comptime_overflow) {
             std.debug.print("error: integer overflow in compile-time constant evaluation\n", .{});
@@ -8048,6 +8064,7 @@ pub const CodeGenerator = struct {
     /// Try to evaluate an expression at compile time (entry point, creates root env).
     /// Returns null if the expression cannot be evaluated statically.
     fn evalComptime(self: *Self, expr: *const Expr) ?ComptimeValue {
+        self.comptime_fuel_exceeded = false;
         var root_env = ComptimeEnv.init(self.allocator, null);
         defer root_env.deinit();
 
@@ -8362,7 +8379,7 @@ pub const CodeGenerator = struct {
         var iterations: u32 = 0;
         while (true) {
             iterations += 1;
-            if (iterations > env.max_iterations) return null;
+            if (iterations > env.max_iterations) { self.comptime_fuel_exceeded = true; return null; }
 
             const cond = self.evalComptimeExpr(wl.condition, env) orelse return null;
             if (cond != .bool_val) return null;
@@ -8401,7 +8418,7 @@ pub const CodeGenerator = struct {
 
         for (iterable.array_val) |elem| {
             iterations += 1;
-            if (iterations > env.max_iterations) return null;
+            if (iterations > env.max_iterations) { self.comptime_fuel_exceeded = true; return null; }
 
             // Bind loop variable
             env.put(loop_var_name, elem) catch return null;
@@ -8463,7 +8480,7 @@ pub const CodeGenerator = struct {
             .block => |blk| blk,
             .expression => |expr| {
                 // Expression-body function: just evaluate the expression
-                if (env.call_depth >= env.max_call_depth) return null;
+                if (env.call_depth >= env.max_call_depth) { self.comptime_fuel_exceeded = true; return null; }
 
                 var call_env = ComptimeEnv.init(self.allocator, env);
                 defer call_env.deinit();
@@ -8482,7 +8499,7 @@ pub const CodeGenerator = struct {
         };
 
         // Check recursion limit
-        if (env.call_depth >= env.max_call_depth) return null;
+        if (env.call_depth >= env.max_call_depth) { self.comptime_fuel_exceeded = true; return null; }
 
         // Create call environment
         var call_env = ComptimeEnv.init(self.allocator, env);
