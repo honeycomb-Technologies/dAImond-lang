@@ -472,6 +472,9 @@ pub const TypeChecker = struct {
     region_scopes: std.ArrayList(*Scope),
     /// Variables holding region-born values (name-based, per function)
     region_born_vars: std.StringHashMap(void),
+    /// Associated (no-self) impl functions by "TypeName.method" -> fn type.
+    /// Populated in pass 1.5 so `Type.new(args)` resolves like a call.
+    associated_functions: std.StringHashMap(TypeId),
 
     const Self = @This();
 
@@ -499,6 +502,7 @@ pub const TypeChecker = struct {
             .region_depth = 0,
             .region_scopes = std.ArrayList(*Scope).init(allocator),
             .region_born_vars = std.StringHashMap(void).init(allocator),
+            .associated_functions = std.StringHashMap(TypeId).init(allocator),
         };
 
         // Register built-in types and functions
@@ -522,6 +526,13 @@ pub const TypeChecker = struct {
         self.tainted_vars.deinit();
         self.region_scopes.deinit();
         self.region_born_vars.deinit();
+        {
+            var key_it = self.associated_functions.keyIterator();
+            while (key_it.next()) |key| {
+                self.allocator.free(key.*);
+            }
+        }
+        self.associated_functions.deinit();
         self.type_ctx.deinit();
         self.allocator.destroy(self.type_ctx);
     }
@@ -1229,7 +1240,80 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Resolve `TypeName.method(args)` where the object names a type:
+    /// the builtin container constructors (`Box.new`, `Box.null`,
+    /// `Map.new`, `List.new`, mirroring `Box_new` etc.) and user
+    /// associated functions from `impl` blocks. Returns null when the
+    /// name is not an associated call (e.g. an enum variant
+    /// constructor), leaving the generic method-call behavior in place.
+    fn inferAssociatedCall(self: *Self, type_name: []const u8, mc: *const ast.MethodCall) anyerror!?TypeId {
+        const method = mc.method.name;
+
+        if (std.mem.eql(u8, type_name, "Box")) {
+            if (std.mem.eql(u8, method, "new")) {
+                if (mc.args.len > 0) {
+                    const inner_type = try self.inferExpr(mc.args[0]);
+                    for (mc.args[1..]) |arg| {
+                        _ = try self.inferExpr(arg);
+                    }
+                    return try self.type_ctx.makeBox(inner_type);
+                }
+                return try self.freshTypeVar();
+            }
+            if (std.mem.eql(u8, method, "null")) {
+                for (mc.args) |arg| {
+                    _ = try self.inferExpr(arg);
+                }
+                return try self.freshTypeVar();
+            }
+            return null;
+        }
+
+        if ((std.mem.eql(u8, type_name, "Map") or std.mem.eql(u8, type_name, "List")) and
+            std.mem.eql(u8, method, "new"))
+        {
+            for (mc.args) |arg| {
+                _ = try self.inferExpr(arg);
+            }
+            return try self.freshTypeVar();
+        }
+
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ type_name, method });
+        defer self.allocator.free(key);
+        const fn_type_id = self.associated_functions.get(key) orelse return null;
+        const typ = self.type_ctx.get(self.resolveType(fn_type_id)) orelse return null;
+        if (typ != .function) return null;
+        const fn_type = typ.function;
+
+        if (mc.args.len != fn_type.param_types.len) {
+            try self.reportError(.type_parameter_count_mismatch, "wrong number of arguments", mc.span);
+        }
+        const min_args = @min(mc.args.len, fn_type.param_types.len);
+        for (mc.args[0..min_args], fn_type.param_types[0..min_args]) |arg, param_type| {
+            const arg_type = try self.inferExpr(arg);
+            try self.addConstraint(Constraint.subtype(arg_type, param_type, mc.span));
+        }
+        for (mc.args[min_args..]) |arg| {
+            _ = try self.inferExpr(arg);
+        }
+        self.current_effects = self.current_effects.unionWith(fn_type.effects);
+        return fn_type.return_type;
+    }
+
     fn inferMethodCall(self: *Self, mc: *const ast.MethodCall) anyerror!TypeId {
+        // Associated (static) call: the object identifier names a type,
+        // not a value (`Point.new(1, 2)`, `Box.new(x)`).
+        if (mc.object.kind == .identifier) {
+            const obj_name = mc.object.kind.identifier.name;
+            if (self.env.lookup(obj_name)) |symbol| {
+                if (symbol.kind == .type_def) {
+                    if (try self.inferAssociatedCall(obj_name, mc)) |assoc_type| {
+                        return assoc_type;
+                    }
+                }
+            }
+        }
+
         const object_type = try self.inferExpr(mc.object);
         _ = object_type;
 
@@ -3477,6 +3561,76 @@ pub const TypeChecker = struct {
         try self.env.pushScope(.trait_def);
     }
 
+    /// True when an impl method takes a receiver (first param named `self`).
+    fn methodHasSelfParam(func: *const ast.FunctionDecl) bool {
+        if (func.params.len > 0) {
+            return std.mem.eql(u8, func.params[0].name.name, "self");
+        }
+        return false;
+    }
+
+    /// Record the signatures of an impl block's associated (no-self)
+    /// functions under "TypeName.method" so `Type.new(args)` style calls
+    /// type-check with the impl function's own signature. Instance
+    /// methods stay receiver-only. Generic impl targets and generic
+    /// associated functions are skipped (call sites keep the fresh-var
+    /// behavior); generic structs are not supported yet.
+    fn registerAssociatedSignatures(self: *Self, ib: *const ast.ImplBlock) !void {
+        if (ib.generic_params != null and ib.generic_params.?.len > 0) return;
+        if (ib.target_type.kind != .named) return;
+        const named = ib.target_type.kind.named;
+        if (named.generic_args != null and named.generic_args.?.len > 0) return;
+        if (named.path.segments.len == 0) return;
+        const type_name = named.path.segments[named.path.segments.len - 1].name;
+
+        try self.env.pushScope(.impl_block);
+        defer self.env.popScope();
+
+        const target_type = try self.resolveTypeExpr(ib.target_type);
+        try self.env.define(Symbol.init("Self", .type_param, target_type));
+
+        for (ib.items) |item| {
+            switch (item.kind) {
+                .function => |func| {
+                    if (methodHasSelfParam(func)) continue;
+                    if (func.generic_params != null and func.generic_params.?.len > 0) continue;
+
+                    var param_types = std.ArrayList(TypeId).init(self.allocator);
+                    defer param_types.deinit();
+                    for (func.params) |param| {
+                        try param_types.append(try self.resolveTypeExpr(param.type_expr));
+                    }
+                    const inner_return_type = if (func.return_type) |rt|
+                        try self.resolveTypeExpr(rt)
+                    else
+                        try self.type_ctx.intern(.unit);
+                    const return_type = if (func.is_async)
+                        try self.type_ctx.makeFuture(inner_return_type)
+                    else
+                        inner_return_type;
+                    var effects = EffectSet.pure;
+                    if (func.effects) |effs| {
+                        for (effs) |eff| {
+                            try self.addEffectFromTypeExpr(eff, &effects);
+                        }
+                    }
+                    if (func.is_async) {
+                        effects.addBuiltin(.async_effect);
+                    }
+                    const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
+                    const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ type_name, func.name.name });
+                    if (self.associated_functions.getKey(key)) |old_key| {
+                        self.allocator.free(key);
+                        try self.associated_functions.put(old_key, fn_type);
+                    } else {
+                        try self.associated_functions.put(key, fn_type);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     fn checkImpl(self: *Self, ib: *const ast.ImplBlock) !void {
         try self.env.pushScope(.impl_block);
         defer self.env.popScope();
@@ -3855,6 +4009,7 @@ pub const TypeChecker = struct {
         for (source_file.declarations) |decl| {
             switch (decl.kind) {
                 .function => |func| try self.registerFunctionSignature(func, decl.visibility == .public),
+                .impl_block => |ib| try self.registerAssociatedSignatures(ib),
                 else => {},
             }
         }

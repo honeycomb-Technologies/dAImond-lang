@@ -4790,6 +4790,203 @@ pub const comprehensive_test = [_]TestCase{
     },
 };
 
+// Stage 0 only: associated constructors `Type.new(args)`. Not listed
+// in the Stage 3/Stage 4 runners, which reuse the suites above.
+pub const constructor_tests = [_]TestCase{
+    .{
+        .name = "box_dot_new_struct",
+        .source =
+            \\module test
+            \\
+            \\struct Wrapper {
+            \\    value: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let b: Box[Wrapper] = Box.new(Wrapper { value: 42 })
+            \\    println(b.value)
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "box_dot_null",
+        .source =
+            \\module test
+            \\
+            \\struct Wrapper {
+            \\    value: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let b: Box[Wrapper] = Box.null()
+            \\    if b == Box.null() {
+            \\        println("null")
+            \\    }
+            \\    let c: Box[Wrapper] = Box.new(Wrapper { value: 1 })
+            \\    if c != Box.null() {
+            \\        println("not null")
+            \\    }
+            \\}
+        ,
+        .expected_output = "null\nnot null\n",
+    },
+    .{
+        .name = "box_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\struct Wrapper {
+            \\    value: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let a: Box[Wrapper] = Box_new(Wrapper { value: 10 })
+            \\    let b: Box[Wrapper] = Box.new(Wrapper { value: 32 })
+            \\    let n1: Box[Wrapper] = Box_null()
+            \\    let n2: Box[Wrapper] = Box.null()
+            \\    println(a.value + b.value)
+            \\    if n1 == Box.null() and n2 == Box_null() {
+            \\        println("both null")
+            \\    }
+            \\}
+        ,
+        .expected_output = "42\nboth null\n",
+    },
+    .{
+        .name = "box_dot_new_unannotated",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let b = Box.new(42)
+            \\    println(*b)
+            \\    let c = Box_new(1)
+            \\    println(*c)
+            \\}
+        ,
+        .expected_output = "42\n1\n",
+    },
+    .{
+        .name = "user_struct_new",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\impl Point {
+            \\    fn new(x: int, y: int) -> Point {
+            \\        return Point { x: x, y: y }
+            \\    }
+            \\
+            \\    fn sum(self: &Self) -> int {
+            \\        return self.x + self.y
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point.new(10, 20)
+            \\    println(p.sum())
+            \\    let q: Point = Point.new(1, 2)
+            \\    println(q.x + q.y)
+            \\}
+        ,
+        .expected_output = "30\n3\n",
+    },
+    .{
+        .name = "user_assoc_fn_origin",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\impl Point {
+            \\    fn origin() -> Point {
+            \\        return Point { x: 0, y: 0 }
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point.origin()
+            \\    println(p.x + p.y)
+            \\}
+        ,
+        .expected_output = "0\n",
+    },
+    .{
+        .name = "user_enum_new",
+        .source =
+            \\module test
+            \\
+            \\enum Shape {
+            \\    Circle(int),
+            \\    Square(int),
+            \\}
+            \\
+            \\impl Shape {
+            \\    fn new(r: int) -> Shape {
+            \\        return Shape.Circle(r)
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let s = Shape.new(5)
+            \\    match s {
+            \\        Shape::Circle(r) => println(r),
+            \\        _ => println("other"),
+            \\    }
+            \\}
+        ,
+        .expected_output = "5\n",
+    },
+    .{
+        .name = "map_list_dot_new",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map.new()
+            \\    m.insert("a", 1)
+            \\    println(m.get("a"))
+            \\    let mut l: List[int] = List.new()
+            \\    l.push(7)
+            \\    println(l[0])
+            \\}
+        ,
+        .expected_output = "1\n7\n",
+    },
+    .{
+        .name = "user_new_wrong_arity",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\impl Point {
+            \\    fn new(x: int, y: int) -> Point {
+            \\        return Point { x: x, y: y }
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point.new(1)
+            \\    println(p.x)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -4870,6 +5067,7 @@ pub fn main() !void {
         .{ .name = "Closures Extended", .tests = &closure_extended_tests },
         .{ .name = "Op Overload Extended", .tests = &op_overload_extended_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
+        .{ .name = "Constructors", .tests = &constructor_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

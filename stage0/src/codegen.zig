@@ -278,6 +278,9 @@ pub const CodeGenerator = struct {
     generated_box_types: std.StringHashMap([]const u8),
     // Deferred buffer for box helper definitions
     box_type_writer: CWriter,
+    /// Bytes of box_type_writer already copied into the main writer;
+    /// helpers discovered during body generation are spliced in later.
+    box_helpers_flushed: usize,
 
     // Track generated map types: maps map type name -> MapTypeInfo
     generated_map_types: std.StringHashMap(MapTypeInfo),
@@ -457,6 +460,7 @@ pub const CodeGenerator = struct {
             .list_type_writer = CWriter.init(allocator),
             .generated_box_types = std.StringHashMap([]const u8).init(allocator),
             .box_type_writer = CWriter.init(allocator),
+            .box_helpers_flushed = 0,
             .generated_map_types = std.StringHashMap(MapTypeInfo).init(allocator),
             .map_value_types = std.StringHashMap(void).init(allocator),
             .map_type_struct_writer = CWriter.init(allocator),
@@ -785,6 +789,7 @@ pub const CodeGenerator = struct {
             try self.writer.blankLine();
             try self.writer.writeLineComment("Monomorphized Box Helpers");
             try self.writer.write(self.box_type_writer.getOutput());
+            self.box_helpers_flushed = self.box_type_writer.getOutput().len;
         }
 
         // Insert monomorphized list type FUNCTION definitions AFTER user structs.
@@ -987,17 +992,29 @@ pub const CodeGenerator = struct {
         // Generate monomorphized function implementations
         try self.emitMonomorphizedImplementations();
 
-        // Insert hoisted lambda definitions before function implementations
-        if (self.lambda_writer.getOutput().len > 0) {
+        // Insert hoisted lambda definitions before function implementations.
+        // Box helpers first needed by a body (e.g. `let b = Box_new(42)`
+        // with no Box[T] annotation anywhere) are spliced in here too:
+        // they were emitted after the post-struct flush above.
+        const late_box_helpers = self.box_type_writer.getOutput()[self.box_helpers_flushed..];
+        if (self.lambda_writer.getOutput().len > 0 or late_box_helpers.len > 0) {
             // Extract the function code that was generated after pre_functions_len
             const function_code = try self.allocator.dupe(u8, self.writer.getOutput()[pre_functions_len..]);
             defer self.allocator.free(function_code);
             // Truncate writer back to pre-function position
             self.writer.truncate(pre_functions_len);
-            // Write lambda definitions
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Hoisted Lambda Functions");
-            try self.writer.write(self.lambda_writer.getOutput());
+            if (self.lambda_writer.getOutput().len > 0) {
+                // Write lambda definitions
+                try self.writer.blankLine();
+                try self.writer.writeLineComment("Hoisted Lambda Functions");
+                try self.writer.write(self.lambda_writer.getOutput());
+            }
+            if (late_box_helpers.len > 0) {
+                try self.writer.blankLine();
+                try self.writer.writeLineComment("Monomorphized Box Helpers (late)");
+                try self.writer.write(late_box_helpers);
+                self.box_helpers_flushed = self.box_type_writer.getOutput().len;
+            }
             // Re-append the function code
             try self.writer.write(function_code);
         }
@@ -2902,7 +2919,11 @@ pub const CodeGenerator = struct {
             const is_fresh_ctor = expr.kind == .array_literal or
                 (expr.kind == .function_call and expr.kind.function_call.function.kind == .identifier and
                     (std.mem.eql(u8, expr.kind.function_call.function.kind.identifier.name, "List_new") or
-                        std.mem.eql(u8, expr.kind.function_call.function.kind.identifier.name, "Map_new")));
+                        std.mem.eql(u8, expr.kind.function_call.function.kind.identifier.name, "Map_new"))) or
+                (expr.kind == .method_call and expr.kind.method_call.object.kind == .identifier and
+                    std.mem.eql(u8, expr.kind.method_call.method.name, "new") and
+                    (std.mem.eql(u8, expr.kind.method_call.object.kind.identifier.name, "List") or
+                        std.mem.eql(u8, expr.kind.method_call.object.kind.identifier.name, "Map")));
             if (isCowContainerCType(h) and std.mem.eql(u8, own, "void*") and !is_fresh_ctor) {
                 chosen = h;
             }
@@ -3869,6 +3890,20 @@ pub const CodeGenerator = struct {
     }
 
     /// Mangle a type name
+    /// Find a no-self (associated) impl function `TypeName.method`, the
+    /// target of a `TypeName.method(args)` call with no receiver.
+    fn findAssociatedMethod(self: *Self, type_name: []const u8, method_name: []const u8) ?*FunctionDecl {
+        for (self.impl_methods.items) |info| {
+            if (std.mem.eql(u8, info.target_type, type_name) and
+                std.mem.eql(u8, info.method.name.name, method_name) and
+                !methodHasSelf(info.method))
+            {
+                return info.method;
+            }
+        }
+        return null;
+    }
+
     /// Check if a type has a specific impl method
     fn hasImplMethod(self: *Self, type_name: []const u8, method_name: []const u8) bool {
         for (self.impl_methods.items) |info| {
@@ -4186,7 +4221,34 @@ pub const CodeGenerator = struct {
                     }
                     const enum_mangled = self.mangleTypeName(name) catch break :blk "int64_t";
                     if (self.generated_enums.contains(enum_mangled)) {
+                        // An associated impl function on the enum (e.g.
+                        // `Shape.new`) keeps its declared return type;
+                        // variant constructors return the enum itself.
+                        if (self.findAssociatedMethod(name, mc.method.name) != null) {
+                            const assoc_key = std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ name, mc.method.name }) catch break :blk enum_mangled;
+                            if (self.lookupFunctionReturnType(assoc_key)) |ret_type| break :blk ret_type;
+                        }
                         break :blk enum_mangled;
+                    }
+                    // Associated calls on builtin container types:
+                    // Box.new(v) -> typeof(v)*, Box.null/Map.new/List.new
+                    // mirror the Box_null/Map_new/List_new builtins.
+                    if (std.mem.eql(u8, name, "Box")) {
+                        if (std.mem.eql(u8, mc.method.name, "new") and mc.args.len > 0) {
+                            const inner = self.inferCTypeFromExpr(mc.args[0]);
+                            break :blk std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{inner}) catch "void*";
+                        }
+                        if (std.mem.eql(u8, mc.method.name, "null")) break :blk "void*";
+                    }
+                    if ((std.mem.eql(u8, name, "Map") or std.mem.eql(u8, name, "List")) and
+                        std.mem.eql(u8, mc.method.name, "new"))
+                    {
+                        break :blk "void*";
+                    }
+                    // Associated (no-self) impl function: Type.method(...)
+                    if (self.findAssociatedMethod(name, mc.method.name) != null) {
+                        const assoc_key = std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ name, mc.method.name }) catch break :blk "int64_t";
+                        if (self.lookupFunctionReturnType(assoc_key)) |ret_type| break :blk ret_type;
                     }
                 }
                 // Try to infer method return type from the method name
@@ -7109,6 +7171,56 @@ pub const CodeGenerator = struct {
             }
         }
 
+        // Associated (static) call: TypeName.method(args) where the object
+        // identifier names a type, not a value. Emits the same code as the
+        // `Type_method` builtin spellings (Box/Map/List) or a direct
+        // dm_Type_method(args) call with no receiver for user impl
+        // functions declared without `self` (e.g. a `new` constructor).
+        if (method.object.kind == .identifier) {
+            const type_name = method.object.kind.identifier.name;
+            if (self.lookupVariableType(type_name) == null) {
+                if (std.mem.eql(u8, type_name, "Box")) {
+                    if (std.mem.eql(u8, method.method.name, "new")) {
+                        if (method.args.len > 0) {
+                            try self.generateBoxAlloc(method.args[0]);
+                        }
+                        return;
+                    }
+                    if (std.mem.eql(u8, method.method.name, "null")) {
+                        try self.writer.write("NULL");
+                        return;
+                    }
+                } else if (std.mem.eql(u8, type_name, "Map") and
+                    std.mem.eql(u8, method.method.name, "new"))
+                {
+                    try self.generateZeroMap();
+                    return;
+                } else if (std.mem.eql(u8, type_name, "List") and
+                    std.mem.eql(u8, method.method.name, "new"))
+                {
+                    try self.generateZeroList();
+                    return;
+                } else if (self.findAssociatedMethod(type_name, method.method.name) != null) {
+                    const mangled = try self.mangleFunctionName(method.method.name, type_name);
+                    const mut_flags = self.function_mut_info.get(mangled);
+                    try self.writer.print("{s}(", .{mangled});
+                    for (method.args, 0..) |arg, i| {
+                        if (i > 0) try self.writer.write(", ");
+                        const is_mut_param = if (mut_flags) |flags| (i < flags.len and flags[i]) else false;
+                        if (is_mut_param) {
+                            try self.writer.write("&(");
+                            try self.generateExpr(arg);
+                            try self.writer.write(")");
+                        } else {
+                            try self.generateRetainedExpr(arg, null);
+                        }
+                    }
+                    try self.writer.write(")");
+                    return;
+                }
+            }
+        }
+
         // Convert obj.method(args) to dm_Type_method(&obj, args)
         // Infer the type name from the object expression
         var obj_type = self.inferCTypeFromExpr(method.object);
@@ -7222,6 +7334,39 @@ pub const CodeGenerator = struct {
         }
 
         try self.writer.write(")");
+    }
+
+    /// Emit a heap allocation of `value_expr` (Box_new / Box.new).
+    fn generateBoxAlloc(self: *Self, value_expr: *Expr) anyerror!void {
+        const arg_type = self.inferCTypeFromExpr(value_expr);
+        const safe_name = try self.sanitizeTypeName(arg_type);
+        const box_helper = try std.fmt.allocPrint(self.stringAllocator(), "dm_box_{s}", .{safe_name});
+        // Ensure the box helper has been generated
+        if (!self.generated_box_types.contains(box_helper)) {
+            try self.generated_box_types.put(box_helper, arg_type);
+            try self.emitBoxTypeDefinition(box_helper, arg_type);
+        }
+        try self.writer.print("{s}(", .{box_helper});
+        try self.generateExpr(value_expr);
+        try self.writer.write(")");
+    }
+
+    /// Emit a zero-initialized list struct (List_new / List.new).
+    fn generateZeroList(self: *Self) anyerror!void {
+        if (self.expected_type) |et| {
+            try self.writer.print("({s}){{ .data = NULL, .len = 0, .capacity = 0 }}", .{et});
+        } else {
+            try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
+        }
+    }
+
+    /// Emit a zero-initialized map struct (Map_new / Map.new).
+    fn generateZeroMap(self: *Self) anyerror!void {
+        if (self.expected_type) |et| {
+            try self.writer.print("({s}){{ .entries = NULL, .len = 0, .capacity = 0 }}", .{et});
+        } else {
+            try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
+        }
     }
 
     /// Generate built-in function calls
@@ -7517,26 +7662,12 @@ pub const CodeGenerator = struct {
             return true;
         } else if (std.mem.eql(u8, name, "List_new")) {
             // List_new() -> zero-initialized list struct
-            if (self.expected_type) |et| {
-                try self.writer.print("({s}){{ .data = NULL, .len = 0, .capacity = 0 }}", .{et});
-            } else {
-                try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
-            }
+            try self.generateZeroList();
             return true;
         } else if (std.mem.eql(u8, name, "Box_new")) {
             // Box_new(value) -> heap-allocate value via monomorphized helper
             if (call.args.len > 0) {
-                const arg_type = self.inferCTypeFromExpr(call.args[0].value);
-                const safe_name = try self.sanitizeTypeName(arg_type);
-                const box_helper = try std.fmt.allocPrint(self.stringAllocator(), "dm_box_{s}", .{safe_name});
-                // Ensure the box helper has been generated
-                if (!self.generated_box_types.contains(box_helper)) {
-                    try self.generated_box_types.put(box_helper, arg_type);
-                    try self.emitBoxTypeDefinition(box_helper, arg_type);
-                }
-                try self.writer.print("{s}(", .{box_helper});
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
+                try self.generateBoxAlloc(call.args[0].value);
             }
             return true;
         } else if (std.mem.eql(u8, name, "Box_null")) {
@@ -7545,11 +7676,7 @@ pub const CodeGenerator = struct {
             return true;
         } else if (std.mem.eql(u8, name, "Map_new")) {
             // Map_new() -> zero-initialized map struct
-            if (self.expected_type) |et| {
-                try self.writer.print("({s}){{ .entries = NULL, .len = 0, .capacity = 0 }}", .{et});
-            } else {
-                try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
-            }
+            try self.generateZeroMap();
             return true;
         } else if (std.mem.eql(u8, name, "string_split")) {
             // Ensure dm_list_dm_string type is generated
