@@ -17840,69 +17840,71 @@ fn is_sret_return_type(ret_type: string) -> bool {
 -- ============================================================
 
 fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    let mut g = gen
-    let b = g.builder
-    let id_key = int_to_string(inst.id)
-    let callee_name = inst.callee
-    -- Look up function in function_map
-    if g.function_map.contains(callee_name) == false {
-        -- Unknown function: skip
-        return g
-    }
-    let callee = g.function_map.get(callee_name)
-    let fn_ty = g.fn_type_map.get(callee_name)
-    -- Check if this function has a wrapper (string ABI)
-    if g.has_wrapper.contains(callee_name) {
-        g = generate_wrapper_call(g, inst, callee, fn_ty, callee_name)
-        return g
-    }
-    -- Check if callee uses sret return convention (result/option types)
-    if g.returns_sret.contains(callee_name) {
-        g = generate_sret_call(g, inst, callee, fn_ty, callee_name)
-        return g
-    }
-    -- Regular (non-wrapper) call
-    -- Resolve arguments, handling string pointer loads
-    let mut args: List[int] = []
-    let mut ai = 0
-    while ai < inst.call_args.len() {
-        let arg = inst.call_args[ai]
-        let mut val = resolve_value(g, arg)
-        g = resolve_value_with_counter(g, arg)
-        -- If arg is a string pointer and target function expects dm_string by value,
-        -- load the struct from the pointer
-        if is_string_ptr(g, arg) {
-            let expects_string = callee_param_is_string(g, callee_name, ai)
-            if expects_string {
-                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
-            }
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id_key = int_to_string(inst.id)
+        let callee_name = inst.callee
+        -- Look up function in function_map
+        if g.function_map.contains(callee_name) == false {
+            -- Unknown function: skip
+            return g
         }
-        args.push(val)
-        ai = ai + 1
-    }
-    -- Determine call result name (empty string for void returns)
-    let mut call_name = ""
-    if inst.has_result {
-        call_name = "call"
-    }
-    -- Build the call
-    dm_llvm_buf_clear()
-    let mut argi = 0
-    while argi < args.len() {
-        dm_llvm_buf_push(args[argi])
-        argi = argi + 1
-    }
-    let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
-    -- Check if callee returns dm_string: store to alloca and track as string ptr
-    if callee_returns_string(g, callee_name) and result != 0 {
-        let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.ret")
-        dm_llvm_build_store(b, result, str_alloca)
-        g.string_ptrs.insert(id_key, true)
-        if inst.has_result { g.value_map.insert(id_key, str_alloca) }
+        let callee = g.function_map.get(callee_name)
+        let fn_ty = g.fn_type_map.get(callee_name)
+        -- Check if this function has a wrapper (string ABI)
+        if g.has_wrapper.contains(callee_name) {
+            g = generate_wrapper_call(g, inst, callee, fn_ty, callee_name)
+            return g
+        }
+        -- Check if callee uses sret return convention (result/option types)
+        if g.returns_sret.contains(callee_name) {
+            g = generate_sret_call(g, inst, callee, fn_ty, callee_name)
+            return g
+        }
+        -- Regular (non-wrapper) call
+        -- Resolve arguments, handling string pointer loads
+        let mut args: List[int] = []
+        let mut ai = 0
+        while ai < inst.call_args.len() {
+            let arg = inst.call_args[ai]
+            let mut val = resolve_value(g, arg)
+            g = resolve_value_with_counter(g, arg)
+            -- If arg is a string pointer and target function expects dm_string by value,
+            -- load the struct from the pointer
+            if is_string_ptr(g, arg) {
+                let expects_string = callee_param_is_string(g, callee_name, ai)
+                if expects_string {
+                    val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
+                }
+            }
+            args.push(val)
+            ai = ai + 1
+        }
+        -- Determine call result name (empty string for void returns)
+        let mut call_name = ""
+        if inst.has_result {
+            call_name = "call"
+        }
+        -- Build the call
+        dm_llvm_buf_clear()
+        let mut argi = 0
+        while argi < args.len() {
+            dm_llvm_buf_push(args[argi])
+            argi = argi + 1
+        }
+        let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
+        -- Check if callee returns dm_string: store to alloca and track as string ptr
+        if callee_returns_string(g, callee_name) and result != 0 {
+            let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.ret")
+            dm_llvm_build_store(b, result, str_alloca)
+            g.string_ptrs.insert(id_key, true)
+            if inst.has_result { g.value_map.insert(id_key, str_alloca) }
+            return g
+        }
+        if inst.has_result { g.value_map.insert(id_key, result) }
         return g
     }
-    if inst.has_result { g.value_map.insert(id_key, result) }
-    return g
 }
 
 -- ============================================================
@@ -17910,24 +17912,55 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 -- ============================================================
 
 fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
-    let mut g = gen
-    let b = g.builder
-    let id_key = int_to_string(inst.id)
-    let returns_string = wrapper_returns_string_for(g, callee_name)
-    if returns_string {
-        -- Allocate stack space for the string result (sret pattern)
-        let sret_name = "sret." + int_to_string(g.sret_counter)
-        g.sret_counter = g.sret_counter + 1
-        let sret = dm_llvm_build_alloca(b, g.dm_string_type, sret_name)
-        -- Build args: sret pointer first, then resolved args
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id_key = int_to_string(inst.id)
+        let returns_string = wrapper_returns_string_for(g, callee_name)
+        if returns_string {
+            -- Allocate stack space for the string result (sret pattern)
+            let sret_name = "sret." + int_to_string(g.sret_counter)
+            g.sret_counter = g.sret_counter + 1
+            let sret = dm_llvm_build_alloca(b, g.dm_string_type, sret_name)
+            -- Build args: sret pointer first, then resolved args
+            let mut args: List[int] = []
+            args.push(sret)
+            let mut ai = 0
+            while ai < inst.call_args.len() {
+                let arg = inst.call_args[ai]
+                let mut val = resolve_value(g, arg)
+                g = resolve_value_with_counter(g, arg)
+                -- If arg is a const_string and param expects dm_string, wrap it
+                if arg.kind == VAL_CONST_STRING() {
+                    let param_is_str = orig_param_is_string(g, callee_name, ai)
+                    if param_is_str {
+                        val = create_dm_string_for_call(g, val)
+                    }
+                }
+                args.push(val)
+                ai = ai + 1
+            }
+            -- Call wrapper (returns void, result written to sret)
+            dm_llvm_buf_clear()
+            let mut argi2 = 0
+            while argi2 < args.len() {
+                dm_llvm_buf_push(args[argi2])
+                argi2 = argi2 + 1
+            }
+            dm_llvm_build_call2_buf(b, fn_ty, callee, "")
+            -- The sret alloca IS the result -- a pointer to dm_string
+            g.string_ptrs.insert(id_key, true)
+            if inst.has_result { g.value_map.insert(id_key, sret) }
+            return g
+        }
+        -- Non-string return, but params may need wrapping
         let mut args: List[int] = []
-        args.push(sret)
         let mut ai = 0
         while ai < inst.call_args.len() {
             let arg = inst.call_args[ai]
             let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
-            -- If arg is a const_string and param expects dm_string, wrap it
+            -- Wrap const_string args if parameter is string type
             if arg.kind == VAL_CONST_STRING() {
                 let param_is_str = orig_param_is_string(g, callee_name, ai)
                 if param_is_str {
@@ -17937,47 +17970,18 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
             args.push(val)
             ai = ai + 1
         }
-        -- Call wrapper (returns void, result written to sret)
+        let mut call_name = ""
+        if inst.has_result { call_name = "call" }
         dm_llvm_buf_clear()
-        let mut argi2 = 0
-        while argi2 < args.len() {
-            dm_llvm_buf_push(args[argi2])
-            argi2 = argi2 + 1
+        let mut argi3 = 0
+        while argi3 < args.len() {
+            dm_llvm_buf_push(args[argi3])
+            argi3 = argi3 + 1
         }
-        dm_llvm_build_call2_buf(b, fn_ty, callee, "")
-        -- The sret alloca IS the result -- a pointer to dm_string
-        g.string_ptrs.insert(id_key, true)
-        if inst.has_result { g.value_map.insert(id_key, sret) }
+        let result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
+        if inst.has_result { g.value_map.insert(id_key, result) }
         return g
     }
-    -- Non-string return, but params may need wrapping
-    let mut args: List[int] = []
-    let mut ai = 0
-    while ai < inst.call_args.len() {
-        let arg = inst.call_args[ai]
-        let mut val = resolve_value(g, arg)
-        g = resolve_value_with_counter(g, arg)
-        -- Wrap const_string args if parameter is string type
-        if arg.kind == VAL_CONST_STRING() {
-            let param_is_str = orig_param_is_string(g, callee_name, ai)
-            if param_is_str {
-                val = create_dm_string_for_call(g, val)
-            }
-        }
-        args.push(val)
-        ai = ai + 1
-    }
-    let mut call_name = ""
-    if inst.has_result { call_name = "call" }
-    dm_llvm_buf_clear()
-    let mut argi3 = 0
-    while argi3 < args.len() {
-        dm_llvm_buf_push(args[argi3])
-        argi3 = argi3 + 1
-    }
-    let result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
-    if inst.has_result { g.value_map.insert(id_key, result) }
-    return g
 }
 
 -- ============================================================
@@ -17985,43 +17989,45 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
 -- ============================================================
 
 fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    let mut g = gen
-    let b = g.builder
-    let id_key = int_to_string(inst.id)
-    -- Resolve the function pointer value
-    let fn_ptr = resolve_value(g, inst.callee_val)
-    g = resolve_value_with_counter(g, inst.callee_val)
-    -- Build the LLVM function type for the indirect call
-    -- Map the return type
-    let ret_ty = map_ir_type_to_llvm(g, inst.result_type)
-    -- Build param types and args simultaneously
-    dm_llvm_buf_clear()
-    let mut args: List[int] = []
-    let mut ai = 0
-    while ai < inst.call_args.len() {
-        let arg = inst.call_args[ai]
-        let val = resolve_value(g, arg)
-        g = resolve_value_with_counter(g, arg)
-        args.push(val)
-        -- Get the LLVM type of the resolved value
-        let val_ty = dm_llvm_type_of(val)
-        dm_llvm_buf_push(val_ty)
-        ai = ai + 1
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id_key = int_to_string(inst.id)
+        -- Resolve the function pointer value
+        let fn_ptr = resolve_value(g, inst.callee_val)
+        g = resolve_value_with_counter(g, inst.callee_val)
+        -- Build the LLVM function type for the indirect call
+        -- Map the return type
+        let ret_ty = map_ir_type_to_llvm(g, inst.result_type)
+        -- Build param types and args simultaneously
+        dm_llvm_buf_clear()
+        let mut args: List[int] = []
+        let mut ai = 0
+        while ai < inst.call_args.len() {
+            let arg = inst.call_args[ai]
+            let val = resolve_value(g, arg)
+            g = resolve_value_with_counter(g, arg)
+            args.push(val)
+            -- Get the LLVM type of the resolved value
+            let val_ty = dm_llvm_type_of(val)
+            dm_llvm_buf_push(val_ty)
+            ai = ai + 1
+        }
+        -- Create function type
+        let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
+        -- Build the indirect call
+        let mut call_name = ""
+        if inst.has_result { call_name = "callptr" }
+        dm_llvm_buf_clear()
+        let mut argi4 = 0
+        while argi4 < args.len() {
+            dm_llvm_buf_push(args[argi4])
+            argi4 = argi4 + 1
+        }
+        let result = dm_llvm_build_call2_buf(b, fn_ty, fn_ptr, call_name)
+        if inst.has_result { g.value_map.insert(id_key, result) }
+        return g
     }
-    -- Create function type
-    let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
-    -- Build the indirect call
-    let mut call_name = ""
-    if inst.has_result { call_name = "callptr" }
-    dm_llvm_buf_clear()
-    let mut argi4 = 0
-    while argi4 < args.len() {
-        dm_llvm_buf_push(args[argi4])
-        argi4 = argi4 + 1
-    }
-    let result = dm_llvm_build_call2_buf(b, fn_ty, fn_ptr, call_name)
-    if inst.has_result { g.value_map.insert(id_key, result) }
-    return g
 }
 
 -- ============================================================
@@ -18085,18 +18091,20 @@ fn orig_param_is_string(gen: LLVMGenerator, fn_name: string, param_idx: int) -> 
 
 -- Create a dm_string on the stack from a raw C string pointer (for call args)
 fn create_dm_string_for_call(gen: LLVMGenerator, raw_str: int) -> int {
-    let b = gen.builder
-    let sret_name = "sret.arg." + int_to_string(gen.sret_counter)
-    let sret = dm_llvm_build_alloca(b, gen.dm_string_type, sret_name)
-    if gen.function_map.contains("dm_string_new") {
-        let func = gen.function_map.get("dm_string_new")
-        let fn_ty = gen.fn_type_map.get("dm_string_new")
-        dm_llvm_buf_clear()
-        dm_llvm_buf_push(sret)
-        dm_llvm_buf_push(raw_str)
-        dm_llvm_build_call2_buf(b, fn_ty, func, "")
+    unsafe {
+        let b = gen.builder
+        let sret_name = "sret.arg." + int_to_string(gen.sret_counter)
+        let sret = dm_llvm_build_alloca(b, gen.dm_string_type, sret_name)
+        if gen.function_map.contains("dm_string_new") {
+            let func = gen.function_map.get("dm_string_new")
+            let fn_ty = gen.fn_type_map.get("dm_string_new")
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(sret)
+            dm_llvm_buf_push(raw_str)
+            dm_llvm_build_call2_buf(b, fn_ty, func, "")
+        }
+        return sret
     }
-    return sret
 }
 
 -- Find an IR function by name for type info lookups
@@ -18165,54 +18173,56 @@ fn is_runtime_string_fn(fn_name: string) -> bool {
 -- Get the LLVM vector type for a SIMD type name
 
 fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
-    let mut g = gen
-    let b = g.builder
-    let id_key = int_to_string(inst.id)
-    -- Allocate stack space for the result struct (sret pattern)
-    let sret_name = "sret." + int_to_string(g.sret_counter)
-    g.sret_counter = g.sret_counter + 1
-    -- Look up the IR function to get its return type for correct alloca sizing
-    let ir_func = find_ir_function(g, callee_name)
-    let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
-    let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
-    -- Build args: sret pointer first, then resolved args
-    let mut args: List[int] = []
-    args.push(sret)
-    let mut ai = 0
-    while ai < inst.call_args.len() {
-        let arg = inst.call_args[ai]
-        let mut val = resolve_value(g, arg)
-        g = resolve_value_with_counter(g, arg)
-        -- If arg is a string pointer and target function expects dm_string by value, load it
-        if is_string_ptr(g, arg) {
-            let expects_string = callee_param_is_string(g, callee_name, ai)
-            if expects_string {
-                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id_key = int_to_string(inst.id)
+        -- Allocate stack space for the result struct (sret pattern)
+        let sret_name = "sret." + int_to_string(g.sret_counter)
+        g.sret_counter = g.sret_counter + 1
+        -- Look up the IR function to get its return type for correct alloca sizing
+        let ir_func = find_ir_function(g, callee_name)
+        let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
+        let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
+        -- Build args: sret pointer first, then resolved args
+        let mut args: List[int] = []
+        args.push(sret)
+        let mut ai = 0
+        while ai < inst.call_args.len() {
+            let arg = inst.call_args[ai]
+            let mut val = resolve_value(g, arg)
+            g = resolve_value_with_counter(g, arg)
+            -- If arg is a string pointer and target function expects dm_string by value, load it
+            if is_string_ptr(g, arg) {
+                let expects_string = callee_param_is_string(g, callee_name, ai)
+                if expects_string {
+                    val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
+                }
+            }
+            args.push(val)
+            ai = ai + 1
+        }
+        -- Call function (returns void, result written to sret pointer)
+        dm_llvm_buf_clear()
+        let mut argi = 0
+        while argi < args.len() {
+            dm_llvm_buf_push(args[argi])
+            argi = argi + 1
+        }
+        dm_llvm_build_call2_buf(b, fn_ty, callee, "")
+        -- Load the result from the sret alloca
+        if inst.has_result {
+            -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
+            if ir_func.return_type == "string" {
+                g.string_ptrs.insert(id_key, true)
+                g.value_map.insert(id_key, sret)
+            } else {
+                let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
+                g.value_map.insert(id_key, loaded)
             }
         }
-        args.push(val)
-        ai = ai + 1
+        return g
     }
-    -- Call function (returns void, result written to sret pointer)
-    dm_llvm_buf_clear()
-    let mut argi = 0
-    while argi < args.len() {
-        dm_llvm_buf_push(args[argi])
-        argi = argi + 1
-    }
-    dm_llvm_build_call2_buf(b, fn_ty, callee, "")
-    -- Load the result from the sret alloca
-    if inst.has_result {
-        -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
-        if ir_func.return_type == "string" {
-            g.string_ptrs.insert(id_key, true)
-            g.value_map.insert(id_key, sret)
-        } else {
-            let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
-            g.value_map.insert(id_key, loaded)
-        }
-    }
-    return g
 }
 
 -- ============================================================
