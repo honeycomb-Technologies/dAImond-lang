@@ -216,29 +216,42 @@ fn find_runtime_dir(input_dir: string) -> string {
     return "../stage0/runtime"
 }
 
--- Find the Stage 3 runtime (llvm_wrappers.c) directory
+-- Find the Stage 5 runtime (llvm_wrappers.c) directory. Stage5's own
+-- wrappers must win over the stage3/stage4 copies: generated code calls
+-- stage5-only runtime helpers (checked arithmetic, cast checks, list
+-- set, mem builtins), so linking an older copy fails or misbehaves.
 fn find_wrappers_dir(input_dir: string) -> string {
     -- Strategy 1: Go up from input file dir
+    let try5 = input_dir + "/../stage5/runtime"
+    if file_exists(try5 + "/llvm_wrappers.c") {
+        return try5
+    }
+
+    -- Strategy 2: Relative (assume running from stage5/ or a sibling dir)
+    if file_exists("../stage5/runtime/llvm_wrappers.c") {
+        return "../stage5/runtime"
+    }
+    if file_exists("runtime/llvm_wrappers.c") {
+        return "runtime"
+    }
+
+    -- Strategy 3: From project root
+    if file_exists("stage5/runtime/llvm_wrappers.c") {
+        return "stage5/runtime"
+    }
+
+    -- Legacy fallbacks (pre-stage5 layouts)
     let try1 = input_dir + "/../stage3/runtime"
     if file_exists(try1 + "/llvm_wrappers.c") {
         return try1
     }
-
-    -- Also check stage4/runtime which may have its own copy
     let try1b = input_dir + "/../stage4/runtime"
     if file_exists(try1b + "/llvm_wrappers.c") {
         return try1b
     }
-
-    -- Strategy 2: Relative (assume running from stage4/)
-    if file_exists("runtime/llvm_wrappers.c") {
-        return "runtime"
-    }
     if file_exists("../stage3/runtime/llvm_wrappers.c") {
         return "../stage3/runtime"
     }
-
-    -- Strategy 3: From project root
     if file_exists("stage4/runtime/llvm_wrappers.c") {
         return "stage4/runtime"
     }
