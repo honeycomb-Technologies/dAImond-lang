@@ -180,27 +180,39 @@ extern fn dm_llvm_add_incoming_one(phi: int, val: int, block: int)
 -- ============================================================
 
 fn llvm_create_module(ctx: int, name: string) -> int {
-    return dm_llvm_module_create(ctx, name)
+    unsafe {
+        return dm_llvm_module_create(ctx, name)
+    }
 }
 
 fn llvm_init_targets() {
-    dm_llvm_initialize_all_targets()
+    unsafe {
+        dm_llvm_initialize_all_targets()
+    }
 }
 
 fn llvm_get_triple() -> int {
-    return dm_llvm_get_default_target_triple()
+    unsafe {
+        return dm_llvm_get_default_target_triple()
+    }
 }
 
 fn llvm_create_tm(triple: string, opt: int) -> int {
-    return dm_llvm_create_target_machine(triple, opt)
+    unsafe {
+        return dm_llvm_create_target_machine(triple, opt)
+    }
 }
 
 fn llvm_emit_object(tm: int, mod: int, filename: string) -> int {
-    return dm_llvm_target_machine_emit_to_file(tm, mod, filename, dm_llvm_object_file())
+    unsafe {
+        return dm_llvm_target_machine_emit_to_file(tm, mod, filename, dm_llvm_object_file())
+    }
 }
 
 fn llvm_emit_asm(tm: int, mod: int, filename: string) -> int {
-    return dm_llvm_target_machine_emit_to_file(tm, mod, filename, dm_llvm_assembly_file())
+    unsafe {
+        return dm_llvm_target_machine_emit_to_file(tm, mod, filename, dm_llvm_assembly_file())
+    }
 }
 
 extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int
