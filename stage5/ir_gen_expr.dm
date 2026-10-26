@@ -4177,6 +4177,21 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         if g.variable_types.contains(str_var_name) {
             let vtype = g.variable_types.get(str_var_name)
             if vtype == "string" {
+                -- Bounds check: panic unless 0 <= idx < strlen
+                let str_len_id = g.builder.next_id
+                let mut str_len_inst = ir_inst_new(str_len_id, OP_CALL())
+                str_len_inst.callee = "dm_string_len"
+                let mut str_len_args: List[IRValue] = []
+                str_len_args.push(ir_val_inst(obj_id))
+                str_len_inst.call_args = str_len_args
+                str_len_inst.result_type = "i64"
+                str_len_inst.has_result = true
+                b.instructions.push(str_len_inst)
+                g.builder.next_id = str_len_id + 1
+                let str_chk = check_index_bounds(g, b, idx_id, ir_val_inst(str_len_id), "(string)")
+                g = str_chk.gen
+                b = str_chk.block
+
                 let id = g.builder.next_id
                 let mut inst = ir_inst_new(id, OP_CALL())
                 inst.callee = "dm_char_at"
