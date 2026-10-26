@@ -448,8 +448,12 @@ void dm_list_int64_new(dm_list_int64* out) {
 void dm_list_int64_push(dm_list_int64* list, int64_t value) {
     if (list->len >= list->capacity) {
         int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
-        int64_t* new_data = (int64_t*)realloc(list->data, (size_t)new_cap * sizeof(int64_t));
+        int64_t* new_data = (int64_t*)malloc((size_t)new_cap * sizeof(int64_t));
         if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
+        if (list->data) memcpy(new_data, list->data, (size_t)list->len * sizeof(int64_t));
+        /* Old buffer intentionally leaked (never-free growth): variable
+           copies share the header by value, so aliases keep reading their
+           snapshot buffer after the original grows. */
         list->data = new_data;
         list->capacity = new_cap;
     }
@@ -509,8 +513,10 @@ void dm_list_string_new(dm_list_dm_string* out) {
 void dm_list_string_push(dm_list_dm_string* list, const dm_string* value) {
     if (list->len >= list->capacity) {
         int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
-        dm_string* new_data = (dm_string*)realloc(list->data, (size_t)new_cap * sizeof(dm_string));
+        dm_string* new_data = (dm_string*)malloc((size_t)new_cap * sizeof(dm_string));
         if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
+        if (list->data) memcpy(new_data, list->data, (size_t)list->len * sizeof(dm_string));
+        /* Old buffer intentionally leaked (never-free growth, see int64 push). */
         list->data = new_data;
         list->capacity = new_cap;
     }
@@ -583,8 +589,10 @@ void dm_list_double_new(dm_list_double* out) {
 void dm_list_double_push(dm_list_double* list, double value) {
     if (list->len >= list->capacity) {
         int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
-        double* new_data = (double*)realloc(list->data, (size_t)new_cap * sizeof(double));
+        double* new_data = (double*)malloc((size_t)new_cap * sizeof(double));
         if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
+        if (list->data) memcpy(new_data, list->data, (size_t)list->len * sizeof(double));
+        /* Old buffer intentionally leaked (never-free growth, see int64 push). */
         list->data = new_data;
         list->capacity = new_cap;
     }
@@ -631,8 +639,10 @@ void dm_list_generic_new(dm_list_generic* out) {
 void dm_list_generic_push(dm_list_generic* list, const void* value, int64_t elem_size) {
     if (list->len >= list->capacity) {
         int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
-        void* new_data = realloc(list->data, (size_t)(new_cap * elem_size));
+        void* new_data = malloc((size_t)(new_cap * elem_size));
         if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
+        if (list->data) memcpy(new_data, list->data, (size_t)(list->len * elem_size));
+        /* Old buffer intentionally leaked (never-free growth, see int64 push). */
         list->data = new_data;
         list->capacity = new_cap;
     }
@@ -879,7 +889,9 @@ static void dm_map_string_int_resize(dm_map_string_int* map) {
             new_map.len++;
         }
     }
-    free(map->entries);
+    /* Old table intentionally leaked (never-free growth): aliases keep
+       reading their snapshot table after the original resizes. */
+
     map->entries = new_entries;
     map->capacity = new_cap;
 }
@@ -993,7 +1005,8 @@ static void dm_map_int_string_resize(dm_map_int_string* map) {
             new_map.len++;
         }
     }
-    free(map->entries);
+    /* Old table intentionally leaked (never-free growth, see string_int resize). */
+
     map->entries = new_entries;
     map->capacity = new_cap;
 }
