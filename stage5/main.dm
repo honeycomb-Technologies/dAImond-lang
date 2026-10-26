@@ -764,6 +764,9 @@ struct Expr {
     lambda_body: Box[Expr],
     -- Cast target type
     cast_type: string,
+    -- Cast target was written as a reference type (&T / &mut T); the
+    -- '&' itself is erased from cast_type by parse_type
+    cast_is_ref: bool,
     -- String interpolation parts (alternating literal and expr)
     interp_parts: List[Expr],
     interp_is_literal: List[bool],
@@ -787,7 +790,7 @@ fn expr_new(kind: int, line: int, col: int) -> Expr {
         scrutinee: Box_null(), match_arms: [],
         stmts: [], result: Box_null(), has_result: false,
         lambda_params: [], lambda_ret_type: "", lambda_body: Box_null(),
-        cast_type: "",
+        cast_type: "", cast_is_ref: false,
         interp_parts: [], interp_is_literal: [],
         pipe_right: Box_null()
     }
@@ -1049,11 +1052,13 @@ fn func_decl_new(name: string, line: int, col: int) -> FunctionDecl {
 struct FuncParam {
     name: string,
     type_name: string,
-    is_mut: bool
+    is_mut: bool,
+    -- Parameter type was written as a reference type (&T / &mut T)
+    is_ref: bool
 }
 
 fn func_param_new(name: string, type_name: string) -> FuncParam {
-    return FuncParam { name: name, type_name: type_name, is_mut: false }
+    return FuncParam { name: name, type_name: type_name, is_mut: false, is_ref: false }
 }
 
 -- Struct declaration
@@ -2850,11 +2855,13 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             let line = p_cur(pp).line
             let col = p_cur(pp).col
             pp = p_advance(pp)
+            let cast_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
             let ty_result = parse_type(pp)
             pp = ty_result.p
             let mut e = expr_new(EXPR_CAST(), line, col)
             e.operand = Box_new(left)
             e.cast_type = ty_result.type_name
+            e.cast_is_ref = cast_ref
             left = e
         } else {
             cont = false
@@ -4074,10 +4081,12 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
         let pname = p_cur(pp).value
         pp = p_advance(pp)
         pp = p_expect(pp, TK_COLON())
+        let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
         let pty = parse_type(pp)
         pp = pty.p
         let mut param = func_param_new(pname, pty.type_name)
         param.is_mut = is_mut
+        param.is_ref = pty_ref
         fd.params.push(param)
         if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
             pp = p_advance(pp)
@@ -4164,9 +4173,12 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
         let pname = p_cur(pp).value
         pp = p_advance(pp)
         pp = p_expect(pp, TK_COLON())
+        let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
         let pty = parse_type(pp)
         pp = pty.p
-        fd.params.push(func_param_new(pname, pty.type_name))
+        let mut eparam = func_param_new(pname, pty.type_name)
+        eparam.is_ref = pty_ref
+        fd.params.push(eparam)
         if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
             pp = p_advance(pp)
         }
@@ -4536,7 +4548,24 @@ struct IRGenerator {
     known_functions: Map[string, bool],
     -- Variable name -> true if declared with a fixed-size array type [T; N]
     -- (normalized to a runtime list; bounds panics say "(array)", not "(list)")
-    array_var_names: Map[string, bool]
+    array_var_names: Map[string, bool],
+    -- Compile-time safety checks (Stage 0 Phase 2 rules, per-function state)
+    -- Depth of enclosing unsafe { } blocks (extern-call/deref fence)
+    unsafe_depth: int,
+    -- Depth of enclosing named region { } blocks (region escape rule)
+    region_depth: int,
+    -- Variable name -> true if it holds a reference of extern/cast provenance
+    tainted_vars: Map[string, bool],
+    -- Variable name -> true if its type is a reference type (&T)
+    ref_vars: Map[string, bool],
+    -- Variable name -> true if it holds a region-born value
+    region_born_vars: Map[string, bool],
+    -- Declaration-order log of variable names for the current function
+    declared_vars: List[string],
+    -- Stack of declared_vars lengths at named-region entry points
+    region_marks: List[int],
+    -- All source-declared extern fn names (unsafe fence; includes dm_*)
+    all_extern_fns: Map[string, bool]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -4583,7 +4612,15 @@ fn ir_generator_new() -> IRGenerator {
         completed_blocks: [],
         var_type_annotations: Map_new(),
         known_functions: Map_new(),
-        array_var_names: Map_new()
+        array_var_names: Map_new(),
+        unsafe_depth: 0,
+        region_depth: 0,
+        tainted_vars: Map_new(),
+        ref_vars: Map_new(),
+        region_born_vars: Map_new(),
+        declared_vars: [],
+        region_marks: [],
+        all_extern_fns: Map_new()
     }
 }
 
@@ -4757,6 +4794,111 @@ fn classify_list_elem(elem_type: string) -> int {
     if elem_type == "float" or elem_type == "f64" { return LIST_ELEM_FLOAT() }
     if elem_type == "string" or elem_type == "String" { return LIST_ELEM_STRING() }
     return LIST_ELEM_OTHER()
+}
+
+-- ============================================================
+-- COMPILE-TIME SAFETY CHECKS (Stage 0 Phase 2 rules)
+-- Cast legality, unsafe fence, region escape. There is no
+-- separate checker pass: the checks run inside this typed IR
+-- walk, where variable types, struct definitions, and the
+-- extern registry already live. A violation prints a
+-- source-located diagnostic and exits before LLVM emission.
+-- Mirrors stage0/src/checker.zig (inferCast, unsafe fence
+-- provenance, REGION ESCAPE RULE).
+-- ============================================================
+
+-- Unwrap parenthesized (grouped) expressions
+fn safety_unwrap_grouped(e: Expr) -> Expr {
+    let mut cur = e
+    while cur.kind == EXPR_GROUPED() {
+        cur = *cur.operand
+    }
+    return cur
+}
+
+-- Normalize a source or IR type string for cast classification:
+-- composite containers collapse to their erased IR kinds
+fn safety_normalize_type(t: string) -> string {
+    if starts_with(t, "dm_list_") { return "list" }
+    if starts_with(t, "dm_map_") { return "map" }
+    return parse_type_to_ir(t)
+}
+
+fn safety_is_numeric_type(t: string) -> bool {
+    return is_integer_type(t) or is_float_type(t)
+}
+
+-- Human-readable type name for cast diagnostics (Stage 0 spellings)
+fn safety_display_name(t: string) -> string {
+    let m = map_type_name(t)
+    if m == "i64" { return "int" }
+    if m == "u64" { return "uint" }
+    if m == "f64" { return "float" }
+    return t
+}
+
+-- Cast legality, mirroring Stage 0 inferCast: same-type casts and
+-- numeric <-> numeric casts are legal, `as dyn Trait` keeps its
+-- legacy meaning, and every other combination is a compile error.
+-- Reference/Box identity is judged on the tracked inner types;
+-- a Box erased to a bare "ptr" with unknown inner type is
+-- unprovable and passes, as do "void" inference gaps.
+fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_type: string, cast_is_ref: bool, line: int) {
+    if starts_with(cast_type, "dyn ") { return }
+
+    -- Source provenance for plain-variable operands
+    let mut src_box_inner = ""
+    let mut src_is_ref = false
+    let inner = safety_unwrap_grouped(operand)
+    if inner.kind == EXPR_IDENTIFIER() {
+        if gen.box_inner_types.contains(inner.name) {
+            src_box_inner = gen.box_inner_types.get(inner.name)
+        }
+        if gen.ref_vars.contains(inner.name) and gen.ref_vars.get(inner.name) {
+            src_is_ref = true
+        }
+    }
+    if inner.kind == EXPR_CAST() and inner.cast_is_ref {
+        src_is_ref = true
+    }
+
+    let src_ir = safety_normalize_type(from_type)
+    let dst_ir = safety_normalize_type(cast_type)
+    let src_numeric = safety_is_numeric_type(src_ir)
+    let dst_numeric = safety_is_numeric_type(dst_ir)
+    let dst_is_box = starts_with(cast_type, "Box[")
+
+    let mut legal = false
+    if cast_is_ref {
+        -- Target &T: only a reference to the same pointee type may cast
+        if src_is_ref and src_ir == dst_ir { legal = true }
+    } else if dst_is_box {
+        let dst_inner = extract_inner_type(cast_type, "Box[")
+        if src_box_inner != "" and src_box_inner == dst_inner { legal = true }
+        if src_ir == "ptr" and src_box_inner == "" { legal = true }
+    } else if src_is_ref {
+        -- &T to a non-reference type forges a pointer/integer
+        legal = false
+    } else if src_box_inner != "" {
+        -- Box[T] to a non-Box type forges a pointer/integer
+        legal = false
+    } else if src_numeric and dst_numeric {
+        legal = true
+    } else if src_ir == dst_ir {
+        legal = true
+    } else if src_ir == "void" or dst_ir == "void" {
+        legal = true
+    }
+
+    if legal == false {
+        let mut src_disp = safety_display_name(from_type)
+        if src_box_inner != "" { src_disp = "Box[" + src_box_inner + "]" }
+        if src_is_ref { src_disp = "&" + safety_display_name(from_type) }
+        let mut dst_disp = safety_display_name(cast_type)
+        if cast_is_ref { dst_disp = "&" + safety_display_name(cast_type) }
+        eprintln("Error: invalid cast from " + src_disp + " to " + dst_disp + ": only numeric to numeric casts are allowed at line " + int_to_string(line))
+        exit(1)
+    }
 }
 
 -- ============================================================
@@ -4935,6 +5077,9 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
         if decl.kind == DECL_FUNCTION() {
             let fd = *decl.func_decl
             g.known_functions.insert(fd.name, true)
+            if fd.is_extern {
+                g.all_extern_fns.insert(fd.name, true)
+            }
             if fd.generic_params.len() > 0 {
                 -- Store generic function for later monomorphization
                 g.generic_fn_decls.insert(fd.name, i)
@@ -5496,6 +5641,16 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     g.variable_types = Map_new()
     g.mut_ptr_vars = Map_new()
     g.param_ptr_map = Map_new()
+    -- Safety-check state is per-function (Stage 0 checker resets likewise)
+    g.unsafe_depth = 0
+    g.region_depth = 0
+    g.tainted_vars = Map_new()
+    g.ref_vars = Map_new()
+    g.region_born_vars = Map_new()
+    let empty_declared: List[string] = []
+    g.declared_vars = empty_declared
+    let empty_marks: List[int] = []
+    g.region_marks = empty_marks
     let empty_blocks: List[IRBasicBlock] = []
     g.completed_blocks = empty_blocks
 
@@ -5608,6 +5763,15 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         if starts_with(ptype_str, "Box[") {
             let inner = extract_inner_type(ptype_str, "Box[")
             g.box_inner_types.insert(pname, inner)
+        }
+
+        -- Safety checks: parameters are declared in the outermost scope;
+        -- reference-typed parameters are tainted by default (their
+        -- provenance is the unchecked caller), mirroring Stage 0
+        g.declared_vars.push(pname)
+        if p.is_ref {
+            g.tainted_vars.insert(pname, true)
+            g.ref_vars.insert(pname, true)
         }
 
         i = i + 1
@@ -9577,6 +9741,9 @@ fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
     -- Determine target type from the cast annotation, mapped to IR names
     let to_type = map_type_name(expr.cast_type)
 
+    -- Compile-time cast legality (Stage 0 Phase 2 cast matrix)
+    check_cast_legal(g, *expr.operand, from_type, expr.cast_type, expr.cast_is_ref, expr.line)
+
     -- If the types are the same, no cast needed
     if from_type == to_type {
         return expr_result(g, b, operand_id)
@@ -10188,6 +10355,13 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     let saved_type_subs = g.type_substitutions
                     let saved_completed_blocks = g.completed_blocks
                     let saved_next_id = g.builder.next_id
+                    let saved_unsafe_depth = g.unsafe_depth
+                    let saved_region_depth = g.region_depth
+                    let saved_tainted_vars = g.tainted_vars
+                    let saved_ref_vars = g.ref_vars
+                    let saved_region_born_vars = g.region_born_vars
+                    let saved_declared_vars = g.declared_vars
+                    let saved_region_marks = g.region_marks
 
                     -- Set up fresh maps for the monomorphized function
                     g.variable_map = Map_new()
@@ -10215,6 +10389,7 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                         let resolved_type = resolve_type_substitution(g, p.type_name)
                         let mut mp = func_param_new(p.name, resolved_type)
                         mp.is_mut = p.is_mut
+                        mp.is_ref = p.is_ref
                         mono_params.push(mp)
                         pi = pi + 1
                     }
@@ -10235,6 +10410,13 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     g.type_substitutions = saved_type_subs
                     g.completed_blocks = saved_completed_blocks
                     g.builder.next_id = saved_next_id
+                    g.unsafe_depth = saved_unsafe_depth
+                    g.region_depth = saved_region_depth
+                    g.tainted_vars = saved_tainted_vars
+                    g.ref_vars = saved_ref_vars
+                    g.region_born_vars = saved_region_born_vars
+                    g.declared_vars = saved_declared_vars
+                    g.region_marks = saved_region_marks
                 }
             }
         }
@@ -11195,6 +11377,13 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                     let saved_next_id = g.builder.next_id
                     let saved_impl_type = g.current_impl_type
                     let saved_has_impl = g.has_impl_type
+                    let saved_unsafe_depth = g.unsafe_depth
+                    let saved_region_depth = g.region_depth
+                    let saved_tainted_vars = g.tainted_vars
+                    let saved_ref_vars = g.ref_vars
+                    let saved_region_born_vars = g.region_born_vars
+                    let saved_declared_vars = g.declared_vars
+                    let saved_region_marks = g.region_marks
 
                     g.variable_map = Map_new()
                     g.variable_types = Map_new()
@@ -11224,6 +11413,7 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                         let resolved = resolve_type_substitution(g, p.type_name)
                         let mut mp = func_param_new(p.name, resolved)
                         mp.is_mut = p.is_mut
+                        mp.is_ref = p.is_ref
                         mono_params.push(mp)
                         mpi = mpi + 1
                     }
@@ -11272,6 +11462,13 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                     g.builder.next_id = saved_next_id
                     g.current_impl_type = saved_impl_type
                     g.has_impl_type = saved_has_impl
+                    g.unsafe_depth = saved_unsafe_depth
+                    g.region_depth = saved_region_depth
+                    g.tainted_vars = saved_tainted_vars
+                    g.ref_vars = saved_ref_vars
+                    g.region_born_vars = saved_region_born_vars
+                    g.declared_vars = saved_declared_vars
+                    g.region_marks = saved_region_marks
                 }
 
                 -- Generate the call to monomorphized function
@@ -13874,9 +14071,24 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let saved_variable_types = g.variable_types
     let saved_return_type = g.current_return_type
     let saved_next_id = g.builder.next_id
+    let saved_region_depth = g.region_depth
+    let saved_tainted_vars = g.tainted_vars
+    let saved_ref_vars = g.ref_vars
+    let saved_region_born_vars = g.region_born_vars
+    let saved_declared_vars = g.declared_vars
+    let saved_region_marks = g.region_marks
 
-    -- Set up new variable scope for the lambda body
+    -- Set up new variable scope for the lambda body. Safety state is
+    -- fresh per function; unsafe_depth is lexical and carries in.
     g.variable_map = Map_new()
+    g.region_depth = 0
+    g.tainted_vars = Map_new()
+    g.ref_vars = Map_new()
+    g.region_born_vars = Map_new()
+    let empty_lambda_declared: List[string] = []
+    g.declared_vars = empty_lambda_declared
+    let empty_lambda_marks: List[int] = []
+    g.region_marks = empty_lambda_marks
     g.variable_types = Map_new()
     g.current_return_type = ret_type
     g.builder.next_id = 0
@@ -13914,6 +14126,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 
         g.variable_map.insert(lp.name, alloca_id)
         g.variable_types.insert(lp.name, ptype)
+        g.declared_vars.push(lp.name)
         param_idx = param_idx + 1
     }
 
@@ -13941,6 +14154,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 
         g.variable_map.insert(cap_name, alloca_id)
         g.variable_types.insert(cap_name, cap_type)
+        g.declared_vars.push(cap_name)
         cap_idx = cap_idx + 1
     }
 
@@ -13968,6 +14182,12 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     g.variable_types = saved_variable_types
     g.current_return_type = saved_return_type
     g.builder.next_id = saved_next_id
+    g.region_depth = saved_region_depth
+    g.tainted_vars = saved_tainted_vars
+    g.ref_vars = saved_ref_vars
+    g.region_born_vars = saved_region_born_vars
+    g.declared_vars = saved_declared_vars
+    g.region_marks = saved_region_marks
 
     -- Record the lambda in fn_ptr_vars and lambda_captures
     g.fn_ptr_vars.insert(lambda_name, lambda_name)

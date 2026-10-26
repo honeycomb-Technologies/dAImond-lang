@@ -184,6 +184,9 @@ struct Expr {
     lambda_body: Box[Expr],
     -- Cast target type
     cast_type: string,
+    -- Cast target was written as a reference type (&T / &mut T); the
+    -- '&' itself is erased from cast_type by parse_type
+    cast_is_ref: bool,
     -- String interpolation parts (alternating literal and expr)
     interp_parts: List[Expr],
     interp_is_literal: List[bool],
@@ -207,7 +210,7 @@ fn expr_new(kind: int, line: int, col: int) -> Expr {
         scrutinee: Box_null(), match_arms: [],
         stmts: [], result: Box_null(), has_result: false,
         lambda_params: [], lambda_ret_type: "", lambda_body: Box_null(),
-        cast_type: "",
+        cast_type: "", cast_is_ref: false,
         interp_parts: [], interp_is_literal: [],
         pipe_right: Box_null()
     }
@@ -469,11 +472,13 @@ fn func_decl_new(name: string, line: int, col: int) -> FunctionDecl {
 struct FuncParam {
     name: string,
     type_name: string,
-    is_mut: bool
+    is_mut: bool,
+    -- Parameter type was written as a reference type (&T / &mut T)
+    is_ref: bool
 }
 
 fn func_param_new(name: string, type_name: string) -> FuncParam {
-    return FuncParam { name: name, type_name: type_name, is_mut: false }
+    return FuncParam { name: name, type_name: type_name, is_mut: false, is_ref: false }
 }
 
 -- Struct declaration

@@ -134,7 +134,24 @@ struct IRGenerator {
     known_functions: Map[string, bool],
     -- Variable name -> true if declared with a fixed-size array type [T; N]
     -- (normalized to a runtime list; bounds panics say "(array)", not "(list)")
-    array_var_names: Map[string, bool]
+    array_var_names: Map[string, bool],
+    -- Compile-time safety checks (Stage 0 Phase 2 rules, per-function state)
+    -- Depth of enclosing unsafe { } blocks (extern-call/deref fence)
+    unsafe_depth: int,
+    -- Depth of enclosing named region { } blocks (region escape rule)
+    region_depth: int,
+    -- Variable name -> true if it holds a reference of extern/cast provenance
+    tainted_vars: Map[string, bool],
+    -- Variable name -> true if its type is a reference type (&T)
+    ref_vars: Map[string, bool],
+    -- Variable name -> true if it holds a region-born value
+    region_born_vars: Map[string, bool],
+    -- Declaration-order log of variable names for the current function
+    declared_vars: List[string],
+    -- Stack of declared_vars lengths at named-region entry points
+    region_marks: List[int],
+    -- All source-declared extern fn names (unsafe fence; includes dm_*)
+    all_extern_fns: Map[string, bool]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -181,7 +198,15 @@ fn ir_generator_new() -> IRGenerator {
         completed_blocks: [],
         var_type_annotations: Map_new(),
         known_functions: Map_new(),
-        array_var_names: Map_new()
+        array_var_names: Map_new(),
+        unsafe_depth: 0,
+        region_depth: 0,
+        tainted_vars: Map_new(),
+        ref_vars: Map_new(),
+        region_born_vars: Map_new(),
+        declared_vars: [],
+        region_marks: [],
+        all_extern_fns: Map_new()
     }
 }
 
@@ -355,6 +380,111 @@ fn classify_list_elem(elem_type: string) -> int {
     if elem_type == "float" or elem_type == "f64" { return LIST_ELEM_FLOAT() }
     if elem_type == "string" or elem_type == "String" { return LIST_ELEM_STRING() }
     return LIST_ELEM_OTHER()
+}
+
+-- ============================================================
+-- COMPILE-TIME SAFETY CHECKS (Stage 0 Phase 2 rules)
+-- Cast legality, unsafe fence, region escape. There is no
+-- separate checker pass: the checks run inside this typed IR
+-- walk, where variable types, struct definitions, and the
+-- extern registry already live. A violation prints a
+-- source-located diagnostic and exits before LLVM emission.
+-- Mirrors stage0/src/checker.zig (inferCast, unsafe fence
+-- provenance, REGION ESCAPE RULE).
+-- ============================================================
+
+-- Unwrap parenthesized (grouped) expressions
+fn safety_unwrap_grouped(e: Expr) -> Expr {
+    let mut cur = e
+    while cur.kind == EXPR_GROUPED() {
+        cur = *cur.operand
+    }
+    return cur
+}
+
+-- Normalize a source or IR type string for cast classification:
+-- composite containers collapse to their erased IR kinds
+fn safety_normalize_type(t: string) -> string {
+    if starts_with(t, "dm_list_") { return "list" }
+    if starts_with(t, "dm_map_") { return "map" }
+    return parse_type_to_ir(t)
+}
+
+fn safety_is_numeric_type(t: string) -> bool {
+    return is_integer_type(t) or is_float_type(t)
+}
+
+-- Human-readable type name for cast diagnostics (Stage 0 spellings)
+fn safety_display_name(t: string) -> string {
+    let m = map_type_name(t)
+    if m == "i64" { return "int" }
+    if m == "u64" { return "uint" }
+    if m == "f64" { return "float" }
+    return t
+}
+
+-- Cast legality, mirroring Stage 0 inferCast: same-type casts and
+-- numeric <-> numeric casts are legal, `as dyn Trait` keeps its
+-- legacy meaning, and every other combination is a compile error.
+-- Reference/Box identity is judged on the tracked inner types;
+-- a Box erased to a bare "ptr" with unknown inner type is
+-- unprovable and passes, as do "void" inference gaps.
+fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_type: string, cast_is_ref: bool, line: int) {
+    if starts_with(cast_type, "dyn ") { return }
+
+    -- Source provenance for plain-variable operands
+    let mut src_box_inner = ""
+    let mut src_is_ref = false
+    let inner = safety_unwrap_grouped(operand)
+    if inner.kind == EXPR_IDENTIFIER() {
+        if gen.box_inner_types.contains(inner.name) {
+            src_box_inner = gen.box_inner_types.get(inner.name)
+        }
+        if gen.ref_vars.contains(inner.name) and gen.ref_vars.get(inner.name) {
+            src_is_ref = true
+        }
+    }
+    if inner.kind == EXPR_CAST() and inner.cast_is_ref {
+        src_is_ref = true
+    }
+
+    let src_ir = safety_normalize_type(from_type)
+    let dst_ir = safety_normalize_type(cast_type)
+    let src_numeric = safety_is_numeric_type(src_ir)
+    let dst_numeric = safety_is_numeric_type(dst_ir)
+    let dst_is_box = starts_with(cast_type, "Box[")
+
+    let mut legal = false
+    if cast_is_ref {
+        -- Target &T: only a reference to the same pointee type may cast
+        if src_is_ref and src_ir == dst_ir { legal = true }
+    } else if dst_is_box {
+        let dst_inner = extract_inner_type(cast_type, "Box[")
+        if src_box_inner != "" and src_box_inner == dst_inner { legal = true }
+        if src_ir == "ptr" and src_box_inner == "" { legal = true }
+    } else if src_is_ref {
+        -- &T to a non-reference type forges a pointer/integer
+        legal = false
+    } else if src_box_inner != "" {
+        -- Box[T] to a non-Box type forges a pointer/integer
+        legal = false
+    } else if src_numeric and dst_numeric {
+        legal = true
+    } else if src_ir == dst_ir {
+        legal = true
+    } else if src_ir == "void" or dst_ir == "void" {
+        legal = true
+    }
+
+    if legal == false {
+        let mut src_disp = safety_display_name(from_type)
+        if src_box_inner != "" { src_disp = "Box[" + src_box_inner + "]" }
+        if src_is_ref { src_disp = "&" + safety_display_name(from_type) }
+        let mut dst_disp = safety_display_name(cast_type)
+        if cast_is_ref { dst_disp = "&" + safety_display_name(cast_type) }
+        eprintln("Error: invalid cast from " + src_disp + " to " + dst_disp + ": only numeric to numeric casts are allowed at line " + int_to_string(line))
+        exit(1)
+    }
 }
 
 -- ============================================================
@@ -533,6 +663,9 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
         if decl.kind == DECL_FUNCTION() {
             let fd = *decl.func_decl
             g.known_functions.insert(fd.name, true)
+            if fd.is_extern {
+                g.all_extern_fns.insert(fd.name, true)
+            }
             if fd.generic_params.len() > 0 {
                 -- Store generic function for later monomorphization
                 g.generic_fn_decls.insert(fd.name, i)

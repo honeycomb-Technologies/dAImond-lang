@@ -291,11 +291,13 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             let line = p_cur(pp).line
             let col = p_cur(pp).col
             pp = p_advance(pp)
+            let cast_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
             let ty_result = parse_type(pp)
             pp = ty_result.p
             let mut e = expr_new(EXPR_CAST(), line, col)
             e.operand = Box_new(left)
             e.cast_type = ty_result.type_name
+            e.cast_is_ref = cast_ref
             left = e
         } else {
             cont = false
@@ -1515,10 +1517,12 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
         let pname = p_cur(pp).value
         pp = p_advance(pp)
         pp = p_expect(pp, TK_COLON())
+        let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
         let pty = parse_type(pp)
         pp = pty.p
         let mut param = func_param_new(pname, pty.type_name)
         param.is_mut = is_mut
+        param.is_ref = pty_ref
         fd.params.push(param)
         if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
             pp = p_advance(pp)
@@ -1605,9 +1609,12 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
         let pname = p_cur(pp).value
         pp = p_advance(pp)
         pp = p_expect(pp, TK_COLON())
+        let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
         let pty = parse_type(pp)
         pp = pty.p
-        fd.params.push(func_param_new(pname, pty.type_name))
+        let mut eparam = func_param_new(pname, pty.type_name)
+        eparam.is_ref = pty_ref
+        fd.params.push(eparam)
         if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
             pp = p_advance(pp)
         }

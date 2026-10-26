@@ -494,6 +494,16 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     g.variable_types = Map_new()
     g.mut_ptr_vars = Map_new()
     g.param_ptr_map = Map_new()
+    -- Safety-check state is per-function (Stage 0 checker resets likewise)
+    g.unsafe_depth = 0
+    g.region_depth = 0
+    g.tainted_vars = Map_new()
+    g.ref_vars = Map_new()
+    g.region_born_vars = Map_new()
+    let empty_declared: List[string] = []
+    g.declared_vars = empty_declared
+    let empty_marks: List[int] = []
+    g.region_marks = empty_marks
     let empty_blocks: List[IRBasicBlock] = []
     g.completed_blocks = empty_blocks
 
@@ -606,6 +616,15 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         if starts_with(ptype_str, "Box[") {
             let inner = extract_inner_type(ptype_str, "Box[")
             g.box_inner_types.insert(pname, inner)
+        }
+
+        -- Safety checks: parameters are declared in the outermost scope;
+        -- reference-typed parameters are tainted by default (their
+        -- provenance is the unchecked caller), mirroring Stage 0
+        g.declared_vars.push(pname)
+        if p.is_ref {
+            g.tainted_vars.insert(pname, true)
+            g.ref_vars.insert(pname, true)
         }
 
         i = i + 1

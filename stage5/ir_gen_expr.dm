@@ -1870,6 +1870,9 @@ fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
     -- Determine target type from the cast annotation, mapped to IR names
     let to_type = map_type_name(expr.cast_type)
 
+    -- Compile-time cast legality (Stage 0 Phase 2 cast matrix)
+    check_cast_legal(g, *expr.operand, from_type, expr.cast_type, expr.cast_is_ref, expr.line)
+
     -- If the types are the same, no cast needed
     if from_type == to_type {
         return expr_result(g, b, operand_id)
@@ -2481,6 +2484,13 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     let saved_type_subs = g.type_substitutions
                     let saved_completed_blocks = g.completed_blocks
                     let saved_next_id = g.builder.next_id
+                    let saved_unsafe_depth = g.unsafe_depth
+                    let saved_region_depth = g.region_depth
+                    let saved_tainted_vars = g.tainted_vars
+                    let saved_ref_vars = g.ref_vars
+                    let saved_region_born_vars = g.region_born_vars
+                    let saved_declared_vars = g.declared_vars
+                    let saved_region_marks = g.region_marks
 
                     -- Set up fresh maps for the monomorphized function
                     g.variable_map = Map_new()
@@ -2508,6 +2518,7 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                         let resolved_type = resolve_type_substitution(g, p.type_name)
                         let mut mp = func_param_new(p.name, resolved_type)
                         mp.is_mut = p.is_mut
+                        mp.is_ref = p.is_ref
                         mono_params.push(mp)
                         pi = pi + 1
                     }
@@ -2528,6 +2539,13 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     g.type_substitutions = saved_type_subs
                     g.completed_blocks = saved_completed_blocks
                     g.builder.next_id = saved_next_id
+                    g.unsafe_depth = saved_unsafe_depth
+                    g.region_depth = saved_region_depth
+                    g.tainted_vars = saved_tainted_vars
+                    g.ref_vars = saved_ref_vars
+                    g.region_born_vars = saved_region_born_vars
+                    g.declared_vars = saved_declared_vars
+                    g.region_marks = saved_region_marks
                 }
             }
         }
@@ -3488,6 +3506,13 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                     let saved_next_id = g.builder.next_id
                     let saved_impl_type = g.current_impl_type
                     let saved_has_impl = g.has_impl_type
+                    let saved_unsafe_depth = g.unsafe_depth
+                    let saved_region_depth = g.region_depth
+                    let saved_tainted_vars = g.tainted_vars
+                    let saved_ref_vars = g.ref_vars
+                    let saved_region_born_vars = g.region_born_vars
+                    let saved_declared_vars = g.declared_vars
+                    let saved_region_marks = g.region_marks
 
                     g.variable_map = Map_new()
                     g.variable_types = Map_new()
@@ -3517,6 +3542,7 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                         let resolved = resolve_type_substitution(g, p.type_name)
                         let mut mp = func_param_new(p.name, resolved)
                         mp.is_mut = p.is_mut
+                        mp.is_ref = p.is_ref
                         mono_params.push(mp)
                         mpi = mpi + 1
                     }
@@ -3565,6 +3591,13 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                     g.builder.next_id = saved_next_id
                     g.current_impl_type = saved_impl_type
                     g.has_impl_type = saved_has_impl
+                    g.unsafe_depth = saved_unsafe_depth
+                    g.region_depth = saved_region_depth
+                    g.tainted_vars = saved_tainted_vars
+                    g.ref_vars = saved_ref_vars
+                    g.region_born_vars = saved_region_born_vars
+                    g.declared_vars = saved_declared_vars
+                    g.region_marks = saved_region_marks
                 }
 
                 -- Generate the call to monomorphized function
@@ -6167,9 +6200,24 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let saved_variable_types = g.variable_types
     let saved_return_type = g.current_return_type
     let saved_next_id = g.builder.next_id
+    let saved_region_depth = g.region_depth
+    let saved_tainted_vars = g.tainted_vars
+    let saved_ref_vars = g.ref_vars
+    let saved_region_born_vars = g.region_born_vars
+    let saved_declared_vars = g.declared_vars
+    let saved_region_marks = g.region_marks
 
-    -- Set up new variable scope for the lambda body
+    -- Set up new variable scope for the lambda body. Safety state is
+    -- fresh per function; unsafe_depth is lexical and carries in.
     g.variable_map = Map_new()
+    g.region_depth = 0
+    g.tainted_vars = Map_new()
+    g.ref_vars = Map_new()
+    g.region_born_vars = Map_new()
+    let empty_lambda_declared: List[string] = []
+    g.declared_vars = empty_lambda_declared
+    let empty_lambda_marks: List[int] = []
+    g.region_marks = empty_lambda_marks
     g.variable_types = Map_new()
     g.current_return_type = ret_type
     g.builder.next_id = 0
@@ -6207,6 +6255,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 
         g.variable_map.insert(lp.name, alloca_id)
         g.variable_types.insert(lp.name, ptype)
+        g.declared_vars.push(lp.name)
         param_idx = param_idx + 1
     }
 
@@ -6234,6 +6283,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 
         g.variable_map.insert(cap_name, alloca_id)
         g.variable_types.insert(cap_name, cap_type)
+        g.declared_vars.push(cap_name)
         cap_idx = cap_idx + 1
     }
 
@@ -6261,6 +6311,12 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     g.variable_types = saved_variable_types
     g.current_return_type = saved_return_type
     g.builder.next_id = saved_next_id
+    g.region_depth = saved_region_depth
+    g.tainted_vars = saved_tainted_vars
+    g.ref_vars = saved_ref_vars
+    g.region_born_vars = saved_region_born_vars
+    g.declared_vars = saved_declared_vars
+    g.region_marks = saved_region_marks
 
     -- Record the lambda in fn_ptr_vars and lambda_captures
     g.fn_ptr_vars.insert(lambda_name, lambda_name)
