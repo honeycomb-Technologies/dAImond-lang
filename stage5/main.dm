@@ -4901,6 +4901,61 @@ fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_typ
     }
 }
 
+-- Unsafe fence provenance (name-based taint tracking, mirroring
+-- Stage 0): an extern call result or a cast to a reference type is
+-- a taint source; taint propagates through plain copies.
+fn expr_is_taint_source(gen: IRGenerator, e: Expr) -> bool {
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_FUNCTION_CALL() {
+        let callee = safety_unwrap_grouped(*inner.callee)
+        if callee.kind == EXPR_IDENTIFIER() {
+            return gen.all_extern_fns.contains(callee.name) and gen.all_extern_fns.get(callee.name)
+        }
+        return false
+    }
+    if inner.kind == EXPR_CAST() {
+        return inner.cast_is_ref
+    }
+    return false
+}
+
+fn expr_is_tainted_ref(gen: IRGenerator, e: Expr) -> bool {
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_IDENTIFIER() {
+        return gen.tainted_vars.contains(inner.name) and gen.tainted_vars.get(inner.name)
+    }
+    return expr_is_taint_source(gen, inner)
+}
+
+-- True if the expression's value has a reference type (&T) as far as
+-- the erased type strings can tell: a cast to &T or a known &T var
+fn expr_is_ref_value(gen: IRGenerator, e: Expr) -> bool {
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_IDENTIFIER() {
+        return gen.ref_vars.contains(inner.name) and gen.ref_vars.get(inner.name)
+    }
+    if inner.kind == EXPR_CAST() {
+        return inner.cast_is_ref
+    }
+    return false
+}
+
+-- Unsafe fence: calling an `extern fn` requires an unsafe block
+fn check_extern_fence(gen: IRGenerator, fn_name: string, line: int) {
+    if gen.unsafe_depth == 0 and gen.all_extern_fns.contains(fn_name) and gen.all_extern_fns.get(fn_name) {
+        eprintln("Error: extern function call '" + fn_name + "' requires unsafe block at line " + int_to_string(line))
+        exit(1)
+    }
+}
+
+-- Record fence provenance for `name` bound/assigned from `value`
+fn safety_track_assignment(gen: IRGenerator, name: string, value: Expr) -> IRGenerator {
+    let mut g = gen
+    g.tainted_vars.insert(name, expr_is_tainted_ref(g, value))
+    g.ref_vars.insert(name, expr_is_ref_value(g, value))
+    return g
+}
+
 -- ============================================================
 -- BUILTIN NAME MAPPING
 -- Maps dAImond builtin names to C runtime function names
@@ -6131,6 +6186,16 @@ fn generate_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
         return gen_result(result.gen, result.block)
     }
     if stmt.kind == STMT_REGION() {
+        -- The parser maps `unsafe { }` to a region statement named
+        -- "unsafe"; it is the unsafe fence, not an arena region
+        if stmt.region_name == "unsafe" {
+            let mut g2 = gen
+            g2.unsafe_depth = g2.unsafe_depth + 1
+            let uresult = generate_block_stmts(g2, block, stmt.region_body)
+            let mut g3 = uresult.gen
+            g3.unsafe_depth = g3.unsafe_depth - 1
+            return gen_result(g3, uresult.block)
+        }
         -- Region blocks: just generate the body (runtime handles arena)
         return generate_block_stmts(gen, block, stmt.region_body)
     }
@@ -6163,6 +6228,16 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
     let mut b = block
     let var_name = stmt.let_name
     let mut type_str = stmt.let_type
+
+    -- Safety checks: declaration order + unsafe fence provenance
+    g.declared_vars.push(var_name)
+    let track_value = *stmt.let_value
+    if track_value.kind != EXPR_LITERAL_NULL() {
+        g = safety_track_assignment(g, var_name, track_value)
+    } else {
+        g.tainted_vars.insert(var_name, false)
+        g.ref_vars.insert(var_name, false)
+    }
 
     -- Normalize fixed-size array type [T; N] to List[T]
     if starts_with(type_str, "[") {
@@ -7588,6 +7663,12 @@ fn generate_continue(gen: IRGenerator, block: IRBasicBlock) -> GenResult {
 fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
     let mut g = gen
     let mut b = block
+
+    -- Unsafe fence provenance across plain assignment
+    let track_target = *stmt.assign_target
+    if stmt.assign_op == ASSIGN_EQ() and track_target.kind == EXPR_IDENTIFIER() {
+        g = safety_track_assignment(g, track_target.name, *stmt.assign_value)
+    }
 
     -- Generate the value
     let val_result = generate_expr(g, b, *stmt.assign_value)
@@ -9671,6 +9752,13 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
     }
 
     if expr.op == UNOP_DEREF() {
+        -- Unsafe fence: references of extern/cast provenance (including
+        -- &T parameters) need an unsafe block to dereference. Box derefs
+        -- stay safe (runtime null check below).
+        if g.unsafe_depth == 0 and expr_is_tainted_ref(g, *expr.operand) {
+            eprintln("Error: dereference of a reference from an extern call or cast requires unsafe block at line " + int_to_string(expr.line))
+            exit(1)
+        }
         -- Dereference Box[T]: load the struct value from the pointer
         -- Try to determine the Box inner type from tracked info
         let mut inner_type = "i64"
@@ -9784,6 +9872,9 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     -- Get the callee name from the callee expression (should be an identifier)
     let callee_expr = *expr.callee
     let fn_name = callee_expr.name
+
+    -- Unsafe fence: calling an `extern fn` requires an unsafe block
+    check_extern_fence(g, fn_name, expr.line)
 
     -- --------------------------------------------------------
     -- Special case dispatch (in priority order)
@@ -14249,6 +14340,8 @@ fn generate_pipeline(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
             ""
         }
 
+        check_extern_fence(g, fn_name, pipe_right.line)
+
         -- Build argument list: left value first, then original args
         let mut call_args: List[IRValue] = []
         call_args.push(ir_val_inst(left_result.val_id))
@@ -14291,6 +14384,8 @@ fn generate_pipeline(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
     -- Case 2: Right side is an identifier -> call it with left as sole arg
     if pipe_right.kind == EXPR_IDENTIFIER() {
         let fn_name = pipe_right.name
+
+        check_extern_fence(g, fn_name, pipe_right.line)
 
         let mut call_args: List[IRValue] = []
         call_args.push(ir_val_inst(left_result.val_id))

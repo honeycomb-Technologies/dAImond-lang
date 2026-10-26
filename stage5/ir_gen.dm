@@ -487,6 +487,61 @@ fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_typ
     }
 }
 
+-- Unsafe fence provenance (name-based taint tracking, mirroring
+-- Stage 0): an extern call result or a cast to a reference type is
+-- a taint source; taint propagates through plain copies.
+fn expr_is_taint_source(gen: IRGenerator, e: Expr) -> bool {
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_FUNCTION_CALL() {
+        let callee = safety_unwrap_grouped(*inner.callee)
+        if callee.kind == EXPR_IDENTIFIER() {
+            return gen.all_extern_fns.contains(callee.name) and gen.all_extern_fns.get(callee.name)
+        }
+        return false
+    }
+    if inner.kind == EXPR_CAST() {
+        return inner.cast_is_ref
+    }
+    return false
+}
+
+fn expr_is_tainted_ref(gen: IRGenerator, e: Expr) -> bool {
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_IDENTIFIER() {
+        return gen.tainted_vars.contains(inner.name) and gen.tainted_vars.get(inner.name)
+    }
+    return expr_is_taint_source(gen, inner)
+}
+
+-- True if the expression's value has a reference type (&T) as far as
+-- the erased type strings can tell: a cast to &T or a known &T var
+fn expr_is_ref_value(gen: IRGenerator, e: Expr) -> bool {
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_IDENTIFIER() {
+        return gen.ref_vars.contains(inner.name) and gen.ref_vars.get(inner.name)
+    }
+    if inner.kind == EXPR_CAST() {
+        return inner.cast_is_ref
+    }
+    return false
+}
+
+-- Unsafe fence: calling an `extern fn` requires an unsafe block
+fn check_extern_fence(gen: IRGenerator, fn_name: string, line: int) {
+    if gen.unsafe_depth == 0 and gen.all_extern_fns.contains(fn_name) and gen.all_extern_fns.get(fn_name) {
+        eprintln("Error: extern function call '" + fn_name + "' requires unsafe block at line " + int_to_string(line))
+        exit(1)
+    }
+}
+
+-- Record fence provenance for `name` bound/assigned from `value`
+fn safety_track_assignment(gen: IRGenerator, name: string, value: Expr) -> IRGenerator {
+    let mut g = gen
+    g.tainted_vars.insert(name, expr_is_tainted_ref(g, value))
+    g.ref_vars.insert(name, expr_is_ref_value(g, value))
+    return g
+}
+
 -- ============================================================
 -- BUILTIN NAME MAPPING
 -- Maps dAImond builtin names to C runtime function names

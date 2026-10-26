@@ -1800,6 +1800,13 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
     }
 
     if expr.op == UNOP_DEREF() {
+        -- Unsafe fence: references of extern/cast provenance (including
+        -- &T parameters) need an unsafe block to dereference. Box derefs
+        -- stay safe (runtime null check below).
+        if g.unsafe_depth == 0 and expr_is_tainted_ref(g, *expr.operand) {
+            eprintln("Error: dereference of a reference from an extern call or cast requires unsafe block at line " + int_to_string(expr.line))
+            exit(1)
+        }
         -- Dereference Box[T]: load the struct value from the pointer
         -- Try to determine the Box inner type from tracked info
         let mut inner_type = "i64"
@@ -1913,6 +1920,9 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     -- Get the callee name from the callee expression (should be an identifier)
     let callee_expr = *expr.callee
     let fn_name = callee_expr.name
+
+    -- Unsafe fence: calling an `extern fn` requires an unsafe block
+    check_extern_fence(g, fn_name, expr.line)
 
     -- --------------------------------------------------------
     -- Special case dispatch (in priority order)
@@ -6378,6 +6388,8 @@ fn generate_pipeline(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
             ""
         }
 
+        check_extern_fence(g, fn_name, pipe_right.line)
+
         -- Build argument list: left value first, then original args
         let mut call_args: List[IRValue] = []
         call_args.push(ir_val_inst(left_result.val_id))
@@ -6420,6 +6432,8 @@ fn generate_pipeline(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
     -- Case 2: Right side is an identifier -> call it with left as sole arg
     if pipe_right.kind == EXPR_IDENTIFIER() {
         let fn_name = pipe_right.name
+
+        check_extern_fence(g, fn_name, pipe_right.line)
 
         let mut call_args: List[IRValue] = []
         call_args.push(ir_val_inst(left_result.val_id))

@@ -104,6 +104,16 @@ fn generate_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
         return gen_result(result.gen, result.block)
     }
     if stmt.kind == STMT_REGION() {
+        -- The parser maps `unsafe { }` to a region statement named
+        -- "unsafe"; it is the unsafe fence, not an arena region
+        if stmt.region_name == "unsafe" {
+            let mut g2 = gen
+            g2.unsafe_depth = g2.unsafe_depth + 1
+            let uresult = generate_block_stmts(g2, block, stmt.region_body)
+            let mut g3 = uresult.gen
+            g3.unsafe_depth = g3.unsafe_depth - 1
+            return gen_result(g3, uresult.block)
+        }
         -- Region blocks: just generate the body (runtime handles arena)
         return generate_block_stmts(gen, block, stmt.region_body)
     }
@@ -136,6 +146,16 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
     let mut b = block
     let var_name = stmt.let_name
     let mut type_str = stmt.let_type
+
+    -- Safety checks: declaration order + unsafe fence provenance
+    g.declared_vars.push(var_name)
+    let track_value = *stmt.let_value
+    if track_value.kind != EXPR_LITERAL_NULL() {
+        g = safety_track_assignment(g, var_name, track_value)
+    } else {
+        g.tainted_vars.insert(var_name, false)
+        g.ref_vars.insert(var_name, false)
+    }
 
     -- Normalize fixed-size array type [T; N] to List[T]
     if starts_with(type_str, "[") {
@@ -1561,6 +1581,12 @@ fn generate_continue(gen: IRGenerator, block: IRBasicBlock) -> GenResult {
 fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
     let mut g = gen
     let mut b = block
+
+    -- Unsafe fence provenance across plain assignment
+    let track_target = *stmt.assign_target
+    if stmt.assign_op == ASSIGN_EQ() and track_target.kind == EXPR_IDENTIFIER() {
+        g = safety_track_assignment(g, track_target.name, *stmt.assign_value)
+    }
 
     -- Generate the value
     let val_result = generate_expr(g, b, *stmt.assign_value)
