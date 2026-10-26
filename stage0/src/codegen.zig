@@ -4192,6 +4192,12 @@ pub const CodeGenerator = struct {
                     // Strip "dm_list_" prefix to get element type
                     break :blk obj_type["dm_list_".len..];
                 }
+                if (std.mem.startsWith(u8, obj_type, "dm_map_")) {
+                    if (self.generated_map_types.get(obj_type)) |map_info| {
+                        break :blk map_info.value_type;
+                    }
+                    break :blk "int64_t";
+                }
                 // Indexing a fixed-size array type "elem[N]" returns the element type
                 if (std.mem.endsWith(u8, obj_type, "]")) {
                     if (std.mem.indexOf(u8, obj_type, "[")) |bracket_pos| {
@@ -6499,6 +6505,22 @@ pub const CodeGenerator = struct {
 
     /// Generate assignment statement
     fn generateAssignment(self: *Self, assign: *Assignment) anyerror!void {
+        // Map index assignment `m[k] = v` is an insert, not an lvalue
+        // store (the map get helper returns a copy).
+        if (assign.op == .assign and assign.target.kind == .index_access) {
+            const idx = assign.target.kind.index_access;
+            const obj_type = self.inferCTypeFromExpr(idx.object);
+            if (std.mem.startsWith(u8, obj_type, "dm_map_") and !std.mem.eql(u8, obj_type, "dm_map_void")) {
+                try self.writer.print("{s}_insert(&(", .{obj_type});
+                try self.generateExpr(idx.object);
+                try self.writer.write("), ");
+                try self.generateExpr(idx.index);
+                try self.writer.write(", ");
+                try self.generateExpr(assign.value);
+                try self.writer.writeLine(");");
+                return;
+            }
+        }
         // Index write into a List (a[i] = v) mutates the buffer: split a
         // shared buffer first when the list object is addressable.
         if (assign.target.kind == .index_access) {
@@ -7128,6 +7150,13 @@ pub const CodeGenerator = struct {
             try self.writer.write(").data)[");
             try self.generateExpr(idx.index);
             try self.writer.write("]");
+        } else if (std.mem.startsWith(u8, obj_type, "dm_map_")) {
+            // Map index read: m[k] -> dm_map_X_get(&(m), k) (panics if missing)
+            try self.writer.print("{s}_get(&(", .{obj_type});
+            try self.generateExpr(idx.object);
+            try self.writer.write("), ");
+            try self.generateRetainedExpr(idx.index, null);
+            try self.writer.write(")");
         } else {
             // Length not statically known (raw pointer): unchecked.
             try self.generateExpr(idx.object);

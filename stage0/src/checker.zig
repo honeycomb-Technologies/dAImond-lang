@@ -1220,17 +1220,30 @@ pub const TypeChecker = struct {
             return try self.freshTypeVar();
         };
 
-        // Check index is integer
-        if (!types.isIntegral(self.type_ctx, index_type)) {
-            try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
-        }
-
         switch (typ) {
-            .array => |arr| return arr.element_type,
-            .slice => |s| return s.element_type,
-            .str => return try self.type_ctx.intern(.char),
+            .array => |arr| {
+                if (!types.isIntegral(self.type_ctx, index_type)) {
+                    try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
+                }
+                return arr.element_type;
+            },
+            .slice => |s| {
+                if (!types.isIntegral(self.type_ctx, index_type)) {
+                    try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
+                }
+                return s.element_type;
+            },
+            .str => {
+                if (!types.isIntegral(self.type_ctx, index_type)) {
+                    try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
+                }
+                return try self.type_ctx.intern(.char);
+            },
             .type_var => {
-                // Type variable (e.g., from List[T]) - allow indexing
+                // Type variable (List[T] elements are int-indexed, Map[K, V]
+                // values are key-indexed; both erase to a type variable
+                // here, so the index type is left to codegen) - allow
+                // indexing.
                 return try self.freshTypeVar();
             },
             else => {

@@ -5011,6 +5011,40 @@ pub const audit_fix_tests = [_]TestCase{
         ,
         .expected_output = "true\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\n",
     },
+    .{
+        .name = "map_index_get_set",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m["a"] = 1
+            \\    m.insert("b", 2)
+            \\    println(m["a"])
+            \\    println(m.get("b"))
+            \\    m["a"] = 10
+            \\    println(m["a"])
+            \\    let v: int = m["b"]
+            \\    println(v)
+            \\}
+        ,
+        .expected_output = "1\n2\n10\n2\n",
+    },
+    .{
+        .name = "map_index_int_keys",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[int, string] = Map_new()
+            \\    m[1] = "one"
+            \\    m[2] = "two"
+            \\    println(m[1])
+            \\    println(m[2])
+            \\}
+        ,
+        .expected_output = "one\ntwo\n",
+    },
 };
 
 // Main entry point for running tests
