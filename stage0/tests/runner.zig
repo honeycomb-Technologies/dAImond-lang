@@ -4987,6 +4987,32 @@ pub const constructor_tests = [_]TestCase{
     },
 };
 
+// Stage 0 only: fixes from the CLAUDE.md builtin/quirks audit.
+pub const audit_fix_tests = [_]TestCase{
+    .{
+        .name = "char_predicates_string_args",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(is_alpha("a"))
+            \\    println(is_alpha("5"))
+            \\    println(is_digit("5"))
+            \\    println(is_digit("a"))
+            \\    println(is_alnum("Z"))
+            \\    println(is_alnum("9"))
+            \\    println(is_whitespace(" "))
+            \\    println(is_whitespace("x"))
+            \\    let s = "a1"
+            \\    println(is_alpha(char_at(s, 0)))
+            \\    println(is_digit(char_at(s, 1)))
+            \\    println(is_alpha(""))
+            \\}
+        ,
+        .expected_output = "true\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\n",
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -5068,6 +5094,7 @@ pub fn main() !void {
         .{ .name = "Op Overload Extended", .tests = &op_overload_extended_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
         .{ .name = "Constructors", .tests = &constructor_tests },
+        .{ .name = "Audit Fixes", .tests = &audit_fix_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

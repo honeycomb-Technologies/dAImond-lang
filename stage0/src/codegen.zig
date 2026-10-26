@@ -7369,6 +7369,27 @@ pub const CodeGenerator = struct {
         }
     }
 
+    /// Emit an is_alpha/is_digit/is_alnum/is_whitespace call. The
+    /// runtime helpers take a C char; a string argument (the usual
+    /// dAImond spelling, e.g. `is_alpha(char_at(s, i))`) is tested by
+    /// its first character, with the empty string testing false. A
+    /// char argument (e.g. `s[i]`) is passed through unchanged.
+    fn generateCharPredicateCall(self: *Self, c_name: []const u8, call: *FunctionCall) anyerror!void {
+        if (call.args.len == 0) return;
+        const arg = call.args[0].value;
+        try self.writer.print("{s}(", .{c_name});
+        if (std.mem.eql(u8, self.inferCTypeFromExpr(arg), "dm_string")) {
+            try self.writer.write("((");
+            try self.generateExpr(arg);
+            try self.writer.write(").len > 0 ? (");
+            try self.generateExpr(arg);
+            try self.writer.write(").data[0] : '\\0')");
+        } else {
+            try self.generateExpr(arg);
+        }
+        try self.writer.write(")");
+    }
+
     /// Generate built-in function calls
     fn generateBuiltinCall(self: *Self, name: []const u8, call: *FunctionCall) !bool {
         if (std.mem.eql(u8, name, "print")) {
@@ -7484,32 +7505,16 @@ pub const CodeGenerator = struct {
             }
             return true;
         } else if (std.mem.eql(u8, name, "is_alpha")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_alpha(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
+            try self.generateCharPredicateCall("dm_is_alpha", call);
             return true;
         } else if (std.mem.eql(u8, name, "is_digit")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_digit(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
+            try self.generateCharPredicateCall("dm_is_digit", call);
             return true;
         } else if (std.mem.eql(u8, name, "is_alnum")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_alnum(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
+            try self.generateCharPredicateCall("dm_is_alnum", call);
             return true;
         } else if (std.mem.eql(u8, name, "is_whitespace")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_whitespace(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
+            try self.generateCharPredicateCall("dm_is_whitespace", call);
             return true;
         } else if (std.mem.eql(u8, name, "string_contains")) {
             if (call.args.len >= 2) {
