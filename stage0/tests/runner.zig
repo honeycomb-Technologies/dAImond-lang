@@ -17,6 +17,13 @@ pub const TestCase = struct {
     expected_output: []const u8,
     expected_exit_code: u8 = 0,
     expect_compile_error: bool = false,
+    /// For expect_compile_error cases: every substring must appear in
+    /// the compiler's stdout (diagnostics are printed there; stderr
+    /// may carry allocator leak traces and is not asserted on).
+    expected_error_contains: []const []const u8 = &.{},
+    /// For expect_compile_error cases: exact number of "Error["
+    /// diagnostics expected in the compiler's stdout.
+    expected_error_count: ?usize = null,
     extra_files: ?[]const TestFile = null,
     skip: bool = false,
 };
@@ -81,6 +88,13 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
     compile_proc.stdout_behavior = .Pipe;
 
     try compile_proc.spawn();
+    // Drain the pipes before waiting: reading after wait() loses the
+    // output. Stderr is drained (and discarded) so a verbose
+    // diagnostic dump cannot block the compiler on a full pipe.
+    const compile_stderr = compile_proc.stderr.?.reader().readAllAlloc(allocator, 16 * 1024 * 1024) catch "";
+    defer allocator.free(compile_stderr);
+    const compile_stdout = compile_proc.stdout.?.reader().readAllAlloc(allocator, 16 * 1024 * 1024) catch "";
+    defer allocator.free(compile_stdout);
     const compile_result = try compile_proc.wait();
 
     const compile_exit_code: u32 = switch (compile_result) {
@@ -96,6 +110,27 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
                 .passed = false,
                 .message = "Expected compile error but compilation succeeded",
             };
+        }
+        for (case.expected_error_contains) |needle| {
+            if (std.mem.indexOf(u8, compile_stdout, needle) == null) {
+                const msg = try std.fmt.allocPrint(allocator, "Compile error output missing expected text: '{s}'\nGot: '{s}'", .{ needle, compile_stdout });
+                return .{
+                    .name = case.name,
+                    .passed = false,
+                    .message = msg,
+                };
+            }
+        }
+        if (case.expected_error_count) |expected_count| {
+            const actual_count = std.mem.count(u8, compile_stdout, "Error[");
+            if (actual_count != expected_count) {
+                const msg = try std.fmt.allocPrint(allocator, "Expected {d} compile error(s), got {d}\nGot: '{s}'", .{ expected_count, actual_count, compile_stdout });
+                return .{
+                    .name = case.name,
+                    .passed = false,
+                    .message = msg,
+                };
+            }
         }
         return .{
             .name = case.name,
@@ -5240,6 +5275,91 @@ pub const len_unified_tests = [_]TestCase{
     },
 };
 
+/// Error-quality tests: diagnostics must name the types/variables an
+/// author (human or LLM) needs, report one root error instead of a
+/// cascade, and surface backend (C compiler) failures. Stage 0-only:
+/// stage3/stage4 runners enumerate their original suites by name.
+pub const error_quality_tests = [_]TestCase{
+    .{
+        .name = "error_type_mismatch_names_both_types",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x: string = 42
+            \\    println(x)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{ "Error[E0100]", "expected string", "found int" },
+        .expected_error_count = 1,
+    },
+    .{
+        .name = "error_arg_mismatch_names_both_types",
+        .source =
+            \\module test
+            \\
+            \\fn take_int(n: int) -> int { return n }
+            \\
+            \\fn main() {
+            \\    let y = take_int("hello")
+            \\    println(y)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{ "Error[E0100]", "expected int", "found string" },
+        .expected_error_count = 1,
+    },
+    .{
+        .name = "error_undefined_var_single_root_error",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(undefined_thing + 1)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"undefined variable 'undefined_thing'"},
+        .expected_error_count = 1,
+    },
+    .{
+        .name = "error_undefined_var_annotated_single",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let y: int = missing_var
+            \\    println(y)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"undefined variable 'missing_var'"},
+        .expected_error_count = 1,
+    },
+    .{
+        // len(42) passes type checking (len does not validate its
+        // argument yet) but cannot compile as C: the driver must show
+        // the C compiler's own diagnostic, not only an exit code.
+        // "request for member" is GCC's wording for `(42).len`.
+        .name = "error_backend_surfaces_cc_diagnostic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(len(42))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{ "C compiler failed with exit code 1", "error:", "request for member" },
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -5323,6 +5443,7 @@ pub fn main() !void {
         .{ .name = "Constructors", .tests = &constructor_tests },
         .{ .name = "Audit Fixes", .tests = &audit_fix_tests },
         .{ .name = "Unified Len", .tests = &len_unified_tests },
+        .{ .name = "Error Quality", .tests = &error_quality_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});
