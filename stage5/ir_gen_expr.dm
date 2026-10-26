@@ -2700,6 +2700,25 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let method_name = expr.method
     let args = expr.args
 
+    -- Region escape: push/insert/set store their argument into the
+    -- container, so a region-born argument must not land in a
+    -- container declared outside the region
+    if g.region_depth > 0 and (method_name == "push" or method_name == "insert" or method_name == "set") {
+        let mut any_born = false
+        let mut bai = 0
+        while bai < args.len() {
+            if expr_is_region_born(g, args[bai]) { any_born = true }
+            bai = bai + 1
+        }
+        if any_born {
+            let born_root = root_identifier_name(obj_expr)
+            if born_root != "" and var_declared_outside_innermost_region(g, born_root) {
+                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(expr.line))
+                exit(1)
+            }
+        }
+    }
+
     -- --------------------------------------------------------
     -- Check if this is an enum variant constructor: EnumName.Variant(args)
     -- --------------------------------------------------------

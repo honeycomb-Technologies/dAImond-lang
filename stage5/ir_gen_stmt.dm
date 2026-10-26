@@ -114,8 +114,17 @@ fn generate_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
             g3.unsafe_depth = g3.unsafe_depth - 1
             return gen_result(g3, uresult.block)
         }
-        -- Region blocks: just generate the body (runtime handles arena)
-        return generate_block_stmts(gen, block, stmt.region_body)
+        -- Named region: record the declaration mark so escapes of
+        -- region-born values to outer variables can be diagnosed.
+        -- The body itself is generated inline (runtime handles arena).
+        let mut rg = gen
+        rg.region_marks.push(rg.declared_vars.len())
+        rg.region_depth = rg.region_depth + 1
+        let rresult = generate_block_stmts(rg, block, stmt.region_body)
+        let mut rg3 = rresult.gen
+        rg3.region_depth = rg3.region_depth - 1
+        rg3.region_marks.pop()
+        return gen_result(rg3, rresult.block)
     }
     return gen_result(gen, block)
 }
@@ -155,6 +164,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
     } else {
         g.tainted_vars.insert(var_name, false)
         g.ref_vars.insert(var_name, false)
+        g.region_born_vars.insert(var_name, false)
     }
 
     -- Normalize fixed-size array type [T; N] to List[T]
@@ -598,6 +608,12 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
     let mut g = gen
     let mut b = block
 
+    -- Region escape: a region-born value must not be returned
+    if stmt.has_ret_value and expr_is_region_born(g, *stmt.ret_value) {
+        eprintln("Error: return of region-born value from inside a region (region escape) at line " + int_to_string(stmt.line))
+        exit(1)
+    }
+
     if stmt.has_ret_value {
         let result = generate_expr(g, b, *stmt.ret_value)
         g = result.gen
@@ -740,6 +756,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let mut b = block
 
     let var_name = stmt.for_var
+    g.declared_vars.push(var_name)
 
     -- Get the iterator expression
     let iter_expr = *stmt.for_iter
@@ -1582,8 +1599,55 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     let mut g = gen
     let mut b = block
 
-    -- Unsafe fence provenance across plain assignment
     let track_target = *stmt.assign_target
+
+    -- Region escape rule: a region-born value must not be assigned
+    -- or stored into anything declared outside the region
+    if g.region_depth > 0 and stmt.assign_op == ASSIGN_EQ() and expr_is_region_born(g, *stmt.assign_value) {
+        if track_target.kind == EXPR_IDENTIFIER() {
+            if var_declared_outside_innermost_region(g, track_target.name) {
+                eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                exit(1)
+            }
+        } else {
+            let store_root = root_identifier_name(track_target)
+            if store_root != "" and var_declared_outside_innermost_region(g, store_root) {
+                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                exit(1)
+            }
+        }
+    }
+    if g.region_depth > 0 and stmt.assign_op == ASSIGN_ADD() {
+        -- String `s += x` is `s = s + x`: the concat result is region-born
+        let mut target_is_string = false
+        if track_target.kind == EXPR_IDENTIFIER() {
+            if g.variable_types.contains(track_target.name) and g.variable_types.get(track_target.name) == "string" {
+                target_is_string = true
+            }
+        } else if track_target.kind == EXPR_FIELD_ACCESS() {
+            if resolve_field_original_type(g, track_target) == "string" {
+                target_is_string = true
+            }
+        }
+        if target_is_string {
+            if track_target.kind == EXPR_IDENTIFIER() {
+                if var_declared_outside_innermost_region(g, track_target.name) {
+                    eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    exit(1)
+                } else {
+                    g.region_born_vars.insert(track_target.name, true)
+                }
+            } else {
+                let add_root = root_identifier_name(track_target)
+                if add_root != "" and var_declared_outside_innermost_region(g, add_root) {
+                    eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    exit(1)
+                }
+            }
+        }
+    }
+
+    -- Unsafe fence provenance across plain assignment
     if stmt.assign_op == ASSIGN_EQ() and track_target.kind == EXPR_IDENTIFIER() {
         g = safety_track_assignment(g, track_target.name, *stmt.assign_value)
     }

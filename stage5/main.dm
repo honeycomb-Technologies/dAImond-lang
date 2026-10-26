@@ -4948,11 +4948,95 @@ fn check_extern_fence(gen: IRGenerator, fn_name: string, line: int) {
     }
 }
 
+-- Region escape rule (name-based region-born tracking, mirroring
+-- Stage 0): string concat/interpolation results, List/Map literals
+-- and constructors (List_new/Map_new), Box_new, and values bound
+-- from those inside a named region must not escape it. Declaration
+-- scopes are approximated by the declared_vars log: a name is
+-- "outside" the innermost region when its last recorded
+-- declaration (parameter, let, or for variable) precedes the
+-- region-entry mark. Match-arm bindings are not logged.
+fn var_declared_outside_innermost_region(gen: IRGenerator, name: string) -> bool {
+    if gen.region_marks.len() == 0 { return false }
+    let mark = gen.region_marks[gen.region_marks.len() - 1]
+    let mut last = -1
+    let mut i = 0
+    while i < gen.declared_vars.len() {
+        if gen.declared_vars[i] == name { last = i }
+        i = i + 1
+    }
+    if last < 0 { return false }
+    return last < mark
+}
+
+-- Base identifier of a field/index chain (a.b[i].c -> a), else ""
+fn root_identifier_name(e: Expr) -> string {
+    let mut cur = safety_unwrap_grouped(e)
+    let mut cont = true
+    while cont {
+        if cur.kind == EXPR_IDENTIFIER() {
+            return cur.name
+        } else if cur.kind == EXPR_FIELD_ACCESS() or cur.kind == EXPR_INDEX_ACCESS() {
+            cur = safety_unwrap_grouped(*cur.object)
+        } else {
+            cont = false
+        }
+    }
+    return ""
+}
+
+fn expr_is_region_born(gen: IRGenerator, e: Expr) -> bool {
+    if gen.region_depth == 0 { return false }
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_IDENTIFIER() {
+        let born = gen.region_born_vars.contains(inner.name) and gen.region_born_vars.get(inner.name)
+        return born and var_declared_outside_innermost_region(gen, inner.name) == false
+    }
+    if inner.kind == EXPR_STRING_INTERP() { return true }
+    if inner.kind == EXPR_ARRAY_LITERAL() { return true }
+    if inner.kind == EXPR_BINARY() {
+        if inner.op != BINOP_ADD() { return false }
+        if infer_expr_type(gen, inner) == "string" { return true }
+        let bl = *inner.left
+        let br = *inner.right
+        if safety_unwrap_grouped(bl).kind == EXPR_LITERAL_STRING() { return true }
+        if safety_unwrap_grouped(br).kind == EXPR_LITERAL_STRING() { return true }
+        return expr_is_region_born(gen, bl) or expr_is_region_born(gen, br)
+    }
+    if inner.kind == EXPR_FUNCTION_CALL() {
+        let callee = safety_unwrap_grouped(*inner.callee)
+        if callee.kind == EXPR_IDENTIFIER() {
+            return callee.name == "List_new" or callee.name == "Map_new" or callee.name == "Box_new"
+        }
+        return false
+    }
+    if inner.kind == EXPR_COMPTIME() or inner.kind == EXPR_CAST() {
+        return expr_is_region_born(gen, *inner.operand)
+    }
+    if inner.kind == EXPR_BLOCK() {
+        if inner.has_result { return expr_is_region_born(gen, *inner.result) }
+        if inner.stmts.len() > 0 {
+            let last_stmt = inner.stmts[inner.stmts.len() - 1]
+            if last_stmt.kind == STMT_EXPRESSION() {
+                return expr_is_region_born(gen, *last_stmt.expr)
+            }
+        }
+        return false
+    }
+    if inner.kind == EXPR_IF() {
+        if expr_is_region_born(gen, *inner.then_branch) { return true }
+        if inner.has_else { return expr_is_region_born(gen, *inner.else_branch) }
+        return false
+    }
+    return false
+}
+
 -- Record fence provenance for `name` bound/assigned from `value`
 fn safety_track_assignment(gen: IRGenerator, name: string, value: Expr) -> IRGenerator {
     let mut g = gen
     g.tainted_vars.insert(name, expr_is_tainted_ref(g, value))
     g.ref_vars.insert(name, expr_is_ref_value(g, value))
+    g.region_born_vars.insert(name, expr_is_region_born(g, value))
     return g
 }
 
@@ -6196,8 +6280,17 @@ fn generate_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
             g3.unsafe_depth = g3.unsafe_depth - 1
             return gen_result(g3, uresult.block)
         }
-        -- Region blocks: just generate the body (runtime handles arena)
-        return generate_block_stmts(gen, block, stmt.region_body)
+        -- Named region: record the declaration mark so escapes of
+        -- region-born values to outer variables can be diagnosed.
+        -- The body itself is generated inline (runtime handles arena).
+        let mut rg = gen
+        rg.region_marks.push(rg.declared_vars.len())
+        rg.region_depth = rg.region_depth + 1
+        let rresult = generate_block_stmts(rg, block, stmt.region_body)
+        let mut rg3 = rresult.gen
+        rg3.region_depth = rg3.region_depth - 1
+        rg3.region_marks.pop()
+        return gen_result(rg3, rresult.block)
     }
     return gen_result(gen, block)
 }
@@ -6237,6 +6330,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
     } else {
         g.tainted_vars.insert(var_name, false)
         g.ref_vars.insert(var_name, false)
+        g.region_born_vars.insert(var_name, false)
     }
 
     -- Normalize fixed-size array type [T; N] to List[T]
@@ -6680,6 +6774,12 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
     let mut g = gen
     let mut b = block
 
+    -- Region escape: a region-born value must not be returned
+    if stmt.has_ret_value and expr_is_region_born(g, *stmt.ret_value) {
+        eprintln("Error: return of region-born value from inside a region (region escape) at line " + int_to_string(stmt.line))
+        exit(1)
+    }
+
     if stmt.has_ret_value {
         let result = generate_expr(g, b, *stmt.ret_value)
         g = result.gen
@@ -6822,6 +6922,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let mut b = block
 
     let var_name = stmt.for_var
+    g.declared_vars.push(var_name)
 
     -- Get the iterator expression
     let iter_expr = *stmt.for_iter
@@ -7664,8 +7765,55 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     let mut g = gen
     let mut b = block
 
-    -- Unsafe fence provenance across plain assignment
     let track_target = *stmt.assign_target
+
+    -- Region escape rule: a region-born value must not be assigned
+    -- or stored into anything declared outside the region
+    if g.region_depth > 0 and stmt.assign_op == ASSIGN_EQ() and expr_is_region_born(g, *stmt.assign_value) {
+        if track_target.kind == EXPR_IDENTIFIER() {
+            if var_declared_outside_innermost_region(g, track_target.name) {
+                eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                exit(1)
+            }
+        } else {
+            let store_root = root_identifier_name(track_target)
+            if store_root != "" and var_declared_outside_innermost_region(g, store_root) {
+                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                exit(1)
+            }
+        }
+    }
+    if g.region_depth > 0 and stmt.assign_op == ASSIGN_ADD() {
+        -- String `s += x` is `s = s + x`: the concat result is region-born
+        let mut target_is_string = false
+        if track_target.kind == EXPR_IDENTIFIER() {
+            if g.variable_types.contains(track_target.name) and g.variable_types.get(track_target.name) == "string" {
+                target_is_string = true
+            }
+        } else if track_target.kind == EXPR_FIELD_ACCESS() {
+            if resolve_field_original_type(g, track_target) == "string" {
+                target_is_string = true
+            }
+        }
+        if target_is_string {
+            if track_target.kind == EXPR_IDENTIFIER() {
+                if var_declared_outside_innermost_region(g, track_target.name) {
+                    eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    exit(1)
+                } else {
+                    g.region_born_vars.insert(track_target.name, true)
+                }
+            } else {
+                let add_root = root_identifier_name(track_target)
+                if add_root != "" and var_declared_outside_innermost_region(g, add_root) {
+                    eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    exit(1)
+                }
+            }
+        }
+    }
+
+    -- Unsafe fence provenance across plain assignment
     if stmt.assign_op == ASSIGN_EQ() and track_target.kind == EXPR_IDENTIFIER() {
         g = safety_track_assignment(g, track_target.name, *stmt.assign_value)
     }
@@ -10651,6 +10799,25 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let obj_expr = *expr.object
     let method_name = expr.method
     let args = expr.args
+
+    -- Region escape: push/insert/set store their argument into the
+    -- container, so a region-born argument must not land in a
+    -- container declared outside the region
+    if g.region_depth > 0 and (method_name == "push" or method_name == "insert" or method_name == "set") {
+        let mut any_born = false
+        let mut bai = 0
+        while bai < args.len() {
+            if expr_is_region_born(g, args[bai]) { any_born = true }
+            bai = bai + 1
+        }
+        if any_born {
+            let born_root = root_identifier_name(obj_expr)
+            if born_root != "" and var_declared_outside_innermost_region(g, born_root) {
+                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(expr.line))
+                exit(1)
+            }
+        }
+    }
 
     -- --------------------------------------------------------
     -- Check if this is an enum variant constructor: EnumName.Variant(args)

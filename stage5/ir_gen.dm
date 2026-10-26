@@ -534,11 +534,95 @@ fn check_extern_fence(gen: IRGenerator, fn_name: string, line: int) {
     }
 }
 
+-- Region escape rule (name-based region-born tracking, mirroring
+-- Stage 0): string concat/interpolation results, List/Map literals
+-- and constructors (List_new/Map_new), Box_new, and values bound
+-- from those inside a named region must not escape it. Declaration
+-- scopes are approximated by the declared_vars log: a name is
+-- "outside" the innermost region when its last recorded
+-- declaration (parameter, let, or for variable) precedes the
+-- region-entry mark. Match-arm bindings are not logged.
+fn var_declared_outside_innermost_region(gen: IRGenerator, name: string) -> bool {
+    if gen.region_marks.len() == 0 { return false }
+    let mark = gen.region_marks[gen.region_marks.len() - 1]
+    let mut last = -1
+    let mut i = 0
+    while i < gen.declared_vars.len() {
+        if gen.declared_vars[i] == name { last = i }
+        i = i + 1
+    }
+    if last < 0 { return false }
+    return last < mark
+}
+
+-- Base identifier of a field/index chain (a.b[i].c -> a), else ""
+fn root_identifier_name(e: Expr) -> string {
+    let mut cur = safety_unwrap_grouped(e)
+    let mut cont = true
+    while cont {
+        if cur.kind == EXPR_IDENTIFIER() {
+            return cur.name
+        } else if cur.kind == EXPR_FIELD_ACCESS() or cur.kind == EXPR_INDEX_ACCESS() {
+            cur = safety_unwrap_grouped(*cur.object)
+        } else {
+            cont = false
+        }
+    }
+    return ""
+}
+
+fn expr_is_region_born(gen: IRGenerator, e: Expr) -> bool {
+    if gen.region_depth == 0 { return false }
+    let inner = safety_unwrap_grouped(e)
+    if inner.kind == EXPR_IDENTIFIER() {
+        let born = gen.region_born_vars.contains(inner.name) and gen.region_born_vars.get(inner.name)
+        return born and var_declared_outside_innermost_region(gen, inner.name) == false
+    }
+    if inner.kind == EXPR_STRING_INTERP() { return true }
+    if inner.kind == EXPR_ARRAY_LITERAL() { return true }
+    if inner.kind == EXPR_BINARY() {
+        if inner.op != BINOP_ADD() { return false }
+        if infer_expr_type(gen, inner) == "string" { return true }
+        let bl = *inner.left
+        let br = *inner.right
+        if safety_unwrap_grouped(bl).kind == EXPR_LITERAL_STRING() { return true }
+        if safety_unwrap_grouped(br).kind == EXPR_LITERAL_STRING() { return true }
+        return expr_is_region_born(gen, bl) or expr_is_region_born(gen, br)
+    }
+    if inner.kind == EXPR_FUNCTION_CALL() {
+        let callee = safety_unwrap_grouped(*inner.callee)
+        if callee.kind == EXPR_IDENTIFIER() {
+            return callee.name == "List_new" or callee.name == "Map_new" or callee.name == "Box_new"
+        }
+        return false
+    }
+    if inner.kind == EXPR_COMPTIME() or inner.kind == EXPR_CAST() {
+        return expr_is_region_born(gen, *inner.operand)
+    }
+    if inner.kind == EXPR_BLOCK() {
+        if inner.has_result { return expr_is_region_born(gen, *inner.result) }
+        if inner.stmts.len() > 0 {
+            let last_stmt = inner.stmts[inner.stmts.len() - 1]
+            if last_stmt.kind == STMT_EXPRESSION() {
+                return expr_is_region_born(gen, *last_stmt.expr)
+            }
+        }
+        return false
+    }
+    if inner.kind == EXPR_IF() {
+        if expr_is_region_born(gen, *inner.then_branch) { return true }
+        if inner.has_else { return expr_is_region_born(gen, *inner.else_branch) }
+        return false
+    }
+    return false
+}
+
 -- Record fence provenance for `name` bound/assigned from `value`
 fn safety_track_assignment(gen: IRGenerator, name: string, value: Expr) -> IRGenerator {
     let mut g = gen
     g.tainted_vars.insert(name, expr_is_tainted_ref(g, value))
     g.ref_vars.insert(name, expr_is_ref_value(g, value))
+    g.region_born_vars.insert(name, expr_is_region_born(g, value))
     return g
 }
 
