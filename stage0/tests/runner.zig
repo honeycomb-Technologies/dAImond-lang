@@ -5045,6 +5045,47 @@ pub const audit_fix_tests = [_]TestCase{
         ,
         .expected_output = "one\ntwo\n",
     },
+    .{
+        .name = "audit_documented_builtins",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    assert(1 + 1 == 2)
+            \\    assert_eq(2 + 2, 4)
+            \\    assert_eq("ab", "ab")
+            \\    file_write("/tmp/dm_audit_misc.txt", "x")
+            \\    file_append("/tmp/dm_audit_misc.txt", "y")
+            \\    println(file_read("/tmp/dm_audit_misc.txt"))
+            \\    println(file_exists("/tmp/dm_audit_misc.txt"))
+            \\    println(len(args_get(0)) > 0)
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.set("k", 3)
+            \\    println(m.contains("k"))
+            \\    m.remove("k")
+            \\    println(m.contains("k"))
+            \\    m.insert("a", 1)
+            \\    println(len(m.keys()))
+            \\    println(len(m.values()))
+            \\    println(float_to_string(1.5))
+            \\    println(bool_to_string(true))
+            \\}
+        ,
+        .expected_output = "xy\ntrue\ntrue\ntrue\nfalse\n1\n1\n1.5\ntrue\n",
+    },
+    .{
+        .name = "audit_panic_exit_code",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println("before")
+            \\    panic("boom")
+            \\}
+        ,
+        .expected_output = "before\n",
+        .expected_exit_code = 1,
+    },
 };
 
 // Main entry point for running tests
