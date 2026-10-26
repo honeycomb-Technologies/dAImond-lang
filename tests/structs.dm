@@ -1,7 +1,13 @@
 -- Struct and enum test file
 -- Tests struct definitions, enums, and pattern matching
+--
+-- Aspirational material formerly in this file (user-defined generic
+-- enums, struct enum variants, if-let) lives in proposals/; it is not
+-- implemented. This file covers the real APIs only.
 
 module tests.structs
+
+import std.math
 
 -- A simple 2D point
 struct Point {
@@ -17,7 +23,9 @@ impl Point {
     fn distance(self, other: Point) -> float {
         let dx = self.x - other.x
         let dy = self.y - other.y
-        return sqrt(dx * dx + dy * dy)
+        let mut r: float = 0.0
+        unsafe { r = sqrt(dx * dx + dy * dy) }
+        return r
     }
 
     fn origin() -> Point {
@@ -25,24 +33,15 @@ impl Point {
     }
 }
 
--- An optional value
-enum Option[T] {
-    Some(T),
-    None,
-}
-
--- A result type for error handling
-enum Result[T, E] {
-    Ok(T),
-    Err(E),
-}
+-- Option and Result are builtin generic types; they are used below
+-- without redefinition (user-defined generic enums are a proposal).
 
 -- A color enum
 enum Color {
     Red,
     Green,
     Blue,
-    Rgb { r: u8, g: u8, b: u8 },
+    Rgb(int, int, int),
 }
 
 fn main() {
@@ -52,28 +51,31 @@ fn main() {
 
     -- Use methods
     let dist = p1.distance(p2)
+    if dist > 4.9 and dist < 5.1 { println("dist ok") }
     let origin = Point.origin()
+    println(origin.x + origin.y)
 
     -- Pattern matching on Option
     let maybe_value: Option[int] = Some(42)
 
     match maybe_value {
-        Some(x) => print("Got value: {x}"),
-        None => print("No value"),
+        Some(x) => println(f"Got value: {x}"),
+        _ => println("No value"),
     }
 
     -- Pattern matching on Color
-    let color = Color.Rgb { r: 255, g: 128, b: 0 }
+    let color = Color.Rgb(255, 128, 0)
 
     match color {
-        Color.Red => print("Red"),
-        Color.Green => print("Green"),
-        Color.Blue => print("Blue"),
-        Color.Rgb { r, g, b } => print("RGB({r}, {g}, {b})"),
+        Color::Red => println("Red"),
+        Color::Green => println("Green"),
+        Color::Blue => println("Blue"),
+        Color::Rgb(r, g, b) => println(f"RGB({r}, {g}, {b})"),
+        _ => println("other"),
     }
 
-    -- If-let pattern
-    if let Some(value) = maybe_value {
-        print("Value is: {value}")
+    -- Option access via has_value/value (if-let is a proposal)
+    if maybe_value.has_value {
+        println(f"Value is: {maybe_value.value}")
     }
 }
