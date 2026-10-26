@@ -1400,7 +1400,6 @@ pub const TypeChecker = struct {
                 std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln") or
                 std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "file_write") or
                 std.mem.eql(u8, name, "file_append") or
-                std.mem.eql(u8, name, "fs_write") or std.mem.eql(u8, name, "fs_append") or
                 std.mem.eql(u8, name, "tcp_close") or
                 std.mem.eql(u8, name, "thread_join") or
                 std.mem.eql(u8, name, "mutex_lock") or std.mem.eql(u8, name, "mutex_unlock") or
@@ -1421,8 +1420,7 @@ pub const TypeChecker = struct {
                 } else if (std.mem.eql(u8, name, "panic") or std.mem.eql(u8, name, "exit")) {
                     self.current_effects.addBuiltin(.io);
                     self.current_effects.addBuiltin(.diverge);
-                } else if (std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_append") or
-                    std.mem.eql(u8, name, "fs_write") or std.mem.eql(u8, name, "fs_append"))
+                } else if (std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_append"))
                 {
                     self.current_effects.addBuiltin(.file_system);
                 } else if (std.mem.eql(u8, name, "sleep_ms") or std.mem.eql(u8, name, "flush")) {
