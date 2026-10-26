@@ -62,12 +62,13 @@ fn list_contains(lst: List[int], val: int) -> bool {
 -- Encode (x, y) as a single int for fast lookup
 fn encode_pos(x: int, y: int) -> int = y * FIELD_W() + x
 
--- Simple RNG (linear congruential)
+-- Simple RNG (linear congruential, modulo 2^31)
+-- The state is reduced mod 2^31 first so the multiply cannot
+-- overflow int (signed overflow is a defined panic in dAImond).
 fn next_rand(seed: int) -> int {
-    let s = seed * 1103515245 + 12345
-    -- Keep it positive
-    if s < 0 { return 0 - s }
-    return s
+    let mut p = seed % 2147483648
+    if p < 0 { p = 0 - p }
+    return (p * 1103515245 + 12345) % 2147483648
 }
 
 -- ============================================================

@@ -385,6 +385,10 @@ pub const CodeGenerator = struct {
     // Source file reference for comptime function resolution
     current_source: ?*SourceFile,
 
+    // Set by the comptime evaluator when constant integer arithmetic
+    // overflows; turned into a clean compile error by callers.
+    comptime_overflow: bool,
+
     const Self = @This();
 
     const CapturedVar = struct {
@@ -496,6 +500,7 @@ pub const CodeGenerator = struct {
             .source_file_path = null,
             .last_debug_line = 0,
             .current_source = null,
+            .comptime_overflow = false,
         };
     }
 
@@ -1193,10 +1198,12 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
-        // Safe division/modulo helpers (runtime division-by-zero protection)
+        // Safe division/modulo helpers (runtime division-by-zero protection;
+        // INT64_MIN / -1 is UB in C and reported as integer overflow)
         try self.writer.writeLine("static inline int64_t dm__safe_div(int64_t a, int64_t b) {");
         self.writer.indent();
         try self.writer.writeLine("if (b == 0) dm_panic(\"division by zero\");");
+        try self.writer.writeLine("if (a == (-9223372036854775807LL - 1LL) && b == -1) dm_panic(\"integer overflow\");");
         try self.writer.writeLine("return a / b;");
         self.writer.dedent();
         try self.writer.writeLine("}");
@@ -1205,7 +1212,48 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("static inline int64_t dm__safe_mod(int64_t a, int64_t b) {");
         self.writer.indent();
         try self.writer.writeLine("if (b == 0) dm_panic(\"modulo by zero\");");
+        try self.writer.writeLine("if (a == (-9223372036854775807LL - 1LL) && b == -1) dm_panic(\"integer overflow\");");
         try self.writer.writeLine("return a % b;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Checked signed arithmetic (defined integer overflow: panic).
+        // Unsigned arithmetic keeps C's defined modulo-2^N wrapping and
+        // does not use these helpers.
+        try self.writer.writeLine("static inline int64_t dm_checked_add_i64(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("int64_t r;");
+        try self.writer.writeLine("if (__builtin_add_overflow(a, b, &r)) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return r;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm_checked_sub_i64(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("int64_t r;");
+        try self.writer.writeLine("if (__builtin_sub_overflow(a, b, &r)) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return r;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm_checked_mul_i64(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("int64_t r;");
+        try self.writer.writeLine("if (__builtin_mul_overflow(a, b, &r)) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return r;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Range check used to define overflow for narrower signed widths
+        // (arithmetic is promoted to int64, checked there, then fitted).
+        try self.writer.writeLine("static inline int64_t dm_checked_range_i64(int64_t v, int64_t lo, int64_t hi) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (v < lo || v > hi) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return v;");
         self.writer.dedent();
         try self.writer.writeLine("}");
         try self.writer.blankLine();
@@ -5390,6 +5438,8 @@ pub const CodeGenerator = struct {
                     .array_val, .struct_val => {},
                 }
             }
+            // Constant folding overflowed: compile error, no fallback.
+            try self.failIfComptimeOverflow();
         }
 
         // Fallback: infer type and use runtime expression
@@ -6429,6 +6479,31 @@ pub const CodeGenerator = struct {
             return;
         }
 
+        // Checked signed compound assignment: x += y on signed integer
+        // targets -> x = dm_checked_add_i64(x, y) (range-fitted for
+        // narrower widths); unsigned targets keep wrapping +=.
+        if (assign.op == .add_assign or assign.op == .sub_assign or assign.op == .mul_assign) {
+            const target_type = self.inferCTypeFromExpr(assign.target);
+            const value_type = self.inferCTypeFromExpr(assign.value);
+            if (cIntInfo(target_type)) |ti| {
+                if (cIntInfo(value_type)) |vi| {
+                    if (ti.signed and vi.signed) {
+                        const bin_op: BinaryExpr.BinaryOp = switch (assign.op) {
+                            .add_assign => .add,
+                            .sub_assign => .sub,
+                            else => .mul,
+                        };
+                        const fit: ?CIntInfo = if (ti.bits < 64) ti else null;
+                        try self.generateExpr(assign.target);
+                        try self.writer.write(" = ");
+                        try self.generateCheckedArith(checkedArithHelper(bin_op), assign.target, assign.value, fit, target_type);
+                        try self.writer.writeLine(";");
+                        return;
+                    }
+                }
+            }
+        }
+
         try self.generateExpr(assign.target);
 
         const op_str: []const u8 = switch (assign.op) {
@@ -6523,6 +6598,9 @@ pub const CodeGenerator = struct {
                 if (self.evalComptime(comp.expr)) |result| {
                     try self.emitComptimeValue(result);
                 } else {
+                    // Constant overflow is a compile error, not a
+                    // runtime fallback (and never a compiler crash).
+                    try self.failIfComptimeOverflow();
                     // Fall back to runtime evaluation
                     try self.generateExpr(comp.expr);
                 }
@@ -6614,6 +6692,35 @@ pub const CodeGenerator = struct {
                 try self.writer.write("()");
             }
         }
+    }
+
+    /// Emit a checked signed arithmetic call:
+    /// helper((int64_t)(a), (int64_t)(b)), range-fitted to `fit`
+    /// (narrower signed width) when given.
+    fn generateCheckedArith(self: *Self, helper: []const u8, a: *Expr, b: *Expr, fit: ?CIntInfo, fit_c_type: []const u8) anyerror!void {
+        if (fit) |info| {
+            try self.writer.print("(({s})dm_checked_range_i64(", .{fit_c_type});
+            try self.writer.print("{s}((int64_t)(", .{helper});
+            try self.generateExpr(a);
+            try self.writer.write("), (int64_t)(");
+            try self.generateExpr(b);
+            try self.writer.print(")), {s}, {s}))", .{ cIntMinLiteral(info), cIntMaxLiteral(info) });
+        } else {
+            try self.writer.print("{s}((int64_t)(", .{helper});
+            try self.generateExpr(a);
+            try self.writer.write("), (int64_t)(");
+            try self.generateExpr(b);
+            try self.writer.write("))");
+        }
+    }
+
+    fn checkedArithHelper(op: BinaryExpr.BinaryOp) []const u8 {
+        return switch (op) {
+            .add => "dm_checked_add_i64",
+            .sub => "dm_checked_sub_i64",
+            .mul => "dm_checked_mul_i64",
+            else => unreachable,
+        };
     }
 
     /// Generate binary expression
@@ -6729,6 +6836,23 @@ pub const CodeGenerator = struct {
             return;
         }
 
+        // Checked signed arithmetic: +,-,* on signed integer operands
+        // PANIC ("integer overflow") instead of C UB/wrapping.
+        // Unsigned (and mixed signed/unsigned, which C converts to
+        // unsigned) keep defined modulo-2^N wrapping via the raw op.
+        if (bin.op == .add or bin.op == .sub or bin.op == .mul) {
+            const right_type = self.inferCTypeFromExpr(bin.right);
+            if (cIntInfo(left_type)) |li| {
+                if (cIntInfo(right_type)) |ri| {
+                    if (li.signed and ri.signed) {
+                        const fit: ?CIntInfo = if (li.bits == ri.bits and li.bits < 64) li else null;
+                        try self.generateCheckedArith(checkedArithHelper(bin.op), bin.left, bin.right, fit, left_type);
+                        return;
+                    }
+                }
+            }
+        }
+
         try self.writer.write("(");
         try self.generateExpr(bin.left);
 
@@ -6798,6 +6922,26 @@ pub const CodeGenerator = struct {
     fn generateUnaryExpr(self: *Self, un: *UnaryExpr) anyerror!void {
         // Dereference of a pointer-typed operand (Box/reference) gets a
         // null check; * on non-pointers keeps the plain form.
+        // Checked negation: -INT64_MIN overflows (C UB) -> panic via
+        // checked 0 - x. Narrower signed widths range-fit the result.
+        if (un.op == .neg and un.operand.kind != .literal) {
+            const operand_type = self.inferCTypeFromExpr(un.operand);
+            if (cIntInfo(operand_type)) |info| {
+                if (info.signed) {
+                    if (info.bits < 64) {
+                        try self.writer.print("(({s})dm_checked_range_i64(dm_checked_sub_i64(0, (int64_t)(", .{operand_type});
+                        try self.generateExpr(un.operand);
+                        try self.writer.print(")), {s}, {s}))", .{ cIntMinLiteral(info), cIntMaxLiteral(info) });
+                    } else {
+                        try self.writer.write("dm_checked_sub_i64(0, (int64_t)(");
+                        try self.generateExpr(un.operand);
+                        try self.writer.write("))");
+                    }
+                    return;
+                }
+            }
+        }
+
         if (un.op == .deref) {
             const operand_type = self.inferCTypeFromExpr(un.operand);
             if (std.mem.endsWith(u8, operand_type, "*")) {
@@ -8143,6 +8287,15 @@ pub const CodeGenerator = struct {
         continue_signal,
     };
 
+    /// Turn a recorded comptime integer overflow into a clean compile
+    /// error (never a compiler crash/signal).
+    fn failIfComptimeOverflow(self: *Self) CodeGenError!void {
+        if (self.comptime_overflow) {
+            std.debug.print("error: integer overflow in compile-time constant evaluation\n", .{});
+            return CodeGenError.InvalidExpression;
+        }
+    }
+
     /// Try to evaluate an expression at compile time (entry point, creates root env).
     /// Returns null if the expression cannot be evaluated statically.
     fn evalComptime(self: *Self, expr: *const Expr) ?ComptimeValue {
@@ -8194,7 +8347,7 @@ pub const CodeGenerator = struct {
                 const operand = self.evalComptimeExpr(un.operand, env) orelse return null;
                 return switch (un.op) {
                     .neg => switch (operand) {
-                        .int_val => |v| ComptimeValue{ .int_val = -v },
+                        .int_val => |v| self.comptimeChecked(std.math.sub(i64, 0, v)),
                         .float_val => |v| ComptimeValue{ .float_val = -v },
                         else => null,
                     },
@@ -8684,18 +8837,44 @@ pub const CodeGenerator = struct {
         return ComptimeValue{ .struct_val = fields };
     }
 
+    /// Checked comptime i64 operation: on overflow, record it (the
+    /// caller turns it into a clean compile error) instead of letting
+    /// a Zig panic crash the compiler.
+    fn comptimeChecked(self: *Self, result: anytype) ?ComptimeValue {
+        if (result) |v| {
+            return ComptimeValue{ .int_val = v };
+        } else |_| {
+            self.comptime_overflow = true;
+            return null;
+        }
+    }
+
     /// Evaluate a binary operation on comptime values.
-    fn evalComptimeBinary(_: *Self, op: BinaryExpr.BinaryOp, left: ComptimeValue, right: ComptimeValue) ?ComptimeValue {
+    fn evalComptimeBinary(self: *Self, op: BinaryExpr.BinaryOp, left: ComptimeValue, right: ComptimeValue) ?ComptimeValue {
         // Integer arithmetic
         if (left == .int_val and right == .int_val) {
             const l = left.int_val;
             const r = right.int_val;
             return switch (op) {
-                .add => ComptimeValue{ .int_val = l + r },
-                .sub => ComptimeValue{ .int_val = l - r },
-                .mul => ComptimeValue{ .int_val = l * r },
-                .div => if (r != 0) ComptimeValue{ .int_val = @divTrunc(l, r) } else null,
-                .mod => if (r != 0) ComptimeValue{ .int_val = @mod(l, r) } else null,
+                .add => self.comptimeChecked(std.math.add(i64, l, r)),
+                .sub => self.comptimeChecked(std.math.sub(i64, l, r)),
+                .mul => self.comptimeChecked(std.math.mul(i64, l, r)),
+                .div => blk: {
+                    if (r == 0) break :blk null;
+                    if (l == std.math.minInt(i64) and r == -1) {
+                        self.comptime_overflow = true;
+                        break :blk null;
+                    }
+                    break :blk ComptimeValue{ .int_val = @divTrunc(l, r) };
+                },
+                .mod => blk: {
+                    if (r == 0) break :blk null;
+                    if (l == std.math.minInt(i64) and r == -1) {
+                        self.comptime_overflow = true;
+                        break :blk null;
+                    }
+                    break :blk ComptimeValue{ .int_val = @mod(l, r) };
+                },
                 .eq => ComptimeValue{ .bool_val = l == r },
                 .ne => ComptimeValue{ .bool_val = l != r },
                 .lt => ComptimeValue{ .bool_val = l < r },
@@ -8705,8 +8884,8 @@ pub const CodeGenerator = struct {
                 .bit_and => ComptimeValue{ .int_val = l & r },
                 .bit_or => ComptimeValue{ .int_val = l | r },
                 .bit_xor => ComptimeValue{ .int_val = l ^ r },
-                .shl => ComptimeValue{ .int_val = l << @as(u6, @intCast(@min(r, 63))) },
-                .shr => ComptimeValue{ .int_val = l >> @as(u6, @intCast(@min(r, 63))) },
+                .shl => if (r >= 0 and r < 64) ComptimeValue{ .int_val = l << @as(u6, @intCast(r)) } else null,
+                .shr => if (r >= 0 and r < 64) ComptimeValue{ .int_val = l >> @as(u6, @intCast(r)) } else null,
                 else => null,
             };
         }
