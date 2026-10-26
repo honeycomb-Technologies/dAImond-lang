@@ -128,9 +128,16 @@ const Timer = struct {
 // ============================================================================
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    // The driver is a one-shot CLI process: arena-allocate for the
+    // whole run and let process exit reclaim memory. A
+    // GeneralPurposeAllocator here dumped pages of leak stack traces
+    // after every successful check/compile/test run (the frontend
+    // intentionally does not free every AST allocation), burying the
+    // result line. Unit tests are unaffected: they allocate through
+    // std.testing.allocator, which keeps its leak checking.
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
