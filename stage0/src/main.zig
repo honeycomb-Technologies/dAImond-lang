@@ -1077,6 +1077,11 @@ fn testFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
             });
             return .error_compile;
         };
+        // Drain before waiting (see compileFile): surface cc stderr.
+        const cc_stderr = child.stderr.?.reader().readAllAlloc(allocator, 1024 * 1024) catch "";
+        defer allocator.free(cc_stderr);
+        const cc_stdout = child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024) catch "";
+        defer allocator.free(cc_stdout);
         const cc_wait = child.wait() catch {
             return .error_compile;
         };
@@ -1086,6 +1091,14 @@ fn testFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
                     try stdout.print("{s}Error:{s} C compilation failed (exit code {d})\n", .{
                         colors.error_style(), colors.reset(), code,
                     });
+                    if (cc_stderr.len > 0) {
+                        try stdout.writeAll(cc_stderr);
+                        if (cc_stderr[cc_stderr.len - 1] != '\n') try stdout.writeAll("\n");
+                    }
+                    if (cc_stdout.len > 0) {
+                        try stdout.writeAll(cc_stdout);
+                        if (cc_stdout[cc_stdout.len - 1] != '\n') try stdout.writeAll("\n");
+                    }
                     return .error_compile;
                 }
             },
@@ -1896,6 +1909,15 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
         return .error_compile;
     };
 
+    // Drain the compiler's output before waiting: reading the pipes
+    // after wait() loses it, which used to reduce every backend
+    // failure to a bare exit code. The captured stderr is shown by
+    // default whenever the C compile fails.
+    const cc_stderr = child.stderr.?.reader().readAllAlloc(allocator, 1024 * 1024) catch "";
+    defer allocator.free(cc_stderr);
+    const cc_stdout = child.stdout.?.reader().readAllAlloc(allocator, 1024 * 1024) catch "";
+    defer allocator.free(cc_stdout);
+
     // Wait for completion and get result
     const result = child.wait() catch |err| {
         try stdout.print("\n{s}Error waiting for C compiler:{s} {}\n", .{
@@ -1914,14 +1936,13 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
                     code,
                     colors.reset(),
                 });
-
-                // Try to read and display compiler errors
-                if (child.stderr) |stderr| {
-                    const err_output = stderr.reader().readAllAlloc(allocator, 10 * 1024) catch "";
-                    defer allocator.free(err_output);
-                    if (err_output.len > 0) {
-                        try stdout.print("{s}\n", .{err_output});
-                    }
+                if (cc_stderr.len > 0) {
+                    try stdout.writeAll(cc_stderr);
+                    if (cc_stderr[cc_stderr.len - 1] != '\n') try stdout.writeAll("\n");
+                }
+                if (cc_stdout.len > 0) {
+                    try stdout.writeAll(cc_stdout);
+                    if (cc_stdout[cc_stdout.len - 1] != '\n') try stdout.writeAll("\n");
                 }
 
                 return .error_compile;
@@ -1932,6 +1953,10 @@ fn compileFile(opts: CompilerOptions, allocator: Allocator) !ExitCode {
                 colors.error_style(),
                 colors.reset(),
             });
+            if (cc_stderr.len > 0) {
+                try stdout.writeAll(cc_stderr);
+                if (cc_stderr[cc_stderr.len - 1] != '\n') try stdout.writeAll("\n");
+            }
             return .error_compile;
         },
     }
