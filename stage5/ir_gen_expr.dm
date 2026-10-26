@@ -1794,6 +1794,11 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
         -- Map the inner type to IR type
         let load_type = map_type_name(inner_type)
 
+        -- Null check before dereferencing the pointer
+        let chk = check_box_not_null(g, b, operand_id)
+        g = chk.gen
+        b = chk.block
+
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_LOAD())
         inst.load_ptr = ir_val_inst(operand_id)
@@ -3631,6 +3636,50 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
 -- and returns expr_result(g, b, result_id).
 
 -- ============================================================
+-- RUNTIME SAFETY CHECKS (Phase 4 M2a)
+-- Conditional-panic block split following the div-by-zero pattern in
+-- generate_binary: terminate the current block with a conditional branch
+-- to a panic block (dm_panic + unreachable) and an OK block, push both
+-- finished blocks to completed_blocks, and continue in the OK block.
+-- Panic messages mirror Stage 0 codegen shapes, including the PANIC:
+-- prefix, which the stage5 dm_panic wrapper does not add itself.
+-- ============================================================
+
+-- Panic if a Box pointer value is null. Branches directly on the pointer
+-- value; llvm_gen coerces a pointer condition to (ptr != null), so the
+-- true edge is the non-null (OK) edge.
+fn check_box_not_null(gen: IRGenerator, block: IRBasicBlock, ptr_id: int) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+
+    let panic_label = gen_next_label(g, "box_null_panic")
+    g = gen_advance_label(g)
+    let ok_label = gen_next_label(g, "box_ok")
+    g = gen_advance_label(g)
+
+    b.terminator = Box_new(term_br_cond(ir_val_inst(ptr_id), ok_label, panic_label))
+    b.has_terminator = true
+    g.completed_blocks.push(b)
+
+    let mut panic_block = ir_block_new(panic_label)
+    let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+    panic_inst.callee = "dm_panic"
+    let mut panic_args: List[IRValue] = []
+    panic_args.push(ir_val_string("PANIC: null Box dereference"))
+    panic_inst.call_args = panic_args
+    panic_inst.result_type = "void"
+    panic_inst.has_result = false
+    panic_block.instructions.push(panic_inst)
+    g.builder.next_id = g.builder.next_id + 1
+    panic_block.terminator = Box_new(term_unreachable())
+    panic_block.has_terminator = true
+    g.completed_blocks.push(panic_block)
+
+    let ok_block = ir_block_new(ok_label)
+    return expr_result(g, ok_block, ptr_id)
+}
+
+-- ============================================================
 -- Field Access: expr.object.expr.field
 -- ============================================================
 
@@ -3679,6 +3728,10 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
             let inner_type = g.box_inner_types.get(var_name)
             if g.struct_defs.contains(inner_type) {
                 let info = g.struct_defs.get(inner_type)
+                -- Null check before dereferencing the box pointer
+                let chk = check_box_not_null(g, b, obj_id)
+                g = chk.gen
+                b = chk.block
                 -- Load the struct from the box pointer
                 let load_id = g.builder.next_id
                 let mut load_inst = ir_inst_new(load_id, OP_LOAD())
@@ -3738,6 +3791,10 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
             let inner_type = g.box_inner_types.get(box_key)
             if g.struct_defs.contains(inner_type) {
                 let info = g.struct_defs.get(inner_type)
+                -- Null check before dereferencing the box pointer
+                let chk = check_box_not_null(g, b, obj_id)
+                g = chk.gen
+                b = chk.block
                 -- Load the struct from the box pointer
                 let load_id = g.builder.next_id
                 let mut load_inst = ir_inst_new(load_id, OP_LOAD())
