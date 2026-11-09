@@ -24,6 +24,7 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
 
         info.field_names.push(fname)
         info.field_types.push(ir_type_name)
+        info.field_src_types.push(ftype)
 
         let field = ir_field_new(fname, ir_type_name)
         ir_fields.push(field)
@@ -375,8 +376,11 @@ fn generate_function(gen: IRGenerator, fd: FunctionDecl) -> IRGenerator {
         return g
     }
 
-    -- Generate function body
+    -- Generate function body (variable source types are per function)
+    let saved_src_types = g.var_src_types
+    g.var_src_types = Map_new()
     g = generate_function_body(g, fd, name)
+    g.var_src_types = saved_src_types
 
     return g
 }
@@ -598,6 +602,8 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             g.variable_types.insert(pname, ptype_str)
         }
 
+        g.var_src_types.insert(pname, ptype_str)
+
         -- Track struct/enum/list/box typed parameters
         if g.struct_defs.contains(ptype_str) {
             g.var_struct_types.insert(pname, ptype_str)
@@ -702,7 +708,10 @@ fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
         g = declare_function(g, fd, mangled)
         if fd.is_extern == false {
             g.method_struct_map.insert(fd.name, struct_name)
+            let saved_src_types = g.var_src_types
+            g.var_src_types = Map_new()
             g = generate_function_body(g, fd, mangled)
+            g.var_src_types = saved_src_types
         }
         i = i + 1
     }

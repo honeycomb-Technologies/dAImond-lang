@@ -488,7 +488,7 @@ fn generate_panic_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) 
         inst.has_result = false
         b.instructions.push(inst)
         g.builder.next_id = g.builder.next_id + 1
-        return expr_result(g, b, id)
+        return end_block_after_panic(g, b, id)
     }
 
     -- Generate the message expression
@@ -503,7 +503,21 @@ fn generate_panic_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) 
     b.instructions.push(inst)
     g.builder.next_id = g.builder.next_id + 1
 
-    return expr_result(g, b, id)
+    return end_block_after_panic(g, b, id)
+}
+
+-- panic never returns: end the block with `unreachable` and continue in a
+-- new block that nothing branches to, so statements after the panic are
+-- not emitted after a terminator.
+fn end_block_after_panic(gen: IRGenerator, block: IRBasicBlock, id: int) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    b.terminator = Box_new(term_unreachable())
+    b.has_terminator = true
+    g.completed_blocks.push(b)
+    let cont_label = gen_next_label(g, "after_panic")
+    g = gen_advance_label(g)
+    return expr_result(g, ir_block_new(cont_label), id)
 }
 
 -- Generate a Box_new(value) call.

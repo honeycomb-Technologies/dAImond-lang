@@ -1870,7 +1870,7 @@ fn generate_panic(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             g = check_call_args(g, fn_ty, func)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
         }
-        dm_llvm_build_unreachable(b)
+        -- The block's `unreachable` terminator follows (end_block_after_panic)
         return g
     }
 }

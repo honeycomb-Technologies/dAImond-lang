@@ -215,6 +215,15 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
 
+    -- Record the variable's source type: the annotation, else the type
+    -- resolved from the value expression
+    let src_type = if len(type_str) > 0 { type_str } else { static_type(g, *stmt.let_value) }
+    if len(src_type) > 0 {
+        g.var_src_types.insert(var_name, src_type)
+    } else if g.var_src_types.contains(var_name) {
+        g.var_src_types.remove(var_name)
+    }
+
     -- Detect List[T] type annotation
     if starts_with(type_str, "List[") {
         let inner = extract_inner_type(type_str, "List[")
@@ -614,6 +623,34 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             if fn_found {
                 g.fn_ptr_vars.insert(var_name, fn_ref_name)
             }
+        }
+    }
+
+    -- Without an annotation, track the resolved source type. Entries left
+    -- under this name by an earlier binding are replaced, not kept.
+    if len(type_str) == 0 and len(src_type) > 0 {
+        if g.struct_defs.contains(src_type) {
+            g.var_struct_types.insert(var_name, src_type)
+        } else if g.var_struct_types.contains(var_name) {
+            g.var_struct_types.remove(var_name)
+        }
+        if g.enum_defs.contains(src_type) {
+            g.var_enum_types.insert(var_name, src_type)
+        }
+        if starts_with(src_type, "Box[") {
+            g.box_inner_types.insert(var_name, extract_inner_type(src_type, "Box["))
+        } else if g.box_inner_types.contains(var_name) {
+            g.box_inner_types.remove(var_name)
+        }
+        if starts_with(src_type, "List[") {
+            let src_inner = extract_inner_type(src_type, "List[")
+            let src_kind = classify_list_elem(src_inner)
+            g.list_elem_kinds.insert(var_name, src_kind)
+            if src_kind == LIST_ELEM_OTHER() {
+                g.list_elem_types.insert(var_name, src_inner)
+            }
+        } else if g.list_elem_kinds.contains(var_name) {
+            g.list_elem_kinds.remove(var_name)
         }
     }
 

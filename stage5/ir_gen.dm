@@ -14,11 +14,14 @@ import ir_builder
 struct StructInfo {
     name: string,
     field_names: List[string],
-    field_types: List[string]
+    -- IR type names (lowered)
+    field_types: List[string],
+    -- Source type names as written, e.g. List[Stmt] or Map[string, int]
+    field_src_types: List[string]
 }
 
 fn struct_info_new(name: string) -> StructInfo {
-    return StructInfo { name: name, field_names: [], field_types: [] }
+    return StructInfo { name: name, field_names: [], field_types: [], field_src_types: [] }
 }
 
 -- Enum info for tracking registered enums
@@ -154,7 +157,13 @@ struct IRGenerator {
     all_extern_fns: Map[string, bool],
     -- Expressions IR generation could not resolve, reported as compile
     -- errors after IR generation instead of being lowered to placeholders
-    type_errors: List[string]
+    type_errors: List[string],
+    -- Declared source return types of functions and impl methods
+    -- (methods keyed Type_method), as written in the source
+    fn_src_return_types: Map[string, string],
+    -- Source type of each variable in the current function, as written
+    -- or as resolved by static_type; reset per function
+    var_src_types: Map[string, string]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -210,7 +219,9 @@ fn ir_generator_new() -> IRGenerator {
         declared_vars: [],
         region_marks: [],
         all_extern_fns: Map_new(),
-        type_errors: []
+        type_errors: [],
+        fn_src_return_types: Map_new(),
+        var_src_types: Map_new()
     }
 }
 
@@ -828,6 +839,23 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                 "void"
             }
             g.fn_return_types.insert(fd.name, ret)
+            g.fn_src_return_types.insert(fd.name, fd.return_type)
+            -- Mut params change how callers pass arguments, so calls that
+            -- precede the declaration must know about them too
+            let mut mut_flags = ""
+            let mut pi = 0
+            while pi < fd.params.len() {
+                if pi > 0 { mut_flags = mut_flags + "|" }
+                if fd.params[pi].is_mut {
+                    mut_flags = mut_flags + "1"
+                } else {
+                    mut_flags = mut_flags + "0"
+                }
+                pi = pi + 1
+            }
+            if string_contains(mut_flags, "1") {
+                g.mut_param_fns.insert(fd.name, mut_flags)
+            }
         } else if decl.kind == DECL_IMPL() {
             let ib = *decl.impl_block
             g = register_impl_methods(g, ib)
@@ -842,6 +870,8 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                     "void"
                 }
                 g.fn_return_types.insert(method_name, mret)
+                let msrc = if method.return_type == "Self" { ib.target_type } else { method.return_type }
+                g.fn_src_return_types.insert(method_name, msrc)
                 mi = mi + 1
             }
         }

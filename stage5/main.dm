@@ -4436,11 +4436,14 @@ fn parse(source: string) -> SourceFile {
 struct StructInfo {
     name: string,
     field_names: List[string],
-    field_types: List[string]
+    -- IR type names (lowered)
+    field_types: List[string],
+    -- Source type names as written, e.g. List[Stmt] or Map[string, int]
+    field_src_types: List[string]
 }
 
 fn struct_info_new(name: string) -> StructInfo {
-    return StructInfo { name: name, field_names: [], field_types: [] }
+    return StructInfo { name: name, field_names: [], field_types: [], field_src_types: [] }
 }
 
 -- Enum info for tracking registered enums
@@ -4576,7 +4579,13 @@ struct IRGenerator {
     all_extern_fns: Map[string, bool],
     -- Expressions IR generation could not resolve, reported as compile
     -- errors after IR generation instead of being lowered to placeholders
-    type_errors: List[string]
+    type_errors: List[string],
+    -- Declared source return types of functions and impl methods
+    -- (methods keyed Type_method), as written in the source
+    fn_src_return_types: Map[string, string],
+    -- Source type of each variable in the current function, as written
+    -- or as resolved by static_type; reset per function
+    var_src_types: Map[string, string]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -4632,7 +4641,9 @@ fn ir_generator_new() -> IRGenerator {
         declared_vars: [],
         region_marks: [],
         all_extern_fns: Map_new(),
-        type_errors: []
+        type_errors: [],
+        fn_src_return_types: Map_new(),
+        var_src_types: Map_new()
     }
 }
 
@@ -5250,6 +5261,23 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                 "void"
             }
             g.fn_return_types.insert(fd.name, ret)
+            g.fn_src_return_types.insert(fd.name, fd.return_type)
+            -- Mut params change how callers pass arguments, so calls that
+            -- precede the declaration must know about them too
+            let mut mut_flags = ""
+            let mut pi = 0
+            while pi < fd.params.len() {
+                if pi > 0 { mut_flags = mut_flags + "|" }
+                if fd.params[pi].is_mut {
+                    mut_flags = mut_flags + "1"
+                } else {
+                    mut_flags = mut_flags + "0"
+                }
+                pi = pi + 1
+            }
+            if string_contains(mut_flags, "1") {
+                g.mut_param_fns.insert(fd.name, mut_flags)
+            }
         } else if decl.kind == DECL_IMPL() {
             let ib = *decl.impl_block
             g = register_impl_methods(g, ib)
@@ -5264,6 +5292,8 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                     "void"
                 }
                 g.fn_return_types.insert(method_name, mret)
+                let msrc = if method.return_type == "Self" { ib.target_type } else { method.return_type }
+                g.fn_src_return_types.insert(method_name, msrc)
                 mi = mi + 1
             }
         }
@@ -5330,6 +5360,7 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
 
         info.field_names.push(fname)
         info.field_types.push(ir_type_name)
+        info.field_src_types.push(ftype)
 
         let field = ir_field_new(fname, ir_type_name)
         ir_fields.push(field)
@@ -5681,8 +5712,11 @@ fn generate_function(gen: IRGenerator, fd: FunctionDecl) -> IRGenerator {
         return g
     }
 
-    -- Generate function body
+    -- Generate function body (variable source types are per function)
+    let saved_src_types = g.var_src_types
+    g.var_src_types = Map_new()
     g = generate_function_body(g, fd, name)
+    g.var_src_types = saved_src_types
 
     return g
 }
@@ -5904,6 +5938,8 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             g.variable_types.insert(pname, ptype_str)
         }
 
+        g.var_src_types.insert(pname, ptype_str)
+
         -- Track struct/enum/list/box typed parameters
         if g.struct_defs.contains(ptype_str) {
             g.var_struct_types.insert(pname, ptype_str)
@@ -6008,7 +6044,10 @@ fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
         g = declare_function(g, fd, mangled)
         if fd.is_extern == false {
             g.method_struct_map.insert(fd.name, struct_name)
+            let saved_src_types = g.var_src_types
+            g.var_src_types = Map_new()
             g = generate_function_body(g, fd, mangled)
+            g.var_src_types = saved_src_types
         }
         i = i + 1
     }
@@ -6399,6 +6438,15 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             type_str = "List[" + inner_type + "]"
             g.array_var_names.insert(var_name, true)
         }
+    }
+
+    -- Record the variable's source type: the annotation, else the type
+    -- resolved from the value expression
+    let src_type = if len(type_str) > 0 { type_str } else { static_type(g, *stmt.let_value) }
+    if len(src_type) > 0 {
+        g.var_src_types.insert(var_name, src_type)
+    } else if g.var_src_types.contains(var_name) {
+        g.var_src_types.remove(var_name)
     }
 
     -- Detect List[T] type annotation
@@ -6800,6 +6848,34 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             if fn_found {
                 g.fn_ptr_vars.insert(var_name, fn_ref_name)
             }
+        }
+    }
+
+    -- Without an annotation, track the resolved source type. Entries left
+    -- under this name by an earlier binding are replaced, not kept.
+    if len(type_str) == 0 and len(src_type) > 0 {
+        if g.struct_defs.contains(src_type) {
+            g.var_struct_types.insert(var_name, src_type)
+        } else if g.var_struct_types.contains(var_name) {
+            g.var_struct_types.remove(var_name)
+        }
+        if g.enum_defs.contains(src_type) {
+            g.var_enum_types.insert(var_name, src_type)
+        }
+        if starts_with(src_type, "Box[") {
+            g.box_inner_types.insert(var_name, extract_inner_type(src_type, "Box["))
+        } else if g.box_inner_types.contains(var_name) {
+            g.box_inner_types.remove(var_name)
+        }
+        if starts_with(src_type, "List[") {
+            let src_inner = extract_inner_type(src_type, "List[")
+            let src_kind = classify_list_elem(src_inner)
+            g.list_elem_kinds.insert(var_name, src_kind)
+            if src_kind == LIST_ELEM_OTHER() {
+                g.list_elem_types.insert(var_name, src_inner)
+            }
+        } else if g.list_elem_kinds.contains(var_name) {
+            g.list_elem_kinds.remove(var_name)
         }
     }
 
@@ -8731,6 +8807,134 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 }
 
 -- ============================================================
+-- STATIC SOURCE TYPES
+-- The dAImond source type of an expression, as written in the
+-- program (e.g. "Parser", "List[Stmt]", "Map[string, int]",
+-- "Box[Expr]"), or "" when it cannot be determined. Used to
+-- dispatch field access and method calls on any receiver, not
+-- just on variables.
+-- ============================================================
+
+-- "K" and "V" of a "Map[K, V]" type; "" when not a map type.
+fn map_type_arg(map_type: string, which: int) -> string {
+    if starts_with(map_type, "Map[") == false { return "" }
+    let inner = extract_inner_type(map_type, "Map[")
+    let mut depth = 0
+    let mut i = 0
+    while i < len(inner) {
+        let c = char_at(inner, i)
+        if c == "[" { depth = depth + 1 }
+        if c == "]" { depth = depth - 1 }
+        if c == "," and depth == 0 {
+            if which == 0 { return string_trim(substr(inner, 0, i)) }
+            return string_trim(substr(inner, i + 1, len(inner) - i - 1))
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn strip_box_type(t: string) -> string {
+    if starts_with(t, "Box[") { return extract_inner_type(t, "Box[") }
+    return t
+}
+
+fn struct_field_src_type(gen: IRGenerator, struct_name: string, field: string) -> string {
+    if gen.struct_defs.contains(struct_name) == false { return "" }
+    let info = gen.struct_defs.get(struct_name)
+    let mut i = 0
+    while i < info.field_names.len() {
+        if info.field_names[i] == field and i < info.field_src_types.len() {
+            return info.field_src_types[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+-- Source type for a builtin's IR return type name
+fn builtin_src_type(ir_type: string) -> string {
+    if ir_type == "i64" { return "int" }
+    if ir_type == "f64" { return "float" }
+    if ir_type == "void" { return "" }
+    return ir_type
+}
+
+fn static_type(gen: IRGenerator, expr: Expr) -> string {
+    let k = expr.kind
+    if k == EXPR_LITERAL_INT() { return "int" }
+    if k == EXPR_LITERAL_FLOAT() { return "float" }
+    if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
+    if k == EXPR_LITERAL_BOOL() { return "bool" }
+    if k == EXPR_STRUCT_LITERAL() { return expr.type_name }
+    if k == EXPR_GROUPED() { return static_type(gen, *expr.operand) }
+    if k == EXPR_IDENTIFIER() {
+        if gen.var_src_types.contains(expr.name) { return gen.var_src_types.get(expr.name) }
+        return ""
+    }
+    if k == EXPR_FIELD_ACCESS() {
+        let obj_t = strip_box_type(static_type(gen, *expr.object))
+        return struct_field_src_type(gen, obj_t, expr.field)
+    }
+    if k == EXPR_INDEX_ACCESS() {
+        let obj_t = static_type(gen, *expr.object)
+        if starts_with(obj_t, "List[") { return extract_inner_type(obj_t, "List[") }
+        if starts_with(obj_t, "Map[") { return map_type_arg(obj_t, 1) }
+        if obj_t == "string" { return "string" }
+        return ""
+    }
+    if k == EXPR_UNARY() {
+        if expr.op == UNOP_DEREF() {
+            let inner_t = static_type(gen, *expr.operand)
+            if starts_with(inner_t, "Box[") { return extract_inner_type(inner_t, "Box[") }
+            return ""
+        }
+        if expr.op == UNOP_NOT() { return "bool" }
+        return static_type(gen, *expr.operand)
+    }
+    if k == EXPR_FUNCTION_CALL() {
+        let callee = *expr.callee
+        if callee.kind != EXPR_IDENTIFIER() { return "" }
+        let fname = callee.name
+        if fname == "Box_new" and expr.args.len() == 1 {
+            let inner_t = static_type(gen, expr.args[0])
+            if inner_t == "" { return "" }
+            return "Box[" + inner_t + "]"
+        }
+        if gen.generic_fn_decls.contains(fname) { return "" }
+        if gen.fn_src_return_types.contains(fname) { return gen.fn_src_return_types.get(fname) }
+        if is_builtin_fn(fname) { return builtin_src_type(builtin_return_type(fname)) }
+        return ""
+    }
+    if k == EXPR_METHOD_CALL() {
+        let recv_t = strip_box_type(static_type(gen, *expr.object))
+        let m = expr.method
+        if gen.struct_defs.contains(recv_t) {
+            let key = recv_t + "_" + m
+            if gen.fn_src_return_types.contains(key) { return gen.fn_src_return_types.get(key) }
+            return ""
+        }
+        if starts_with(recv_t, "List[") {
+            if m == "len" { return "int" }
+            if m == "pop" or m == "get" { return extract_inner_type(recv_t, "List[") }
+            if m == "contains" { return "bool" }
+            return ""
+        }
+        if starts_with(recv_t, "Map[") {
+            if m == "get" { return map_type_arg(recv_t, 1) }
+            if m == "contains" { return "bool" }
+            if m == "len" { return "int" }
+            if m == "keys" { return "List[" + map_type_arg(recv_t, 0) + "]" }
+            if m == "values" { return "List[" + map_type_arg(recv_t, 1) + "]" }
+            return ""
+        }
+        if recv_t == "string" and m == "len" { return "int" }
+        return ""
+    }
+    return ""
+}
+
+-- ============================================================
 -- EXPRESSION TYPE INFERENCE
 -- Determines the IR type name for an expression without
 -- generating instructions. Used to select the correct opcode
@@ -8885,6 +9089,10 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
                     }
                 }
             }
+            -- Declared later in the source: use the signature registered up front
+            if gen.fn_return_types.contains(fn_name) {
+                return gen.fn_return_types.get(fn_name)
+            }
             -- Check if callee is a lambda/fn-ptr variable: look up actual function
             if gen.fn_ptr_vars.contains(fn_name) {
                 let lambda_fn_name = gen.fn_ptr_vars.get(fn_name)
@@ -8933,6 +9141,9 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
                         return func.return_type
                     }
                     fi = fi + 1
+                }
+                if gen.fn_return_types.contains(fn_name) and gen.generic_fn_decls.contains(fn_name) == false {
+                    return gen.fn_return_types.get(fn_name)
                 }
             }
         } else if rhs.kind == EXPR_IDENTIFIER() {
@@ -10272,6 +10483,26 @@ fn generate_normal_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
                 b = arg_result.block
                 call_args.push(ir_val_inst(arg_result.val_id))
             }
+        } else if is_mut_arg {
+            -- A mut parameter takes a pointer: spill a non-variable argument
+            -- (e.g. a struct literal) to a temporary and pass its address
+            let arg_type = infer_expr_type(g, args[i])
+            let arg_result = generate_expr(g, b, args[i])
+            g = arg_result.gen
+            b = arg_result.block
+            let tmp_id = g.builder.next_id
+            let mut tmp_inst = ir_inst_new(tmp_id, OP_ALLOCA())
+            tmp_inst.alloc_type = arg_type
+            tmp_inst.result_type = "ptr(" + arg_type + ")"
+            tmp_inst.has_result = true
+            b.instructions.push(tmp_inst)
+            g.builder.next_id = tmp_id + 1
+            let mut st_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+            st_inst.store_ptr = ir_val_inst(tmp_id)
+            st_inst.store_val = ir_val_inst(arg_result.val_id)
+            b.instructions.push(st_inst)
+            g.builder.next_id = g.builder.next_id + 1
+            call_args.push(ir_val_inst(tmp_id))
         } else {
             let arg_result = generate_expr(g, b, args[i])
             g = arg_result.gen
@@ -10323,6 +10554,11 @@ fn infer_call_return_type(gen: IRGenerator, fn_name: string) -> string {
             return f.return_type
         }
         i = i + 1
+    }
+
+    -- Declared later in the source: use the signature registered up front
+    if gen.fn_return_types.contains(fn_name) {
+        return gen.fn_return_types.get(fn_name)
     }
 
     -- Unknown function: assume i64 return
@@ -10996,6 +11232,24 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 
     if len(struct_type) > 0 {
         return generate_struct_method_call(g, b, struct_type, obj_expr, method_name, args)
+    }
+
+    -- --------------------------------------------------------
+    -- Any other receiver: dispatch on its static source type
+    -- --------------------------------------------------------
+    let recv_type = static_type(g, obj_expr)
+    if g.struct_defs.contains(recv_type) {
+        return generate_struct_method_call(g, b, recv_type, obj_expr, method_name, args)
+    }
+    if starts_with(recv_type, "List[") {
+        let recv_elem = extract_inner_type(recv_type, "List[")
+        let recv_result = generate_expr(g, b, obj_expr)
+        g = recv_result.gen
+        b = recv_result.block
+        -- Generic list methods look up the element type by name
+        let recv_key = "_listrecv_" + int_to_string(recv_result.val_id)
+        g.list_elem_types.insert(recv_key, recv_elem)
+        return generate_list_method_call(g, b, classify_list_elem(recv_elem), recv_result.val_id, recv_key, method_name, args)
     }
 
     -- --------------------------------------------------------
@@ -11757,6 +12011,7 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                             let ftype = resolve_type_substitution(g, base_info.field_types[fi])
                             mono_info.field_names.push(fname)
                             mono_info.field_types.push(map_type_name(ftype))
+                            mono_info.field_src_types.push(ftype)
                             mono_fields.push(ir_field_new(fname, map_type_name(ftype)))
                             fi = fi + 1
                         }
@@ -12569,6 +12824,13 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                 g.builder.next_id = id + 1
                 return expr_result(g, b, id)
             }
+        }
+    }
+
+    if struct_name == "" {
+        let obj_static = static_type(g, object)
+        if g.struct_defs.contains(obj_static) {
+            struct_name = obj_static
         }
     }
 
@@ -15621,7 +15883,7 @@ fn generate_panic_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) 
         inst.has_result = false
         b.instructions.push(inst)
         g.builder.next_id = g.builder.next_id + 1
-        return expr_result(g, b, id)
+        return end_block_after_panic(g, b, id)
     }
 
     -- Generate the message expression
@@ -15636,7 +15898,21 @@ fn generate_panic_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) 
     b.instructions.push(inst)
     g.builder.next_id = g.builder.next_id + 1
 
-    return expr_result(g, b, id)
+    return end_block_after_panic(g, b, id)
+}
+
+-- panic never returns: end the block with `unreachable` and continue in a
+-- new block that nothing branches to, so statements after the panic are
+-- not emitted after a terminator.
+fn end_block_after_panic(gen: IRGenerator, block: IRBasicBlock, id: int) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    b.terminator = Box_new(term_unreachable())
+    b.has_terminator = true
+    g.completed_blocks.push(b)
+    let cont_label = gen_next_label(g, "after_panic")
+    g = gen_advance_label(g)
+    return expr_result(g, ir_block_new(cont_label), id)
 }
 
 -- Generate a Box_new(value) call.
@@ -18827,7 +19103,7 @@ fn generate_panic(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             g = check_call_args(g, fn_ty, func)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
         }
-        dm_llvm_build_unreachable(b)
+        -- The block's `unreachable` terminator follows (end_block_after_panic)
         return g
     }
 }

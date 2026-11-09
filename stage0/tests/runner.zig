@@ -1647,6 +1647,51 @@ pub const io_tests = [_]TestCase{
         .expected_exit_code = 42,
     },
     .{
+        .name = "statements_after_panic",
+        .source =
+            \\module test
+            \\
+            \\fn check(x: int) -> int {
+            \\    if x > 5 {
+            \\        panic("too big")
+            \\        return 0
+            \\    }
+            \\    return x * 2
+            \\}
+            \\
+            \\fn main() {
+            \\    println(int_to_string(check(3)))
+            \\}
+        ,
+        .expected_output = "6\n",
+    },
+    .{
+        .name = "forward_call_mut_struct_param",
+        .source =
+            \\module test
+            \\
+            \\struct State { pos: int }
+            \\struct Res { value: int, st: State }
+            \\
+            \\fn first(mut s: State) -> Res {
+            \\    let inner = second(s)
+            \\    return Res { value: inner.value + 1, st: inner.st }
+            \\}
+            \\
+            \\fn second(mut s: State) -> Res {
+            \\    s.pos = s.pos + 10
+            \\    return Res { value: s.pos, st: s }
+            \\}
+            \\
+            \\fn main() {
+            \\    let r = first(State { pos: 1 })
+            \\    println(int_to_string(r.value))
+            \\    println(int_to_string(r.st.pos))
+            \\}
+        ,
+        .expected_output = "12\n11\n",
+    },
+    .{
         .name = "main_return_code",
         .source =
             \\module test
