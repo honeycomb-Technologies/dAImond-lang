@@ -151,7 +151,10 @@ struct IRGenerator {
     -- Stack of declared_vars lengths at named-region entry points
     region_marks: List[int],
     -- All source-declared extern fn names (unsafe fence; includes dm_*)
-    all_extern_fns: Map[string, bool]
+    all_extern_fns: Map[string, bool],
+    -- Expressions IR generation could not resolve, reported as compile
+    -- errors after IR generation instead of being lowered to placeholders
+    type_errors: List[string]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -206,8 +209,17 @@ fn ir_generator_new() -> IRGenerator {
         region_born_vars: Map_new(),
         declared_vars: [],
         region_marks: [],
-        all_extern_fns: Map_new()
+        all_extern_fns: Map_new(),
+        type_errors: []
     }
+}
+
+-- Record a compile error for an expression IR generation cannot resolve.
+-- Generation continues with a placeholder so every error is reported.
+fn ir_type_error(gen: IRGenerator, msg: string, line: int) -> IRGenerator {
+    let mut g = gen
+    g.type_errors.push("Error: " + msg + " at line " + int_to_string(line))
+    return g
 }
 
 -- ============================================================

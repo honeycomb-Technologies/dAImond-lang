@@ -1032,8 +1032,16 @@ pub const CodeGenerator = struct {
         self.writer.indent();
         try self.writer.writeLine("dm_argc = argc;");
         try self.writer.writeLine("dm_argv = argv;");
-        try self.writer.writeLine("dm_main();");
-        try self.writer.writeLine("return 0;");
+        // An integer-returning main() sets the process exit status.
+        const main_ret = self.lookupFunctionReturnType("main") orelse "void";
+        const main_returns_int = std.mem.endsWith(u8, main_ret, "_t") and
+            (std.mem.startsWith(u8, main_ret, "int") or std.mem.startsWith(u8, main_ret, "uint"));
+        if (main_returns_int) {
+            try self.writer.writeLine("return (int)dm_main();");
+        } else {
+            try self.writer.writeLine("dm_main();");
+            try self.writer.writeLine("return 0;");
+        }
         self.writer.dedent();
         try self.writer.writeLine("}");
 

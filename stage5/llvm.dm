@@ -168,6 +168,14 @@ extern fn dm_llvm_free_c_string(c_str_ptr: int)
 -- Buffer-based API (for passing arrays to LLVM without raw pointers)
 extern fn dm_llvm_buf_clear()
 extern fn dm_llvm_buf_push(ref: int)
+extern fn dm_llvm_buf_len() -> int
+extern fn dm_llvm_buf_get(index: int) -> int
+extern fn dm_llvm_count_param_types(fn_ty: int) -> int
+extern fn dm_llvm_param_type_at(fn_ty: int, index: int) -> int
+extern fn dm_llvm_is_function_var_arg(fn_ty: int) -> int
+extern fn dm_llvm_print_type_to_string(ty: int) -> int
+extern fn dm_llvm_get_value_name(val: int) -> string
+extern fn dm_llvm_get_struct_name(ty: int) -> string
 extern fn dm_llvm_struct_set_body_buf(struct_ty: int, is_packed: int)
 extern fn dm_llvm_function_type_buf(ret: int, is_var_arg: int) -> int
 extern fn dm_llvm_build_call2_buf(b: int, fn_ty: int, func: int, name: string) -> int

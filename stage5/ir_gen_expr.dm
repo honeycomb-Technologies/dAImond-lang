@@ -560,7 +560,8 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         fi = fi + 1
     }
 
-    -- Unknown identifier - return undef
+    -- Unknown identifier: report it, then emit a placeholder to continue
+    g = ir_type_error(g, "undefined variable '" + expr.name + "'", expr.line)
     let id = g.builder.next_id
     let mut inst = ir_inst_new(id, OP_ALLOCA())
     inst.alloc_type = "i64"
@@ -1729,7 +1730,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         return expr_result(g, b, id)
     }
 
-    -- Fallback: unsupported binary operator, return lhs
+    g = ir_type_error(g, "unsupported binary operator", expr.line)
     return expr_result(g, b, lhs_id)
 }
 
@@ -2049,7 +2050,7 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Check if function is defined
     if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false {
-        eprintln("Error: undefined function '" + fn_name + "'")
+        eprintln("Error: undefined function '" + fn_name + "' at line " + int_to_string(expr.line))
         exit(1)
     }
 
@@ -2840,8 +2841,12 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     }
 
     -- --------------------------------------------------------
-    -- Fallback: treat as a regular function call with self as first arg
+    -- Fallback: a free function called with method syntax, self first.
+    -- Any other method means the receiver's type is unknown.
     -- --------------------------------------------------------
+    if g.known_functions.contains(method_name) == false {
+        g = ir_type_error(g, "cannot determine the type of the value '." + method_name + "()' is called on", expr.line)
+    }
     let obj_result = generate_expr(g, b, obj_expr)
     g = obj_result.gen
     b = obj_result.block
@@ -4411,7 +4416,8 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
 
     -- Look up struct definition to find the field index and type
     if struct_name == "" {
-        -- Cannot resolve struct type; emit an extract at index 0 as fallback
+        -- Cannot resolve struct type: report it, then extract index 0 to continue
+        g = ir_type_error(g, "cannot determine the struct type for field access '." + expr.field + "'", expr.line)
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_EXTRACT_FIELD())
         inst.field_base = ir_val_inst(obj_id)
@@ -6503,7 +6509,7 @@ fn generate_pipeline(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
         }
     }
 
-    -- Fallback: just return the left value (pipeline target not recognized)
+    g = ir_type_error(g, "unsupported pipeline target", expr.line)
     return expr_result(g, b, left_result.val_id)
 }
 

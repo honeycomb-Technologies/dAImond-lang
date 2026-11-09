@@ -127,8 +127,8 @@ fn generate_simd_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
         return generate_simd_extract(gen, block, args)
     }
 
-    -- Fallback: return zero
-    return expr_result(gen, block, 0)
+    let line = if args.len() > 0 { args[0].line } else { 0 }
+    return expr_result(ir_type_error(gen, "unknown SIMD builtin '" + fn_name + "'", line), block, 0)
 }
 
 -- ============================================================

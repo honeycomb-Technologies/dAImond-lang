@@ -467,6 +467,15 @@ fn compile(cli: CLIArgs) -> int {
 
     let mut ir_gen = ir_generator_new()
     ir_gen = generate_module(ir_gen, sf)
+    if ir_gen.type_errors.len() > 0 {
+        let mut te = 0
+        while te < ir_gen.type_errors.len() {
+            eprintln(ir_gen.type_errors[te])
+            te = te + 1
+        }
+        eprintln("Error: " + int_to_string(ir_gen.type_errors.len()) + " type errors")
+        return 1
+    }
 
     -- If --emit-ir, print the IR module and exit
     if cli.emit_ir {
@@ -522,15 +531,26 @@ fn compile(cli: CLIArgs) -> int {
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
     lg = lg_generate_module(lg)
 
+    -- Calls with mismatched argument types and field reads from non-structs
+    -- mean IR generation failed to type an expression; report them at their
+    -- source lines instead of handing invalid IR to the verifier.
+    if lg.type_errors.len() > 0 {
+        let mut ti = 0
+        while ti < lg.type_errors.len() {
+            eprintln(lg.type_errors[ti])
+            ti = ti + 1
+        }
+        eprintln("Error: " + int_to_string(lg.type_errors.len()) + " type errors")
+        llvm_gen_dispose(lg)
+        return 1
+    }
+
     -- Verify LLVM module (fatal: invalid IR must not produce any output;
     -- dm_llvm_module_verify in llvm_bridge.c prints the detailed diagnostic)
     let verify_result = verify_module(lg)
     if verify_result != 0 {
         eprintln("Error: LLVM module verification failed")
         llvm_gen_dispose(lg)
-        -- exit(1) as well as return: the Stage 0 C wrapper discards
-        -- dm_main()'s return value, so return alone would exit 0.
-        exit(1)
         return 1
     }
 

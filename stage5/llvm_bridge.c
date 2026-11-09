@@ -434,19 +434,10 @@ int64_t dm_llvm_build_extract_value(int64_t b, int64_t agg, int64_t idx, const c
     LLVMTypeRef agg_ty = LLVMTypeOf(agg_val);
     LLVMTypeKind tk = LLVMGetTypeKind(agg_ty);
     if (tk != LLVMStructTypeKind) {
-        /* Find which function this builder is in */
+        /* llvm_gen reports this as a type error; return a dummy so
+         * generation can continue and collect every error. */
         LLVMBasicBlockRef bb = LLVMGetInsertBlock(TO_PTR(LLVMBuilderRef, b));
-        LLVMValueRef fn = bb ? LLVMGetBasicBlockParent(bb) : NULL;
-        const char* fn_name = fn ? LLVMGetValueName(fn) : "(unknown)";
-        fprintf(stderr, "DEBUG extract_value in %s: agg type kind=%d (expected %d=struct), idx=%lld, name=%s\n",
-                fn_name, (int)tk, (int)LLVMStructTypeKind, (long long)idx, name ? name : "(null)");
-        char *s = LLVMPrintTypeToString(agg_ty);
-        fprintf(stderr, "  agg type: %s\n", s);
-        LLVMDisposeMessage(s);
-        char *vs = LLVMPrintValueToString(agg_val);
-        fprintf(stderr, "  agg value: %s\n", vs);
-        LLVMDisposeMessage(vs);
-        /* Return a safe dummy value instead of crashing */
+        LLVMValueRef fn = LLVMGetBasicBlockParent(bb);
         return TO_INT(LLVMConstInt(LLVMInt64TypeInContext(
             LLVMGetModuleContext(LLVMGetGlobalParent(fn))), 0, 0));
     }
@@ -772,6 +763,46 @@ void dm_llvm_buf_push(int64_t ref) {
     if (dm_llvm_buf_count < DM_LLVM_BUF_MAX) {
         dm_llvm_buf[dm_llvm_buf_count++] = ref;
     }
+}
+
+/* Read access to the buffer and to function types, so the generator can
+ * check call arguments against parameter types before building a call. */
+int64_t dm_llvm_buf_len(void) {
+    return dm_llvm_buf_count;
+}
+
+int64_t dm_llvm_buf_get(int64_t index) {
+    return dm_llvm_buf[index];
+}
+
+int64_t dm_llvm_count_param_types(int64_t fn_ty) {
+    return (int64_t)LLVMCountParamTypes(TO_PTR(LLVMTypeRef, fn_ty));
+}
+
+int64_t dm_llvm_param_type_at(int64_t fn_ty, int64_t index) {
+    LLVMTypeRef types[DM_LLVM_BUF_MAX];
+    LLVMGetParamTypes(TO_PTR(LLVMTypeRef, fn_ty), types);
+    return TO_INT(types[index]);
+}
+
+int64_t dm_llvm_is_function_var_arg(int64_t fn_ty) {
+    return (int64_t)LLVMIsFunctionVarArg(TO_PTR(LLVMTypeRef, fn_ty));
+}
+
+const char* dm_llvm_get_value_name(int64_t val) {
+    size_t len = 0;
+    const char* name = LLVMGetValueName2(TO_PTR(LLVMValueRef, val), &len);
+    return strndup(name ? name : "", len);
+}
+
+/* Returns a C string; free it with dm_llvm_free_c_string. */
+int64_t dm_llvm_print_type_to_string(int64_t ty) {
+    return TO_INT(LLVMPrintTypeToString(TO_PTR(LLVMTypeRef, ty)));
+}
+
+const char* dm_llvm_get_struct_name(int64_t ty) {
+    const char* name = LLVMGetStructName(TO_PTR(LLVMTypeRef, ty));
+    return strdup(name ? name : "");
 }
 
 int64_t dm_llvm_struct_type_buf(int64_t ctx, int64_t count, int64_t is_packed) {

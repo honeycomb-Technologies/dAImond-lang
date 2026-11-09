@@ -67,7 +67,45 @@ fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
 -- STATEMENT GENERATION
 -- ============================================================
 
+-- Stamp instructions from index `from` on that have no source line yet.
+fn stamp_block_lines(block: IRBasicBlock, from: int, line: int) -> IRBasicBlock {
+    let mut b = block
+    let mut i = from
+    while i < b.instructions.len() {
+        let mut inst = b.instructions[i]
+        if inst.source_line == 0 {
+            inst.source_line = line
+            b.instructions[i] = inst
+        }
+        i = i + 1
+    }
+    return b
+}
+
+-- Generate a statement and record its source line on every instruction it
+-- produced, in the current block and in blocks it completed. Nested
+-- statements stamp first, so each instruction keeps its innermost line.
 fn generate_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
+    let start_inst = block.instructions.len()
+    let start_label = block.label
+    let start_completed = gen.completed_blocks.len()
+    let result = generate_statement_kind(gen, block, stmt)
+    if stmt.line <= 0 { return result }
+    let mut g = result.gen
+    let mut b = result.block
+    let from = if b.label == start_label { start_inst } else { 0 }
+    b = stamp_block_lines(b, from, stmt.line)
+    let mut ci = start_completed
+    while ci < g.completed_blocks.len() {
+        let cb = g.completed_blocks[ci]
+        let cfrom = if cb.label == start_label { start_inst } else { 0 }
+        g.completed_blocks[ci] = stamp_block_lines(cb, cfrom, stmt.line)
+        ci = ci + 1
+    }
+    return gen_result(g, b)
+}
+
+fn generate_statement_kind(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
     if stmt.kind == STMT_LET() {
         return generate_let_binding(gen, block, stmt)
     }

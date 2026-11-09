@@ -2518,6 +2518,14 @@ extern fn dm_llvm_free_c_string(c_str_ptr: int)
 -- Buffer-based API (for passing arrays to LLVM without raw pointers)
 extern fn dm_llvm_buf_clear()
 extern fn dm_llvm_buf_push(ref: int)
+extern fn dm_llvm_buf_len() -> int
+extern fn dm_llvm_buf_get(index: int) -> int
+extern fn dm_llvm_count_param_types(fn_ty: int) -> int
+extern fn dm_llvm_param_type_at(fn_ty: int, index: int) -> int
+extern fn dm_llvm_is_function_var_arg(fn_ty: int) -> int
+extern fn dm_llvm_print_type_to_string(ty: int) -> int
+extern fn dm_llvm_get_value_name(val: int) -> string
+extern fn dm_llvm_get_struct_name(ty: int) -> string
 extern fn dm_llvm_struct_set_body_buf(struct_ty: int, is_packed: int)
 extern fn dm_llvm_function_type_buf(ret: int, is_var_arg: int) -> int
 extern fn dm_llvm_build_call2_buf(b: int, fn_ty: int, func: int, name: string) -> int
@@ -4565,7 +4573,10 @@ struct IRGenerator {
     -- Stack of declared_vars lengths at named-region entry points
     region_marks: List[int],
     -- All source-declared extern fn names (unsafe fence; includes dm_*)
-    all_extern_fns: Map[string, bool]
+    all_extern_fns: Map[string, bool],
+    -- Expressions IR generation could not resolve, reported as compile
+    -- errors after IR generation instead of being lowered to placeholders
+    type_errors: List[string]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -4620,8 +4631,17 @@ fn ir_generator_new() -> IRGenerator {
         region_born_vars: Map_new(),
         declared_vars: [],
         region_marks: [],
-        all_extern_fns: Map_new()
+        all_extern_fns: Map_new(),
+        type_errors: []
     }
+}
+
+-- Record a compile error for an expression IR generation cannot resolve.
+-- Generation continues with a placeholder so every error is reported.
+fn ir_type_error(gen: IRGenerator, msg: string, line: int) -> IRGenerator {
+    let mut g = gen
+    g.type_errors.push("Error: " + msg + " at line " + int_to_string(line))
+    return g
 }
 
 -- ============================================================
@@ -6233,7 +6253,45 @@ fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
 -- STATEMENT GENERATION
 -- ============================================================
 
+-- Stamp instructions from index `from` on that have no source line yet.
+fn stamp_block_lines(block: IRBasicBlock, from: int, line: int) -> IRBasicBlock {
+    let mut b = block
+    let mut i = from
+    while i < b.instructions.len() {
+        let mut inst = b.instructions[i]
+        if inst.source_line == 0 {
+            inst.source_line = line
+            b.instructions[i] = inst
+        }
+        i = i + 1
+    }
+    return b
+}
+
+-- Generate a statement and record its source line on every instruction it
+-- produced, in the current block and in blocks it completed. Nested
+-- statements stamp first, so each instruction keeps its innermost line.
 fn generate_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
+    let start_inst = block.instructions.len()
+    let start_label = block.label
+    let start_completed = gen.completed_blocks.len()
+    let result = generate_statement_kind(gen, block, stmt)
+    if stmt.line <= 0 { return result }
+    let mut g = result.gen
+    let mut b = result.block
+    let from = if b.label == start_label { start_inst } else { 0 }
+    b = stamp_block_lines(b, from, stmt.line)
+    let mut ci = start_completed
+    while ci < g.completed_blocks.len() {
+        let cb = g.completed_blocks[ci]
+        let cfrom = if cb.label == start_label { start_inst } else { 0 }
+        g.completed_blocks[ci] = stamp_block_lines(cb, cfrom, stmt.line)
+        ci = ci + 1
+    }
+    return gen_result(g, b)
+}
+
+fn generate_statement_kind(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
     if stmt.kind == STMT_LET() {
         return generate_let_binding(gen, block, stmt)
     }
@@ -8660,7 +8718,8 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         fi = fi + 1
     }
 
-    -- Unknown identifier - return undef
+    -- Unknown identifier: report it, then emit a placeholder to continue
+    g = ir_type_error(g, "undefined variable '" + expr.name + "'", expr.line)
     let id = g.builder.next_id
     let mut inst = ir_inst_new(id, OP_ALLOCA())
     inst.alloc_type = "i64"
@@ -9829,7 +9888,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         return expr_result(g, b, id)
     }
 
-    -- Fallback: unsupported binary operator, return lhs
+    g = ir_type_error(g, "unsupported binary operator", expr.line)
     return expr_result(g, b, lhs_id)
 }
 
@@ -10149,7 +10208,7 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Check if function is defined
     if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false {
-        eprintln("Error: undefined function '" + fn_name + "'")
+        eprintln("Error: undefined function '" + fn_name + "' at line " + int_to_string(expr.line))
         exit(1)
     }
 
@@ -10940,8 +10999,12 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     }
 
     -- --------------------------------------------------------
-    -- Fallback: treat as a regular function call with self as first arg
+    -- Fallback: a free function called with method syntax, self first.
+    -- Any other method means the receiver's type is unknown.
     -- --------------------------------------------------------
+    if g.known_functions.contains(method_name) == false {
+        g = ir_type_error(g, "cannot determine the type of the value '." + method_name + "()' is called on", expr.line)
+    }
     let obj_result = generate_expr(g, b, obj_expr)
     g = obj_result.gen
     b = obj_result.block
@@ -12511,7 +12574,8 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
 
     -- Look up struct definition to find the field index and type
     if struct_name == "" {
-        -- Cannot resolve struct type; emit an extract at index 0 as fallback
+        -- Cannot resolve struct type: report it, then extract index 0 to continue
+        g = ir_type_error(g, "cannot determine the struct type for field access '." + expr.field + "'", expr.line)
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_EXTRACT_FIELD())
         inst.field_base = ir_val_inst(obj_id)
@@ -14603,7 +14667,7 @@ fn generate_pipeline(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
         }
     }
 
-    -- Fallback: just return the left value (pipeline target not recognized)
+    g = ir_type_error(g, "unsupported pipeline target", expr.line)
     return expr_result(g, b, left_result.val_id)
 }
 
@@ -15196,8 +15260,8 @@ fn generate_simd_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
         return generate_simd_extract(gen, block, args)
     }
 
-    -- Fallback: return zero
-    return expr_result(gen, block, 0)
+    let line = if args.len() > 0 { args[0].line } else { 0 }
+    return expr_result(ir_type_error(gen, "unknown SIMD builtin '" + fn_name + "'", line), block, 0)
 }
 
 -- ============================================================
@@ -16948,7 +17012,12 @@ struct LLVMGenerator {
     -- Reference to IR module for type lookups
     ir_module: IRModule,
     -- Current function being generated (for param lookups)
-    current_func_name: string
+    current_func_name: string,
+    -- Source line of the IR instruction being lowered (0 if unknown)
+    current_line: int,
+    -- Call argument type mismatches found while lowering; reported as
+    -- compile errors instead of handing invalid IR to the LLVM verifier
+    type_errors: List[string]
 }
 
 -- ============================================================
@@ -16979,7 +17048,9 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
             ir_module: ir_mod,
-            current_func_name: ""
+            current_func_name: "",
+            current_line: 0,
+            type_errors: []
         }
     }
 }
@@ -17026,6 +17097,57 @@ fn lg_is_float_type(type_name: string) -> bool {
 }
 
 -- Check if a type name represents an integer type
+fn llvm_type_name(ty: int) -> string {
+    unsafe {
+        -- Named structs print as %Name rather than their full body
+        if dm_llvm_get_type_kind(ty) == 10 {
+            let sname = dm_llvm_get_struct_name(ty)
+            if sname != "" { return "%" + sname }
+        }
+        let ptr = dm_llvm_print_type_to_string(ty)
+        let name = dm_llvm_c_str_to_string(ptr)
+        dm_llvm_free_c_string(ptr)
+        return name
+    }
+}
+
+-- " (in function 'f') at line N" for errors found while lowering an instruction.
+fn type_error_location(g: LLVMGenerator) -> string {
+    let mut loc = " (in function '" + g.current_func_name + "')"
+    if g.current_line > 0 { loc = loc + " at line " + int_to_string(g.current_line) }
+    return loc
+}
+
+-- Check the arguments in the call buffer against fn_ty's parameter types.
+-- Call this right before dm_llvm_build_call2_buf. A mismatch means IR
+-- generation could not type an expression; it becomes a compile error
+-- at the source line instead of invalid IR for the LLVM verifier.
+fn check_call_args(gen: LLVMGenerator, fn_ty: int, callee: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let nparams = dm_llvm_count_param_types(fn_ty)
+        let nargs = dm_llvm_buf_len()
+        let mut callee_name = dm_llvm_get_value_name(callee)
+        if callee_name == "" { callee_name = "<function pointer>" }
+        let loc = type_error_location(g)
+        let var_arg = dm_llvm_is_function_var_arg(fn_ty) != 0
+        if nargs < nparams or (nargs > nparams and var_arg == false) {
+            g.type_errors.push("Error: call to '" + callee_name + "' passes " + int_to_string(nargs) + " arguments, expected " + int_to_string(nparams) + loc)
+            return g
+        }
+        let mut i = 0
+        while i < nparams {
+            let want = dm_llvm_param_type_at(fn_ty, i)
+            let got = dm_llvm_type_of(dm_llvm_buf_get(i))
+            if got != want {
+                g.type_errors.push("Error: call to '" + callee_name + "' argument " + int_to_string(i + 1) + " has type " + llvm_type_name(got) + ", expected " + llvm_type_name(want) + loc)
+            }
+            i = i + 1
+        }
+        return g
+    }
+}
+
 fn is_int_type(type_name: string) -> bool {
     if type_name == "i8" { return true }
     if type_name == "i16" { return true }
@@ -17778,6 +17900,7 @@ fn expected_field_ir_type(gen: LLVMGenerator, type_name: string, idx: int) -> st
 fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
+        g.current_line = inst.source_line
         let b = g.builder
         let op = inst.op
         let id_key = int_to_string(inst.id)
@@ -18106,6 +18229,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                     dm_llvm_buf_clear()
                     dm_llvm_buf_push(dst)
                     dm_llvm_buf_push(raw_ptr)
+                    g = check_call_args(g, fn_ty, func)
                     dm_llvm_build_call2_buf(b, fn_ty, func, "")
                 } else {
                     dm_llvm_build_store(b, raw_ptr, dst)
@@ -18128,6 +18252,10 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if op == OP_EXTRACT_FIELD() {
             let base = resolve_value(g, inst.field_base)
             g = resolve_value_with_counter(g, inst.field_base)
+            let base_ty = dm_llvm_type_of(base)
+            if dm_llvm_get_type_kind(base_ty) != 10 {
+                g.type_errors.push("Error: field " + int_to_string(inst.field_index) + " read from a value of type " + llvm_type_name(base_ty) + ", which is not a struct" + type_error_location(g))
+            }
             let result = dm_llvm_build_extract_value(b, base, inst.field_index, "field")
             -- If extracted field is dm_string, store to alloca and track
             if inst.field_type == "string" {
@@ -18378,6 +18506,7 @@ fn generate_string_concat(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_push(sret)
             dm_llvm_buf_push(lhs_ptr)
             dm_llvm_buf_push(rhs_ptr)
+            g = check_call_args(g, fn_ty, func)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
             g.string_ptrs.insert(id_key, true)
             if inst.has_result { g.value_map.insert(id_key, sret) }
@@ -18410,6 +18539,7 @@ fn generate_string_eq(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_clear()
             dm_llvm_buf_push(lhs_ptr)
             dm_llvm_buf_push(rhs_ptr)
+            g = check_call_args(g, fn_ty, func)
             let result = dm_llvm_build_call2_buf(b, fn_ty, func, "streq")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
@@ -18450,6 +18580,7 @@ fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let func = g.function_map.get("dm_list_new")
             let fn_ty = g.fn_type_map.get("dm_list_new")
             dm_llvm_buf_clear()
+            g = check_call_args(g, fn_ty, func)
             let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "list")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
@@ -18478,6 +18609,7 @@ fn generate_list_push(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_clear()
             dm_llvm_buf_push(list_val)
             dm_llvm_buf_push(elem_val)
+            g = check_call_args(g, fn_ty, func)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
         }
         return g
@@ -18511,12 +18643,14 @@ fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 dm_llvm_buf_push(sret)
                 dm_llvm_buf_push(list_val)
                 dm_llvm_buf_push(idx_val)
+                g = check_call_args(g, fn_ty, func)
                 dm_llvm_build_call2_buf(b, fn_ty, func, "")
                 if inst.has_result { g.value_map.insert(id_key, sret) }
             } else {
                 dm_llvm_buf_clear()
                 dm_llvm_buf_push(list_val)
                 dm_llvm_buf_push(idx_val)
+                g = check_call_args(g, fn_ty, func)
                 let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
                 if inst.has_result { g.value_map.insert(id_key, result) }
             }
@@ -18546,6 +18680,7 @@ fn generate_list_len(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let fn_ty = g.fn_type_map.get(fn_name)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(list_val)
+            g = check_call_args(g, fn_ty, func)
             let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listlen")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
@@ -18566,6 +18701,7 @@ fn generate_list_pop(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let fn_ty = g.fn_type_map.get(fn_name)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(list_val)
+            g = check_call_args(g, fn_ty, func)
             let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listpop")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
@@ -18586,6 +18722,7 @@ fn generate_map_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let func = g.function_map.get(fn_name)
             let fn_ty = g.fn_type_map.get(fn_name)
             dm_llvm_buf_clear()
+            g = check_call_args(g, fn_ty, func)
             let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "map")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
@@ -18611,6 +18748,7 @@ fn generate_map_insert(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_push(map_val)
             dm_llvm_buf_push(key_val)
             dm_llvm_buf_push(value_val)
+            g = check_call_args(g, fn_ty, func)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
         }
         return g
@@ -18633,6 +18771,7 @@ fn generate_map_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_clear()
             dm_llvm_buf_push(map_val)
             dm_llvm_buf_push(key_val)
+            g = check_call_args(g, fn_ty, func)
             let result = dm_llvm_build_call2_buf(b, fn_ty, func, "mapget")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
@@ -18656,6 +18795,7 @@ fn generate_map_contains(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_clear()
             dm_llvm_buf_push(map_val)
             dm_llvm_buf_push(key_val)
+            g = check_call_args(g, fn_ty, func)
             let result = dm_llvm_build_call2_buf(b, fn_ty, func, "maphas")
             if inst.has_result { g.value_map.insert(id_key, result) }
         }
@@ -18684,6 +18824,7 @@ fn generate_panic(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             }
             dm_llvm_buf_clear()
             dm_llvm_buf_push(msg_val)
+            g = check_call_args(g, fn_ty, func)
             dm_llvm_build_call2_buf(b, fn_ty, func, "")
         }
         dm_llvm_build_unreachable(b)
@@ -18732,9 +18873,16 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
             let ctx = g.context
             let is_main = func.name == "main"
             if is_main {
-                -- main() always returns i32 0
-                let ret_val = dm_llvm_const_int(dm_llvm_int32_type(ctx), 0, 0)
-                dm_llvm_build_ret(b, ret_val)
+                -- An integer-returning main() sets the process exit status;
+                -- any other main() exits 0.
+                let i32_ty = dm_llvm_int32_type(ctx)
+                if is_int_type(func.return_type) {
+                    let ret_val = resolve_value(g, term.ret_val)
+                    g = resolve_value_with_counter(g, term.ret_val)
+                    dm_llvm_build_ret(b, dm_llvm_build_int_cast2(b, ret_val, i32_ty, 1, "exit.code"))
+                } else {
+                    dm_llvm_build_ret(b, dm_llvm_const_int(i32_ty, 0, 0))
+                }
             } else if g.returns_sret.contains(func.name) {
                 -- sret convention: store return value to the sret output pointer (param 0), then ret void
                 let mut ret_val = resolve_value(g, term.ret_val)
@@ -18929,6 +19077,7 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
             ci = ci + 1
         }
         let call_name = if returns_string { "c_result" } else { "" }
+        g = check_call_args(g, c_fn_ty, real_fn)
         let c_result = dm_llvm_build_call2_buf(g.builder, c_fn_ty, real_fn, call_name)
 
         if returns_string {
@@ -18950,6 +19099,7 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
                 dm_llvm_buf_clear()
                 dm_llvm_buf_push(sret_ptr)
                 dm_llvm_buf_push(empty_str)
+                g = check_call_args(g, sn_ty, sn_fn)
                 dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
             }
             dm_llvm_build_br(g.builder, merge_bb)
@@ -18962,6 +19112,7 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
                 dm_llvm_buf_clear()
                 dm_llvm_buf_push(sret_ptr)
                 dm_llvm_buf_push(c_result)
+                g = check_call_args(g, sn_ty, sn_fn)
                 dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
             }
             dm_llvm_build_br(g.builder, merge_bb)
@@ -19089,6 +19240,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_push(args[argi])
             argi = argi + 1
         }
+        g = check_call_args(g, fn_ty, callee)
         let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
         -- Check if callee returns dm_string: store to alloca and track as string ptr
         if callee_returns_string(g, callee_name) and result != 0 {
@@ -19144,6 +19296,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                 dm_llvm_buf_push(args[argi2])
                 argi2 = argi2 + 1
             }
+            g = check_call_args(g, fn_ty, callee)
             dm_llvm_build_call2_buf(b, fn_ty, callee, "")
             -- The sret alloca IS the result -- a pointer to dm_string
             g.string_ptrs.insert(id_key, true)
@@ -19176,6 +19329,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
             dm_llvm_buf_push(args[argi3])
             argi3 = argi3 + 1
         }
+        g = check_call_args(g, fn_ty, callee)
         let result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
         if inst.has_result { g.value_map.insert(id_key, result) }
         return g
@@ -19222,6 +19376,7 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_push(args[argi4])
             argi4 = argi4 + 1
         }
+        g = check_call_args(g, fn_ty, fn_ptr)
         let result = dm_llvm_build_call2_buf(b, fn_ty, fn_ptr, call_name)
         if inst.has_result { g.value_map.insert(id_key, result) }
         return g
@@ -19408,6 +19563,7 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
             dm_llvm_buf_push(args[argi])
             argi = argi + 1
         }
+        g = check_call_args(g, fn_ty, callee)
         dm_llvm_build_call2_buf(b, fn_ty, callee, "")
         -- Load the result from the sret alloca
         if inst.has_result {
@@ -20203,6 +20359,15 @@ fn compile(cli: CLIArgs) -> int {
 
     let mut ir_gen = ir_generator_new()
     ir_gen = generate_module(ir_gen, sf)
+    if ir_gen.type_errors.len() > 0 {
+        let mut te = 0
+        while te < ir_gen.type_errors.len() {
+            eprintln(ir_gen.type_errors[te])
+            te = te + 1
+        }
+        eprintln("Error: " + int_to_string(ir_gen.type_errors.len()) + " type errors")
+        return 1
+    }
 
     -- If --emit-ir, print the IR module and exit
     if cli.emit_ir {
@@ -20258,15 +20423,26 @@ fn compile(cli: CLIArgs) -> int {
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
     lg = lg_generate_module(lg)
 
+    -- Calls with mismatched argument types and field reads from non-structs
+    -- mean IR generation failed to type an expression; report them at their
+    -- source lines instead of handing invalid IR to the verifier.
+    if lg.type_errors.len() > 0 {
+        let mut ti = 0
+        while ti < lg.type_errors.len() {
+            eprintln(lg.type_errors[ti])
+            ti = ti + 1
+        }
+        eprintln("Error: " + int_to_string(lg.type_errors.len()) + " type errors")
+        llvm_gen_dispose(lg)
+        return 1
+    }
+
     -- Verify LLVM module (fatal: invalid IR must not produce any output;
     -- dm_llvm_module_verify in llvm_bridge.c prints the detailed diagnostic)
     let verify_result = verify_module(lg)
     if verify_result != 0 {
         eprintln("Error: LLVM module verification failed")
         llvm_gen_dispose(lg)
-        -- exit(1) as well as return: the Stage 0 C wrapper discards
-        -- dm_main()'s return value, so return alone would exit 0.
-        exit(1)
         return 1
     }
 

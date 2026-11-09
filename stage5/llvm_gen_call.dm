@@ -91,6 +91,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_push(args[argi])
             argi = argi + 1
         }
+        g = check_call_args(g, fn_ty, callee)
         let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
         -- Check if callee returns dm_string: store to alloca and track as string ptr
         if callee_returns_string(g, callee_name) and result != 0 {
@@ -146,6 +147,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                 dm_llvm_buf_push(args[argi2])
                 argi2 = argi2 + 1
             }
+            g = check_call_args(g, fn_ty, callee)
             dm_llvm_build_call2_buf(b, fn_ty, callee, "")
             -- The sret alloca IS the result -- a pointer to dm_string
             g.string_ptrs.insert(id_key, true)
@@ -178,6 +180,7 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
             dm_llvm_buf_push(args[argi3])
             argi3 = argi3 + 1
         }
+        g = check_call_args(g, fn_ty, callee)
         let result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
         if inst.has_result { g.value_map.insert(id_key, result) }
         return g
@@ -224,6 +227,7 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             dm_llvm_buf_push(args[argi4])
             argi4 = argi4 + 1
         }
+        g = check_call_args(g, fn_ty, fn_ptr)
         let result = dm_llvm_build_call2_buf(b, fn_ty, fn_ptr, call_name)
         if inst.has_result { g.value_map.insert(id_key, result) }
         return g
@@ -410,6 +414,7 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
             dm_llvm_buf_push(args[argi])
             argi = argi + 1
         }
+        g = check_call_args(g, fn_ty, callee)
         dm_llvm_build_call2_buf(b, fn_ty, callee, "")
         -- Load the result from the sret alloca
         if inst.has_result {

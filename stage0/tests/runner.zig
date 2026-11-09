@@ -506,6 +506,30 @@ pub const compile_error_tests = [_]TestCase{
         .expect_compile_error = true,
     },
     .{
+        .name = "undefined_variable",
+        .source =
+        \\module test
+        \\fn main() {
+        \\    let a = 1
+        \\    println(int_to_string(a + b))
+        \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+    .{
+        .name = "field_access_on_int",
+        .source =
+        \\module test
+        \\fn main() {
+        \\    let x = 5
+        \\    println(int_to_string(x.count))
+        \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+    .{
         .name = "missing_main",
         .source =
         \\module test
@@ -1621,6 +1645,19 @@ pub const io_tests = [_]TestCase{
         ,
         .expected_output = "",
         .expected_exit_code = 42,
+    },
+    .{
+        .name = "main_return_code",
+        .source =
+            \\module test
+            \\
+            \\fn main() -> int {
+            \\    println("before return")
+            \\    return 3
+            \\}
+        ,
+        .expected_output = "before return\n",
+        .expected_exit_code = 3,
     },
     .{
         .name = "args_len_test",
