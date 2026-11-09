@@ -1,5 +1,11 @@
 -- Generics test file
--- Tests generic functions, structs, and traits
+-- Tests generic functions and list operations with lambdas/pipelines
+--
+-- Aspirational material formerly in this file (generic structs,
+-- generic list higher-order functions, trait bounds, @derive,
+-- fn(x) => lambdas) lives in proposals/; it is not implemented.
+-- The list operations below use concrete List[int] signatures,
+-- which is the supported form today.
 
 module tests.generics
 
@@ -8,47 +14,31 @@ fn identity[T](x: T) -> T {
     return x
 }
 
--- Generic pair struct
-struct Pair[A, B] {
-    first: A,
-    second: B,
-}
-
-impl Pair[A, B] {
-    fn new(first: A, second: B) -> Pair[A, B] {
-        return Pair { first, second }
-    }
-
-    fn swap(self) -> Pair[B, A] {
-        return Pair { first: self.second, second: self.first }
-    }
-}
-
--- Generic list operations
-fn first[T](list: List[T]) -> Option[T] {
+-- List operations (concrete over int; see proposals/generic_list_hofs.dm)
+fn first_int(list: List[int]) -> Option[int] {
     if list.len() == 0 {
         return None
     }
     return Some(list[0])
 }
 
-fn last[T](list: List[T]) -> Option[T] {
+fn last_int(list: List[int]) -> Option[int] {
     if list.len() == 0 {
         return None
     }
     return Some(list[list.len() - 1])
 }
 
-fn map[T, U](list: List[T], f: fn(T) -> U) -> List[U] {
-    let mut result: List[U] = []
+fn map_int(list: List[int], f: fn(int) -> int) -> List[int] {
+    let mut result: List[int] = []
     for item in list {
         result.push(f(item))
     }
     return result
 }
 
-fn filter[T](list: List[T], predicate: fn(T) -> bool) -> List[T] {
-    let mut result: List[T] = []
+fn filter_int(list: List[int], predicate: fn(int) -> bool) -> List[int] {
+    let mut result: List[int] = []
     for item in list {
         if predicate(item) {
             result.push(item)
@@ -57,7 +47,7 @@ fn filter[T](list: List[T], predicate: fn(T) -> bool) -> List[T] {
     return result
 }
 
-fn fold[T, U](list: List[T], initial: U, f: fn(U, T) -> U) -> U {
+fn fold_int(list: List[int], initial: int, f: fn(int, int) -> int) -> int {
     let mut acc = initial
     for item in list {
         acc = f(acc, item)
@@ -65,63 +55,39 @@ fn fold[T, U](list: List[T], initial: U, f: fn(U, T) -> U) -> U {
     return acc
 }
 
--- Trait example
-trait Eq {
-    fn eq(self, other: Self) -> bool
-}
-
-trait Ord: Eq {
-    fn cmp(self, other: Self) -> Ordering
-}
-
-enum Ordering {
-    Less,
-    Equal,
-    Greater,
-}
-
--- Implement traits for Point
-@derive(Eq)
-struct Point3D {
-    x: float,
-    y: float,
-    z: float,
-}
-
--- Generic function with trait bounds
-fn max[T: Ord](a: T, b: T) -> T {
-    match a.cmp(b) {
-        Ordering.Greater => a,
-        _ => b,
-    }
-}
-
-fn min[T: Ord](a: T, b: T) -> T {
-    match a.cmp(b) {
-        Ordering.Less => a,
-        _ => b,
-    }
-}
-
 fn main() {
     -- Use generic functions
     let x = identity(42)
     let y = identity("hello")
     let z = identity(3.14)
-
-    -- Use generic structs
-    let pair = Pair.new(1, "one")
-    let swapped = pair.swap()
+    println(x)
+    println(y)
+    if z > 3.0 { println("float ok") }
 
     -- Use list functions
-    let numbers = [1, 2, 3, 4, 5]
-    let doubled = map(numbers, fn(x) => x * 2)
-    let evens = filter(numbers, fn(x) => x % 2 == 0)
-    let sum = fold(numbers, 0, fn(acc, x) => acc + x)
+    let mut numbers: List[int] = []
+    numbers.push(1)
+    numbers.push(2)
+    numbers.push(3)
+    numbers.push(4)
+    numbers.push(5)
+
+    let doubled = map_int(numbers, |x: int| -> int x * 2)
+    let evens = filter_int(numbers, |x: int| -> bool x % 2 == 0)
+    let sum = fold_int(numbers, 0, |acc: int, x: int| -> int acc + x)
+    println(fold_int(doubled, 0, |a: int, b: int| -> int a + b))
+    println(len(evens))
+    println(sum)
+
+    let f = first_int(numbers)
+    if f.has_value { println(f.value) }
+    let l = last_int(numbers)
+    if l.has_value { println(l.value) }
 
     -- Pipeline syntax
     let result = numbers
-        |> filter(fn(x) => x > 2)
-        |> map(fn(x) => x * x)
-        |> fold(0, fn(a, b) => a + b)
+        |> filter_int(|x: int| -> bool x > 2)
+        |> map_int(|x: int| -> int x * x)
+        |> fold_int(0, |a: int, b: int| -> int a + b)
+    println(result)
 }

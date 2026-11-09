@@ -516,6 +516,7 @@ _Noreturn void dm_panic(const char* msg, const char* file, int line);
  */
 static inline int64_t dm_safe_div(int64_t a, int64_t b) {
     if (b == 0) dm_panic("division by zero", __FILE__, __LINE__);
+    if (a == (-9223372036854775807LL - 1LL) && b == -1) dm_panic("integer overflow", __FILE__, __LINE__);
     return a / b;
 }
 
@@ -524,6 +525,7 @@ static inline int64_t dm_safe_div(int64_t a, int64_t b) {
  */
 static inline int64_t dm_safe_mod(int64_t a, int64_t b) {
     if (b == 0) dm_panic("modulo by zero", __FILE__, __LINE__);
+    if (a == (-9223372036854775807LL - 1LL) && b == -1) dm_panic("integer overflow", __FILE__, __LINE__);
     return a % b;
 }
 

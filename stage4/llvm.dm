@@ -114,6 +114,9 @@ extern fn dm_llvm_build_fp_to_si(b: int, val: int, dest_ty: int, name: string) -
 extern fn dm_llvm_build_trunc(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_sext(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_bit_cast(b: int, val: int, dest_ty: int, name: string) -> int
+extern fn dm_llvm_build_ptr_to_int(b: int, val: int, dest_ty: int, name: string) -> int
+extern fn dm_llvm_build_int_to_ptr(b: int, val: int, dest_ty: int, name: string) -> int
+extern fn dm_llvm_sizeof_type(ty: int) -> int
 
 -- Logical
 extern fn dm_llvm_build_and(b: int, lhs: int, rhs: int, name: string) -> int
@@ -199,3 +202,5 @@ fn llvm_emit_object(tm: int, mod: int, filename: string) -> int {
 fn llvm_emit_asm(tm: int, mod: int, filename: string) -> int {
     return dm_llvm_target_machine_emit_to_file(tm, mod, filename, dm_llvm_assembly_file())
 }
+
+extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int

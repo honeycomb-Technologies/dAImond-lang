@@ -129,6 +129,20 @@ fn register_impl_methods(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
     let mut i = 0
     while i < ib.methods.len() {
         g.method_struct_map.insert(ib.methods[i].name, struct_name)
+
+        -- For generic impl blocks, register each method as a generic fn decl
+        -- so it can be monomorphized when called
+        if ib.generic_params.len() > 0 {
+            let mangled = struct_name + "_" + ib.methods[i].name
+            -- Create a modified FunctionDecl with the impl's generic params
+            let mut method_fd = ib.methods[i]
+            method_fd.generic_params = ib.generic_params
+            -- Push it as a synthetic declaration and record its index
+            let decl_idx = g.declarations.len()
+            g.declarations.push(decl_function(method_fd))
+            g.generic_fn_decls.insert(mangled, decl_idx)
+        }
+
         i = i + 1
     }
 
@@ -173,11 +187,12 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_string_to_upper", "string", "string")
     g = declare_extern(g, "dm_string_to_lower", "string", "string")
 
-    -- Character classification
+    -- Character classification and conversion
     g = declare_extern(g, "dm_is_alpha", "string", "bool")
     g = declare_extern(g, "dm_is_digit", "string", "bool")
     g = declare_extern(g, "dm_is_whitespace", "string", "bool")
     g = declare_extern(g, "dm_is_alnum", "string", "bool")
+    g = declare_extern(g, "dm_char_to_string", "string", "string")
 
     -- List contains
     g = declare_extern2(g, "dm_list_int64_contains", "ptr", "i64", "bool")
@@ -372,7 +387,28 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        let ptype_str = p.type_name
+        -- Resolve "Self" to current impl type
+        let mut ptype_str = if p.type_name == "Self" and g.has_impl_type {
+            g.current_impl_type
+        } else {
+            p.type_name
+        }
+        -- Resolve dyn Trait to concrete implementor type
+        if starts_with(ptype_str, "dyn ") {
+            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
+            let impl_keys = g.trait_impl_methods.keys()
+            let mut ki = 0
+            while ki < impl_keys.len() {
+                let impl_key = impl_keys[ki]
+                if ends_with(impl_key, ":" + dyn_trait) {
+                    let colon_pos = string_find(impl_key, ":")
+                    if colon_pos > 0 {
+                        ptype_str = substr(impl_key, 0, colon_pos)
+                    }
+                }
+                ki = ki + 1
+            }
+        }
         let ptype = map_type_name(ptype_str)
 
         let actual_type = if p.is_mut {
@@ -441,9 +477,11 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     }
     g.current_return_type = ret_type
 
-    -- Reset variable maps and completed blocks for this function
+    -- Reset variable maps for this function
     g.variable_map = Map_new()
     g.variable_types = Map_new()
+    g.mut_ptr_vars = Map_new()
+    g.param_ptr_map = Map_new()
     let empty_blocks: List[IRBasicBlock] = []
     g.completed_blocks = empty_blocks
 
@@ -456,28 +494,38 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     while i < fd.params.len() {
         let p = fd.params[i]
         let pname = p.name
-        let ptype_str = p.type_name
+        -- Resolve "Self" to current impl type
+        let mut ptype_str = if p.type_name == "Self" and g.has_impl_type {
+            g.current_impl_type
+        } else {
+            p.type_name
+        }
+        -- Resolve dyn Trait to concrete implementor type
+        if starts_with(ptype_str, "dyn ") {
+            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
+            let impl_keys = g.trait_impl_methods.keys()
+            let mut ki = 0
+            while ki < impl_keys.len() {
+                let impl_key = impl_keys[ki]
+                if ends_with(impl_key, ":" + dyn_trait) {
+                    let colon_pos = string_find(impl_key, ":")
+                    if colon_pos > 0 {
+                        ptype_str = substr(impl_key, 0, colon_pos)
+                    }
+                }
+                ki = ki + 1
+            }
+        }
         let ptype = map_type_name(ptype_str)
 
         if p.is_mut {
-            -- Mut param: alloca + store from param ref (pointer semantics)
-            let alloca_id = g.builder.next_id
-            let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
-            alloca_inst.alloc_type = ptype
-            alloca_inst.result_type = "ptr(" + ptype + ")"
-            alloca_inst.has_result = true
-            blk.instructions.push(alloca_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_inst.store_ptr = ir_val_inst(alloca_id)
-            store_inst.store_val = ir_val_param(i)
-            store_inst.has_result = false
-            blk.instructions.push(store_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(pname, alloca_id)
+            -- Mut param: the caller passes a POINTER to the struct.
+            -- Do NOT create an alloca — use the param ref directly as a pointer.
+            -- Loads/stores go through the caller's memory, so mutations are visible.
+            g.variable_map.insert(pname, -(i + 1))
             g.variable_types.insert(pname, ptype)
+            g.mut_ptr_vars.insert(pname, true)
+            g.param_ptr_map.insert(pname, i)
         } else {
             -- Regular param: alloca + store
             let alloca_id = g.builder.next_id
@@ -497,6 +545,35 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
 
             g.variable_map.insert(pname, alloca_id)
             g.variable_types.insert(pname, ptype)
+        }
+
+        -- Track dyn Trait parameters: resolve to concrete implementor
+        if starts_with(ptype_str, "dyn ") {
+            let dyn_trait_name = substr(ptype_str, 4, len(ptype_str) - 4)
+            -- Find a concrete type that implements this trait
+            let mut concrete_found = ""
+            let impl_keys = g.trait_impl_methods.keys()
+            let mut ki = 0
+            while ki < impl_keys.len() {
+                let impl_key = impl_keys[ki]
+                if ends_with(impl_key, ":" + dyn_trait_name) {
+                    let colon_pos = string_find(impl_key, ":")
+                    if colon_pos > 0 {
+                        concrete_found = substr(impl_key, 0, colon_pos)
+                    }
+                }
+                ki = ki + 1
+            }
+            if len(concrete_found) > 0 {
+                g.dyn_var_concrete.insert(pname, concrete_found)
+                g.dyn_var_traits.insert(pname, dyn_trait_name)
+                g.var_struct_types.insert(pname, concrete_found)
+            }
+        }
+
+        -- Track function-pointer-typed parameters for indirect calls
+        if starts_with(ptype_str, "fn(") {
+            g.variable_types.insert(pname, ptype_str)
         }
 
         -- Track struct/enum/list/box typed parameters
@@ -546,15 +623,25 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         }
     }
 
-    -- Add blocks to function
+    -- Add blocks to function in correct order (entry block must be first)
     let mut func = g.ir_mod.functions[func_idx]
-    -- First push all completed blocks (terminated blocks from control flow)
+    -- Find and push the entry block first
     i = 0
     while i < g.completed_blocks.len() {
-        func.blocks.push(g.completed_blocks[i])
+        if g.completed_blocks[i].label == "entry" {
+            func.blocks.push(g.completed_blocks[i])
+        }
         i = i + 1
     }
-    -- Then push the final block
+    -- Push remaining completed blocks (non-entry)
+    i = 0
+    while i < g.completed_blocks.len() {
+        if g.completed_blocks[i].label != "entry" {
+            func.blocks.push(g.completed_blocks[i])
+        }
+        i = i + 1
+    }
+    -- Then push the final block (if it's the entry and no blocks, push it; otherwise push as last)
     func.blocks.push(blk)
     g.ir_mod.functions[func_idx] = func
 
@@ -568,6 +655,12 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
 fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
     let mut g = gen
     let struct_name = ib.target_type
+
+    -- Skip generic impl blocks — their methods are monomorphized on demand
+    if ib.generic_params.len() > 0 {
+        return g
+    }
+
     g.current_impl_type = struct_name
     g.has_impl_type = true
 
@@ -595,8 +688,33 @@ fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
 fn generate_constant(gen: IRGenerator, cd: ConstDecl) -> IRGenerator {
     let mut g = gen
 
+    -- Pre-grow globals list to avoid realloc during comptime evaluation.
+    -- Comptime recursion copies the generator by value, sharing the list buffer.
+    -- A realloc in a callee would free the buffer the caller is still using.
+    -- By pre-growing, we ensure enough capacity for comptime variable pushes.
+    if cd.is_comptime {
+        let mut prealloc_i = 0
+        while prealloc_i < 1024 {
+            let mut dummy = ir_global_new("__comptime_prealloc__", "i64")
+            dummy.has_init = false
+            dummy.is_const = false
+            g.ir_mod.globals.push(dummy)
+            prealloc_i = prealloc_i + 1
+        }
+        let mut pop_i = 0
+        while pop_i < 1024 {
+            g.ir_mod.globals.pop()
+            pop_i = pop_i + 1
+        }
+    }
+
     -- Try to evaluate the value at compile time
-    let val = eval_const_value(g, cd.value)
+    -- Use the full comptime evaluator for comptime expressions (blocks, fn calls, etc.)
+    let val = if cd.is_comptime {
+        eval_comptime_expr(g, *cd.value)
+    } else {
+        eval_const_value(g, cd.value)
+    }
 
     let ty = if len(cd.type_name) > 0 {
         map_type_name(cd.type_name)
@@ -656,8 +774,19 @@ fn eval_const_value(gen: IRGenerator, expr_box: Box[Expr]) -> IRValue {
         if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
             if e.op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
         }
+        -- Boolean AND/OR
+        if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
+            if e.op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
+            if e.op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
+        }
     }
     if e.kind == EXPR_UNARY() {
+        if e.op == UNOP_NOT() {
+            let operand_val = eval_const_value(gen, e.operand)
+            if operand_val.kind == VAL_CONST_BOOL() {
+                return ir_val_bool(operand_val.bool_val == false)
+            }
+        }
         if e.op == UNOP_NEG() {
             let operand_val = eval_const_value(gen, e.operand)
             if operand_val.kind == VAL_CONST_INT() {
@@ -695,3 +824,31 @@ fn estimate_type_size(type_name: string) -> int {
     -- Struct size: rough estimate of 8 bytes per field
     return 64
 }
+
+fn estimate_type_size_gen(gen: IRGenerator, type_name: string) -> int {
+    if type_name == "i8" or type_name == "u8" or type_name == "bool" { return 1 }
+    if type_name == "i16" or type_name == "u16" { return 2 }
+    if type_name == "i32" or type_name == "u32" or type_name == "f32" { return 4 }
+    if type_name == "i64" or type_name == "u64" or type_name == "f64" or type_name == "ptr" { return 8 }
+    if type_name == "string" { return 24 }
+    -- Look up struct definition
+    if gen.struct_defs.contains(type_name) {
+        let info = gen.struct_defs.get(type_name)
+        let mut size = 0
+        let mut fi = 0
+        while fi < info.field_names.len() {
+            let field_type = info.field_types[fi]
+            let fs = estimate_type_size(field_type)
+            let aligned = if fs < 8 { 8 } else { fs }
+            size = size + aligned
+            fi = fi + 1
+        }
+        return size
+    }
+    return 64
+}
+
+
+-- ============================================================
+-- GenResult: return both generator and current block
+-- ============================================================

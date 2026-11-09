@@ -1,6 +1,64 @@
 const std = @import("std");
 
+/// Detected LLVM configuration (via llvm-config).
+const LlvmConfig = struct {
+    /// System library name, e.g. "LLVM-23" (fallback: "LLVM").
+    lib_name: []const u8,
+    libdir: ?[]const u8,
+    includedir: ?[]const u8,
+};
+
+/// Run `llvm-config <flag>` and return its trimmed stdout, or null on failure.
+fn runLlvmConfig(b: *std.Build, flag: []const u8) ?[]const u8 {
+    var code: u8 = undefined;
+    const out = b.runAllowFail(&.{ "llvm-config", flag }, &code, .Ignore) catch return null;
+    if (code != 0) return null;
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return trimmed;
+}
+
+/// Detect LLVM via llvm-config: parse the -lLLVM-N token from `--libs`,
+/// plus `--libdir` / `--includedir`. Falls back to plain "LLVM" and
+/// "/usr/include" (the previous hard-coded behavior) if detection fails.
+fn detectLlvm(b: *std.Build) LlvmConfig {
+    var lib_name: []const u8 = "LLVM";
+    if (runLlvmConfig(b, "--libs")) |libs| {
+        var it = std.mem.tokenizeAny(u8, libs, " \t");
+        var plain: ?[]const u8 = null;
+        while (it.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-lLLVM-")) {
+                lib_name = tok[2..];
+                plain = null;
+                break;
+            } else if (std.mem.eql(u8, tok, "-lLLVM")) {
+                plain = tok[2..];
+            }
+        } else if (plain) |p| {
+            lib_name = p;
+        }
+    }
+    return .{
+        .lib_name = lib_name,
+        .libdir = runLlvmConfig(b, "--libdir"),
+        .includedir = runLlvmConfig(b, "--includedir") orelse "/usr/include",
+    };
+}
+
+/// Link a compile step against the detected LLVM.
+fn linkLlvm(step: *std.Build.Step.Compile, llvm: LlvmConfig) void {
+    step.linkLibC();
+    step.linkSystemLibrary(llvm.lib_name);
+    if (llvm.libdir) |libdir| {
+        step.addLibraryPath(.{ .cwd_relative = libdir });
+    }
+    if (llvm.includedir) |includedir| {
+        step.addIncludePath(.{ .cwd_relative = includedir });
+    }
+}
+
 pub fn build(b: *std.Build) void {
+    const llvm = detectLlvm(b);
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -19,10 +77,8 @@ pub fn build(b: *std.Build) void {
 
     exe.root_module.addImport("frontend", frontend_mod);
 
-    // Link against LLVM
-    exe.linkLibC();
-    exe.linkSystemLibrary("LLVM-21");
-    exe.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    // Link against LLVM (detected via llvm-config)
+    linkLlvm(exe, llvm);
 
     b.installArtifact(exe);
 
@@ -49,9 +105,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    llvm_tests.linkLibC();
-    llvm_tests.linkSystemLibrary("LLVM-21");
-    llvm_tests.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    linkLlvm(llvm_tests, llvm);
     const run_llvm_tests = b.addRunArtifact(llvm_tests);
 
     // Unit tests for IR generation (needs frontend)
@@ -69,9 +123,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    llvm_gen_tests.linkLibC();
-    llvm_gen_tests.linkSystemLibrary("LLVM-21");
-    llvm_gen_tests.addIncludePath(.{ .cwd_relative = "/usr/include" });
+    linkLlvm(llvm_gen_tests, llvm);
     const run_llvm_gen_tests = b.addRunArtifact(llvm_gen_tests);
 
     const test_step = b.step("test", "Run unit tests");

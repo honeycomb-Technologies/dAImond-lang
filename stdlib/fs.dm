@@ -4,8 +4,11 @@ module fs
 -- Convenience wrappers around filesystem builtins.
 --
 -- The builtins fs_mkdir, fs_readdir, fs_remove, fs_rename, fs_getcwd
--- are recognized by the compiler and emitted as direct C calls.
--- These wrapper functions use different names to avoid shadowing.
+-- are recognized by the compiler and emitted as direct C calls; call
+-- them directly. Wrapper names must not match C runtime symbols
+-- (dm_mkdir, dm_readdir, dm_getcwd): a wrapper named mkdir/readdir/
+-- getcwd mangles to the same symbol and fails to link, so this
+-- module intentionally has no wrappers for the directory builtins.
 
 -- Read entire file contents
 fn read(path: string) -> string {
@@ -27,17 +30,6 @@ fn exists(path: string) -> bool {
     return file_exists(path)
 }
 
--- Create a directory (and parents if needed)
--- Returns 0 on success, -1 on error
-fn mkdir(path: string) -> int {
-    return fs_mkdir(path)
-}
-
--- Read directory entries as newline-separated string
-fn readdir(path: string) -> string {
-    return fs_readdir(path)
-}
-
 -- Remove a file or empty directory
 -- Returns 0 on success, -1 on error
 fn remove_file(path: string) -> int {
@@ -48,9 +40,4 @@ fn remove_file(path: string) -> int {
 -- Returns 0 on success, -1 on error
 fn rename_file(old_path: string, new_path: string) -> int {
     return fs_rename(old_path, new_path)
-}
-
--- Get the current working directory
-fn getcwd() -> string {
-    return fs_getcwd()
 }

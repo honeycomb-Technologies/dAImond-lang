@@ -28,6 +28,10 @@ fn compile_stmt(c: Compiler) -> Compiler {
             let val = compile_expr(cc)
             cc = val.c
             cc.expected_type = saved_expected
+            -- Region escape check: no returning region-arena values
+            if region_code_is_born(cc, val.code) {
+                cc = c_error(cc, "return of region-born value from inside a region (region escape)")
+            }
             -- If in async function, wrap return value with _ready()
             if cc.current_fn_is_async and cc.current_fn_async_inner_type != "" {
                 let future_t = "dm_future_" + cc.current_fn_async_inner_type
@@ -77,6 +81,17 @@ fn compile_stmt(c: Compiler) -> Compiler {
         cc = c_advance(cc)
         let rhs = compile_expr(cc)
         cc = rhs.c
+        -- Region escape check: no assigning region-arena values to
+        -- plain variables declared outside the innermost region.
+        -- (Field/index targets are not checked in Stage 1: lhs.code
+        -- is then not exactly a tracked variable name.)
+        if region_code_is_born(cc, rhs.code) {
+            if string_contains(cc.region_declared, "|" + lhs.code + "|") {
+                cc = region_track_born(cc, lhs.code)
+            } else if lookup_var_type(cc, lhs.code) != "" {
+                cc = c_error(cc, "assignment of region-born value to variable declared outside the region (region escape)")
+            }
+        }
         -- Check for map index assignment: dm_map_K_V_get(&dm_var, key) = val -> dm_map_K_V_insert(&dm_var, key, val)
         if starts_with(lhs.code, "dm_map_") and string_contains(lhs.code, "_get(") {
             let get_pos = string_find(lhs.code, "_get(")
@@ -449,6 +464,26 @@ fn infer_ternary_type(code: string, c: Compiler) -> string {
     return ""
 }
 
+-- Region escape check (syntactic; Stage 1 has no checker/scopes).
+-- Inside a region, string concat/interpolation compiles to
+-- dm_string_concat_arena(arena, ...), so generated code containing
+-- that call - or exactly naming a var already known region-born -
+-- denotes a value that dies with the region arena.
+fn region_code_is_born(c: Compiler, code: string) -> bool {
+    if c.current_region_arena == "" { return false }
+    if string_contains(code, "dm_string_concat_arena(") { return true }
+    if string_contains(c.region_born, "|" + code + "|") { return true }
+    return false
+}
+
+fn region_track_born(c: Compiler, mangled_name: string) -> Compiler {
+    let mut cc = c
+    if string_contains(cc.region_born, "|" + mangled_name + "|") == false {
+        cc.region_born = cc.region_born + "|" + mangled_name + "|"
+    }
+    return cc
+}
+
 fn track_str_var(c: Compiler, mangled_name: string, is_str: bool) -> Compiler {
     let mut cc = c
     if is_str == false { return cc }
@@ -538,6 +573,13 @@ fn compile_let_stmt(c: Compiler) -> Compiler {
     cc = track_list_elem_type(cc, type_str, var_name)
     -- Track variable type for inference
     cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    -- Region escape check: record declarations and region-born values
+    if cc.current_region_arena != "" {
+        cc.region_declared = cc.region_declared + "|" + dm_mangle(var_name) + "|"
+        if region_code_is_born(cc, val.code) {
+            cc = region_track_born(cc, dm_mangle(var_name))
+        }
+    }
     -- Function pointer types need special declaration syntax: ret (*name)(params)
     let is_fptr = string_contains(type_str, "(*)")
     if is_fptr {
@@ -1174,6 +1216,12 @@ fn compile_region_stmt(c: Compiler) -> Compiler {
     -- Set current region arena for allocation redirection
     let saved_arena = cc.current_region_arena
     cc.current_region_arena = arena_name
+    -- Region escape check: fresh declared set for this region
+    -- (outer-region vars count as outside); born set is inherited
+    -- but restored on exit so inner-only names do not leak out.
+    let saved_declared = cc.region_declared
+    let saved_born = cc.region_born
+    cc.region_declared = ""
     cc = c_expect(cc, TK_LBRACE())
     cc.indent = cc.indent + 1
     cc = compile_block_body(cc)
@@ -1181,6 +1229,8 @@ fn compile_region_stmt(c: Compiler) -> Compiler {
     cc.indent = cc.indent - 1
     -- Restore previous region arena (supports nesting)
     cc.current_region_arena = saved_arena
+    cc.region_declared = saved_declared
+    cc.region_born = saved_born
     -- Emit arena destroy
     cc.output = cc.output + ind + "dm_arena_destroy(" + arena_name + ");\n"
     return cc

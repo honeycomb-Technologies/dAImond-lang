@@ -551,3 +551,13 @@ fn ir_module_new() -> IRModule {
         user_extern_fns: Map_new()
     }
 }
+
+fn VAL_BREAK_SENTINEL() -> int { return 9 }
+
+fn ir_val_break() -> IRValue {
+    return IRValue { kind: VAL_BREAK_SENTINEL(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
+}
+
+-- ============================================================
+-- IR INSTRUCTION OP KINDS
+-- ============================================================

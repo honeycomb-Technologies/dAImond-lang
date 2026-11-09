@@ -17,6 +17,13 @@ pub const TestCase = struct {
     expected_output: []const u8,
     expected_exit_code: u8 = 0,
     expect_compile_error: bool = false,
+    /// For expect_compile_error cases: every substring must appear in
+    /// the compiler's stdout (diagnostics are printed there; stderr
+    /// may carry allocator leak traces and is not asserted on).
+    expected_error_contains: []const []const u8 = &.{},
+    /// For expect_compile_error cases: exact number of "Error["
+    /// diagnostics expected in the compiler's stdout.
+    expected_error_count: ?usize = null,
     extra_files: ?[]const TestFile = null,
     skip: bool = false,
 };
@@ -81,6 +88,13 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
     compile_proc.stdout_behavior = .Pipe;
 
     try compile_proc.spawn();
+    // Drain the pipes before waiting: reading after wait() loses the
+    // output. Stderr is drained (and discarded) so a verbose
+    // diagnostic dump cannot block the compiler on a full pipe.
+    const compile_stderr = compile_proc.stderr.?.reader().readAllAlloc(allocator, 16 * 1024 * 1024) catch "";
+    defer allocator.free(compile_stderr);
+    const compile_stdout = compile_proc.stdout.?.reader().readAllAlloc(allocator, 16 * 1024 * 1024) catch "";
+    defer allocator.free(compile_stdout);
     const compile_result = try compile_proc.wait();
 
     const compile_exit_code: u32 = switch (compile_result) {
@@ -96,6 +110,27 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
                 .passed = false,
                 .message = "Expected compile error but compilation succeeded",
             };
+        }
+        for (case.expected_error_contains) |needle| {
+            if (std.mem.indexOf(u8, compile_stdout, needle) == null) {
+                const msg = try std.fmt.allocPrint(allocator, "Compile error output missing expected text: '{s}'\nGot: '{s}'", .{ needle, compile_stdout });
+                return .{
+                    .name = case.name,
+                    .passed = false,
+                    .message = msg,
+                };
+            }
+        }
+        if (case.expected_error_count) |expected_count| {
+            const actual_count = std.mem.count(u8, compile_stdout, "Error[");
+            if (actual_count != expected_count) {
+                const msg = try std.fmt.allocPrint(allocator, "Expected {d} compile error(s), got {d}\nGot: '{s}'", .{ expected_count, actual_count, compile_stdout });
+                return .{
+                    .name = case.name,
+                    .passed = false,
+                    .message = msg,
+                };
+            }
         }
         return .{
             .name = case.name,
@@ -3040,7 +3075,10 @@ pub const extern_tests = [_]TestCase{
             \\extern fn getenv(name: string) -> string
             \\
             \\fn main() {
-            \\    let path = getenv("PATH")
+            \\    let mut path: string = ""
+            \\    unsafe {
+            \\        path = getenv("PATH")
+            \\    }
             \\    if len(path) > 0 {
             \\        println("has path")
             \\    } else {
@@ -4787,6 +4825,583 @@ pub const comprehensive_test = [_]TestCase{
     },
 };
 
+// Stage 0 only: associated constructors `Type.new(args)`. Not listed
+// in the Stage 3/Stage 4 runners, which reuse the suites above.
+pub const constructor_tests = [_]TestCase{
+    .{
+        .name = "box_dot_new_struct",
+        .source =
+            \\module test
+            \\
+            \\struct Wrapper {
+            \\    value: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let b: Box[Wrapper] = Box.new(Wrapper { value: 42 })
+            \\    println(b.value)
+            \\}
+        ,
+        .expected_output = "42\n",
+    },
+    .{
+        .name = "box_dot_null",
+        .source =
+            \\module test
+            \\
+            \\struct Wrapper {
+            \\    value: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let b: Box[Wrapper] = Box.null()
+            \\    if b == Box.null() {
+            \\        println("null")
+            \\    }
+            \\    let c: Box[Wrapper] = Box.new(Wrapper { value: 1 })
+            \\    if c != Box.null() {
+            \\        println("not null")
+            \\    }
+            \\}
+        ,
+        .expected_output = "null\nnot null\n",
+    },
+    .{
+        .name = "box_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\struct Wrapper {
+            \\    value: int,
+            \\}
+            \\
+            \\fn main() {
+            \\    let a: Box[Wrapper] = Box_new(Wrapper { value: 10 })
+            \\    let b: Box[Wrapper] = Box.new(Wrapper { value: 32 })
+            \\    let n1: Box[Wrapper] = Box_null()
+            \\    let n2: Box[Wrapper] = Box.null()
+            \\    println(a.value + b.value)
+            \\    if n1 == Box.null() and n2 == Box_null() {
+            \\        println("both null")
+            \\    }
+            \\}
+        ,
+        .expected_output = "42\nboth null\n",
+    },
+    .{
+        .name = "box_dot_new_unannotated",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let b = Box.new(42)
+            \\    println(*b)
+            \\    let c = Box_new(1)
+            \\    println(*c)
+            \\}
+        ,
+        .expected_output = "42\n1\n",
+    },
+    .{
+        .name = "user_struct_new",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\impl Point {
+            \\    fn new(x: int, y: int) -> Point {
+            \\        return Point { x: x, y: y }
+            \\    }
+            \\
+            \\    fn sum(self: &Self) -> int {
+            \\        return self.x + self.y
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point.new(10, 20)
+            \\    println(p.sum())
+            \\    let q: Point = Point.new(1, 2)
+            \\    println(q.x + q.y)
+            \\}
+        ,
+        .expected_output = "30\n3\n",
+    },
+    .{
+        .name = "user_assoc_fn_origin",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\impl Point {
+            \\    fn origin() -> Point {
+            \\        return Point { x: 0, y: 0 }
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point.origin()
+            \\    println(p.x + p.y)
+            \\}
+        ,
+        .expected_output = "0\n",
+    },
+    .{
+        .name = "user_enum_new",
+        .source =
+            \\module test
+            \\
+            \\enum Shape {
+            \\    Circle(int),
+            \\    Square(int),
+            \\}
+            \\
+            \\impl Shape {
+            \\    fn new(r: int) -> Shape {
+            \\        return Shape.Circle(r)
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let s = Shape.new(5)
+            \\    match s {
+            \\        Shape::Circle(r) => println(r),
+            \\        _ => println("other"),
+            \\    }
+            \\}
+        ,
+        .expected_output = "5\n",
+    },
+    .{
+        .name = "map_list_dot_new",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map.new()
+            \\    m.insert("a", 1)
+            \\    println(m.get("a"))
+            \\    let mut l: List[int] = List.new()
+            \\    l.push(7)
+            \\    println(l[0])
+            \\}
+        ,
+        .expected_output = "1\n7\n",
+    },
+    .{
+        .name = "user_new_wrong_arity",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\impl Point {
+            \\    fn new(x: int, y: int) -> Point {
+            \\        return Point { x: x, y: y }
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = Point.new(1)
+            \\    println(p.x)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+};
+
+// Stage 0 only: fixes from the CLAUDE.md builtin/quirks audit.
+pub const audit_fix_tests = [_]TestCase{
+    .{
+        .name = "char_predicates_string_args",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(is_alpha("a"))
+            \\    println(is_alpha("5"))
+            \\    println(is_digit("5"))
+            \\    println(is_digit("a"))
+            \\    println(is_alnum("Z"))
+            \\    println(is_alnum("9"))
+            \\    println(is_whitespace(" "))
+            \\    println(is_whitespace("x"))
+            \\    let s = "a1"
+            \\    println(is_alpha(char_at(s, 0)))
+            \\    println(is_digit(char_at(s, 1)))
+            \\    println(is_alpha(""))
+            \\}
+        ,
+        .expected_output = "true\nfalse\ntrue\nfalse\ntrue\ntrue\ntrue\nfalse\ntrue\ntrue\nfalse\n",
+    },
+    .{
+        .name = "map_index_get_set",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m["a"] = 1
+            \\    m.insert("b", 2)
+            \\    println(m["a"])
+            \\    println(m.get("b"))
+            \\    m["a"] = 10
+            \\    println(m["a"])
+            \\    let v: int = m["b"]
+            \\    println(v)
+            \\}
+        ,
+        .expected_output = "1\n2\n10\n2\n",
+    },
+    .{
+        .name = "map_index_int_keys",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[int, string] = Map_new()
+            \\    m[1] = "one"
+            \\    m[2] = "two"
+            \\    println(m[1])
+            \\    println(m[2])
+            \\}
+        ,
+        .expected_output = "one\ntwo\n",
+    },
+    .{
+        .name = "audit_documented_builtins",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    assert(1 + 1 == 2)
+            \\    assert_eq(2 + 2, 4)
+            \\    assert_eq("ab", "ab")
+            \\    file_write("/tmp/dm_audit_misc.txt", "x")
+            \\    file_append("/tmp/dm_audit_misc.txt", "y")
+            \\    println(file_read("/tmp/dm_audit_misc.txt"))
+            \\    println(file_exists("/tmp/dm_audit_misc.txt"))
+            \\    println(len(args_get(0)) > 0)
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.set("k", 3)
+            \\    println(m.contains("k"))
+            \\    m.remove("k")
+            \\    println(m.contains("k"))
+            \\    m.insert("a", 1)
+            \\    println(len(m.keys()))
+            \\    println(len(m.values()))
+            \\    println(float_to_string(1.5))
+            \\    println(bool_to_string(true))
+            \\}
+        ,
+        .expected_output = "xy\ntrue\ntrue\ntrue\nfalse\n1\n1\n1.5\ntrue\n",
+    },
+    .{
+        .name = "audit_panic_exit_code",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println("before")
+            \\    panic("boom")
+            \\}
+        ,
+        .expected_output = "before\n",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "struct_field_shorthand",
+        .source =
+            \\module test
+            \\
+            \\struct Point {
+            \\    x: int,
+            \\    y: int,
+            \\}
+            \\
+            \\fn make(x: int, y: int) -> Point {
+            \\    return Point { x, y }
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = make(3, 4)
+            \\    println(p.x + p.y)
+            \\    let x = 10
+            \\    let q = Point { x, y: 5 }
+            \\    println(q.x + q.y)
+            \\}
+        ,
+        .expected_output = "7\n15\n",
+    },
+};
+
+// Stage 0 only: one `len` — `len(x)` and `x.len()` are the same
+// int-typed builtin for strings, Lists, and Maps (checker + codegen).
+pub const len_unified_tests = [_]TestCase{
+    .{
+        .name = "len_string_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hello"
+            \\    let a: int = len(s)
+            \\    let b: int = s.len()
+            \\    println(a)
+            \\    println(b)
+            \\    println(len("abcd"))
+            \\    println(("ab" + "cde").len())
+            \\    println(len(s) + s.len())
+            \\}
+        ,
+        .expected_output = "5\n5\n4\n5\n10\n",
+    },
+    .{
+        .name = "len_list_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\fn count_mut(mut l: List[int]) -> int {
+            \\    return l.len()
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut l: List[int] = []
+            \\    l.push(1)
+            \\    l.push(2)
+            \\    l.push(3)
+            \\    println(len(l))
+            \\    println(l.len())
+            \\    println(l.pop())
+            \\    println(len(l) + l.len())
+            \\    println(count_mut(l))
+            \\}
+        ,
+        .expected_output = "3\n3\n3\n4\n2\n",
+    },
+    .{
+        .name = "len_map_both_spellings",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("a", 1)
+            \\    m.insert("b", 2)
+            \\    println(len(m))
+            \\    println(m.len())
+            \\    println(m.keys().len())
+            \\    println(len(m.values()))
+            \\}
+        ,
+        .expected_output = "2\n2\n2\n2\n",
+    },
+    .{
+        .name = "len_fixed_array_and_box_string",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let arr: [int; 3] = [1, 2, 3]
+            \\    println(len(arr))
+            \\    println(arr.len())
+            \\    let bs: Box[string] = Box.new("world!")
+            \\    println(bs.len())
+            \\}
+        ,
+        .expected_output = "3\n3\n6\n",
+    },
+    .{
+        .name = "len_user_impl_method_wins",
+        .source =
+            \\module test
+            \\
+            \\struct Bag {
+            \\    n: int,
+            \\}
+            \\
+            \\impl Bag {
+            \\    fn len(self: &Self) -> int {
+            \\        return self.n
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    let bag = Bag { n: 7 }
+            \\    println(bag.len())
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+    .{
+        .name = "len_method_is_int_not_string",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hi"
+            \\    let bad: string = s.len()
+            \\    println(bad)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+    .{
+        .name = "len_free_is_int_not_string",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let s = "hi"
+            \\    let bad: string = len(s)
+            \\    println(bad)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+    },
+};
+
+/// Error-quality tests: diagnostics must name the types/variables an
+/// author (human or LLM) needs, report one root error instead of a
+/// cascade, and surface backend (C compiler) failures. Stage 0-only:
+/// stage3/stage4 runners enumerate their original suites by name.
+pub const error_quality_tests = [_]TestCase{
+    .{
+        .name = "error_type_mismatch_names_both_types",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let x: string = 42
+            \\    println(x)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{ "Error[E0100]", "expected string", "found int" },
+        .expected_error_count = 1,
+    },
+    .{
+        .name = "error_arg_mismatch_names_both_types",
+        .source =
+            \\module test
+            \\
+            \\fn take_int(n: int) -> int { return n }
+            \\
+            \\fn main() {
+            \\    let y = take_int("hello")
+            \\    println(y)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{ "Error[E0100]", "expected int", "found string" },
+        .expected_error_count = 1,
+    },
+    .{
+        .name = "error_undefined_var_single_root_error",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(undefined_thing + 1)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"undefined variable 'undefined_thing'"},
+        .expected_error_count = 1,
+    },
+    .{
+        .name = "error_undefined_var_annotated_single",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let y: int = missing_var
+            \\    println(y)
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"undefined variable 'missing_var'"},
+        .expected_error_count = 1,
+    },
+    .{
+        // len(42) passes type checking (len does not validate its
+        // argument yet) but cannot compile as C: the driver must show
+        // the C compiler's own diagnostic, not only an exit code.
+        // "request for member" is GCC's wording for `(42).len`.
+        .name = "error_backend_surfaces_cc_diagnostic",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(len(42))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{ "C compiler failed with exit code 1", "error:", "request for member" },
+    },
+};
+
+/// Nested-List regression tests: an index assignment to one List
+/// must not mistype indexing into an unrelated List[List[...]].
+/// Stage 0-only (stage3/stage4 enumerate their original suites).
+pub const nested_list_tests = [_]TestCase{
+    .{
+        .name = "nested_list_index_after_other_list_assign",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut a: List[int] = []
+            \\    a.push(1)
+            \\    a[0] = 5
+            \\    let mut outer: List[List[int]] = []
+            \\    let mut inner: List[int] = []
+            \\    inner.push(7)
+            \\    outer.push(inner)
+            \\    println(outer[0][0])
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+    .{
+        .name = "nested_list_index_assign_between",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let mut outer: List[List[int]] = []
+            \\    let mut inner: List[int] = []
+            \\    inner.push(7)
+            \\    outer.push(inner)
+            \\    let mut b: List[int] = []
+            \\    b.push(1)
+            \\    b[0] = 9
+            \\    println(outer[0][0])
+            \\}
+        ,
+        .expected_output = "7\n",
+    },
+};
+
 // Main entry point for running tests
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -4867,6 +5482,11 @@ pub fn main() !void {
         .{ .name = "Closures Extended", .tests = &closure_extended_tests },
         .{ .name = "Op Overload Extended", .tests = &op_overload_extended_tests },
         .{ .name = "Comprehensive", .tests = &comprehensive_test },
+        .{ .name = "Constructors", .tests = &constructor_tests },
+        .{ .name = "Audit Fixes", .tests = &audit_fix_tests },
+        .{ .name = "Unified Len", .tests = &len_unified_tests },
+        .{ .name = "Error Quality", .tests = &error_quality_tests },
+        .{ .name = "Nested Lists", .tests = &nested_list_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

@@ -143,11 +143,14 @@ fn tokenize(source: string) -> List[Token] {
                         lex.col = lex.col + 1
                     }
                 }
-                if lex.pos < lex.src_len {
-                    lex.pos = lex.pos + 1
-                    lex.col = lex.col + 1
+                if lex.pos >= lex.src_len {
+                    eprintln("Error: unterminated string at line " + int_to_string(sl))
+                    exit(1)
                 }
-                let text = substr(lex.source, sp + 1, lex.pos - sp - 2)
+                lex.pos = lex.pos + 1
+                lex.col = lex.col + 1
+                let raw_text = substr(lex.source, sp + 1, lex.pos - sp - 2)
+                let text = unescape_string(raw_text)
                 tokens.push(token_new(TK_STRING(), text, sl, sc))
             } else if ch == "(" {
                 tokens.push(token_new(TK_LPAREN(), "(", sl, sc))
@@ -208,7 +211,15 @@ fn tokenize(source: string) -> List[Token] {
                     lex.col = lex.col + 1
                 }
             } else if ch == "/" {
-                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
+                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "/" {
+                    -- C-style // comment: skip to end of line
+                    lex.pos = lex.pos + 2
+                    lex.col = lex.col + 2
+                    while lex.pos < lex.src_len and char_at(lex.source, lex.pos) != "\n" {
+                        lex.pos = lex.pos + 1
+                        lex.col = lex.col + 1
+                    }
+                } else if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
                     tokens.push(token_new(TK_SLASHEQ(), "/=", sl, sc))
                     lex.pos = lex.pos + 2
                     lex.col = lex.col + 2
@@ -327,4 +338,55 @@ fn tokenize(source: string) -> List[Token] {
     }
 
     return tokens
+}
+
+-- ============================================================
+-- AST Node Definitions for dAImond Stage 4
+-- Uses integer kind tags (not tagged unions) following Stage 1 pattern
+-- ============================================================
+
+-- ============================================================
+-- EXPRESSION KINDS
+-- ============================================================
+
+fn unescape_string(s: string) -> string {
+    -- Quick check: if no backslashes, return as-is
+    if string_find(s, "\\") < 0 {
+        return s
+    }
+    let mut result = ""
+    let mut i = 0
+    let slen = len(s)
+    while i < slen {
+        let ch = char_at(s, i)
+        if ch == "\\" and i + 1 < slen {
+            let next = char_at(s, i + 1)
+            if next == "n" {
+                result = result + "\n"
+                i = i + 2
+            } else if next == "t" {
+                result = result + "\t"
+                i = i + 2
+            } else if next == "r" {
+                result = result + "\r"
+                i = i + 2
+            } else if next == "\\" {
+                result = result + "\\"
+                i = i + 2
+            } else if next == "\"" {
+                result = result + "\""
+                i = i + 2
+            } else if next == "'" {
+                result = result + "'"
+                i = i + 2
+            } else {
+                result = result + ch
+                i = i + 1
+            }
+        } else {
+            result = result + ch
+            i = i + 1
+        }
+    }
+    return result
 }

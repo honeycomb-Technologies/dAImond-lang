@@ -286,6 +286,7 @@ pub const Statement = struct {
         break_stmt: *BreakStmt,
         continue_stmt: *ContinueStmt,
         region_block: *RegionBlock,
+        unsafe_block: *UnsafeBlock,
         expression: *Expr, // expression statement
         assignment: *Assignment,
         discard: *DiscardStmt,
@@ -369,6 +370,12 @@ pub const ContinueStmt = struct {
 /// Region block: `region name { }`
 pub const RegionBlock = struct {
     name: Identifier,
+    body: *BlockExpr,
+    span: Span,
+};
+
+/// Unsafe block: `unsafe { }` — fences extern calls and tainted derefs
+pub const UnsafeBlock = struct {
     body: *BlockExpr,
     span: Span,
 };

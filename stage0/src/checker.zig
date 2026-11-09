@@ -16,6 +16,7 @@ const ast = @import("ast.zig");
 const types = @import("types.zig");
 const errors = @import("errors.zig");
 const lexer = @import("lexer.zig");
+const builtins = @import("builtins.zig");
 
 // Re-export commonly used types
 pub const TypeId = types.TypeId;
@@ -458,6 +459,23 @@ pub const TypeChecker = struct {
     source_file: ?[]const u8,
     /// Names of functions that have generic parameters
     generic_function_names: std.StringHashMap(void),
+    /// Diagnostic messages allocated by this checker (freed in deinit)
+    owned_messages: std.ArrayList([]const u8),
+    /// Depth of enclosing `unsafe { }` blocks (extern-call/deref fence)
+    unsafe_depth: u32,
+    /// Names of functions declared `extern fn`
+    extern_functions: std.StringHashMap(void),
+    /// Variables holding references of extern/cast provenance (tainted)
+    tainted_vars: std.StringHashMap(void),
+    /// Depth of enclosing `region { }` blocks (region escape rule)
+    region_depth: u32,
+    /// Scope created by each enclosing region block, outermost first
+    region_scopes: std.ArrayList(*Scope),
+    /// Variables holding region-born values (name-based, per function)
+    region_born_vars: std.StringHashMap(void),
+    /// Associated (no-self) impl functions by "TypeName.method" -> fn type.
+    /// Populated in pass 1.5 so `Type.new(args)` resolves like a call.
+    associated_functions: std.StringHashMap(TypeId),
 
     const Self = @This();
 
@@ -478,6 +496,14 @@ pub const TypeChecker = struct {
             .source = null,
             .source_file = null,
             .generic_function_names = std.StringHashMap(void).init(allocator),
+            .owned_messages = std.ArrayList([]const u8).init(allocator),
+            .unsafe_depth = 0,
+            .extern_functions = std.StringHashMap(void).init(allocator),
+            .tainted_vars = std.StringHashMap(void).init(allocator),
+            .region_depth = 0,
+            .region_scopes = std.ArrayList(*Scope).init(allocator),
+            .region_born_vars = std.StringHashMap(void).init(allocator),
+            .associated_functions = std.StringHashMap(TypeId).init(allocator),
         };
 
         // Register built-in types and functions
@@ -493,6 +519,21 @@ pub const TypeChecker = struct {
         self.union_find.deinit();
         self.constraints.deinit();
         self.generic_function_names.deinit();
+        for (self.owned_messages.items) |msg| {
+            self.allocator.free(msg);
+        }
+        self.owned_messages.deinit();
+        self.extern_functions.deinit();
+        self.tainted_vars.deinit();
+        self.region_scopes.deinit();
+        self.region_born_vars.deinit();
+        {
+            var key_it = self.associated_functions.keyIterator();
+            while (key_it.next()) |key| {
+                self.allocator.free(key.*);
+            }
+        }
+        self.associated_functions.deinit();
         self.type_ctx.deinit();
         self.allocator.destroy(self.type_ctx);
     }
@@ -688,18 +729,24 @@ pub const TypeChecker = struct {
     // UNIFICATION
     // ========================================================================
 
-    /// Unify two types
+    /// Unify two types. Call-site convention: `a` is the actual
+    /// (inferred) type, `b` the expected (declared) type; mismatch
+    /// diagnostics report "expected b, found a".
     pub fn unify(self: *Self, a: TypeId, b: TypeId, location: ?ast.Span) !void {
         const resolved_a = self.resolveType(a);
         const resolved_b = self.resolveType(b);
 
         if (resolved_a == resolved_b) return;
 
+        // Error recovery: an error type already produced its root
+        // diagnostic; unifying against it must stay silent.
+        if (self.isErrorType(resolved_a) or self.isErrorType(resolved_b)) return;
+
         const type_a = self.type_ctx.get(resolved_a);
         const type_b = self.type_ctx.get(resolved_b);
 
         if (type_a == null or type_b == null) {
-            try self.reportTypeMismatch(resolved_a, resolved_b, location);
+            try self.reportTypeMismatch(resolved_b, resolved_a, location);
             return;
         }
 
@@ -725,19 +772,19 @@ pub const TypeChecker = struct {
             if (types.canCoerce(self.type_ctx, resolved_a, resolved_b)) {
                 return;
             }
-            try self.reportTypeMismatch(resolved_a, resolved_b, location);
+            try self.reportTypeMismatch(resolved_b, resolved_a, location);
             return;
         }
 
         switch (ta) {
             .int => |int_a| {
                 if (tb.int != int_a) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                 }
             },
             .float => |float_a| {
                 if (tb.float != float_a) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                 }
             },
             .option => |inner_a| {
@@ -749,7 +796,7 @@ pub const TypeChecker = struct {
             },
             .array => |arr_a| {
                 if (arr_a.size != tb.array.size) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                     return;
                 }
                 try self.unify(arr_a.element_type, tb.array.element_type, location);
@@ -759,7 +806,7 @@ pub const TypeChecker = struct {
             },
             .tuple => |tup_a| {
                 if (tup_a.element_types.len != tb.tuple.element_types.len) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                     return;
                 }
                 for (tup_a.element_types, tb.tuple.element_types) |elem_a, elem_b| {
@@ -768,7 +815,7 @@ pub const TypeChecker = struct {
             },
             .function => |fn_a| {
                 if (fn_a.param_types.len != tb.function.param_types.len) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                     return;
                 }
                 for (fn_a.param_types, tb.function.param_types) |param_a, param_b| {
@@ -785,7 +832,7 @@ pub const TypeChecker = struct {
             else => {
                 // For simple types, they should be equal already
                 if (resolved_a != resolved_b) {
-                    try self.reportTypeMismatch(resolved_a, resolved_b, location);
+                    try self.reportTypeMismatch(resolved_b, resolved_a, location);
                 }
             },
         }
@@ -833,6 +880,15 @@ pub const TypeChecker = struct {
         };
     }
 
+    /// True when a type is the error-recovery type. Error types poison
+    /// quietly: the root error was already reported, so downstream
+    /// checks against them must not emit cascade errors.
+    fn isErrorType(self: *Self, type_id: TypeId) bool {
+        const resolved = self.resolveType(type_id);
+        const typ = self.type_ctx.get(resolved) orelse return false;
+        return typ == .error_type;
+    }
+
     /// Resolve a type, following type variable bindings
     pub fn resolveType(self: *Self, type_id: TypeId) TypeId {
         const typ = self.type_ctx.get(type_id) orelse return type_id;
@@ -871,6 +927,7 @@ pub const TypeChecker = struct {
     }
 
     fn checkHasField(self: *Self, type_id: TypeId, field_name: []const u8, expected_type: TypeId, location: ?ast.Span) !void {
+        if (self.isErrorType(type_id)) return;
         const resolved = self.resolveType(type_id);
         const typ = self.type_ctx.get(resolved) orelse {
             try self.reportError(.undefined_field, "cannot access field on unknown type", location);
@@ -904,6 +961,7 @@ pub const TypeChecker = struct {
     }
 
     fn checkCallable(self: *Self, fn_type: TypeId, return_type: TypeId, location: ?ast.Span) !void {
+        if (self.isErrorType(fn_type)) return;
         const resolved = self.resolveType(fn_type);
         const typ = self.type_ctx.get(resolved) orelse {
             try self.reportError(.expected_function_type, "expected callable type", location);
@@ -986,7 +1044,9 @@ pub const TypeChecker = struct {
             return symbol.type_id;
         }
 
-        try self.reportError(.undefined_variable, "undefined variable", span);
+        const msg = try std.fmt.allocPrint(self.allocator, "undefined variable '{s}'", .{ident.name});
+        try self.owned_messages.append(msg);
+        try self.reportError(.undefined_variable, msg, span);
         return try self.type_ctx.intern(.error_type);
     }
 
@@ -998,7 +1058,10 @@ pub const TypeChecker = struct {
             }
         }
 
-        try self.reportError(.undefined_variable, "undefined path", path.span);
+        const first_name = if (path.segments.len > 0) path.segments[0].name else "";
+        const msg = try std.fmt.allocPrint(self.allocator, "undefined variable '{s}'", .{first_name});
+        try self.owned_messages.append(msg);
+        try self.reportError(.undefined_variable, msg, path.span);
         return try self.type_ctx.intern(.error_type);
     }
 
@@ -1009,11 +1072,22 @@ pub const TypeChecker = struct {
         return switch (bin.op) {
             // Arithmetic operators
             .add, .sub, .mul, .div, .mod => {
+                if (self.isErrorType(left_type) or self.isErrorType(right_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 const common = types.commonType(self.type_ctx, left_type, right_type);
                 if (common) |t| {
                     return t;
                 }
-                try self.reportError(.incompatible_types, "incompatible types for arithmetic operation", bin.span);
+                const left_name = try self.castTypeName(left_type);
+                const right_name = try self.castTypeName(right_type);
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "incompatible types for arithmetic operation: {s} and {s}",
+                    .{ left_name, right_name },
+                );
+                try self.owned_messages.append(msg);
+                try self.reportError(.incompatible_types, msg, bin.span);
                 return try self.type_ctx.intern(.error_type);
             },
 
@@ -1033,6 +1107,9 @@ pub const TypeChecker = struct {
 
             // Bitwise operators
             .bit_and, .bit_or, .bit_xor, .shl, .shr => {
+                if (self.isErrorType(left_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 if (!types.isIntegral(self.type_ctx, left_type)) {
                     try self.reportError(.expected_numeric_type, "bitwise operator requires integer type", bin.span);
                 }
@@ -1051,6 +1128,9 @@ pub const TypeChecker = struct {
 
         return switch (un.op) {
             .neg => {
+                if (self.isErrorType(operand_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 if (!types.isNumeric(self.type_ctx, operand_type)) {
                     try self.reportError(.expected_numeric_type, "negation requires numeric type", un.span);
                 }
@@ -1062,6 +1142,9 @@ pub const TypeChecker = struct {
                 return bool_type;
             },
             .bit_not => {
+                if (self.isErrorType(operand_type)) {
+                    return try self.type_ctx.intern(.error_type);
+                }
                 if (!types.isIntegral(self.type_ctx, operand_type)) {
                     try self.reportError(.expected_numeric_type, "bitwise not requires integer type", un.span);
                 }
@@ -1074,6 +1157,12 @@ pub const TypeChecker = struct {
                     return try self.type_ctx.intern(.error_type);
                 };
                 if (typ == .ref) {
+                    // Unsafe fence: references of extern/cast provenance
+                    // (including &T parameters) need an unsafe block to
+                    // dereference. Box derefs stay safe (null-checked).
+                    if (self.unsafe_depth == 0 and self.exprIsTaintedRef(un.operand)) {
+                        try self.reportError(.type_mismatch, "dereference of a reference from an extern call or cast requires unsafe block", un.span);
+                    }
                     return typ.ref.pointee;
                 }
                 if (typ == .box) {
@@ -1082,6 +1171,9 @@ pub const TypeChecker = struct {
                 if (typ == .type_var) {
                     // Type variable (e.g., from generic container elements) - allow deref
                     return try self.freshTypeVar();
+                }
+                if (typ == .error_type) {
+                    return try self.type_ctx.intern(.error_type);
                 }
                 try self.reportError(.type_mismatch, "cannot dereference non-reference type", un.span);
                 return try self.type_ctx.intern(.error_type);
@@ -1158,6 +1250,9 @@ pub const TypeChecker = struct {
                 try self.reportError(.undefined_field, "Result has no such field", fa.span);
                 return try self.type_ctx.intern(.error_type);
             },
+            .error_type => {
+                return try self.type_ctx.intern(.error_type);
+            },
             else => {
                 try self.reportError(.expected_struct_type, "field access requires struct type", fa.span);
                 return try self.type_ctx.intern(.error_type);
@@ -1174,18 +1269,34 @@ pub const TypeChecker = struct {
             return try self.freshTypeVar();
         };
 
-        // Check index is integer
-        if (!types.isIntegral(self.type_ctx, index_type)) {
-            try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
-        }
-
         switch (typ) {
-            .array => |arr| return arr.element_type,
-            .slice => |s| return s.element_type,
-            .str => return try self.type_ctx.intern(.char),
+            .array => |arr| {
+                if (!self.isErrorType(index_type) and !types.isIntegral(self.type_ctx, index_type)) {
+                    try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
+                }
+                return arr.element_type;
+            },
+            .slice => |s| {
+                if (!self.isErrorType(index_type) and !types.isIntegral(self.type_ctx, index_type)) {
+                    try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
+                }
+                return s.element_type;
+            },
+            .str => {
+                if (!self.isErrorType(index_type) and !types.isIntegral(self.type_ctx, index_type)) {
+                    try self.reportError(.expected_numeric_type, "array index must be integer", ia.span);
+                }
+                return try self.type_ctx.intern(.char);
+            },
             .type_var => {
-                // Type variable (e.g., from List[T]) - allow indexing
+                // Type variable (List[T] elements are int-indexed, Map[K, V]
+                // values are key-indexed; both erase to a type variable
+                // here, so the index type is left to codegen) - allow
+                // indexing.
                 return try self.freshTypeVar();
+            },
+            .error_type => {
+                return try self.type_ctx.intern(.error_type);
             },
             else => {
                 try self.reportError(.expected_array_type, "indexing requires array or slice type", ia.span);
@@ -1194,13 +1305,124 @@ pub const TypeChecker = struct {
         }
     }
 
+    /// Resolve `TypeName.method(args)` where the object names a type:
+    /// the builtin container constructors (`Box.new`, `Box.null`,
+    /// `Map.new`, `List.new`, mirroring `Box_new` etc.) and user
+    /// associated functions from `impl` blocks. Returns null when the
+    /// name is not an associated call (e.g. an enum variant
+    /// constructor), leaving the generic method-call behavior in place.
+    fn inferAssociatedCall(self: *Self, type_name: []const u8, mc: *const ast.MethodCall) anyerror!?TypeId {
+        const method = mc.method.name;
+
+        if (std.mem.eql(u8, type_name, "Box")) {
+            if (std.mem.eql(u8, method, "new")) {
+                if (mc.args.len > 0) {
+                    const inner_type = try self.inferExpr(mc.args[0]);
+                    for (mc.args[1..]) |arg| {
+                        _ = try self.inferExpr(arg);
+                    }
+                    return try self.type_ctx.makeBox(inner_type);
+                }
+                return try self.freshTypeVar();
+            }
+            if (std.mem.eql(u8, method, "null")) {
+                for (mc.args) |arg| {
+                    _ = try self.inferExpr(arg);
+                }
+                return try self.freshTypeVar();
+            }
+            return null;
+        }
+
+        if ((std.mem.eql(u8, type_name, "Map") or std.mem.eql(u8, type_name, "List")) and
+            std.mem.eql(u8, method, "new"))
+        {
+            for (mc.args) |arg| {
+                _ = try self.inferExpr(arg);
+            }
+            return try self.freshTypeVar();
+        }
+
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ type_name, method });
+        defer self.allocator.free(key);
+        const fn_type_id = self.associated_functions.get(key) orelse return null;
+        const typ = self.type_ctx.get(self.resolveType(fn_type_id)) orelse return null;
+        if (typ != .function) return null;
+        const fn_type = typ.function;
+
+        if (mc.args.len != fn_type.param_types.len) {
+            try self.reportError(.type_parameter_count_mismatch, "wrong number of arguments", mc.span);
+        }
+        const min_args = @min(mc.args.len, fn_type.param_types.len);
+        for (mc.args[0..min_args], fn_type.param_types[0..min_args]) |arg, param_type| {
+            const arg_type = try self.inferExpr(arg);
+            try self.addConstraint(Constraint.subtype(arg_type, param_type, mc.span));
+        }
+        for (mc.args[min_args..]) |arg| {
+            _ = try self.inferExpr(arg);
+        }
+        self.current_effects = self.current_effects.unionWith(fn_type.effects);
+        return fn_type.return_type;
+    }
+
     fn inferMethodCall(self: *Self, mc: *const ast.MethodCall) anyerror!TypeId {
+        // Associated (static) call: the object identifier names a type,
+        // not a value (`Point.new(1, 2)`, `Box.new(x)`).
+        if (mc.object.kind == .identifier) {
+            const obj_name = mc.object.kind.identifier.name;
+            if (self.env.lookup(obj_name)) |symbol| {
+                if (symbol.kind == .type_def) {
+                    if (try self.inferAssociatedCall(obj_name, mc)) |assoc_type| {
+                        return assoc_type;
+                    }
+                }
+            }
+        }
+
         const object_type = try self.inferExpr(mc.object);
-        _ = object_type;
 
         // Infer argument types
+        var any_region_born_arg = false;
         for (mc.args) |arg| {
-            _ = try self.inferExpr(arg);
+            const arg_type = try self.inferExpr(arg);
+            if (self.exprIsRegionBorn(arg, arg_type)) any_region_born_arg = true;
+        }
+
+        // Region escape: push/insert/set store their argument into the
+        // container, so storing a region-born value into a container
+        // declared outside the region is an escape.
+        if (any_region_born_arg and
+            (std.mem.eql(u8, mc.method.name, "push") or
+                std.mem.eql(u8, mc.method.name, "insert") or
+                std.mem.eql(u8, mc.method.name, "set")))
+        {
+            if (rootIdentifierName(mc.object)) |root_name| {
+                if (self.varDeclaredOutsideInnermostRegion(root_name)) {
+                    try self.reportError(.type_mismatch, "store of region-born value into container declared outside the region (region escape)", mc.span);
+                }
+            }
+        }
+
+        // `x.len()` is the builtin length, identical to `len(x)`: int.
+        // Applies to strings, fixed arrays, slices, and the erased
+        // List/Map type variables. On a user struct/enum the name may
+        // be the type's own impl method, which stays unchecked here.
+        if (std.mem.eql(u8, mc.method.name, "len") and mc.args.len == 0) {
+            var resolved = self.resolveType(object_type);
+            if (self.type_ctx.get(resolved)) |t| {
+                if (t == .ref) resolved = self.resolveType(t.ref.pointee);
+                if (self.type_ctx.get(resolved)) |t2| {
+                    if (t2 == .box) resolved = self.resolveType(t2.box);
+                }
+            }
+            if (self.type_ctx.get(resolved)) |t| {
+                switch (t) {
+                    .str, .array, .slice, .type_var => return try self.type_ctx.intern(.{ .int = .i64 }),
+                    else => {},
+                }
+            } else {
+                return try self.type_ctx.intern(.{ .int = .i64 });
+            }
         }
 
         // For now, create fresh return type
@@ -1214,208 +1436,64 @@ pub const TypeChecker = struct {
         // Special handling for built-in functions that accept any type
         if (fc.function.kind == .identifier) {
             const name = fc.function.kind.identifier.name;
-            // Builtins returning void/unit
-            if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
-                std.mem.eql(u8, name, "assert") or std.mem.eql(u8, name, "assert_eq") or std.mem.eql(u8, name, "panic") or
-                std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln") or
-                std.mem.eql(u8, name, "exit") or std.mem.eql(u8, name, "file_write") or
-                std.mem.eql(u8, name, "file_append") or
-                std.mem.eql(u8, name, "fs_write") or std.mem.eql(u8, name, "fs_append") or
-                std.mem.eql(u8, name, "tcp_close") or
-                std.mem.eql(u8, name, "thread_join") or
-                std.mem.eql(u8, name, "mutex_lock") or std.mem.eql(u8, name, "mutex_unlock") or
-                std.mem.eql(u8, name, "mutex_destroy") or
-                std.mem.eql(u8, name, "sleep_ms") or
-                std.mem.eql(u8, name, "flush") or
-                std.mem.eql(u8, name, "mem_sweep"))
-            {
+            // Unsafe fence: calling an `extern fn` requires an unsafe block.
+            if (self.extern_functions.contains(name) and self.unsafe_depth == 0) {
+                const msg = try std.fmt.allocPrint(
+                    self.allocator,
+                    "extern function call '{s}' requires unsafe block",
+                    .{name},
+                );
+                try self.owned_messages.append(msg);
+                try self.reportError(.type_mismatch, msg, fc.span);
+            }
+            // Free-function builtins: one registry lookup (builtins.zig
+            // is the single table; its header documents every
+            // signature). Parameter types and arity are recorded there
+            // but intentionally not enforced here, matching the
+            // historical checker behavior. Some/None/Ok/Err keep their
+            // symbol-based checking below (registered in
+            // registerBuiltins), so only their codegen lowering comes
+            // from the registry.
+            if (builtins.lookup(name)) |entry| {
+                switch (entry.lowering) {
+                    .option_some, .option_none, .result_ok, .result_err => {},
+                    else => {
+                        // Box_new historically infers only its first argument.
+                        if (entry.ret == .box_of_arg0) {
+                            if (fc.args.len > 0) {
+                                const inner_type = try self.inferExpr(fc.args[0].value);
+                                return try self.type_ctx.makeBox(inner_type);
+                            }
+                            return try self.freshTypeVar();
+                        }
+                        var first_type: ?TypeId = null;
+                        for (fc.args, 0..) |arg, i| {
+                            const t = try self.inferExpr(arg.value);
+                            if (i == 0) first_type = t;
+                        }
+                        if (entry.effects.io) self.current_effects.addBuiltin(.io);
+                        if (entry.effects.console) self.current_effects.addBuiltin(.console);
+                        if (entry.effects.file_system) self.current_effects.addBuiltin(.file_system);
+                        if (entry.effects.diverge) self.current_effects.addBuiltin(.diverge);
+                        return switch (entry.ret) {
+                            .unit => try self.type_ctx.intern(.unit),
+                            .int => try self.type_ctx.intern(.{ .int = .i64 }),
+                            .float => try self.type_ctx.intern(.{ .float = .f64 }),
+                            .string => try self.type_ctx.intern(.str),
+                            .bool => try self.type_ctx.intern(.bool),
+                            .fresh => try self.freshTypeVar(),
+                            .box_of_arg0 => unreachable,
+                            .first_arg => first_type orelse try self.freshTypeVar(),
+                        };
+                    },
+                }
+            }
+            // SIMD splat/set prefix families: simd_splat_f32x4(v) -> f32x4.
+            if (builtins.simdPrefix(name)) |simd| {
                 for (fc.args) |arg| {
                     _ = try self.inferExpr(arg.value);
                 }
-                // Effect tracking for builtins
-                if (std.mem.eql(u8, name, "print") or std.mem.eql(u8, name, "println") or
-                    std.mem.eql(u8, name, "eprint") or std.mem.eql(u8, name, "eprintln"))
-                {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.console);
-                } else if (std.mem.eql(u8, name, "panic") or std.mem.eql(u8, name, "exit")) {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.diverge);
-                } else if (std.mem.eql(u8, name, "file_write") or std.mem.eql(u8, name, "file_append") or
-                    std.mem.eql(u8, name, "fs_write") or std.mem.eql(u8, name, "fs_append"))
-                {
-                    self.current_effects.addBuiltin(.file_system);
-                } else if (std.mem.eql(u8, name, "sleep_ms") or std.mem.eql(u8, name, "flush")) {
-                    self.current_effects.addBuiltin(.io);
-                }
-                return try self.type_ctx.intern(.unit);
-            }
-            // Builtins returning int
-            if (std.mem.eql(u8, name, "len") or std.mem.eql(u8, name, "parse_int") or
-                std.mem.eql(u8, name, "string_to_int") or
-                std.mem.eql(u8, name, "string_find") or std.mem.eql(u8, name, "args_len") or
-                std.mem.eql(u8, name, "system") or
-                std.mem.eql(u8, name, "fs_mkdir") or std.mem.eql(u8, name, "fs_remove") or
-                std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir") or
-                std.mem.eql(u8, name, "tcp_listen") or std.mem.eql(u8, name, "tcp_accept") or
-                std.mem.eql(u8, name, "tcp_connect") or std.mem.eql(u8, name, "tcp_write") or
-                std.mem.eql(u8, name, "thread_spawn") or std.mem.eql(u8, name, "mutex_new") or
-                std.mem.eql(u8, name, "read_key") or std.mem.eql(u8, name, "read_key_nb") or
-                std.mem.eql(u8, name, "term_width") or std.mem.eql(u8, name, "term_height") or
-                std.mem.eql(u8, name, "time_ms") or std.mem.eql(u8, name, "mem_mark"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Effect tracking
-                if (std.mem.eql(u8, name, "system")) {
-                    self.current_effects.addBuiltin(.io);
-                } else if (std.mem.eql(u8, name, "args_len")) {
-                    self.current_effects.addBuiltin(.io);
-                } else if (std.mem.eql(u8, name, "fs_mkdir") or std.mem.eql(u8, name, "fs_remove") or
-                    std.mem.eql(u8, name, "fs_rename") or std.mem.eql(u8, name, "fs_rmdir"))
-                {
-                    self.current_effects.addBuiltin(.file_system);
-                } else if (std.mem.eql(u8, name, "read_key") or std.mem.eql(u8, name, "read_key_nb")) {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.console);
-                } else if (std.mem.eql(u8, name, "term_width") or std.mem.eql(u8, name, "term_height") or
-                    std.mem.eql(u8, name, "time_ms"))
-                {
-                    self.current_effects.addBuiltin(.io);
-                }
-                return try self.type_ctx.intern(.{ .int = .i64 });
-            }
-            // Builtins returning float
-            if (std.mem.eql(u8, name, "parse_float"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.type_ctx.intern(.{ .float = .f64 });
-            }
-            // Builtins returning string
-            if (std.mem.eql(u8, name, "int_to_string") or std.mem.eql(u8, name, "bool_to_string") or
-                std.mem.eql(u8, name, "float_to_string") or std.mem.eql(u8, name, "substr") or
-                std.mem.eql(u8, name, "char_to_string") or std.mem.eql(u8, name, "char_at") or
-                std.mem.eql(u8, name, "file_read") or
-                std.mem.eql(u8, name, "args_get") or
-                std.mem.eql(u8, name, "string_trim") or std.mem.eql(u8, name, "string_replace") or
-                std.mem.eql(u8, name, "string_to_upper") or std.mem.eql(u8, name, "string_to_lower") or
-                std.mem.eql(u8, name, "path_dirname") or std.mem.eql(u8, name, "path_basename") or
-                std.mem.eql(u8, name, "path_extension") or std.mem.eql(u8, name, "path_stem") or
-                std.mem.eql(u8, name, "path_join") or std.mem.eql(u8, name, "read_line") or std.mem.eql(u8, name, "chr") or
-                std.mem.eql(u8, name, "fs_readdir") or std.mem.eql(u8, name, "fs_getcwd") or
-                std.mem.eql(u8, name, "env_get") or
-                std.mem.eql(u8, name, "tcp_read"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Effect tracking
-                if (std.mem.eql(u8, name, "file_read") or std.mem.eql(u8, name, "fs_readdir") or
-                    std.mem.eql(u8, name, "fs_getcwd"))
-                {
-                    self.current_effects.addBuiltin(.file_system);
-                } else if (std.mem.eql(u8, name, "env_get")) {
-                    self.current_effects.addBuiltin(.io);
-                } else if (std.mem.eql(u8, name, "read_line")) {
-                    self.current_effects.addBuiltin(.io);
-                    self.current_effects.addBuiltin(.console);
-                } else if (std.mem.eql(u8, name, "args_get")) {
-                    self.current_effects.addBuiltin(.io);
-                }
-                return try self.type_ctx.intern(.str);
-            }
-            // string_split returns a fresh type var (codegen handles the split_result struct)
-            if (std.mem.eql(u8, name, "string_split"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // Builtins returning bool
-            if (std.mem.eql(u8, name, "is_alpha") or std.mem.eql(u8, name, "is_digit") or
-                std.mem.eql(u8, name, "is_alnum") or std.mem.eql(u8, name, "is_whitespace") or
-                std.mem.eql(u8, name, "string_contains") or std.mem.eql(u8, name, "starts_with") or
-                std.mem.eql(u8, name, "ends_with") or std.mem.eql(u8, name, "file_exists") or
-                std.mem.eql(u8, name, "fs_exists"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Effect tracking
-                if (std.mem.eql(u8, name, "file_exists") or std.mem.eql(u8, name, "fs_exists")) {
-                    self.current_effects.addBuiltin(.file_system);
-                }
-                return try self.type_ctx.intern(.bool);
-            }
-            // List_new returns a fresh type var (its type is inferred from usage context)
-            if (std.mem.eql(u8, name, "List_new"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // Box_new(value) returns Box[T] where T is inferred from the argument
-            if (std.mem.eql(u8, name, "Box_new"))
-            {
-                if (fc.args.len > 0) {
-                    const inner_type = try self.inferExpr(fc.args[0].value);
-                    return try self.type_ctx.makeBox(inner_type);
-                }
-                return try self.freshTypeVar();
-            }
-            // Box_null() returns a fresh type var (type inferred from context)
-            if (std.mem.eql(u8, name, "Box_null"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // Map_new() returns a fresh type var (type inferred from let binding)
-            if (std.mem.eql(u8, name, "Map_new"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // SIMD arithmetic builtins: return same type as first argument
-            if (std.mem.eql(u8, name, "simd_add") or std.mem.eql(u8, name, "simd_sub") or
-                std.mem.eql(u8, name, "simd_mul") or std.mem.eql(u8, name, "simd_div"))
-            {
-                var first_type: ?TypeId = null;
-                for (fc.args, 0..) |arg, i| {
-                    const t = try self.inferExpr(arg.value);
-                    if (i == 0) first_type = t;
-                }
-                return first_type orelse try self.freshTypeVar();
-            }
-            // SIMD extract: returns scalar (use fresh type var, C handles the actual type)
-            if (std.mem.eql(u8, name, "simd_extract"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                return try self.freshTypeVar();
-            }
-            // SIMD splat/set builtins: simd_splat_f32x4(val) -> f32x4, etc.
-            if (std.mem.startsWith(u8, name, "simd_splat_") or std.mem.startsWith(u8, name, "simd_set_"))
-            {
-                for (fc.args) |arg| {
-                    _ = try self.inferExpr(arg.value);
-                }
-                // Extract the SIMD type suffix (e.g., "f32x4" from "simd_splat_f32x4")
-                const suffix = if (std.mem.startsWith(u8, name, "simd_splat_"))
-                    name[11..]
-                else
-                    name[9..];
-                // Look up the SIMD type by name
-                if (self.type_ctx.type_names.get(suffix)) |simd_type_id| {
+                if (self.type_ctx.type_names.get(simd.suffix)) |simd_type_id| {
                     return simd_type_id;
                 }
                 return try self.freshTypeVar();
@@ -1472,6 +1550,9 @@ pub const TypeChecker = struct {
             return try self.type_ctx.intern(.error_type);
         };
 
+        if (typ == .error_type) {
+            return try self.type_ctx.intern(.error_type);
+        }
         if (typ != .function) {
             try self.reportError(.expected_function_type, "expected function type", fc.span);
             return try self.type_ctx.intern(.error_type);
@@ -1861,9 +1942,116 @@ pub const TypeChecker = struct {
         return elem_type;
     }
 
+    fn castTypeIsUnprovable(typ: Type) bool {
+        return switch (typ) {
+            .type_var, .type_param, .error_type, .any, .unknown, .never => true,
+            else => false,
+        };
+    }
+
+    /// Human-readable type name for cast diagnostics. The returned slice is
+    /// owned by the checker (tracked in owned_messages).
+    fn castTypeName(self: *Self, type_id: TypeId) anyerror![]const u8 {
+        const resolved = self.resolveType(type_id);
+        const typ = self.type_ctx.get(resolved) orelse {
+            const msg = try self.allocator.dupe(u8, "<unknown>");
+            try self.owned_messages.append(msg);
+            return msg;
+        };
+        const msg: []const u8 = switch (typ) {
+            .int => |i| switch (i) {
+                .i64 => try self.allocator.dupe(u8, "int"),
+                .u64 => try self.allocator.dupe(u8, "uint"),
+                .u8 => try self.allocator.dupe(u8, "u8"),
+                else => try self.allocator.dupe(u8, i.name()),
+            },
+            .float => |f| switch (f) {
+                .f64 => try self.allocator.dupe(u8, "float"),
+                .f32 => try self.allocator.dupe(u8, "f32"),
+            },
+            .str => try self.allocator.dupe(u8, "string"),
+            .bool => try self.allocator.dupe(u8, "bool"),
+            .char => try self.allocator.dupe(u8, "char"),
+            .unit => try self.allocator.dupe(u8, "unit"),
+            .ref => |r| blk: {
+                const inner = try self.castTypeName(r.pointee);
+                break :blk if (r.is_mutable)
+                    try std.fmt.allocPrint(self.allocator, "&mut {s}", .{inner})
+                else
+                    try std.fmt.allocPrint(self.allocator, "&{s}", .{inner});
+            },
+            .box => |inner_id| blk: {
+                const inner = try self.castTypeName(inner_id);
+                break :blk try std.fmt.allocPrint(self.allocator, "Box[{s}]", .{inner});
+            },
+            .@"struct" => |s| try self.allocator.dupe(u8, s.name orelse "struct"),
+            .@"enum" => |e| try self.allocator.dupe(u8, e.name),
+            .array => |a| blk: {
+                const inner = try self.castTypeName(a.element_type);
+                break :blk try std.fmt.allocPrint(self.allocator, "[{s}; {d}]", .{ inner, a.size });
+            },
+            .slice => |s| blk: {
+                const inner = try self.castTypeName(s.element_type);
+                break :blk try std.fmt.allocPrint(self.allocator, "[{s}]", .{inner});
+            },
+            .option => |inner_id| blk: {
+                const inner = try self.castTypeName(inner_id);
+                break :blk try std.fmt.allocPrint(self.allocator, "Option[{s}]", .{inner});
+            },
+            .result => blk: {
+                const ok_name = try self.castTypeName(typ.result.ok_type);
+                const err_name = try self.castTypeName(typ.result.err_type);
+                break :blk try std.fmt.allocPrint(self.allocator, "Result[{s}, {s}]", .{ ok_name, err_name });
+            },
+            .future => |inner_id| blk: {
+                const inner = try self.castTypeName(inner_id);
+                break :blk try std.fmt.allocPrint(self.allocator, "Future[{s}]", .{inner});
+            },
+            .trait_object => try self.allocator.dupe(u8, "dyn Trait"),
+            .simd => |s| try self.allocator.dupe(u8, s.name()),
+            .generic_instance => try self.allocator.dupe(u8, "generic instance (List/Map/struct)"),
+            .tuple => try self.allocator.dupe(u8, "tuple"),
+            .function => try self.allocator.dupe(u8, "function"),
+            else => types.typeName(self.type_ctx, resolved, self.allocator) catch try self.allocator.dupe(u8, "<unknown>"),
+        };
+        try self.owned_messages.append(msg);
+        return msg;
+    }
+
     fn inferCast(self: *Self, cast: *const ast.CastExpr) anyerror!TypeId {
-        _ = try self.inferExpr(cast.expr);
-        return try self.resolveTypeExpr(cast.target_type);
+        const src_type = try self.inferExpr(cast.expr);
+        const dst_type = try self.resolveTypeExpr(cast.target_type);
+
+        const src = self.resolveType(src_type);
+        const dst = self.resolveType(dst_type);
+
+        // Same-type casts are no-ops.
+        if (src == dst) return dst_type;
+
+        const src_t = self.type_ctx.get(src) orelse return dst_type;
+        const dst_t = self.type_ctx.get(dst) orelse return dst_type;
+
+        // Types still under inference (generics, List/Map element vars,
+        // error recovery) cannot be proven non-numeric; let them through.
+        if (castTypeIsUnprovable(src_t) or castTypeIsUnprovable(dst_t)) return dst_type;
+
+        // `x as dyn Trait` keeps its legacy meaning (trait-object coercion).
+        if (dst_t == .trait_object) return dst_type;
+
+        // Numeric <-> numeric casts are allowed. Narrowing integer casts
+        // additionally get a runtime range check in codegen.
+        if (src_t.isNumeric() and dst_t.isNumeric()) return dst_type;
+
+        const src_name = try self.castTypeName(src);
+        const dst_name = try self.castTypeName(dst);
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "invalid cast from {s} to {s}: only numeric to numeric casts are allowed",
+            .{ src_name, dst_name },
+        );
+        try self.owned_messages.append(msg);
+        try self.reportError(.type_mismatch, msg, cast.span);
+        return dst_type;
     }
 
     fn inferTypeCheck(self: *Self, tc: *const ast.TypeCheckExpr) anyerror!TypeId {
@@ -1889,6 +2077,172 @@ pub const TypeChecker = struct {
     // STATEMENT CHECKING
     // ========================================================================
 
+    // ========================================================================
+    // UNSAFE FENCE PROVENANCE (simple, name-based taint tracking)
+    // ========================================================================
+
+    fn unwrapGroupedExpr(expr: *const ast.Expr) *const ast.Expr {
+        var cur = expr;
+        while (cur.kind == .grouped) {
+            cur = cur.kind.grouped;
+        }
+        return cur;
+    }
+
+    /// True if the expression directly produces a reference of untrusted
+    /// provenance: an extern function call result or a cast to a reference
+    /// type.
+    fn exprIsTaintSource(self: *Self, expr: *const ast.Expr) bool {
+        const inner = unwrapGroupedExpr(expr);
+        switch (inner.kind) {
+            .function_call => |fc| {
+                if (fc.function.kind == .identifier) {
+                    return self.extern_functions.contains(fc.function.kind.identifier.name);
+                }
+                return false;
+            },
+            .cast => |c| {
+                return c.target_type.kind == .reference or c.target_type.kind == .pointer;
+            },
+            else => return false,
+        }
+    }
+
+    /// True if the expression denotes a tainted reference value: a taint
+    /// source, a tainted variable, or a copy of one.
+    fn exprIsTaintedRef(self: *Self, expr: *const ast.Expr) bool {
+        const inner = unwrapGroupedExpr(expr);
+        if (inner.kind == .identifier) {
+            return self.tainted_vars.contains(inner.kind.identifier.name);
+        }
+        return self.exprIsTaintSource(inner);
+    }
+
+    fn updateVarTaint(self: *Self, name: []const u8, value: *const ast.Expr) !void {
+        if (self.exprIsTaintedRef(value)) {
+            try self.tainted_vars.put(name, {});
+        } else {
+            _ = self.tainted_vars.remove(name);
+        }
+    }
+
+    // ========================================================================
+    // REGION ESCAPE RULE (name-based region-born tracking, like taint)
+    // ========================================================================
+    //
+    // A region-born value is one allocated by the region: string
+    // concat/interpolation results, List/Map literals and constructors
+    // (List_new/Map_new), Box_new, and values let-bound or assigned from
+    // those inside the region. Such a value must not escape: no
+    // assignment to a variable declared outside the region, no return
+    // from the enclosing function, and no store into a field/element of
+    // a container declared outside the region.
+
+    /// True if `name` resolves to a variable whose defining scope is
+    /// outside the innermost enclosing region block.
+    fn varDeclaredOutsideInnermostRegion(self: *Self, name: []const u8) bool {
+        if (self.region_scopes.items.len == 0) return false;
+        const region_scope = self.region_scopes.items[self.region_scopes.items.len - 1];
+        var inside = true;
+        var scope: ?*Scope = self.env.current;
+        while (scope) |s| {
+            if (s.lookupLocal(name) != null) return !inside;
+            if (s == region_scope) inside = false;
+            scope = s.parent;
+        }
+        return false;
+    }
+
+    /// Base identifier of a field/index chain (a.b[i].c -> a), if any.
+    fn rootIdentifierName(expr: *const ast.Expr) ?[]const u8 {
+        var cur = unwrapGroupedExpr(expr);
+        while (true) {
+            switch (cur.kind) {
+                .identifier => |ident| return ident.name,
+                .field_access => |fa| cur = unwrapGroupedExpr(fa.object),
+                .index_access => |ia| cur = unwrapGroupedExpr(ia.object),
+                else => return null,
+            }
+        }
+    }
+
+    fn exprIsStringLiteral(expr: *const ast.Expr) bool {
+        const inner = unwrapGroupedExpr(expr);
+        return inner.kind == .literal and inner.kind.literal.kind == .string;
+    }
+
+    /// True if the expression denotes a region-born value (see block
+    /// comment above). `expr_type` is the already-inferred type of the
+    /// whole expression when the caller has it (used to recognise
+    /// string concatenation); null for subexpressions.
+    fn exprIsRegionBorn(self: *Self, expr: *const ast.Expr, expr_type: ?TypeId) bool {
+        if (self.region_depth == 0) return false;
+        const inner = unwrapGroupedExpr(expr);
+        switch (inner.kind) {
+            .identifier => |ident| {
+                return self.region_born_vars.contains(ident.name) and
+                    !self.varDeclaredOutsideInnermostRegion(ident.name);
+            },
+            .string_interpolation => return true,
+            .array_literal => return true,
+            .binary => |bin| {
+                if (bin.op != .add) return false;
+                if (expr_type) |t| {
+                    const resolved = self.resolveType(t);
+                    if (self.type_ctx.get(resolved)) |typ| {
+                        if (std.meta.activeTag(typ) == .str) return true;
+                    }
+                }
+                return self.exprIsRegionBorn(bin.left, null) or
+                    self.exprIsRegionBorn(bin.right, null) or
+                    exprIsStringLiteral(bin.left) or exprIsStringLiteral(bin.right);
+            },
+            .function_call => |fc| {
+                if (fc.function.kind == .identifier) {
+                    const name = fc.function.kind.identifier.name;
+                    return builtins.isFreshCtor(name);
+                }
+                return false;
+            },
+            .comptime_expr => |ce| return self.exprIsRegionBorn(ce.expr, null),
+            .cast => |c| return self.exprIsRegionBorn(c.expr, null),
+            .block => |blk| {
+                if (blk.result) |result| return self.exprIsRegionBorn(result, null);
+                return false;
+            },
+            .if_expr => |ie| {
+                if (ie.then_branch.result) |result| {
+                    if (self.exprIsRegionBorn(result, null)) return true;
+                }
+                if (ie.else_branch) |else_br| {
+                    switch (else_br) {
+                        .else_block => |block| {
+                            if (block.result) |result| {
+                                if (self.exprIsRegionBorn(result, null)) return true;
+                            }
+                        },
+                        .else_if => |else_if| {
+                            // Recurse via a synthetic view: check branches.
+                            if (else_if.then_branch.result) |result| {
+                                if (self.exprIsRegionBorn(result, null)) return true;
+                            }
+                        },
+                    }
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn updateRegionBornVar(self: *Self, name: []const u8, value: *const ast.Expr, value_type: ?TypeId) !void {
+        if (self.exprIsRegionBorn(value, value_type)) {
+            try self.region_born_vars.put(name, {});
+        } else {
+            _ = self.region_born_vars.remove(name);
+        }
+    }
+
     pub fn checkStatement(self: *Self, stmt: *const ast.Statement) !void {
         switch (stmt.kind) {
             .let_binding => |lb| try self.checkLetBinding(lb),
@@ -1901,6 +2255,7 @@ pub const TypeChecker = struct {
             .break_stmt => |bs| try self.checkBreak(bs),
             .continue_stmt => |cs| try self.checkContinue(cs),
             .region_block => |rb| try self.checkRegionBlock(rb),
+            .unsafe_block => |ub| try self.checkUnsafeBlock(ub),
             .expression => |expr| _ = try self.inferExpr(expr),
             .assignment => |assign| try self.checkAssignment(assign),
             .discard => |disc| _ = try self.inferExpr(disc.value),
@@ -1937,6 +2292,16 @@ pub const TypeChecker = struct {
 
         // Bind pattern
         try self.bindPattern(lb.pattern, final_type, lb.is_mut);
+
+        // Unsafe fence provenance: extern-call / cast-to-reference
+        // initializers taint the bound variable.
+        if (lb.pattern.kind == .identifier) {
+            if (lb.value) |val| {
+                try self.updateVarTaint(lb.pattern.kind.identifier.name.name, val);
+                // Region escape: record region-born initializers.
+                try self.updateRegionBornVar(lb.pattern.kind.identifier.name.name, val, value_type);
+            }
+        }
     }
 
     /// Check if an expression is an unsuffixed integer or float literal that
@@ -1986,6 +2351,14 @@ pub const TypeChecker = struct {
             try self.inferExpr(val)
         else
             try self.type_ctx.intern(.unit);
+
+        // Region escape: a region-born value must not be returned from
+        // the enclosing function while inside a region.
+        if (rs.value) |val| {
+            if (self.exprIsRegionBorn(val, return_type)) {
+                try self.reportError(.type_mismatch, "return of region-born value from inside a region (region escape)", rs.span);
+            }
+        }
 
         if (fn_scope.?.return_type) |expected| {
             try self.unify(return_type, expected, rs.span);
@@ -2053,6 +2426,16 @@ pub const TypeChecker = struct {
         try self.env.pushScope(.block);
         defer self.env.popScope();
 
+        // Region escape rule: remember this region's scope so
+        // assignments/returns/stores inside can tell whether their
+        // target was declared outside the region.
+        try self.region_scopes.append(self.env.current);
+        self.region_depth += 1;
+        defer {
+            _ = self.region_scopes.pop();
+            self.region_depth -= 1;
+        }
+
         // Register the region
         const region_type = try self.type_ctx.intern(.{
             .region = .{
@@ -2064,6 +2447,12 @@ pub const TypeChecker = struct {
         try self.env.define(Symbol.init(rb.name.name, .type_def, region_type));
 
         _ = try self.inferBlock(rb.body);
+    }
+
+    fn checkUnsafeBlock(self: *Self, ub: *const ast.UnsafeBlock) !void {
+        self.unsafe_depth += 1;
+        defer self.unsafe_depth -= 1;
+        _ = try self.inferBlock(ub.body);
     }
 
     fn checkAssignment(self: *Self, assign: *const ast.Assignment) !void {
@@ -2097,6 +2486,53 @@ pub const TypeChecker = struct {
                 }
                 try self.unify(value_type, target_type, assign.span);
             },
+        }
+
+        // Region escape rule (see REGION ESCAPE RULE block above).
+        if (self.region_depth > 0 and assign.op == .assign and
+            self.exprIsRegionBorn(assign.value, value_type))
+        {
+            if (assign.target.kind == .identifier) {
+                const name = assign.target.kind.identifier.name;
+                if (self.varDeclaredOutsideInnermostRegion(name)) {
+                    try self.reportError(.type_mismatch, "assignment of region-born value to variable declared outside the region (region escape)", assign.span);
+                }
+            } else if (rootIdentifierName(assign.target)) |root_name| {
+                if (self.varDeclaredOutsideInnermostRegion(root_name)) {
+                    try self.reportError(.type_mismatch, "store of region-born value into container declared outside the region (region escape)", assign.span);
+                }
+            }
+        }
+        if (self.region_depth > 0 and assign.op == .add_assign) {
+            // String `s += x` is `s = s + x`: the concat result is
+            // region-born, so writing it to an outer variable/field is
+            // an escape; writing it to an inner variable makes that
+            // variable region-born.
+            const resolved_target = self.resolveType(target_type);
+            const target_is_str = if (self.type_ctx.get(resolved_target)) |typ|
+                std.meta.activeTag(typ) == .str
+            else
+                false;
+            if (target_is_str) {
+                if (assign.target.kind == .identifier) {
+                    const name = assign.target.kind.identifier.name;
+                    if (self.varDeclaredOutsideInnermostRegion(name)) {
+                        try self.reportError(.type_mismatch, "assignment of region-born value to variable declared outside the region (region escape)", assign.span);
+                    } else {
+                        try self.region_born_vars.put(name, {});
+                    }
+                } else if (rootIdentifierName(assign.target)) |root_name| {
+                    if (self.varDeclaredOutsideInnermostRegion(root_name)) {
+                        try self.reportError(.type_mismatch, "store of region-born value into container declared outside the region (region escape)", assign.span);
+                    }
+                }
+            }
+        }
+
+        // Unsafe fence provenance across plain assignment.
+        if (assign.op == .assign and assign.target.kind == .identifier) {
+            try self.updateVarTaint(assign.target.kind.identifier.name, assign.value);
+            try self.updateRegionBornVar(assign.target.kind.identifier.name, assign.value, value_type);
         }
     }
 
@@ -2439,6 +2875,12 @@ pub const TypeChecker = struct {
     /// Pre-register a function's type signature without checking its body.
     /// This enables forward function references across the module.
     fn registerFunctionSignature(self: *Self, func: *const ast.FunctionDecl, is_public: bool) !void {
+        // Track extern declarations for the unsafe fence (even on the
+        // early-return path below, the name must stay fenced).
+        if (func.is_extern) {
+            try self.extern_functions.put(func.name.name, {});
+        }
+
         // Skip if already registered (e.g. duplicate function name - error reported later)
         if (self.env.lookupLocal(func.name.name)) |_| {
             return;
@@ -2573,10 +3015,21 @@ pub const TypeChecker = struct {
             }
         }
 
-        // Define parameters in function scope
+        // Define parameters in function scope. Reference-typed parameters
+        // are tainted by default for the unsafe fence: their provenance is
+        // the (unchecked) caller. Taint state is per-function.
+        self.tainted_vars.clearRetainingCapacity();
+        self.unsafe_depth = 0;
+        // Region-born tracking is per-function too.
+        self.region_born_vars.clearRetainingCapacity();
+        self.region_scopes.clearRetainingCapacity();
+        self.region_depth = 0;
         for (func.params) |param| {
             const param_type = try self.resolveTypeExpr(param.type_expr);
             try self.env.define(Symbol.init(param.name.name, .variable, param_type).withMutable(param.is_mut));
+            if (param.type_expr.kind == .reference or param.type_expr.kind == .pointer) {
+                try self.tainted_vars.put(param.name.name, {});
+            }
         }
 
         // For async functions, the body checks against inner_return_type (T, not Future[T])
@@ -2757,6 +3210,7 @@ pub const TypeChecker = struct {
             .loop_stmt => |ls| blockContainsAwait(ls.body),
             .match_stmt => |me| exprContainsAwait(me.scrutinee) or matchContainsAwait(me),
             .region_block => |rb| blockContainsAwait(rb.body),
+            .unsafe_block => |ub| blockContainsAwait(ub.body),
             .discard => |d| exprContainsAwait(d.value),
             .break_stmt => |bs| if (bs.value) |v| exprContainsAwait(v) else false,
             .continue_stmt => false,
@@ -3040,6 +3494,76 @@ pub const TypeChecker = struct {
         try self.env.pushScope(.trait_def);
     }
 
+    /// True when an impl method takes a receiver (first param named `self`).
+    fn methodHasSelfParam(func: *const ast.FunctionDecl) bool {
+        if (func.params.len > 0) {
+            return std.mem.eql(u8, func.params[0].name.name, "self");
+        }
+        return false;
+    }
+
+    /// Record the signatures of an impl block's associated (no-self)
+    /// functions under "TypeName.method" so `Type.new(args)` style calls
+    /// type-check with the impl function's own signature. Instance
+    /// methods stay receiver-only. Generic impl targets and generic
+    /// associated functions are skipped (call sites keep the fresh-var
+    /// behavior); generic structs are not supported yet.
+    fn registerAssociatedSignatures(self: *Self, ib: *const ast.ImplBlock) !void {
+        if (ib.generic_params != null and ib.generic_params.?.len > 0) return;
+        if (ib.target_type.kind != .named) return;
+        const named = ib.target_type.kind.named;
+        if (named.generic_args != null and named.generic_args.?.len > 0) return;
+        if (named.path.segments.len == 0) return;
+        const type_name = named.path.segments[named.path.segments.len - 1].name;
+
+        try self.env.pushScope(.impl_block);
+        defer self.env.popScope();
+
+        const target_type = try self.resolveTypeExpr(ib.target_type);
+        try self.env.define(Symbol.init("Self", .type_param, target_type));
+
+        for (ib.items) |item| {
+            switch (item.kind) {
+                .function => |func| {
+                    if (methodHasSelfParam(func)) continue;
+                    if (func.generic_params != null and func.generic_params.?.len > 0) continue;
+
+                    var param_types = std.ArrayList(TypeId).init(self.allocator);
+                    defer param_types.deinit();
+                    for (func.params) |param| {
+                        try param_types.append(try self.resolveTypeExpr(param.type_expr));
+                    }
+                    const inner_return_type = if (func.return_type) |rt|
+                        try self.resolveTypeExpr(rt)
+                    else
+                        try self.type_ctx.intern(.unit);
+                    const return_type = if (func.is_async)
+                        try self.type_ctx.makeFuture(inner_return_type)
+                    else
+                        inner_return_type;
+                    var effects = EffectSet.pure;
+                    if (func.effects) |effs| {
+                        for (effs) |eff| {
+                            try self.addEffectFromTypeExpr(eff, &effects);
+                        }
+                    }
+                    if (func.is_async) {
+                        effects.addBuiltin(.async_effect);
+                    }
+                    const fn_type = try self.type_ctx.makeFunction(param_types.items, return_type, effects);
+                    const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ type_name, func.name.name });
+                    if (self.associated_functions.getKey(key)) |old_key| {
+                        self.allocator.free(key);
+                        try self.associated_functions.put(old_key, fn_type);
+                    } else {
+                        try self.associated_functions.put(key, fn_type);
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+
     fn checkImpl(self: *Self, ib: *const ast.ImplBlock) !void {
         try self.env.pushScope(.impl_block);
         defer self.env.popScope();
@@ -3169,13 +3693,32 @@ pub const TypeChecker = struct {
                     }
                     return try self.freshTypeVar();
                 }
+                // Erased containers (List/Vec/Map/HashMap) have no
+                // distinct checker type; codegen monomorphizes them.
+                // Each resolution must get a FRESH type variable: the
+                // registered symbol holds one shared variable, and
+                // returning it for every annotation let one List's
+                // unification (e.g. an index assignment binding its
+                // element) mistype every other List in the program.
+                if (std.mem.eql(u8, name, "List") or std.mem.eql(u8, name, "Vec") or
+                    std.mem.eql(u8, name, "Map") or std.mem.eql(u8, name, "HashMap"))
+                {
+                    if (named.generic_args) |args| {
+                        for (args) |arg| {
+                            _ = try self.resolveTypeExpr(arg);
+                        }
+                    }
+                    return try self.freshTypeVar();
+                }
                 if (self.env.lookup(name)) |symbol| {
                     if (named.generic_args) |args| {
                         return try self.instantiateGeneric(symbol.type_id, args);
                     }
                     return symbol.type_id;
                 }
-                try self.reportError(.undefined_type, "undefined type", te.span);
+                const type_msg = try std.fmt.allocPrint(self.allocator, "undefined type '{s}'", .{name});
+                try self.owned_messages.append(type_msg);
+                try self.reportError(.undefined_type, type_msg, te.span);
                 return try self.type_ctx.intern(.error_type);
             },
             .function => |func| {
@@ -3369,9 +3912,26 @@ pub const TypeChecker = struct {
     }
 
     fn reportTypeMismatch(self: *Self, expected: TypeId, found: TypeId, span: ?ast.Span) !void {
-        _ = expected;
-        _ = found;
-        try self.reportError(.type_mismatch, "type mismatch", span);
+        // Never cascade off an error type (root error already reported).
+        if (self.isErrorType(expected) or self.isErrorType(found)) return;
+        const expected_name = self.castTypeName(expected) catch {
+            try self.reportError(.type_mismatch, "type mismatch", span);
+            return;
+        };
+        const found_name = self.castTypeName(found) catch {
+            try self.reportError(.type_mismatch, "type mismatch", span);
+            return;
+        };
+        const msg = std.fmt.allocPrint(
+            self.allocator,
+            "type mismatch: expected {s}, found {s}",
+            .{ expected_name, found_name },
+        ) catch {
+            try self.reportError(.type_mismatch, "type mismatch", span);
+            return;
+        };
+        try self.owned_messages.append(msg);
+        try self.reportError(.type_mismatch, msg, span);
     }
 
     // ========================================================================
@@ -3418,6 +3978,7 @@ pub const TypeChecker = struct {
         for (source_file.declarations) |decl| {
             switch (decl.kind) {
                 .function => |func| try self.registerFunctionSignature(func, decl.visibility == .public),
+                .impl_block => |ib| try self.registerAssociatedSignatures(ib),
                 else => {},
             }
         }

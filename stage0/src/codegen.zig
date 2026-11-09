@@ -16,6 +16,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const types = @import("types.zig");
+const builtins = @import("builtins.zig");
 
 // Re-import AST types
 const Span = ast.Span;
@@ -39,6 +40,7 @@ const LoopStmt = ast.LoopStmt;
 const BreakStmt = ast.BreakStmt;
 const ContinueStmt = ast.ContinueStmt;
 const RegionBlock = ast.RegionBlock;
+const UnsafeBlock = ast.UnsafeBlock;
 const Expr = ast.Expr;
 const Literal = ast.Literal;
 const BinaryExpr = ast.BinaryExpr;
@@ -277,6 +279,9 @@ pub const CodeGenerator = struct {
     generated_box_types: std.StringHashMap([]const u8),
     // Deferred buffer for box helper definitions
     box_type_writer: CWriter,
+    /// Bytes of box_type_writer already copied into the main writer;
+    /// helpers discovered during body generation are spliced in later.
+    box_helpers_flushed: usize,
 
     // Track generated map types: maps map type name -> MapTypeInfo
     generated_map_types: std.StringHashMap(MapTypeInfo),
@@ -384,6 +389,15 @@ pub const CodeGenerator = struct {
     // Source file reference for comptime function resolution
     current_source: ?*SourceFile,
 
+    // Set by the comptime evaluator when constant integer arithmetic
+    // overflows; turned into a clean compile error by callers.
+    comptime_overflow: bool,
+
+    // Set by the comptime evaluator when evaluation stops at a fuel
+    // limit (call depth / loop iterations); callers that fall back to
+    // runtime evaluation turn it into a compile-time note.
+    comptime_fuel_exceeded: bool,
+
     const Self = @This();
 
     const CapturedVar = struct {
@@ -452,6 +466,7 @@ pub const CodeGenerator = struct {
             .list_type_writer = CWriter.init(allocator),
             .generated_box_types = std.StringHashMap([]const u8).init(allocator),
             .box_type_writer = CWriter.init(allocator),
+            .box_helpers_flushed = 0,
             .generated_map_types = std.StringHashMap(MapTypeInfo).init(allocator),
             .map_value_types = std.StringHashMap(void).init(allocator),
             .map_type_struct_writer = CWriter.init(allocator),
@@ -495,6 +510,8 @@ pub const CodeGenerator = struct {
             .source_file_path = null,
             .last_debug_line = 0,
             .current_source = null,
+            .comptime_overflow = false,
+            .comptime_fuel_exceeded = false,
         };
     }
 
@@ -779,6 +796,7 @@ pub const CodeGenerator = struct {
             try self.writer.blankLine();
             try self.writer.writeLineComment("Monomorphized Box Helpers");
             try self.writer.write(self.box_type_writer.getOutput());
+            self.box_helpers_flushed = self.box_type_writer.getOutput().len;
         }
 
         // Insert monomorphized list type FUNCTION definitions AFTER user structs.
@@ -981,17 +999,29 @@ pub const CodeGenerator = struct {
         // Generate monomorphized function implementations
         try self.emitMonomorphizedImplementations();
 
-        // Insert hoisted lambda definitions before function implementations
-        if (self.lambda_writer.getOutput().len > 0) {
+        // Insert hoisted lambda definitions before function implementations.
+        // Box helpers first needed by a body (e.g. `let b = Box_new(42)`
+        // with no Box[T] annotation anywhere) are spliced in here too:
+        // they were emitted after the post-struct flush above.
+        const late_box_helpers = self.box_type_writer.getOutput()[self.box_helpers_flushed..];
+        if (self.lambda_writer.getOutput().len > 0 or late_box_helpers.len > 0) {
             // Extract the function code that was generated after pre_functions_len
             const function_code = try self.allocator.dupe(u8, self.writer.getOutput()[pre_functions_len..]);
             defer self.allocator.free(function_code);
             // Truncate writer back to pre-function position
             self.writer.truncate(pre_functions_len);
-            // Write lambda definitions
-            try self.writer.blankLine();
-            try self.writer.writeLineComment("Hoisted Lambda Functions");
-            try self.writer.write(self.lambda_writer.getOutput());
+            if (self.lambda_writer.getOutput().len > 0) {
+                // Write lambda definitions
+                try self.writer.blankLine();
+                try self.writer.writeLineComment("Hoisted Lambda Functions");
+                try self.writer.write(self.lambda_writer.getOutput());
+            }
+            if (late_box_helpers.len > 0) {
+                try self.writer.blankLine();
+                try self.writer.writeLineComment("Monomorphized Box Helpers (late)");
+                try self.writer.write(late_box_helpers);
+                self.box_helpers_flushed = self.box_type_writer.getOutput().len;
+            }
             // Re-append the function code
             try self.writer.write(function_code);
         }
@@ -1192,10 +1222,12 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
-        // Safe division/modulo helpers (runtime division-by-zero protection)
+        // Safe division/modulo helpers (runtime division-by-zero protection;
+        // INT64_MIN / -1 is UB in C and reported as integer overflow)
         try self.writer.writeLine("static inline int64_t dm__safe_div(int64_t a, int64_t b) {");
         self.writer.indent();
         try self.writer.writeLine("if (b == 0) dm_panic(\"division by zero\");");
+        try self.writer.writeLine("if (a == (-9223372036854775807LL - 1LL) && b == -1) dm_panic(\"integer overflow\");");
         try self.writer.writeLine("return a / b;");
         self.writer.dedent();
         try self.writer.writeLine("}");
@@ -1204,7 +1236,48 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("static inline int64_t dm__safe_mod(int64_t a, int64_t b) {");
         self.writer.indent();
         try self.writer.writeLine("if (b == 0) dm_panic(\"modulo by zero\");");
+        try self.writer.writeLine("if (a == (-9223372036854775807LL - 1LL) && b == -1) dm_panic(\"integer overflow\");");
         try self.writer.writeLine("return a % b;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Checked signed arithmetic (defined integer overflow: panic).
+        // Unsigned arithmetic keeps C's defined modulo-2^N wrapping and
+        // does not use these helpers.
+        try self.writer.writeLine("static inline int64_t dm_checked_add_i64(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("int64_t r;");
+        try self.writer.writeLine("if (__builtin_add_overflow(a, b, &r)) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return r;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm_checked_sub_i64(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("int64_t r;");
+        try self.writer.writeLine("if (__builtin_sub_overflow(a, b, &r)) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return r;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline int64_t dm_checked_mul_i64(int64_t a, int64_t b) {");
+        self.writer.indent();
+        try self.writer.writeLine("int64_t r;");
+        try self.writer.writeLine("if (__builtin_mul_overflow(a, b, &r)) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return r;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Range check used to define overflow for narrower signed widths
+        // (arithmetic is promoted to int64, checked there, then fitted).
+        try self.writer.writeLine("static inline int64_t dm_checked_range_i64(int64_t v, int64_t lo, int64_t hi) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (v < lo || v > hi) dm_panic(\"integer overflow\");");
+        try self.writer.writeLine("return v;");
         self.writer.dedent();
         try self.writer.writeLine("}");
         try self.writer.blankLine();
@@ -1238,6 +1311,33 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
+        // Checked narrowing-cast helpers (panic if the value does not fit
+        // the destination integer type; see generateCast)
+        try self.writer.writeLine("static inline int64_t dm_cast_check_i64(int64_t v, int64_t lo, int64_t hi) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (v < lo || v > hi) dm_panic(\"integer cast out of range\");");
+        try self.writer.writeLine("return v;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        // Null-pointer check helper (Box field access / dereference)
+        try self.writer.writeLine("static inline void* dm_null_check_ptr(void* p) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (p == NULL) dm_panic(\"null Box dereference\");");
+        try self.writer.writeLine("return p;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
+        try self.writer.writeLine("static inline uint64_t dm_cast_check_u64(uint64_t v, uint64_t hi) {");
+        self.writer.indent();
+        try self.writer.writeLine("if (v > hi) dm_panic(\"integer cast out of range\");");
+        try self.writer.writeLine("return v;");
+        self.writer.dedent();
+        try self.writer.writeLine("}");
+        try self.writer.blankLine();
+
         // Print functions
         try self.writer.writeLine("static inline void dm_print_str(dm_string s) {");
         self.writer.indent();
@@ -1254,28 +1354,18 @@ pub const CodeGenerator = struct {
         try self.writer.writeLine("}");
         try self.writer.blankLine();
 
-        // String allocation pool for mem_mark/mem_sweep
-        try self.writer.writeLine("static char** _dm_str_pool = NULL;");
-        try self.writer.writeLine("static int64_t _dm_str_pool_len = 0;");
-        try self.writer.writeLine("static int64_t _dm_str_pool_cap = 0;");
-        try self.writer.writeLine("static inline void _dm_str_track(char* p) {");
-        self.writer.indent();
-        try self.writer.writeLine("if (_dm_str_pool_len >= _dm_str_pool_cap) {");
-        self.writer.indent();
-        try self.writer.writeLine("_dm_str_pool_cap = _dm_str_pool_cap ? _dm_str_pool_cap * 2 : 4096;");
-        try self.writer.writeLine("_dm_str_pool = (char**)realloc(_dm_str_pool, (size_t)_dm_str_pool_cap * sizeof(char*));");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        try self.writer.writeLine("_dm_str_pool[_dm_str_pool_len++] = p;");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
-        try self.writer.writeLine("static inline int64_t dm_mem_mark(void) { return _dm_str_pool_len; }");
-        try self.writer.writeLine("static inline void dm_mem_sweep(int64_t mark) {");
-        self.writer.indent();
-        try self.writer.writeLine("for (int64_t i = mark; i < _dm_str_pool_len; i++) free(_dm_str_pool[i]);");
-        try self.writer.writeLine("_dm_str_pool_len = mark;");
-        self.writer.dedent();
-        try self.writer.writeLine("}");
+        // mem_mark/mem_sweep are documented no-ops. The previous string
+        // pool design freed every tracked allocation newer than a mark,
+        // including strings still referenced by live variables
+        // (use-after-free). There is no sound small way to know which
+        // tracked strings are unreferenced, so nothing is ever swept:
+        // allocations live until process exit (the runtime's leak
+        // discipline). Programs that call mem_mark/mem_sweep (e.g.
+        // snake, breakout) keep compiling and running; their per-frame
+        // sweep now simply does not reclaim memory.
+        try self.writer.writeLine("static inline void _dm_str_track(char* p) { (void)p; }");
+        try self.writer.writeLine("static inline int64_t dm_mem_mark(void) { return 0; }");
+        try self.writer.writeLine("static inline void dm_mem_sweep(int64_t mark) { (void)mark; }");
         try self.writer.blankLine();
 
         // String concatenation (tracked)
@@ -2803,6 +2893,63 @@ pub const CodeGenerator = struct {
         try w.blankLine();
     }
 
+    /// True for C types that are COW containers (monomorphized List/Map
+    /// structs with _retain/_cow helpers). The *_void placeholders have
+    /// no helpers and are excluded.
+    fn isCowContainerCType(c_type: []const u8) bool {
+        if (std.mem.eql(u8, c_type, "dm_list_void") or std.mem.eql(u8, c_type, "dm_map_void")) return false;
+        return std.mem.startsWith(u8, c_type, "dm_list_") or std.mem.startsWith(u8, c_type, "dm_map_");
+    }
+
+    /// True for the zero-initialized container constructors
+    /// (List_new/Map_new in the builtin registry).
+    fn isZeroContainerCtor(name: []const u8) bool {
+        const entry = builtins.lookup(name) orelse return false;
+        return entry.lowering == .zero_list or entry.lowering == .zero_map;
+    }
+
+    /// Generate an expression in a copy position (let init, assignment
+    /// value, call argument, return value, struct field). List/Map
+    /// values are wrapped in _retain so the new header copy is counted
+    /// as an alias; mutators then copy-on-write instead of mutating a
+    /// shared buffer. `hint` is the statically known C type of the
+    /// copy destination when available.
+    fn generateRetainedExpr(self: *Self, expr: *Expr, hint: ?[]const u8) anyerror!void {
+        // Multi-statement block expressions emit statements before their
+        // result; wrapping them in a call would produce invalid C.
+        if (expr.kind == .block and expr.kind.block.statements.len > 0) {
+            try self.generateExpr(expr);
+            return;
+        }
+        const own = self.inferCTypeFromExpr(expr);
+        var chosen: ?[]const u8 = null;
+        if (isCowContainerCType(own)) {
+            chosen = own;
+        } else if (hint) |h| {
+            // Destination-typed copy whose value type is unknown to
+            // inference (e.g. generic call result). Fresh constructors
+            // (List_new/Map_new/[]) need no retain and may emit bare
+            // brace initializers that cannot be call arguments.
+            const is_fresh_ctor = expr.kind == .array_literal or
+                (expr.kind == .function_call and expr.kind.function_call.function.kind == .identifier and
+                    isZeroContainerCtor(expr.kind.function_call.function.kind.identifier.name)) or
+                (expr.kind == .method_call and expr.kind.method_call.object.kind == .identifier and
+                    std.mem.eql(u8, expr.kind.method_call.method.name, "new") and
+                    (std.mem.eql(u8, expr.kind.method_call.object.kind.identifier.name, "List") or
+                        std.mem.eql(u8, expr.kind.method_call.object.kind.identifier.name, "Map")));
+            if (isCowContainerCType(h) and std.mem.eql(u8, own, "void*") and !is_fresh_ctor) {
+                chosen = h;
+            }
+        }
+        if (chosen) |c_type| {
+            try self.writer.print("{s}_retain(", .{c_type});
+            try self.generateExpr(expr);
+            try self.writer.write(")");
+            return;
+        }
+        try self.generateExpr(expr);
+    }
+
     /// Generate List type name and emit monomorphized struct + helpers if not already done
     fn generateListType(self: *Self, elem: *TypeExpr) CodeGenError![]const u8 {
         const elem_name = try self.mapType(elem);
@@ -2826,6 +2973,9 @@ pub const CodeGenerator = struct {
         try sw.printLine("{s}* data;", .{elem_type});
         try sw.writeLine("size_t len;");
         try sw.writeLine("size_t capacity;");
+        // COW refcount cell shared by header copies (NULL when no buffer).
+        // Only triggers copy-on-write; buffers are never freed (leak discipline).
+        try sw.writeLine("size_t* rc;");
         sw.dedent();
         try sw.printLine("}} {s};", .{list_type_name});
         try sw.blankLine();
@@ -2836,24 +2986,72 @@ pub const CodeGenerator = struct {
         // _new constructor
         try w.printLine("static inline {s} {s}_new(void) {{", .{ list_type_name, list_type_name });
         w.indent();
-        try w.printLine("return ({s}){{ .data = NULL, .len = 0, .capacity = 0 }};", .{list_type_name});
+        try w.printLine("return ({s}){{ .data = NULL, .len = 0, .capacity = 0, .rc = NULL }};", .{list_type_name});
         w.dedent();
         try w.writeLine("}");
         try w.blankLine();
 
-        // _push
+        // _retain: mark a header copy as another alias of the buffer
+        try w.printLine("static inline {s} {s}_retain({s} list) {{", .{ list_type_name, list_type_name, list_type_name });
+        w.indent();
+        try w.writeLine("if (list.rc) (*list.rc)++;");
+        try w.writeLine("return list;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _cow: if the buffer is shared (rc > 1), duplicate it so this
+        // header privately owns its buffer before any mutation.
+        try w.printLine("static inline void {s}_cow({s}* list) {{", .{ list_type_name, list_type_name });
+        w.indent();
+        try w.writeLine("if (list->rc && *list->rc > 1) {");
+        w.indent();
+        try w.writeLine("(*list->rc)--;");
+        try w.printLine("{s}* new_data = NULL;", .{elem_type});
+        try w.writeLine("if (list->capacity > 0) {");
+        w.indent();
+        try w.printLine("new_data = ({s}*)malloc(list->capacity * sizeof({s}));", .{ elem_type, elem_type });
+        try w.writeLine("if (!new_data) dm_panic(\"list copy-on-write: out of memory\");");
+        try w.printLine("memcpy(new_data, list->data, list->len * sizeof({s}));", .{elem_type});
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"list copy-on-write: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
+        try w.writeLine("list->data = new_data;");
+        try w.writeLine("list->rc = new_rc;");
+        w.dedent();
+        try w.writeLine("}");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _push. Growth never uses realloc/free: the old buffer is leaked
+        // on purpose, because untracked header copies may still alias it.
+        // Tracked aliases (rc > 1) are split off by _cow first.
         try w.printLine("static inline void {s}_push({s}* list, {s} value) {{", .{ list_type_name, list_type_name, elem_type });
         w.indent();
+        try w.printLine("{s}_cow(list);", .{list_type_name});
         try w.writeLine("if (list->len >= list->capacity) {");
         w.indent();
         try w.writeLine("size_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;");
-        try w.printLine("{s}* new_data = ({s}*)realloc(list->data, new_cap * sizeof({s}));", .{ elem_type, elem_type, elem_type });
+        try w.printLine("{s}* new_data = ({s}*)malloc(new_cap * sizeof({s}));", .{ elem_type, elem_type, elem_type });
         try w.writeLine("if (!new_data) dm_panic(\"list push: out of memory\");");
+        try w.printLine("if (list->data) memcpy(new_data, list->data, list->len * sizeof({s}));", .{elem_type});
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"list push: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
         try w.writeLine("list->data = new_data;");
         try w.writeLine("list->capacity = new_cap;");
+        try w.writeLine("list->rc = new_rc;");
         w.dedent();
         try w.writeLine("}");
-        try w.writeLine("list->data[list->len] = value;");
+        if (isCowContainerCType(elem_type)) {
+            // Element store is a header copy: retain nested containers.
+            try w.printLine("list->data[list->len] = {s}_retain(value);", .{elem_type});
+        } else {
+            try w.writeLine("list->data[list->len] = value;");
+        }
         try w.writeLine("list->len++;");
         w.dedent();
         try w.writeLine("}");
@@ -3020,6 +3218,8 @@ pub const CodeGenerator = struct {
         try sw.printLine("{s}_entry* entries;", .{map_type_name});
         try sw.writeLine("size_t len;");
         try sw.writeLine("size_t capacity;");
+        // COW refcount cell shared by header copies (NULL when no table).
+        try sw.writeLine("size_t* rc;");
         sw.dedent();
         try sw.printLine("}} {s};", .{map_type_name});
         try sw.blankLine();
@@ -3069,7 +3269,41 @@ pub const CodeGenerator = struct {
         // _new constructor
         try w.printLine("static inline {s} {s}_new(void) {{", .{ map_type_name, map_type_name });
         w.indent();
-        try w.printLine("return ({s}){{ .entries = NULL, .len = 0, .capacity = 0 }};", .{map_type_name});
+        try w.printLine("return ({s}){{ .entries = NULL, .len = 0, .capacity = 0, .rc = NULL }};", .{map_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _retain: mark a header copy as another alias of the table
+        try w.printLine("static inline {s} {s}_retain({s} map) {{", .{ map_type_name, map_type_name, map_type_name });
+        w.indent();
+        try w.writeLine("if (map.rc) (*map.rc)++;");
+        try w.writeLine("return map;");
+        w.dedent();
+        try w.writeLine("}");
+        try w.blankLine();
+
+        // _cow: duplicate a shared table before mutation
+        try w.printLine("static inline void {s}_cow({s}* map) {{", .{ map_type_name, map_type_name });
+        w.indent();
+        try w.writeLine("if (map->rc && *map->rc > 1) {");
+        w.indent();
+        try w.writeLine("(*map->rc)--;");
+        try w.printLine("{s}_entry* new_entries = NULL;", .{map_type_name});
+        try w.writeLine("if (map->capacity > 0) {");
+        w.indent();
+        try w.printLine("new_entries = ({s}_entry*)malloc(map->capacity * sizeof({s}_entry));", .{ map_type_name, map_type_name });
+        try w.writeLine("if (!new_entries) dm_panic(\"map copy-on-write: out of memory\");");
+        try w.printLine("memcpy(new_entries, map->entries, map->capacity * sizeof({s}_entry));", .{map_type_name});
+        w.dedent();
+        try w.writeLine("}");
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"map copy-on-write: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
+        try w.writeLine("map->entries = new_entries;");
+        try w.writeLine("map->rc = new_rc;");
+        w.dedent();
+        try w.writeLine("}");
         w.dedent();
         try w.writeLine("}");
         try w.blankLine();
@@ -3124,9 +3358,13 @@ pub const CodeGenerator = struct {
         try w.writeLine("}");
         w.dedent();
         try w.writeLine("}");
-        try w.writeLine("free(map->entries);");
+        // Old table intentionally leaked: untracked header copies may alias it.
+        try w.writeLine("size_t* new_rc = (size_t*)malloc(sizeof(size_t));");
+        try w.writeLine("if (!new_rc) dm_panic(\"map resize: out of memory\");");
+        try w.writeLine("*new_rc = 1;");
         try w.writeLine("map->entries = new_entries;");
         try w.writeLine("map->capacity = new_cap;");
+        try w.writeLine("map->rc = new_rc;");
         w.dedent();
         try w.writeLine("}");
         try w.blankLine();
@@ -3134,6 +3372,7 @@ pub const CodeGenerator = struct {
         // _insert
         try w.printLine("static inline void {s}_insert({s}* map, {s} key, {s} value) {{", .{ map_type_name, map_type_name, key_type, val_type });
         w.indent();
+        try w.printLine("{s}_cow(map);", .{map_type_name});
         try w.writeLine("if (map->capacity == 0 || (map->len + 1) * 4 > map->capacity * 3) {");
         w.indent();
         try w.printLine("{s}_resize(map);", .{map_type_name});
@@ -3145,8 +3384,16 @@ pub const CodeGenerator = struct {
         try w.writeLine("map->len++;");
         w.dedent();
         try w.writeLine("}");
-        try w.writeLine("map->entries[slot].key = key;");
-        try w.writeLine("map->entries[slot].value = value;");
+        if (isCowContainerCType(key_type)) {
+            try w.printLine("map->entries[slot].key = {s}_retain(key);", .{key_type});
+        } else {
+            try w.writeLine("map->entries[slot].key = key;");
+        }
+        if (isCowContainerCType(val_type)) {
+            try w.printLine("map->entries[slot].value = {s}_retain(value);", .{val_type});
+        } else {
+            try w.writeLine("map->entries[slot].value = value;");
+        }
         try w.writeLine("map->entries[slot].state = 1;");
         w.dedent();
         try w.writeLine("}");
@@ -3176,6 +3423,7 @@ pub const CodeGenerator = struct {
         // _remove
         try w.printLine("static inline bool {s}_remove({s}* map, {s} key) {{", .{ map_type_name, map_type_name, key_type });
         w.indent();
+        try w.printLine("{s}_cow(map);", .{map_type_name});
         try w.writeLine("if (map->capacity == 0) return false;");
         try w.printLine("size_t slot = {s}_find_slot(map, key);", .{map_type_name});
         try w.writeLine("if (map->entries[slot].state != 1) return false;");
@@ -3382,6 +3630,8 @@ pub const CodeGenerator = struct {
                 .for_loop => |for_stmt| try self.scanBlockForListTypes(for_stmt.body),
                 .while_loop => |while_stmt| try self.scanBlockForListTypes(while_stmt.body),
                 .loop_stmt => |loop| try self.scanBlockForListTypes(loop.body),
+                .unsafe_block => |ub| try self.scanBlockForListTypes(ub.body),
+                .region_block => |rb| try self.scanBlockForListTypes(rb.body),
                 .expression => |expr| try self.scanExprForBuiltinListTypes(expr),
                 else => {},
             }
@@ -3394,8 +3644,10 @@ pub const CodeGenerator = struct {
             .function_call => |fc| {
                 if (fc.function.kind == .identifier) {
                     const name = fc.function.kind.identifier.name;
-                    if (std.mem.eql(u8, name, "string_split")) {
-                        _ = try self.generateListTypeByName("dm_string");
+                    if (builtins.lookup(name)) |entry| {
+                        if (entry.lowering == .string_split) {
+                            _ = try self.generateListTypeByName("dm_string");
+                        }
                     }
                 }
                 // Also scan arguments
@@ -3560,6 +3812,8 @@ pub const CodeGenerator = struct {
                 try self.scanBlockForGenericCalls(while_stmt.body);
             },
             .loop_stmt => |loop| try self.scanBlockForGenericCalls(loop.body),
+            .unsafe_block => |ub| try self.scanBlockForGenericCalls(ub.body),
+            .region_block => |rb| try self.scanBlockForGenericCalls(rb.body),
             .assignment => |asgn| {
                 try self.scanExprForGenericCalls(asgn.target);
                 try self.scanExprForGenericCalls(asgn.value);
@@ -3651,6 +3905,20 @@ pub const CodeGenerator = struct {
     }
 
     /// Mangle a type name
+    /// Find a no-self (associated) impl function `TypeName.method`, the
+    /// target of a `TypeName.method(args)` call with no receiver.
+    fn findAssociatedMethod(self: *Self, type_name: []const u8, method_name: []const u8) ?*FunctionDecl {
+        for (self.impl_methods.items) |info| {
+            if (std.mem.eql(u8, info.target_type, type_name) and
+                std.mem.eql(u8, info.method.name.name, method_name) and
+                !methodHasSelf(info.method))
+            {
+                return info.method;
+            }
+        }
+        return null;
+    }
+
     /// Check if a type has a specific impl method
     fn hasImplMethod(self: *Self, type_name: []const u8, method_name: []const u8) bool {
         for (self.impl_methods.items) |info| {
@@ -3768,95 +4036,43 @@ pub const CodeGenerator = struct {
                 // Try to look up the function's return type from declarations
                 if (call.function.kind == .identifier) {
                     const name = call.function.kind.identifier.name;
-                    // Box_new(value) returns pointer to arg type
-                    if (std.mem.eql(u8, name, "Box_new")) {
-                        if (call.args.len > 0) {
-                            const arg_type = self.inferCTypeFromExpr(call.args[0].value);
-                            break :blk std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{arg_type}) catch "void*";
+                    // Builtin return C types come from the registry
+                    // (builtins.zig). Context-dependent constructors
+                    // (Box/Option/Result and the zero containers) are
+                    // resolved from the expected type, as before.
+                    if (builtins.lookup(name)) |entry| {
+                        switch (entry.lowering) {
+                            .box_alloc => {
+                                if (call.args.len > 0) {
+                                    const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                                    break :blk std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{arg_type}) catch "void*";
+                                }
+                                break :blk "void*";
+                            },
+                            .box_null, .zero_map => break :blk "void*",
+                            .option_some, .option_none => {
+                                if (self.expected_type) |et| {
+                                    if (std.mem.startsWith(u8, et, "dm_option_")) break :blk et;
+                                }
+                                if (self.current_function_return_type) |rt| {
+                                    if (std.mem.startsWith(u8, rt, "dm_option_")) break :blk rt;
+                                }
+                                break :blk "void*";
+                            },
+                            .result_ok, .result_err => {
+                                if (self.expected_type) |et| {
+                                    if (std.mem.startsWith(u8, et, "dm_result_")) break :blk et;
+                                }
+                                if (self.current_function_return_type) |rt| {
+                                    if (std.mem.startsWith(u8, rt, "dm_result_")) break :blk rt;
+                                }
+                                break :blk "void*";
+                            },
+                            else => {
+                                if (entry.c_ret) |c_ret| break :blk c_ret;
+                            },
                         }
-                        break :blk "void*";
                     }
-                    // Box_null() returns void* (type inferred from context)
-                    if (std.mem.eql(u8, name, "Box_null")) break :blk "void*";
-                    // Map_new() type inferred from let binding context
-                    if (std.mem.eql(u8, name, "Map_new")) break :blk "void*";
-                    // Some/Ok/Err return type from context
-                    if (std.mem.eql(u8, name, "Some") or std.mem.eql(u8, name, "None")) {
-                        if (self.expected_type) |et| {
-                            if (std.mem.startsWith(u8, et, "dm_option_")) break :blk et;
-                        }
-                        if (self.current_function_return_type) |rt| {
-                            if (std.mem.startsWith(u8, rt, "dm_option_")) break :blk rt;
-                        }
-                        break :blk "void*";
-                    }
-                    if (std.mem.eql(u8, name, "Ok") or std.mem.eql(u8, name, "Err")) {
-                        if (self.expected_type) |et| {
-                            if (std.mem.startsWith(u8, et, "dm_result_")) break :blk et;
-                        }
-                        if (self.current_function_return_type) |rt| {
-                            if (std.mem.startsWith(u8, rt, "dm_result_")) break :blk rt;
-                        }
-                        break :blk "void*";
-                    }
-                    // Check known built-in return types
-                    if (std.mem.eql(u8, name, "len") or
-                        std.mem.eql(u8, name, "parse_int") or
-                        std.mem.eql(u8, name, "string_to_int") or
-                        std.mem.eql(u8, name, "string_find") or
-                        std.mem.eql(u8, name, "args_len") or
-                        std.mem.eql(u8, name, "system") or
-                        std.mem.eql(u8, name, "fs_mkdir") or
-                        std.mem.eql(u8, name, "fs_remove") or
-                        std.mem.eql(u8, name, "fs_rename") or
-                        std.mem.eql(u8, name, "fs_rmdir") or
-                        std.mem.eql(u8, name, "tcp_listen") or
-                        std.mem.eql(u8, name, "tcp_accept") or
-                        std.mem.eql(u8, name, "tcp_connect") or
-                        std.mem.eql(u8, name, "tcp_write") or
-                        std.mem.eql(u8, name, "thread_spawn") or
-                        std.mem.eql(u8, name, "mutex_new") or
-                        std.mem.eql(u8, name, "read_key") or
-                        std.mem.eql(u8, name, "read_key_nb") or
-                        std.mem.eql(u8, name, "term_width") or
-                        std.mem.eql(u8, name, "term_height") or
-                        std.mem.eql(u8, name, "time_ms")) break :blk "int64_t";
-                    if (std.mem.eql(u8, name, "parse_float")) break :blk "double";
-                    if (std.mem.eql(u8, name, "to_string") or
-                        std.mem.eql(u8, name, "int_to_string") or
-                        std.mem.eql(u8, name, "bool_to_string") or
-                        std.mem.eql(u8, name, "float_to_string") or
-                        std.mem.eql(u8, name, "substr") or
-                        std.mem.eql(u8, name, "char_to_string") or
-                        std.mem.eql(u8, name, "char_at") or
-                        std.mem.eql(u8, name, "file_read") or
-                        std.mem.eql(u8, name, "args_get") or
-                        std.mem.eql(u8, name, "string_trim") or
-                        std.mem.eql(u8, name, "string_replace") or
-                        std.mem.eql(u8, name, "string_to_upper") or
-                        std.mem.eql(u8, name, "string_to_lower") or
-                        std.mem.eql(u8, name, "path_dirname") or
-                        std.mem.eql(u8, name, "path_basename") or
-                        std.mem.eql(u8, name, "path_extension") or
-                        std.mem.eql(u8, name, "path_stem") or
-                        std.mem.eql(u8, name, "path_join") or
-                        std.mem.eql(u8, name, "read_line") or
-                        std.mem.eql(u8, name, "fs_readdir") or
-                        std.mem.eql(u8, name, "fs_getcwd") or
-                        std.mem.eql(u8, name, "env_get") or
-                        std.mem.eql(u8, name, "tcp_read") or
-                        std.mem.eql(u8, name, "chr")) break :blk "dm_string";
-                    if (std.mem.eql(u8, name, "string_split")) break :blk "dm_list_dm_string";
-                    if (std.mem.eql(u8, name, "is_alpha") or
-                        std.mem.eql(u8, name, "is_digit") or
-                        std.mem.eql(u8, name, "is_alnum") or
-                        std.mem.eql(u8, name, "is_whitespace") or
-                        std.mem.eql(u8, name, "string_contains") or
-                        std.mem.eql(u8, name, "starts_with") or
-                        std.mem.eql(u8, name, "ends_with") or
-                        std.mem.eql(u8, name, "file_exists") or
-                        std.mem.eql(u8, name, "fs_exists")) break :blk "bool";
-                    if (std.mem.eql(u8, name, "char")) break :blk "char";
                     // Look up in function declarations tracked during generation
                     if (self.lookupFunctionReturnType(name)) |ret_type| break :blk ret_type;
                     // Check if this is a generic function call - look up monomorphized name
@@ -3939,6 +4155,12 @@ pub const CodeGenerator = struct {
                     // Strip "dm_list_" prefix to get element type
                     break :blk obj_type["dm_list_".len..];
                 }
+                if (std.mem.startsWith(u8, obj_type, "dm_map_")) {
+                    if (self.generated_map_types.get(obj_type)) |map_info| {
+                        break :blk map_info.value_type;
+                    }
+                    break :blk "int64_t";
+                }
                 // Indexing a fixed-size array type "elem[N]" returns the element type
                 if (std.mem.endsWith(u8, obj_type, "]")) {
                     if (std.mem.indexOf(u8, obj_type, "[")) |bracket_pos| {
@@ -3968,8 +4190,46 @@ pub const CodeGenerator = struct {
                     }
                     const enum_mangled = self.mangleTypeName(name) catch break :blk "int64_t";
                     if (self.generated_enums.contains(enum_mangled)) {
+                        // An associated impl function on the enum (e.g.
+                        // `Shape.new`) keeps its declared return type;
+                        // variant constructors return the enum itself.
+                        if (self.findAssociatedMethod(name, mc.method.name) != null) {
+                            const assoc_key = std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ name, mc.method.name }) catch break :blk enum_mangled;
+                            if (self.lookupFunctionReturnType(assoc_key)) |ret_type| break :blk ret_type;
+                        }
                         break :blk enum_mangled;
                     }
+                    // Associated calls on builtin container types:
+                    // Box.new(v) -> typeof(v)*, Box.null/Map.new/List.new
+                    // mirror the Box_null/Map_new/List_new builtins.
+                    if (std.mem.eql(u8, name, "Box")) {
+                        if (std.mem.eql(u8, mc.method.name, "new") and mc.args.len > 0) {
+                            const inner = self.inferCTypeFromExpr(mc.args[0]);
+                            break :blk std.fmt.allocPrint(self.stringAllocator(), "{s}*", .{inner}) catch "void*";
+                        }
+                        if (std.mem.eql(u8, mc.method.name, "null")) break :blk "void*";
+                    }
+                    if ((std.mem.eql(u8, name, "Map") or std.mem.eql(u8, name, "List")) and
+                        std.mem.eql(u8, mc.method.name, "new"))
+                    {
+                        break :blk "void*";
+                    }
+                    // Associated (no-self) impl function: Type.method(...)
+                    if (self.findAssociatedMethod(name, mc.method.name) != null) {
+                        const assoc_key = std.fmt.allocPrint(self.stringAllocator(), "{s}_{s}", .{ name, mc.method.name }) catch break :blk "int64_t";
+                        if (self.lookupFunctionReturnType(assoc_key)) |ret_type| break :blk ret_type;
+                    }
+                }
+                // Builtin `x.len()` has C type int64_t, like `len(x)`,
+                // unless the receiver's own type defines `fn len`.
+                if (std.mem.eql(u8, mc.method.name, "len") and mc.args.len == 0) {
+                    var len_obj_type = self.inferCTypeFromExpr(mc.object);
+                    if (std.mem.endsWith(u8, len_obj_type, "*")) len_obj_type = len_obj_type[0 .. len_obj_type.len - 1];
+                    const len_raw = if (std.mem.startsWith(u8, len_obj_type, "dm_"))
+                        len_obj_type[3..]
+                    else
+                        len_obj_type;
+                    if (!self.hasImplMethod(len_raw, "len")) break :blk "int64_t";
                 }
                 // Try to infer method return type from the method name
                 var obj_type = self.inferCTypeFromExpr(mc.object);
@@ -4129,7 +4389,15 @@ pub const CodeGenerator = struct {
 
         for (s.fields) |field| {
             const field_type = try self.mapType(field.type_expr);
-            try self.writer.printLine("{s} {s};", .{ field_type, field.name.name });
+            // Array/function-pointer field types need the declarator split
+            // (same as emitVarDecl): "int64_t[4]" -> "int64_t name[4];"
+            if (std.mem.indexOf(u8, field_type, "(*)(")) |star_pos| {
+                try self.writer.printLine("{s}{s}{s};", .{ field_type[0 .. star_pos + 2], field.name.name, field_type[star_pos + 2 ..] });
+            } else if (std.mem.indexOf(u8, field_type, "[")) |bracket_pos| {
+                try self.writer.printLine("{s} {s}{s};", .{ field_type[0..bracket_pos], field.name.name, field_type[bracket_pos..] });
+            } else {
+                try self.writer.printLine("{s} {s};", .{ field_type, field.name.name });
+            }
             // Track field types for inference: "dm_StructName.fieldName" -> C type
             const key = try std.fmt.allocPrint(self.stringAllocator(), "{s}.{s}", .{ name, field.name.name });
             try self.struct_field_types.put(key, field_type);
@@ -5212,6 +5480,8 @@ pub const CodeGenerator = struct {
                     .array_val, .struct_val => {},
                 }
             }
+            // Constant folding overflowed: compile error, no fallback.
+            try self.failIfComptimeOverflow();
         }
 
         // Fallback: infer type and use runtime expression
@@ -5295,7 +5565,7 @@ pub const CodeGenerator = struct {
                     try self.writer.writeLine(";");
                 } else {
                     try self.writer.print("return {s}_ready(", .{future_type});
-                    try self.generateExpr(result);
+                    try self.generateRetainedExpr(result, null);
                     try self.writer.writeLine(");");
                 }
             } else {
@@ -5310,7 +5580,7 @@ pub const CodeGenerator = struct {
                     try self.writer.writeLine(";");
                 } else {
                     try self.writer.write("return ");
-                    try self.generateExpr(result);
+                    try self.generateRetainedExpr(result, self.current_function_return_type);
                     try self.writer.writeLine(";");
                 }
             }
@@ -5331,6 +5601,7 @@ pub const CodeGenerator = struct {
             .break_stmt => |brk| try self.generateBreak(brk),
             .continue_stmt => |cont| try self.generateContinue(cont),
             .region_block => |region| try self.generateRegionBlock(region),
+            .unsafe_block => |ub| try self.generateUnsafeBlock(ub),
             .expression => |expr| {
                 // If the expression is an if or match, generate as statement form
                 if (expr.kind == .if_expr) {
@@ -5465,7 +5736,7 @@ pub const CodeGenerator = struct {
                 try self.emitVarDecl(type_str, ident.name.name);
                 if (let.value) |val| {
                     try self.writer.write(" = ");
-                    try self.generateExpr(val);
+                    try self.generateRetainedExpr(val, type_str);
                 }
                 try self.writer.writeLine(";");
             },
@@ -5530,7 +5801,7 @@ pub const CodeGenerator = struct {
             if (ret.value) |val| {
                 const future_type = self.current_function_future_type.?;
                 try self.writer.print("return {s}_ready(", .{future_type});
-                try self.generateExpr(val);
+                try self.generateRetainedExpr(val, null);
                 try self.writer.writeLine(");");
             } else {
                 const future_type = self.current_function_future_type.?;
@@ -5544,7 +5815,7 @@ pub const CodeGenerator = struct {
             defer self.expected_type = prev_expected;
 
             try self.writer.write("return ");
-            try self.generateExpr(val);
+            try self.generateRetainedExpr(val, self.current_function_return_type);
             try self.writer.writeLine(";");
         } else {
             try self.writer.writeLine("return;");
@@ -5601,7 +5872,7 @@ pub const CodeGenerator = struct {
                 try self.generateIfStatementWithReturn(result.kind.if_expr);
             } else {
                 try self.writer.write("return ");
-                try self.generateExpr(result);
+                try self.generateRetainedExpr(result, self.current_function_return_type);
                 try self.writer.writeLine(";");
             }
         }
@@ -5620,7 +5891,7 @@ pub const CodeGenerator = struct {
                             try self.generateIfStatementWithReturn(result.kind.if_expr);
                         } else {
                             try self.writer.write("return ");
-                            try self.generateExpr(result);
+                            try self.generateRetainedExpr(result, self.current_function_return_type);
                             try self.writer.writeLine(";");
                         }
                     }
@@ -5654,7 +5925,7 @@ pub const CodeGenerator = struct {
                 try self.generateIfStatementWithAsyncReturn(result.kind.if_expr);
             } else {
                 try self.writer.print("return {s}_ready(", .{future_type});
-                try self.generateExpr(result);
+                try self.generateRetainedExpr(result, null);
                 try self.writer.writeLine(");");
             }
         }
@@ -5673,7 +5944,7 @@ pub const CodeGenerator = struct {
                             try self.generateIfStatementWithAsyncReturn(result.kind.if_expr);
                         } else {
                             try self.writer.print("return {s}_ready(", .{future_type});
-                            try self.generateExpr(result);
+                            try self.generateRetainedExpr(result, null);
                             try self.writer.writeLine(");");
                         }
                     }
@@ -6198,8 +6469,47 @@ pub const CodeGenerator = struct {
         try self.writer.printLine("dm_arena_destroy({s});", .{arena_name});
     }
 
+    /// Generate unsafe block (transparent: plain braced block; the fence
+    /// itself is enforced by the type checker)
+    fn generateUnsafeBlock(self: *Self, ub: *UnsafeBlock) anyerror!void {
+        try self.writer.openBrace();
+        try self.generateBlock(ub.body);
+        try self.writer.closeBrace();
+    }
+
     /// Generate assignment statement
     fn generateAssignment(self: *Self, assign: *Assignment) anyerror!void {
+        // Map index assignment `m[k] = v` is an insert, not an lvalue
+        // store (the map get helper returns a copy).
+        if (assign.op == .assign and assign.target.kind == .index_access) {
+            const idx = assign.target.kind.index_access;
+            const obj_type = self.inferCTypeFromExpr(idx.object);
+            if (std.mem.startsWith(u8, obj_type, "dm_map_") and !std.mem.eql(u8, obj_type, "dm_map_void")) {
+                try self.writer.print("{s}_insert(&(", .{obj_type});
+                try self.generateExpr(idx.object);
+                try self.writer.write("), ");
+                try self.generateExpr(idx.index);
+                try self.writer.write(", ");
+                try self.generateExpr(assign.value);
+                try self.writer.writeLine(");");
+                return;
+            }
+        }
+        // Index write into a List (a[i] = v) mutates the buffer: split a
+        // shared buffer first when the list object is addressable.
+        if (assign.target.kind == .index_access) {
+            const idx = assign.target.kind.index_access;
+            const obj_type = self.inferCTypeFromExpr(idx.object);
+            const addressable = switch (idx.object.kind) {
+                .identifier, .field_access, .index_access => true,
+                else => false,
+            };
+            if (addressable and isCowContainerCType(obj_type) and std.mem.startsWith(u8, obj_type, "dm_list_")) {
+                try self.writer.print("{s}_cow(&(", .{obj_type});
+                try self.generateExpr(idx.object);
+                try self.writer.writeLine("));");
+            }
+        }
         // Safe division/modulo for compound assignment: x /= y -> x = dm__safe_div(x, y)
         if (assign.op == .div_assign or assign.op == .mod_assign) {
             const target_type = self.inferCTypeFromExpr(assign.target);
@@ -6225,6 +6535,31 @@ pub const CodeGenerator = struct {
             try self.generateExpr(assign.value);
             try self.writer.writeLine(");");
             return;
+        }
+
+        // Checked signed compound assignment: x += y on signed integer
+        // targets -> x = dm_checked_add_i64(x, y) (range-fitted for
+        // narrower widths); unsigned targets keep wrapping +=.
+        if (assign.op == .add_assign or assign.op == .sub_assign or assign.op == .mul_assign) {
+            const target_type = self.inferCTypeFromExpr(assign.target);
+            const value_type = self.inferCTypeFromExpr(assign.value);
+            if (cIntInfo(target_type)) |ti| {
+                if (cIntInfo(value_type)) |vi| {
+                    if (ti.signed and vi.signed) {
+                        const bin_op: BinaryExpr.BinaryOp = switch (assign.op) {
+                            .add_assign => .add,
+                            .sub_assign => .sub,
+                            else => .mul,
+                        };
+                        const fit: ?CIntInfo = if (ti.bits < 64) ti else null;
+                        try self.generateExpr(assign.target);
+                        try self.writer.write(" = ");
+                        try self.generateCheckedArith(checkedArithHelper(bin_op), assign.target, assign.value, fit, target_type);
+                        try self.writer.writeLine(";");
+                        return;
+                    }
+                }
+            }
         }
 
         try self.generateExpr(assign.target);
@@ -6254,7 +6589,11 @@ pub const CodeGenerator = struct {
         }
         defer self.expected_type = prev_expected;
 
-        try self.generateExpr(assign.value);
+        if (assign.op == .assign) {
+            try self.generateRetainedExpr(assign.value, target_type);
+        } else {
+            try self.generateExpr(assign.value);
+        }
         try self.writer.writeLine(";");
     }
 
@@ -6317,6 +6656,10 @@ pub const CodeGenerator = struct {
                 if (self.evalComptime(comp.expr)) |result| {
                     try self.emitComptimeValue(result);
                 } else {
+                    // Constant overflow is a compile error, not a
+                    // runtime fallback (and never a compiler crash).
+                    try self.failIfComptimeOverflow();
+                    self.noteComptimeFuelFallback(comp.span);
                     // Fall back to runtime evaluation
                     try self.generateExpr(comp.expr);
                 }
@@ -6408,6 +6751,35 @@ pub const CodeGenerator = struct {
                 try self.writer.write("()");
             }
         }
+    }
+
+    /// Emit a checked signed arithmetic call:
+    /// helper((int64_t)(a), (int64_t)(b)), range-fitted to `fit`
+    /// (narrower signed width) when given.
+    fn generateCheckedArith(self: *Self, helper: []const u8, a: *Expr, b: *Expr, fit: ?CIntInfo, fit_c_type: []const u8) anyerror!void {
+        if (fit) |info| {
+            try self.writer.print("(({s})dm_checked_range_i64(", .{fit_c_type});
+            try self.writer.print("{s}((int64_t)(", .{helper});
+            try self.generateExpr(a);
+            try self.writer.write("), (int64_t)(");
+            try self.generateExpr(b);
+            try self.writer.print(")), {s}, {s}))", .{ cIntMinLiteral(info), cIntMaxLiteral(info) });
+        } else {
+            try self.writer.print("{s}((int64_t)(", .{helper});
+            try self.generateExpr(a);
+            try self.writer.write("), (int64_t)(");
+            try self.generateExpr(b);
+            try self.writer.write("))");
+        }
+    }
+
+    fn checkedArithHelper(op: BinaryExpr.BinaryOp) []const u8 {
+        return switch (op) {
+            .add => "dm_checked_add_i64",
+            .sub => "dm_checked_sub_i64",
+            .mul => "dm_checked_mul_i64",
+            else => unreachable,
+        };
     }
 
     /// Generate binary expression
@@ -6523,6 +6895,23 @@ pub const CodeGenerator = struct {
             return;
         }
 
+        // Checked signed arithmetic: +,-,* on signed integer operands
+        // PANIC ("integer overflow") instead of C UB/wrapping.
+        // Unsigned (and mixed signed/unsigned, which C converts to
+        // unsigned) keep defined modulo-2^N wrapping via the raw op.
+        if (bin.op == .add or bin.op == .sub or bin.op == .mul) {
+            const right_type = self.inferCTypeFromExpr(bin.right);
+            if (cIntInfo(left_type)) |li| {
+                if (cIntInfo(right_type)) |ri| {
+                    if (li.signed and ri.signed) {
+                        const fit: ?CIntInfo = if (li.bits == ri.bits and li.bits < 64) li else null;
+                        try self.generateCheckedArith(checkedArithHelper(bin.op), bin.left, bin.right, fit, left_type);
+                        return;
+                    }
+                }
+            }
+        }
+
         try self.writer.write("(");
         try self.generateExpr(bin.left);
 
@@ -6590,6 +6979,38 @@ pub const CodeGenerator = struct {
 
     /// Generate unary expression
     fn generateUnaryExpr(self: *Self, un: *UnaryExpr) anyerror!void {
+        // Dereference of a pointer-typed operand (Box/reference) gets a
+        // null check; * on non-pointers keeps the plain form.
+        // Checked negation: -INT64_MIN overflows (C UB) -> panic via
+        // checked 0 - x. Narrower signed widths range-fit the result.
+        if (un.op == .neg and un.operand.kind != .literal) {
+            const operand_type = self.inferCTypeFromExpr(un.operand);
+            if (cIntInfo(operand_type)) |info| {
+                if (info.signed) {
+                    if (info.bits < 64) {
+                        try self.writer.print("(({s})dm_checked_range_i64(dm_checked_sub_i64(0, (int64_t)(", .{operand_type});
+                        try self.generateExpr(un.operand);
+                        try self.writer.print(")), {s}, {s}))", .{ cIntMinLiteral(info), cIntMaxLiteral(info) });
+                    } else {
+                        try self.writer.write("dm_checked_sub_i64(0, (int64_t)(");
+                        try self.generateExpr(un.operand);
+                        try self.writer.write("))");
+                    }
+                    return;
+                }
+            }
+        }
+
+        if (un.op == .deref) {
+            const operand_type = self.inferCTypeFromExpr(un.operand);
+            if (std.mem.endsWith(u8, operand_type, "*")) {
+                try self.writer.print("*(({s})dm_null_check_ptr((void*)(", .{operand_type});
+                try self.generateExpr(un.operand);
+                try self.writer.write(")))");
+                return;
+            }
+        }
+
         const op_str: []const u8 = switch (un.op) {
             .neg => "-",
             .not => "!",
@@ -6623,14 +7044,18 @@ pub const CodeGenerator = struct {
         };
 
         if (is_pointer) {
+            // Null-check the pointer (Box may be Box_null()); the pointee
+            // member access stays an lvalue in every form below.
             if (field.object.kind == .identifier) {
-                // For identifier pointers, emit name->field directly
-                try self.writer.print("{s}->{s}", .{ field.object.kind.identifier.name, field.field.name });
+                // (dm_null_check_ptr((void*)name), name)->field
+                const name = field.object.kind.identifier.name;
+                try self.writer.print("(dm_null_check_ptr((void*)({s})), {s})->{s}", .{ name, name, field.field.name });
             } else {
-                // For complex expressions: (expr)->field
-                try self.writer.write("(");
+                // ((TYPE)dm_null_check_ptr((void*)(expr)))->field (single eval)
+                const obj_type = self.inferCTypeFromExpr(field.object);
+                try self.writer.print("(({s})dm_null_check_ptr((void*)(", .{obj_type});
                 try self.generateExpr(field.object);
-                try self.writer.print(")->{s}", .{field.field.name});
+                try self.writer.print(")))->{s}", .{field.field.name});
             }
         } else {
             try self.generateExpr(field.object);
@@ -6638,14 +7063,28 @@ pub const CodeGenerator = struct {
         }
     }
 
+    /// Length of a fixed-size array C type ("elem[N]" or "elem[N][M]"),
+    /// or null when the length is not statically known.
+    fn fixedArrayLen(c_type: []const u8) ?usize {
+        const open = std.mem.indexOf(u8, c_type, "[") orelse return null;
+        const close = std.mem.indexOfPos(u8, c_type, open, "]") orelse return null;
+        if (close <= open + 1) return null;
+        return std.fmt.parseInt(usize, c_type[open + 1 .. close], 10) catch null;
+    }
+
     /// Generate index access
     fn generateIndexAccess(self: *Self, idx: *IndexAccess) anyerror!void {
         const obj_type = self.inferCTypeFromExpr(idx.object);
         if (std.mem.eql(u8, obj_type, "dm_string")) {
-            // dm_string is a struct: s[i] -> ((char)(s).data[i])
-            try self.writer.write("((char)(");
+            // dm_string is a struct: s[i] -> bounds-checked ((char)(s).data[i])
+            // Emit: ((char)(dm_bounds_check(i, (s).len, "string"), (s).data)[i])
+            try self.writer.write("((char)(dm_bounds_check((int64_t)(");
+            try self.generateExpr(idx.index);
+            try self.writer.write("), (int64_t)(");
             try self.generateExpr(idx.object);
-            try self.writer.write(").data[");
+            try self.writer.write(").len, \"string\"), (");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").data)[");
             try self.generateExpr(idx.index);
             try self.writer.write("])");
         } else if (std.mem.startsWith(u8, obj_type, "dm_list_")) {
@@ -6664,7 +7103,37 @@ pub const CodeGenerator = struct {
             try self.writer.write(").data)[");
             try self.generateExpr(idx.index);
             try self.writer.write("]");
+        } else if (fixedArrayLen(obj_type)) |arr_len| {
+            // Fixed-size array: bounds-checked, lvalue-preserving.
+            // Emit: (dm_bounds_check(i, N, "array"), &((obj)[0]))[i]
+            try self.writer.write("(dm_bounds_check((int64_t)(");
+            try self.generateExpr(idx.index);
+            try self.writer.print("), (int64_t){d}, \"array\"), &((", .{arr_len});
+            try self.generateExpr(idx.object);
+            try self.writer.write(")[0]))[");
+            try self.generateExpr(idx.index);
+            try self.writer.write("]");
+        } else if (std.mem.startsWith(u8, obj_type, "struct {")) {
+            // Slice (fat pointer struct { T* data; size_t len; }):
+            // bounds-checked data access.
+            try self.writer.write("(dm_bounds_check((int64_t)(");
+            try self.generateExpr(idx.index);
+            try self.writer.write("), (int64_t)(");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").len, \"array\"), (");
+            try self.generateExpr(idx.object);
+            try self.writer.write(").data)[");
+            try self.generateExpr(idx.index);
+            try self.writer.write("]");
+        } else if (std.mem.startsWith(u8, obj_type, "dm_map_")) {
+            // Map index read: m[k] -> dm_map_X_get(&(m), k) (panics if missing)
+            try self.writer.print("{s}_get(&(", .{obj_type});
+            try self.generateExpr(idx.object);
+            try self.writer.write("), ");
+            try self.generateRetainedExpr(idx.index, null);
+            try self.writer.write(")");
         } else {
+            // Length not statically known (raw pointer): unchecked.
             try self.generateExpr(idx.object);
             try self.writer.write("[");
             try self.generateExpr(idx.index);
@@ -6682,7 +7151,7 @@ pub const CodeGenerator = struct {
                 try self.writer.print("{s}.vtable->{s}({s}.data", .{ obj_name, method.method.name, obj_name });
                 for (method.args) |arg| {
                     try self.writer.write(", ");
-                    try self.generateExpr(arg);
+                    try self.generateRetainedExpr(arg, null);
                 }
                 try self.writer.write(")");
                 return;
@@ -6699,10 +7168,98 @@ pub const CodeGenerator = struct {
                 try self.writer.print("{s}_{s}(", .{ mangled, method.method.name });
                 for (method.args, 0..) |arg, i| {
                     if (i > 0) try self.writer.write(", ");
-                    try self.generateExpr(arg);
+                    try self.generateRetainedExpr(arg, null);
                 }
                 try self.writer.write(")");
                 return;
+            }
+        }
+
+        // Associated (static) call: TypeName.method(args) where the object
+        // identifier names a type, not a value. Emits the same code as the
+        // `Type_method` builtin spellings (Box/Map/List) or a direct
+        // dm_Type_method(args) call with no receiver for user impl
+        // functions declared without `self` (e.g. a `new` constructor).
+        if (method.object.kind == .identifier) {
+            const type_name = method.object.kind.identifier.name;
+            if (self.lookupVariableType(type_name) == null) {
+                if (std.mem.eql(u8, type_name, "Box")) {
+                    if (std.mem.eql(u8, method.method.name, "new")) {
+                        if (method.args.len > 0) {
+                            try self.generateBoxAlloc(method.args[0]);
+                        }
+                        return;
+                    }
+                    if (std.mem.eql(u8, method.method.name, "null")) {
+                        try self.writer.write("NULL");
+                        return;
+                    }
+                } else if (std.mem.eql(u8, type_name, "Map") and
+                    std.mem.eql(u8, method.method.name, "new"))
+                {
+                    try self.generateZeroMap();
+                    return;
+                } else if (std.mem.eql(u8, type_name, "List") and
+                    std.mem.eql(u8, method.method.name, "new"))
+                {
+                    try self.generateZeroList();
+                    return;
+                } else if (self.findAssociatedMethod(type_name, method.method.name) != null) {
+                    const mangled = try self.mangleFunctionName(method.method.name, type_name);
+                    const mut_flags = self.function_mut_info.get(mangled);
+                    try self.writer.print("{s}(", .{mangled});
+                    for (method.args, 0..) |arg, i| {
+                        if (i > 0) try self.writer.write(", ");
+                        const is_mut_param = if (mut_flags) |flags| (i < flags.len and flags[i]) else false;
+                        if (is_mut_param) {
+                            try self.writer.write("&(");
+                            try self.generateExpr(arg);
+                            try self.writer.write(")");
+                        } else {
+                            try self.generateRetainedExpr(arg, null);
+                        }
+                    }
+                    try self.writer.write(")");
+                    return;
+                }
+            }
+        }
+
+        // `x.len()` is the builtin length, identical to `len(x)`: an
+        // int64_t read of the .len field (strings, Lists, Maps, slices)
+        // or the static size of a fixed array. Never a helper call, so
+        // it also works on rvalues. A user `fn len` impl on the
+        // receiver's own type takes precedence (falls through).
+        if (std.mem.eql(u8, method.method.name, "len") and method.args.len == 0) {
+            const full_obj_type = self.inferCTypeFromExpr(method.object);
+            // Only true C pointers (Box receivers) need ->len: `mut`
+            // parameter identifiers already emit dereferenced, so the
+            // value form applies to them.
+            const is_ptr = std.mem.endsWith(u8, full_obj_type, "*");
+            const base_type = if (is_ptr) full_obj_type[0 .. full_obj_type.len - 1] else full_obj_type;
+            const raw_name = if (std.mem.startsWith(u8, base_type, "dm_")) base_type[3..] else base_type;
+            if (!self.hasImplMethod(raw_name, "len")) {
+                if (!is_ptr) {
+                    if (fixedArrayLen(full_obj_type)) |arr_len| {
+                        try self.writer.print("((int64_t){d})", .{arr_len});
+                        return;
+                    }
+                }
+                if (std.mem.eql(u8, base_type, "dm_string") or
+                    isCowContainerCType(base_type) or
+                    std.mem.startsWith(u8, base_type, "struct {"))
+                {
+                    if (is_ptr) {
+                        try self.writer.print("((int64_t)(({s})dm_null_check_ptr((void*)(", .{full_obj_type});
+                        try self.generateExpr(method.object);
+                        try self.writer.write(")))->len)");
+                    } else {
+                        try self.writer.write("((int64_t)(");
+                        try self.generateExpr(method.object);
+                        try self.writer.write(").len)");
+                    }
+                    return;
+                }
             }
         }
 
@@ -6731,9 +7288,20 @@ pub const CodeGenerator = struct {
         try self.generateExpr(method.object);
         try self.writer.write(")");
 
+        // Builtin container stores (push/insert/set) retain their
+        // element argument inside the helper; retaining here too would
+        // only inflate the count. All other method arguments are copies.
+        const builtin_store = isCowContainerCType(obj_type) and
+            (std.mem.eql(u8, method.method.name, "push") or
+                std.mem.eql(u8, method.method.name, "insert") or
+                std.mem.eql(u8, method.method.name, "set"));
         for (method.args) |arg| {
             try self.writer.write(", ");
-            try self.generateExpr(arg);
+            if (builtin_store) {
+                try self.generateExpr(arg);
+            } else {
+                try self.generateRetainedExpr(arg, null);
+            }
         }
 
         try self.writer.write(")");
@@ -6756,7 +7324,7 @@ pub const CodeGenerator = struct {
                 try self.writer.print("&{s}", .{info.env_var});
                 for (call.args) |arg| {
                     try self.writer.write(", ");
-                    try self.generateExpr(arg.value);
+                    try self.generateRetainedExpr(arg.value, null);
                 }
                 try self.writer.write(")");
                 return;
@@ -6803,688 +7371,301 @@ pub const CodeGenerator = struct {
                 try self.generateExpr(arg.value);
                 try self.writer.write(")");
             } else {
-                try self.generateExpr(arg.value);
+                try self.generateRetainedExpr(arg.value, null);
             }
         }
 
         try self.writer.write(")");
     }
 
-    /// Generate built-in function calls
-    fn generateBuiltinCall(self: *Self, name: []const u8, call: *FunctionCall) !bool {
-        if (std.mem.eql(u8, name, "print")) {
-            if (call.args.len > 0) {
-                try self.generatePrintCall(call.args[0].value, false);
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "println")) {
-            if (call.args.len > 0) {
-                try self.generatePrintCall(call.args[0].value, true);
-            } else {
-                try self.writer.write("putchar('\\n')");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "panic")) {
-            try self.writer.write("dm_panic(");
-            if (call.args.len > 0) {
-                // panic takes a string argument - extract C string
-                const arg_type = self.inferCTypeFromExpr(call.args[0].value);
-                if (std.mem.eql(u8, arg_type, "dm_string")) {
-                    try self.writer.write("(");
-                    try self.generateExpr(call.args[0].value);
-                    try self.writer.write(").data");
-                } else {
-                    try self.generateExpr(call.args[0].value);
-                }
-            } else {
-                try self.writer.write("\"panic\"");
+    /// Emit a heap allocation of `value_expr` (Box_new / Box.new).
+    fn generateBoxAlloc(self: *Self, value_expr: *Expr) anyerror!void {
+        const arg_type = self.inferCTypeFromExpr(value_expr);
+        const safe_name = try self.sanitizeTypeName(arg_type);
+        const box_helper = try std.fmt.allocPrint(self.stringAllocator(), "dm_box_{s}", .{safe_name});
+        // Ensure the box helper has been generated
+        if (!self.generated_box_types.contains(box_helper)) {
+            try self.generated_box_types.put(box_helper, arg_type);
+            try self.emitBoxTypeDefinition(box_helper, arg_type);
+        }
+        try self.writer.print("{s}(", .{box_helper});
+        try self.generateExpr(value_expr);
+        try self.writer.write(")");
+    }
+
+    /// Emit a zero-initialized list struct (List_new / List.new).
+    fn generateZeroList(self: *Self) anyerror!void {
+        if (self.expected_type) |et| {
+            try self.writer.print("({s}){{ .data = NULL, .len = 0, .capacity = 0 }}", .{et});
+        } else {
+            try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
+        }
+    }
+
+    /// Emit a zero-initialized map struct (Map_new / Map.new).
+    fn generateZeroMap(self: *Self) anyerror!void {
+        if (self.expected_type) |et| {
+            try self.writer.print("({s}){{ .entries = NULL, .len = 0, .capacity = 0 }}", .{et});
+        } else {
+            try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
+        }
+    }
+
+    /// Emit an is_alpha/is_digit/is_alnum/is_whitespace call. The
+    /// runtime helpers take a C char; a string argument (the usual
+    /// dAImond spelling, e.g. `is_alpha(char_at(s, i))`) is tested by
+    /// its first character, with the empty string testing false. A
+    /// char argument (e.g. `s[i]`) is passed through unchanged.
+    fn generateCharPredicateCall(self: *Self, c_name: []const u8, call: *FunctionCall) anyerror!void {
+        if (call.args.len == 0) return;
+        const arg = call.args[0].value;
+        try self.writer.print("{s}(", .{c_name});
+        if (std.mem.eql(u8, self.inferCTypeFromExpr(arg), "dm_string")) {
+            try self.writer.write("((");
+            try self.generateExpr(arg);
+            try self.writer.write(").len > 0 ? (");
+            try self.generateExpr(arg);
+            try self.writer.write(").data[0] : '\\0')");
+        } else {
+            try self.generateExpr(arg);
+        }
+        try self.writer.write(")");
+    }
+
+    /// Emit `c_name(arg0, ..., argN)` using the first `nargs`
+    /// arguments; emit nothing when fewer are present (the historical
+    /// per-builtin guard behavior, now driven by `min_args`).
+    fn generateSimpleBuiltinCall(self: *Self, c_name: []const u8, call: *FunctionCall, nargs: usize) anyerror!void {
+        if (call.args.len >= nargs) {
+            try self.writer.print("{s}(", .{c_name});
+            for (0..nargs) |i| {
+                if (i > 0) try self.writer.write(", ");
+                try self.generateExpr(call.args[i].value);
             }
             try self.writer.write(")");
-            return true;
-        } else if (std.mem.eql(u8, name, "assert")) {
-            try self.writer.write("dm_assert(");
-            if (call.args.len > 0) {
-                try self.generateExpr(call.args[0].value);
+        }
+    }
+
+    /// Generate built-in function calls. Dispatch is driven by the
+    /// builtin registry (builtins.zig): each entry's `lowering` key
+    /// selects the emitter; plain runtime calls share
+    /// generateSimpleBuiltinCall.
+    fn generateBuiltinCall(self: *Self, name: []const u8, call: *FunctionCall) !bool {
+        const entry = builtins.lookup(name) orelse {
+            // SIMD prefix families: simd_splat_<V>(x) / simd_set_<V>(...)
+            if (builtins.simdPrefix(name)) |simd| {
+                if (call.args.len >= 1) {
+                    try self.writer.write("dm_");
+                    try self.writer.write(name);
+                    try self.writer.write("(");
+                    switch (simd.kind) {
+                        .splat => try self.generateExpr(call.args[0].value),
+                        .set => {
+                            for (call.args, 0..) |arg, i| {
+                                if (i > 0) try self.writer.write(", ");
+                                try self.generateExpr(arg.value);
+                            }
+                        },
+                    }
+                    try self.writer.write(")");
+                }
+                return true;
             }
-            try self.writer.write(", \"assertion failed\")");
-            return true;
-        } else if (std.mem.eql(u8, name, "assert_eq")) {
-            // assert_eq(actual, expected) — compare two values, panic with message if not equal
-            if (call.args.len >= 2) {
-                const lhs_type = self.inferCTypeFromExpr(call.args[0].value);
-                if (std.mem.eql(u8, lhs_type, "dm_string")) {
-                    // String comparison
-                    try self.writer.write("if (!dm_string_eq(");
+            return false;
+        };
+
+        switch (entry.lowering) {
+            .call => try self.generateSimpleBuiltinCall(entry.c_name.?, call, entry.min_args),
+            .call_no_args => try self.writer.print("{s}()", .{entry.c_name.?}),
+            .print => {
+                if (call.args.len > 0) {
+                    try self.generatePrintCall(call.args[0].value, false);
+                }
+            },
+            .println => {
+                if (call.args.len > 0) {
+                    try self.generatePrintCall(call.args[0].value, true);
+                } else {
+                    try self.writer.write("putchar('\\n')");
+                }
+            },
+            .eprint => {
+                if (call.args.len > 0) {
+                    try self.generateEprintCall(call.args[0].value, false);
+                }
+            },
+            .eprintln => {
+                if (call.args.len > 0) {
+                    try self.generateEprintCall(call.args[0].value, true);
+                } else {
+                    try self.writer.write("fputc('\\n', stderr)");
+                }
+            },
+            .panic => {
+                try self.writer.write("dm_panic(");
+                if (call.args.len > 0) {
+                    // panic takes a string argument - extract C string
+                    const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                    if (std.mem.eql(u8, arg_type, "dm_string")) {
+                        try self.writer.write("(");
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(").data");
+                    } else {
+                        try self.generateExpr(call.args[0].value);
+                    }
+                } else {
+                    try self.writer.write("\"panic\"");
+                }
+                try self.writer.write(")");
+            },
+            .assert_fn => {
+                try self.writer.write("dm_assert(");
+                if (call.args.len > 0) {
+                    try self.generateExpr(call.args[0].value);
+                }
+                try self.writer.write(", \"assertion failed\")");
+            },
+            .assert_eq_fn => {
+                // assert_eq(actual, expected) — compare two values, panic with message if not equal
+                if (call.args.len >= 2) {
+                    const lhs_type = self.inferCTypeFromExpr(call.args[0].value);
+                    if (std.mem.eql(u8, lhs_type, "dm_string")) {
+                        // String comparison
+                        try self.writer.write("if (!dm_string_eq(");
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(", ");
+                        try self.generateExpr(call.args[1].value);
+                        try self.writer.write(")) dm_panic(\"assert_eq failed: strings not equal\")");
+                    } else {
+                        // Numeric/bool comparison
+                        try self.writer.write("if ((");
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(") != (");
+                        try self.generateExpr(call.args[1].value);
+                        try self.writer.write(")) dm_panic(\"assert_eq failed: values not equal\")");
+                    }
+                }
+            },
+            .len => {
+                // len(x) -> length of string/List/Map/slice (.len field),
+                // or the static size of a fixed-size array
+                if (call.args.len > 0) {
+                    const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                    if (fixedArrayLen(arg_type)) |arr_len| {
+                        try self.writer.print("((int64_t){d})", .{arr_len});
+                    } else {
+                        try self.writer.write("((int64_t)(");
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(").len)");
+                    }
+                }
+            },
+            .char_predicate => try self.generateCharPredicateCall(entry.c_name.?, call),
+            .char_at => {
+                // char_at(s, i) -> bounds-checked character at index as string
+                if (call.args.len >= 2) {
+                    try self.writer.write("dm_char_to_string((dm_bounds_check((int64_t)(");
+                    try self.generateExpr(call.args[1].value);
+                    try self.writer.write("), (int64_t)(");
+                    try self.generateExpr(call.args[0].value);
+                    try self.writer.write(").len, \"string\"), (");
+                    try self.generateExpr(call.args[0].value);
+                    try self.writer.write(").data)[");
+                    try self.generateExpr(call.args[1].value);
+                    try self.writer.write("])");
+                }
+            },
+            .box_alloc => {
+                // Box_new(value) -> heap-allocate value via monomorphized helper
+                if (call.args.len > 0) {
+                    try self.generateBoxAlloc(call.args[0].value);
+                }
+            },
+            .box_null => try self.writer.write("NULL"),
+            .zero_list => try self.generateZeroList(),
+            .zero_map => try self.generateZeroMap(),
+            .string_split => {
+                // Ensure dm_list_dm_string type is generated
+                _ = try self.generateListTypeByName("dm_string");
+                try self.generateSimpleBuiltinCall("dm_string_split", call, 2);
+            },
+            .option_some => {
+                // Some(value) -> dm_option_T_Some(value)
+                if (call.args.len > 0) {
+                    const target_type = self.resolveOptionResultContext();
+                    if (target_type) |tt| {
+                        try self.writer.print("{s}_Some(", .{tt});
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(")");
+                    } else {
+                        // Infer from argument type
+                        const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                        const opt_type = try self.generateOptionTypeByName(arg_type);
+                        try self.writer.print("{s}_Some(", .{opt_type});
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(")");
+                    }
+                }
+            },
+            .option_none => {
+                // None() -> dm_option_T_None()
+                const target_type = self.resolveOptionResultContext();
+                if (target_type) |tt| {
+                    try self.writer.print("{s}_None()", .{tt});
+                } else {
+                    try self.writer.write("{ .has_value = false }");
+                }
+            },
+            .result_ok => {
+                // Ok(value) -> dm_result_T_E_Ok(value)
+                if (call.args.len > 0) {
+                    const target_type = self.resolveOptionResultContext();
+                    if (target_type) |tt| {
+                        try self.writer.print("{s}_Ok(", .{tt});
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(")");
+                    } else {
+                        // Infer: create Result[arg_type, string] by default
+                        const arg_type = self.inferCTypeFromExpr(call.args[0].value);
+                        const res_type = try self.generateResultTypeByName(arg_type, "dm_string");
+                        try self.writer.print("{s}_Ok(", .{res_type});
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(")");
+                    }
+                }
+            },
+            .result_err => {
+                // Err(value) -> dm_result_T_E_Err(value)
+                if (call.args.len > 0) {
+                    const target_type = self.resolveOptionResultContext();
+                    if (target_type) |tt| {
+                        try self.writer.print("{s}_Err(", .{tt});
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(")");
+                    } else {
+                        // Default: Result[int, string]
+                        const res_type = try self.generateResultTypeByName("int64_t", "dm_string");
+                        try self.writer.print("{s}_Err(", .{res_type});
+                        try self.generateExpr(call.args[0].value);
+                        try self.writer.write(")");
+                    }
+                }
+            },
+            .simd_binary => {
+                // simd_add(a, b) -> dm_simd_add(a, b), etc.
+                if (call.args.len >= 2) {
+                    try self.writer.write("dm_");
+                    try self.writer.write(name);
+                    try self.writer.write("(");
                     try self.generateExpr(call.args[0].value);
                     try self.writer.write(", ");
                     try self.generateExpr(call.args[1].value);
-                    try self.writer.write(")) dm_panic(\"assert_eq failed: strings not equal\")");
-                } else {
-                    // Numeric/bool comparison
-                    try self.writer.write("if ((");
-                    try self.generateExpr(call.args[0].value);
-                    try self.writer.write(") != (");
-                    try self.generateExpr(call.args[1].value);
-                    try self.writer.write(")) dm_panic(\"assert_eq failed: values not equal\")");
-                }
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "len")) {
-            // len(x) -> get length of string or array
-            if (call.args.len > 0) {
-                try self.writer.write("((int64_t)(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(").len)");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "int_to_string")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_int_to_string(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "chr")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_chr(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "bool_to_string")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_bool_to_string(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "float_to_string")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_float_to_string(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "substr")) {
-            // substr(s, start, length)
-            if (call.args.len >= 3) {
-                try self.writer.write("dm_string_substr(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[2].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "char_to_string")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_char_to_string(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "is_alpha")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_alpha(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "is_digit")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_digit(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "is_alnum")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_alnum(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "is_whitespace")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_is_whitespace(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_contains")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_string_contains(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_find")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_string_find(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "starts_with")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_string_starts_with(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "ends_with")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_string_ends_with(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "parse_int")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_parse_int(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "file_read")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_file_read(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "file_write")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_file_write(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "file_append")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_append_file(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "file_exists")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_file_exists(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "read_line")) {
-            try self.writer.write("dm_read_line()");
-            return true;
-        } else if (std.mem.eql(u8, name, "read_key")) {
-            try self.writer.write("dm_read_key()");
-            return true;
-        } else if (std.mem.eql(u8, name, "read_key_nb")) {
-            try self.writer.write("dm_read_key_nb()");
-            return true;
-        } else if (std.mem.eql(u8, name, "term_width")) {
-            try self.writer.write("dm_term_width()");
-            return true;
-        } else if (std.mem.eql(u8, name, "term_height")) {
-            try self.writer.write("dm_term_height()");
-            return true;
-        } else if (std.mem.eql(u8, name, "time_ms")) {
-            try self.writer.write("dm_time_ms()");
-            return true;
-        } else if (std.mem.eql(u8, name, "sleep_ms")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_sleep_ms(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "flush")) {
-            try self.writer.write("fflush(stdout)");
-            return true;
-        } else if (std.mem.eql(u8, name, "mem_mark")) {
-            try self.writer.write("dm_mem_mark()");
-            return true;
-        } else if (std.mem.eql(u8, name, "mem_sweep")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_mem_sweep(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "eprint")) {
-            if (call.args.len > 0) {
-                try self.generateEprintCall(call.args[0].value, false);
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "eprintln")) {
-            if (call.args.len > 0) {
-                try self.generateEprintCall(call.args[0].value, true);
-            } else {
-                try self.writer.write("fputc('\\n', stderr)");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "exit")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_exit(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "args_get")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_args_get(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "args_len")) {
-            try self.writer.write("dm_args_len()");
-            return true;
-        } else if (std.mem.eql(u8, name, "system")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_system(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "List_new")) {
-            // List_new() -> zero-initialized list struct
-            if (self.expected_type) |et| {
-                try self.writer.print("({s}){{ .data = NULL, .len = 0, .capacity = 0 }}", .{et});
-            } else {
-                try self.writer.write("{ .data = NULL, .len = 0, .capacity = 0 }");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "Box_new")) {
-            // Box_new(value) -> heap-allocate value via monomorphized helper
-            if (call.args.len > 0) {
-                const arg_type = self.inferCTypeFromExpr(call.args[0].value);
-                const safe_name = try self.sanitizeTypeName(arg_type);
-                const box_helper = try std.fmt.allocPrint(self.stringAllocator(), "dm_box_{s}", .{safe_name});
-                // Ensure the box helper has been generated
-                if (!self.generated_box_types.contains(box_helper)) {
-                    try self.generated_box_types.put(box_helper, arg_type);
-                    try self.emitBoxTypeDefinition(box_helper, arg_type);
-                }
-                try self.writer.print("{s}(", .{box_helper});
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "Box_null")) {
-            // Box_null() -> NULL pointer
-            try self.writer.write("NULL");
-            return true;
-        } else if (std.mem.eql(u8, name, "Map_new")) {
-            // Map_new() -> zero-initialized map struct
-            if (self.expected_type) |et| {
-                try self.writer.print("({s}){{ .entries = NULL, .len = 0, .capacity = 0 }}", .{et});
-            } else {
-                try self.writer.write("{ .entries = NULL, .len = 0, .capacity = 0 }");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_split")) {
-            // Ensure dm_list_dm_string type is generated
-            _ = try self.generateListTypeByName("dm_string");
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_string_split(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_trim")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_string_trim(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_replace")) {
-            if (call.args.len >= 3) {
-                try self.writer.write("dm_string_replace(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[2].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_to_upper")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_string_to_upper(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_to_lower")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_string_to_lower(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "path_dirname")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_path_dirname(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "path_basename")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_path_basename(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "path_extension")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_path_extension(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "path_stem")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_path_stem(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "path_join")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_path_join(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "fs_mkdir")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_fs_mkdir(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "fs_readdir")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_fs_readdir(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "fs_remove")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_fs_remove(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "fs_rename")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_fs_rename(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "fs_rmdir")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_fs_remove(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "fs_getcwd")) {
-            try self.writer.write("dm_fs_getcwd()");
-            return true;
-        } else if (std.mem.eql(u8, name, "fs_exists")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_file_exists(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "env_get")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_os_getenv(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "tcp_listen")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_tcp_listen_fd(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "tcp_accept")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_tcp_accept_fd(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "tcp_connect")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_tcp_connect_fd(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "tcp_read")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_tcp_read_fd(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "tcp_write")) {
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_tcp_write_fd(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "tcp_close")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_tcp_close_fd(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "thread_join")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_thread_join_id(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "mutex_new")) {
-            try self.writer.write("dm_mutex_new_ptr()");
-            return true;
-        } else if (std.mem.eql(u8, name, "mutex_lock")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_mutex_lock_ptr(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "mutex_unlock")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_mutex_unlock_ptr(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "mutex_destroy")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_mutex_destroy_ptr(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "Some")) {
-            // Some(value) -> dm_option_T_Some(value)
-            if (call.args.len > 0) {
-                const target_type = self.resolveOptionResultContext();
-                if (target_type) |tt| {
-                    try self.writer.print("{s}_Some(", .{tt});
-                    try self.generateExpr(call.args[0].value);
-                    try self.writer.write(")");
-                } else {
-                    // Infer from argument type
-                    const arg_type = self.inferCTypeFromExpr(call.args[0].value);
-                    const opt_type = try self.generateOptionTypeByName(arg_type);
-                    try self.writer.print("{s}_Some(", .{opt_type});
-                    try self.generateExpr(call.args[0].value);
                     try self.writer.write(")");
                 }
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "None")) {
-            // None() -> dm_option_T_None()
-            const target_type = self.resolveOptionResultContext();
-            if (target_type) |tt| {
-                try self.writer.print("{s}_None()", .{tt});
-            } else {
-                try self.writer.write("{ .has_value = false }");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "Ok")) {
-            // Ok(value) -> dm_result_T_E_Ok(value)
-            if (call.args.len > 0) {
-                const target_type = self.resolveOptionResultContext();
-                if (target_type) |tt| {
-                    try self.writer.print("{s}_Ok(", .{tt});
-                    try self.generateExpr(call.args[0].value);
-                    try self.writer.write(")");
-                } else {
-                    // Infer: create Result[arg_type, string] by default
-                    const arg_type = self.inferCTypeFromExpr(call.args[0].value);
-                    const res_type = try self.generateResultTypeByName(arg_type, "dm_string");
-                    try self.writer.print("{s}_Ok(", .{res_type});
-                    try self.generateExpr(call.args[0].value);
-                    try self.writer.write(")");
-                }
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "Err")) {
-            // Err(value) -> dm_result_T_E_Err(value)
-            if (call.args.len > 0) {
-                const target_type = self.resolveOptionResultContext();
-                if (target_type) |tt| {
-                    try self.writer.print("{s}_Err(", .{tt});
-                    try self.generateExpr(call.args[0].value);
-                    try self.writer.write(")");
-                } else {
-                    // Default: Result[int, string]
-                    const res_type = try self.generateResultTypeByName("int64_t", "dm_string");
-                    try self.writer.print("{s}_Err(", .{res_type});
-                    try self.generateExpr(call.args[0].value);
-                    try self.writer.write(")");
-                }
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "string_to_int")) {
-            // string_to_int is alias for parse_int
-            if (call.args.len > 0) {
-                try self.writer.write("dm_parse_int(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "char_at")) {
-            // char_at(s, i) -> character at index as string
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_char_to_string((");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(").data[");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write("])");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "parse_float")) {
-            if (call.args.len > 0) {
-                try self.writer.write("dm_parse_float(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "simd_add") or std.mem.eql(u8, name, "simd_sub") or
-            std.mem.eql(u8, name, "simd_mul") or std.mem.eql(u8, name, "simd_div"))
-        {
-            // simd_add(a, b) -> dm_simd_add(a, b), etc.
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_");
-                try self.writer.write(name);
-                try self.writer.write("(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.eql(u8, name, "simd_extract")) {
-            // simd_extract(vec, idx) -> dm_simd_extract(vec, idx)
-            if (call.args.len >= 2) {
-                try self.writer.write("dm_simd_extract(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(", ");
-                try self.generateExpr(call.args[1].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.startsWith(u8, name, "simd_splat_")) {
-            // simd_splat_f32x4(val) -> dm_simd_splat_f32x4(val)
-            if (call.args.len >= 1) {
-                try self.writer.write("dm_");
-                try self.writer.write(name);
-                try self.writer.write("(");
-                try self.generateExpr(call.args[0].value);
-                try self.writer.write(")");
-            }
-            return true;
-        } else if (std.mem.startsWith(u8, name, "simd_set_")) {
-            // simd_set_f32x4(a, b, c, d) -> dm_simd_set_f32x4(a, b, c, d)
-            if (call.args.len >= 1) {
-                try self.writer.write("dm_");
-                try self.writer.write(name);
-                try self.writer.write("(");
-                for (call.args, 0..) |arg, i| {
-                    if (i > 0) try self.writer.write(", ");
-                    try self.generateExpr(arg.value);
-                }
-                try self.writer.write(")");
-            }
-            return true;
+            },
+            .flush_stdout => try self.writer.write("fflush(stdout)"),
         }
-
-        return false;
+        return true;
     }
 
     /// Generate print/println with type-based dispatch
@@ -7609,7 +7790,7 @@ pub const CodeGenerator = struct {
             const prev_expected = self.expected_type;
             self.expected_type = null;
             defer self.expected_type = prev_expected;
-            try self.generateExpr(field.value);
+            try self.generateRetainedExpr(field.value, null);
         }
 
         try self.writer.write(" }");
@@ -7636,13 +7817,13 @@ pub const CodeGenerator = struct {
             .tuple => |exprs| {
                 for (exprs, 0..) |expr, i| {
                     if (i > 0) try self.writer.write(", ");
-                    try self.generateExpr(expr);
+                    try self.generateRetainedExpr(expr, null);
                 }
             },
             .struct_fields => |fields| {
                 for (fields, 0..) |field, i| {
                     if (i > 0) try self.writer.write(", ");
-                    try self.generateExpr(field.value);
+                    try self.generateRetainedExpr(field.value, null);
                 }
             },
         }
@@ -7862,9 +8043,28 @@ pub const CodeGenerator = struct {
         continue_signal,
     };
 
+    /// Turn a recorded comptime integer overflow into a clean compile
+    /// error (never a compiler crash/signal).
+    /// Note (once per fallen-back comptime expression) that fuel ran
+    /// out and runtime code was emitted instead of a constant.
+    fn noteComptimeFuelFallback(self: *Self, span: Span) void {
+        if (self.comptime_fuel_exceeded) {
+            std.debug.print("note: comptime evaluation exceeded fuel limits at line {d}; falling back to runtime evaluation\n", .{span.start.line});
+            self.comptime_fuel_exceeded = false;
+        }
+    }
+
+    fn failIfComptimeOverflow(self: *Self) CodeGenError!void {
+        if (self.comptime_overflow) {
+            std.debug.print("error: integer overflow in compile-time constant evaluation\n", .{});
+            return CodeGenError.InvalidExpression;
+        }
+    }
+
     /// Try to evaluate an expression at compile time (entry point, creates root env).
     /// Returns null if the expression cannot be evaluated statically.
     fn evalComptime(self: *Self, expr: *const Expr) ?ComptimeValue {
+        self.comptime_fuel_exceeded = false;
         var root_env = ComptimeEnv.init(self.allocator, null);
         defer root_env.deinit();
 
@@ -7913,7 +8113,7 @@ pub const CodeGenerator = struct {
                 const operand = self.evalComptimeExpr(un.operand, env) orelse return null;
                 return switch (un.op) {
                     .neg => switch (operand) {
-                        .int_val => |v| ComptimeValue{ .int_val = -v },
+                        .int_val => |v| self.comptimeChecked(std.math.sub(i64, 0, v)),
                         .float_val => |v| ComptimeValue{ .float_val = -v },
                         else => null,
                     },
@@ -8093,6 +8293,12 @@ pub const CodeGenerator = struct {
             .continue_stmt => {
                 return ComptimeStmtResult{ .control = .{ .continue_signal = {} } };
             },
+            .unsafe_block => |ub| {
+                return self.evalComptimeBlockFull(ub.body, env);
+            },
+            .region_block => |rb| {
+                return self.evalComptimeBlockFull(rb.body, env);
+            },
             else => return null,
         }
     }
@@ -8173,7 +8379,7 @@ pub const CodeGenerator = struct {
         var iterations: u32 = 0;
         while (true) {
             iterations += 1;
-            if (iterations > env.max_iterations) return null;
+            if (iterations > env.max_iterations) { self.comptime_fuel_exceeded = true; return null; }
 
             const cond = self.evalComptimeExpr(wl.condition, env) orelse return null;
             if (cond != .bool_val) return null;
@@ -8212,7 +8418,7 @@ pub const CodeGenerator = struct {
 
         for (iterable.array_val) |elem| {
             iterations += 1;
-            if (iterations > env.max_iterations) return null;
+            if (iterations > env.max_iterations) { self.comptime_fuel_exceeded = true; return null; }
 
             // Bind loop variable
             env.put(loop_var_name, elem) catch return null;
@@ -8245,8 +8451,9 @@ pub const CodeGenerator = struct {
             else => return null,
         };
 
-        // Handle builtin pure functions
-        if (std.mem.eql(u8, func_name, "len")) {
+        // Handle builtin pure functions (classes from builtins.zig)
+        const builtin_entry = builtins.lookup(func_name);
+        if (builtin_entry != null and builtin_entry.?.comptime_kind == .pure_len) {
             if (call.args.len != 1) return null;
             const arg = self.evalComptimeExpr(call.args[0].value, env) orelse return null;
             return switch (arg) {
@@ -8255,7 +8462,7 @@ pub const CodeGenerator = struct {
                 else => null,
             };
         }
-        if (std.mem.eql(u8, func_name, "int_to_string")) {
+        if (builtin_entry != null and builtin_entry.?.comptime_kind == .pure_int_to_string) {
             if (call.args.len != 1) return null;
             const arg = self.evalComptimeExpr(call.args[0].value, env) orelse return null;
             if (arg != .int_val) return null;
@@ -8264,16 +8471,7 @@ pub const CodeGenerator = struct {
         }
 
         // Reject impure builtins
-        const impure_builtins = [_][]const u8{
-            "print",     "println",    "eprint",      "eprintln",
-            "file_read", "file_write", "file_append",  "read_line",
-            "exit",      "system",     "panic",        "read_key",
-            "read_key_nb", "sleep_ms", "term_width",   "term_height",
-            "time_ms",   "flush",      "mem_mark",    "mem_sweep",
-        };
-        for (impure_builtins) |name| {
-            if (std.mem.eql(u8, func_name, name)) return null;
-        }
+        if (builtin_entry != null and builtin_entry.?.comptime_kind == .impure) return null;
 
         // Look up function declaration in source file
         const func_decl = self.findFunctionDecl(func_name) orelse return null;
@@ -8282,7 +8480,7 @@ pub const CodeGenerator = struct {
             .block => |blk| blk,
             .expression => |expr| {
                 // Expression-body function: just evaluate the expression
-                if (env.call_depth >= env.max_call_depth) return null;
+                if (env.call_depth >= env.max_call_depth) { self.comptime_fuel_exceeded = true; return null; }
 
                 var call_env = ComptimeEnv.init(self.allocator, env);
                 defer call_env.deinit();
@@ -8301,7 +8499,7 @@ pub const CodeGenerator = struct {
         };
 
         // Check recursion limit
-        if (env.call_depth >= env.max_call_depth) return null;
+        if (env.call_depth >= env.max_call_depth) { self.comptime_fuel_exceeded = true; return null; }
 
         // Create call environment
         var call_env = ComptimeEnv.init(self.allocator, env);
@@ -8397,18 +8595,44 @@ pub const CodeGenerator = struct {
         return ComptimeValue{ .struct_val = fields };
     }
 
+    /// Checked comptime i64 operation: on overflow, record it (the
+    /// caller turns it into a clean compile error) instead of letting
+    /// a Zig panic crash the compiler.
+    fn comptimeChecked(self: *Self, result: anytype) ?ComptimeValue {
+        if (result) |v| {
+            return ComptimeValue{ .int_val = v };
+        } else |_| {
+            self.comptime_overflow = true;
+            return null;
+        }
+    }
+
     /// Evaluate a binary operation on comptime values.
-    fn evalComptimeBinary(_: *Self, op: BinaryExpr.BinaryOp, left: ComptimeValue, right: ComptimeValue) ?ComptimeValue {
+    fn evalComptimeBinary(self: *Self, op: BinaryExpr.BinaryOp, left: ComptimeValue, right: ComptimeValue) ?ComptimeValue {
         // Integer arithmetic
         if (left == .int_val and right == .int_val) {
             const l = left.int_val;
             const r = right.int_val;
             return switch (op) {
-                .add => ComptimeValue{ .int_val = l + r },
-                .sub => ComptimeValue{ .int_val = l - r },
-                .mul => ComptimeValue{ .int_val = l * r },
-                .div => if (r != 0) ComptimeValue{ .int_val = @divTrunc(l, r) } else null,
-                .mod => if (r != 0) ComptimeValue{ .int_val = @mod(l, r) } else null,
+                .add => self.comptimeChecked(std.math.add(i64, l, r)),
+                .sub => self.comptimeChecked(std.math.sub(i64, l, r)),
+                .mul => self.comptimeChecked(std.math.mul(i64, l, r)),
+                .div => blk: {
+                    if (r == 0) break :blk null;
+                    if (l == std.math.minInt(i64) and r == -1) {
+                        self.comptime_overflow = true;
+                        break :blk null;
+                    }
+                    break :blk ComptimeValue{ .int_val = @divTrunc(l, r) };
+                },
+                .mod => blk: {
+                    if (r == 0) break :blk null;
+                    if (l == std.math.minInt(i64) and r == -1) {
+                        self.comptime_overflow = true;
+                        break :blk null;
+                    }
+                    break :blk ComptimeValue{ .int_val = @mod(l, r) };
+                },
                 .eq => ComptimeValue{ .bool_val = l == r },
                 .ne => ComptimeValue{ .bool_val = l != r },
                 .lt => ComptimeValue{ .bool_val = l < r },
@@ -8418,8 +8642,8 @@ pub const CodeGenerator = struct {
                 .bit_and => ComptimeValue{ .int_val = l & r },
                 .bit_or => ComptimeValue{ .int_val = l | r },
                 .bit_xor => ComptimeValue{ .int_val = l ^ r },
-                .shl => ComptimeValue{ .int_val = l << @as(u6, @intCast(@min(r, 63))) },
-                .shr => ComptimeValue{ .int_val = l >> @as(u6, @intCast(@min(r, 63))) },
+                .shl => if (r >= 0 and r < 64) ComptimeValue{ .int_val = l << @as(u6, @intCast(r)) } else null,
+                .shr => if (r >= 0 and r < 64) ComptimeValue{ .int_val = l >> @as(u6, @intCast(r)) } else null,
                 else => null,
             };
         }
@@ -8639,6 +8863,12 @@ pub const CodeGenerator = struct {
             .while_loop => |wl| {
                 self.collectFreeVars(wl.condition, param_names, result);
                 self.collectFreeVarsBlock(wl.body, param_names, result);
+            },
+            .unsafe_block => |ub| {
+                self.collectFreeVarsBlock(ub.body, param_names, result);
+            },
+            .region_block => |rb| {
+                self.collectFreeVarsBlock(rb.body, param_names, result);
             },
             else => {},
         }
@@ -8866,6 +9096,7 @@ pub const CodeGenerator = struct {
                 break :blk false;
             },
             .region_block => |rb| blockHasAwait(rb.body),
+            .unsafe_block => |ub| blockHasAwait(ub.body),
             .discard => |d| exprHasAwait(d.value),
             .break_stmt => |bs| if (bs.value) |v| exprHasAwait(v) else false,
             .continue_stmt => false,
@@ -9154,8 +9385,94 @@ pub const CodeGenerator = struct {
         }
     }
 
+    const CIntInfo = struct {
+        bits: u8,
+        signed: bool,
+    };
+
+    fn cIntInfo(c_type: []const u8) ?CIntInfo {
+        if (std.mem.eql(u8, c_type, "int8_t")) return .{ .bits = 8, .signed = true };
+        if (std.mem.eql(u8, c_type, "int16_t")) return .{ .bits = 16, .signed = true };
+        if (std.mem.eql(u8, c_type, "int32_t")) return .{ .bits = 32, .signed = true };
+        if (std.mem.eql(u8, c_type, "int64_t")) return .{ .bits = 64, .signed = true };
+        if (std.mem.eql(u8, c_type, "uint8_t")) return .{ .bits = 8, .signed = false };
+        if (std.mem.eql(u8, c_type, "uint16_t")) return .{ .bits = 16, .signed = false };
+        if (std.mem.eql(u8, c_type, "uint32_t")) return .{ .bits = 32, .signed = false };
+        if (std.mem.eql(u8, c_type, "uint64_t")) return .{ .bits = 64, .signed = false };
+        if (std.mem.eql(u8, c_type, "char")) return .{ .bits = 8, .signed = true };
+        return null;
+    }
+
+    fn intCastFits(src: CIntInfo, dst: CIntInfo) bool {
+        if (src.signed == dst.signed) return dst.bits >= src.bits;
+        if (!src.signed and dst.signed) return dst.bits > src.bits;
+        return false; // signed -> unsigned never fits (negative values)
+    }
+
+    fn cIntMinLiteral(info: CIntInfo) []const u8 {
+        return switch (info.bits) {
+            8 => "-128LL",
+            16 => "-32768LL",
+            32 => "-2147483647LL - 1LL",
+            else => "-9223372036854775807LL - 1LL",
+        };
+    }
+
+    fn cIntMaxLiteral(info: CIntInfo) []const u8 {
+        if (info.signed) {
+            return switch (info.bits) {
+                8 => "127LL",
+                16 => "32767LL",
+                32 => "2147483647LL",
+                else => "9223372036854775807LL",
+            };
+        }
+        return switch (info.bits) {
+            8 => "255ULL",
+            16 => "65535ULL",
+            32 => "4294967295ULL",
+            else => "18446744073709551615ULL",
+        };
+    }
+
     fn generateCast(self: *Self, cast: *CastExpr) anyerror!void {
         const target_type = try self.mapType(cast.target_type);
+        const src_type = self.inferCTypeFromExpr(cast.expr);
+
+        // Narrowing integer casts get a runtime range check
+        // (PANIC: integer cast out of range). Float<->int and widening
+        // casts keep plain C conversion semantics.
+        if (cIntInfo(src_type)) |src_info| {
+            if (cIntInfo(target_type)) |dst_info| {
+                if (!intCastFits(src_info, dst_info)) {
+                    if (dst_info.signed and src_info.signed) {
+                        try self.writer.print("(({s})dm_cast_check_i64((int64_t)(", .{target_type});
+                        try self.generateExpr(cast.expr);
+                        try self.writer.print("), {s}, {s}))", .{ cIntMinLiteral(dst_info), cIntMaxLiteral(dst_info) });
+                        return;
+                    }
+                    if (dst_info.signed and !src_info.signed) {
+                        try self.writer.print("(({s})dm_cast_check_u64((uint64_t)(", .{target_type});
+                        try self.generateExpr(cast.expr);
+                        try self.writer.print("), {s}))", .{cIntMaxLiteral(dst_info)});
+                        return;
+                    }
+                    if (!dst_info.signed and src_info.signed) {
+                        const hi = if (dst_info.bits >= 64) "9223372036854775807LL" else cIntMaxLiteral(dst_info);
+                        try self.writer.print("(({s})dm_cast_check_i64((int64_t)(", .{target_type});
+                        try self.generateExpr(cast.expr);
+                        try self.writer.print("), 0LL, {s}))", .{hi});
+                        return;
+                    }
+                    // unsigned -> unsigned (shrinking)
+                    try self.writer.print("(({s})dm_cast_check_u64((uint64_t)(", .{target_type});
+                    try self.generateExpr(cast.expr);
+                    try self.writer.print("), {s}))", .{cIntMaxLiteral(dst_info)});
+                    return;
+                }
+            }
+        }
+
         try self.writer.print("(({s})(", .{target_type});
         try self.generateExpr(cast.expr);
         try self.writer.write("))");

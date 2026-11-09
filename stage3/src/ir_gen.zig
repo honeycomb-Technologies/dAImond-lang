@@ -1191,6 +1191,14 @@ pub const IRGenerator = struct {
                     const if_result = self.evalIfComptime(if_e, env);
                     if (env.return_flag or env.break_flag) return if_result;
                 },
+                .unsafe_block => |ub| {
+                    const ub_result = self.evalBlockComptime(ub.body, env);
+                    if (env.return_flag or env.break_flag) return ub_result;
+                },
+                .region_block => |rb| {
+                    const rb_result = self.evalBlockComptime(rb.body, env);
+                    if (env.return_flag or env.break_flag) return rb_result;
+                },
                 else => {},
             }
         }
@@ -1468,6 +1476,7 @@ pub const IRGenerator = struct {
                 _ = try self.generateMatchExpr(match_expr);
             },
             .region_block => |rb| try self.generateBlock(rb.body),
+            .unsafe_block => |ub| try self.generateBlock(ub.body),
             .discard => |d| {
                 _ = try self.generateExpr(d.value);
             },

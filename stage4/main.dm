@@ -82,6 +82,7 @@ fn TK_FSTRING() -> int { return 100 }
 fn TK_COMPTIME() -> int { return 101 }
 fn TK_ASYNC() -> int { return 102 }
 fn TK_AWAIT() -> int { return 103 }
+fn TK_UNSAFE() -> int { return 104 }
 
 struct Token {
     kind: int,
@@ -128,6 +129,7 @@ fn keyword_lookup(name: string) -> int {
     if name == "comptime" { return TK_COMPTIME() }
     if name == "async" { return TK_ASYNC() }
     if name == "await" { return TK_AWAIT() }
+    if name == "unsafe" { return TK_UNSAFE() }
     return TK_IDENT()
 }
 
@@ -184,6 +186,7 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_COMPTIME() { return "'comptime'" }
     if kind == TK_ASYNC() { return "'async'" }
     if kind == TK_AWAIT() { return "'await'" }
+    if kind == TK_UNSAFE() { return "'unsafe'" }
     return "token(" + int_to_string(kind) + ")"
 }
 
@@ -239,48 +242,6 @@ fn lexer_skip_ws(lex: Lexer) -> Lexer {
         }
     }
     return l
-}
-
-fn unescape_string(s: string) -> string {
-    -- Quick check: if no backslashes, return as-is
-    if string_find(s, "\\") < 0 {
-        return s
-    }
-    let mut result = ""
-    let mut i = 0
-    let slen = len(s)
-    while i < slen {
-        let ch = char_at(s, i)
-        if ch == "\\" and i + 1 < slen {
-            let next = char_at(s, i + 1)
-            if next == "n" {
-                result = result + "\n"
-                i = i + 2
-            } else if next == "t" {
-                result = result + "\t"
-                i = i + 2
-            } else if next == "r" {
-                result = result + "\r"
-                i = i + 2
-            } else if next == "\\" {
-                result = result + "\\"
-                i = i + 2
-            } else if next == "\"" {
-                result = result + "\""
-                i = i + 2
-            } else if next == "'" {
-                result = result + "'"
-                i = i + 2
-            } else {
-                result = result + ch
-                i = i + 1
-            }
-        } else {
-            result = result + ch
-            i = i + 1
-        }
-    }
-    return result
 }
 
 fn tokenize(source: string) -> List[Token] {
@@ -576,6 +537,57 @@ fn tokenize(source: string) -> List[Token] {
 -- ============================================================
 -- EXPRESSION KINDS
 -- ============================================================
+
+fn unescape_string(s: string) -> string {
+    -- Quick check: if no backslashes, return as-is
+    if string_find(s, "\\") < 0 {
+        return s
+    }
+    let mut result = ""
+    let mut i = 0
+    let slen = len(s)
+    while i < slen {
+        let ch = char_at(s, i)
+        if ch == "\\" and i + 1 < slen {
+            let next = char_at(s, i + 1)
+            if next == "n" {
+                result = result + "\n"
+                i = i + 2
+            } else if next == "t" {
+                result = result + "\t"
+                i = i + 2
+            } else if next == "r" {
+                result = result + "\r"
+                i = i + 2
+            } else if next == "\\" {
+                result = result + "\\"
+                i = i + 2
+            } else if next == "\"" {
+                result = result + "\""
+                i = i + 2
+            } else if next == "'" {
+                result = result + "'"
+                i = i + 2
+            } else {
+                result = result + ch
+                i = i + 1
+            }
+        } else {
+            result = result + ch
+            i = i + 1
+        }
+    }
+    return result
+}
+
+-- ============================================================
+-- AST Node Definitions for dAImond Stage 4
+-- Uses integer kind tags (not tagged unions) following Stage 1 pattern
+-- ============================================================
+
+-- ============================================================
+-- EXPRESSION KINDS
+-- ============================================================
 fn EXPR_LITERAL_INT() -> int { return 1 }
 fn EXPR_LITERAL_FLOAT() -> int { return 2 }
 fn EXPR_LITERAL_STRING() -> int { return 3 }
@@ -658,6 +670,7 @@ fn BINOP_SHR() -> int { return 34 }
 fn UNOP_NEG() -> int { return 1 }
 fn UNOP_NOT() -> int { return 2 }
 fn UNOP_BIT_NOT() -> int { return 3 }
+fn UNOP_DEREF() -> int { return 4 }
 
 -- ============================================================
 -- ASSIGNMENT OPERATOR KINDS
@@ -1444,7 +1457,6 @@ fn VAL_INST_REF() -> int { return 5 }
 fn VAL_PARAM_REF() -> int { return 6 }
 fn VAL_GLOBAL_REF() -> int { return 7 }
 fn VAL_UNDEF() -> int { return 8 }
-fn VAL_BREAK_SENTINEL() -> int { return 9 }
 
 struct IRValue {
     kind: int,
@@ -1485,10 +1497,6 @@ fn ir_val_global(name: string) -> IRValue {
 
 fn ir_val_undef() -> IRValue {
     return IRValue { kind: VAL_UNDEF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
-}
-
-fn ir_val_break() -> IRValue {
-    return IRValue { kind: VAL_BREAK_SENTINEL(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
 }
 
 -- ============================================================
@@ -1798,6 +1806,16 @@ fn ir_module_new() -> IRModule {
         user_extern_fns: Map_new()
     }
 }
+
+fn VAL_BREAK_SENTINEL() -> int { return 9 }
+
+fn ir_val_break() -> IRValue {
+    return IRValue { kind: VAL_BREAK_SENTINEL(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
+}
+
+-- ============================================================
+-- IR INSTRUCTION OP KINDS
+-- ============================================================
 
 
 -- ============================================================
@@ -2441,7 +2459,9 @@ extern fn dm_llvm_build_fp_to_si(b: int, val: int, dest_ty: int, name: string) -
 extern fn dm_llvm_build_trunc(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_sext(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_bit_cast(b: int, val: int, dest_ty: int, name: string) -> int
+extern fn dm_llvm_build_ptr_to_int(b: int, val: int, dest_ty: int, name: string) -> int
 extern fn dm_llvm_build_int_to_ptr(b: int, val: int, dest_ty: int, name: string) -> int
+extern fn dm_llvm_sizeof_type(ty: int) -> int
 
 -- Logical
 extern fn dm_llvm_build_and(b: int, lhs: int, rhs: int, name: string) -> int
@@ -2493,7 +2513,6 @@ extern fn dm_llvm_free_c_string(c_str_ptr: int)
 -- Buffer-based API (for passing arrays to LLVM without raw pointers)
 extern fn dm_llvm_buf_clear()
 extern fn dm_llvm_buf_push(ref: int)
-extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int
 extern fn dm_llvm_struct_set_body_buf(struct_ty: int, is_packed: int)
 extern fn dm_llvm_function_type_buf(ret: int, is_var_arg: int) -> int
 extern fn dm_llvm_build_call2_buf(b: int, fn_ty: int, func: int, name: string) -> int
@@ -2528,6 +2547,8 @@ fn llvm_emit_object(tm: int, mod: int, filename: string) -> int {
 fn llvm_emit_asm(tm: int, mod: int, filename: string) -> int {
     return dm_llvm_target_machine_emit_to_file(tm, mod, filename, dm_llvm_assembly_file())
 }
+
+extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int
 
 
 -- ============================================================
@@ -2958,6 +2979,13 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
         pp = p_advance(pp)
         let operand = parse_expr_pratt(pp, 8)
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_NOT(), operand.expr, tok.line, tok.col) }
+    }
+
+    -- Dereference *expr (Box[T] -> T)
+    if tok.kind == TK_STAR() {
+        pp = p_advance(pp)
+        let operand = parse_expr_pratt(pp, 8)
+        return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_DEREF(), operand.expr, tok.line, tok.col) }
     }
 
     -- Parenthesized expression
@@ -3634,6 +3662,11 @@ fn parse_stmt(p: Parser) -> ParseStmtResult {
         return parse_region_stmt(pp)
     }
 
+    -- Unsafe block (transparent; fence lives in the Stage 0 checker)
+    if tok.kind == TK_UNSAFE() {
+        return parse_unsafe_stmt(pp)
+    }
+
     -- Expression statement (may also be assignment)
     let expr_result = parse_expr(pp)
     pp = expr_result.p
@@ -3842,6 +3875,20 @@ fn parse_region_stmt(p: Parser) -> ParseStmtResult {
     pp = p_expect(pp, TK_RBRACE())
     let mut s = stmt_new(STMT_REGION(), tok.line, tok.col)
     s.region_name = name_tok.value
+    s.region_body = body.stmts
+    return ParseStmtResult { p: pp, stmt: s }
+}
+
+fn parse_unsafe_stmt(p: Parser) -> ParseStmtResult {
+    let mut pp = p
+    let tok = p_cur(pp)
+    pp = p_advance(pp) -- skip 'unsafe'
+    pp = p_expect(pp, TK_LBRACE())
+    let body = parse_block_body(pp)
+    pp = body.p
+    pp = p_expect(pp, TK_RBRACE())
+    let mut s = stmt_new(STMT_REGION(), tok.line, tok.col)
+    s.region_name = "unsafe"
     s.region_body = body.stmts
     return ParseStmtResult { p: pp, stmt: s }
 }
@@ -4433,10 +4480,14 @@ struct IRGenerator {
     trait_impl_methods: Map[string, string],
     -- User extern function names
     user_extern_fns: Map[string, bool],
+    -- Function name -> return type (IR type string)
+    fn_return_types: Map[string, string],
     -- "StructName.field" -> list elem kind
     field_list_elem_kinds: Map[string, int],
     -- "StructName.field" -> list elem type name
     field_list_elem_types: Map[string, string],
+    -- "StructName.field" -> map kind
+    field_map_kinds: Map[string, int],
     -- Variable name -> true if it's a mut pointer (e.g. mut self)
     mut_ptr_vars: Map[string, bool],
     -- Variable name -> param index for mut pointer params (no alloca created)
@@ -4459,6 +4510,8 @@ struct IRGenerator {
     declarations: List[Declaration],
     -- Completed blocks that need to be added to the function
     completed_blocks: List[IRBasicBlock],
+    -- Variable name -> full type annotation (e.g., "Result[int, string]")
+    var_type_annotations: Map[string, string],
     -- Known user-defined function names (for undefined function detection)
     known_functions: Map[string, bool]
 }
@@ -4488,8 +4541,10 @@ fn ir_generator_new() -> IRGenerator {
         dyn_var_traits: Map_new(),
         trait_impl_methods: Map_new(),
         user_extern_fns: Map_new(),
+        fn_return_types: Map_new(),
         field_list_elem_kinds: Map_new(),
         field_list_elem_types: Map_new(),
+        field_map_kinds: Map_new(),
         mut_ptr_vars: Map_new(),
         param_ptr_map: Map_new(),
         label_counter: 0,
@@ -4503,6 +4558,7 @@ fn ir_generator_new() -> IRGenerator {
         has_impl_type: false,
         declarations: [],
         completed_blocks: [],
+        var_type_annotations: Map_new(),
         known_functions: Map_new()
     }
 }
@@ -4740,17 +4796,6 @@ fn map_builtin_name(name: string) -> string {
     if name == "fs_remove" { return "dm_fs_remove" }
     -- OS builtins
     if name == "os_getenv" { return "dm_os_getenv" }
-    -- Game/terminal builtins
-    if name == "chr" { return "dm_chr" }
-    if name == "flush" { return "dm_flush" }
-    if name == "read_key" { return "dm_read_key" }
-    if name == "read_key_nb" { return "dm_read_key_nb" }
-    if name == "time_ms" { return "dm_time_ms" }
-    if name == "sleep_ms" { return "dm_sleep_ms" }
-    if name == "mem_mark" { return "dm_mem_mark" }
-    if name == "mem_sweep" { return "dm_mem_sweep" }
-    if name == "term_width" { return "dm_term_width" }
-    if name == "term_height" { return "dm_term_height" }
     return name
 }
 
@@ -4781,12 +4826,6 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "fs_getcwd" or name == "fs_readdir" or name == "fs_rename" { return true }
     if name == "fs_mkdir" or name == "fs_remove" { return true }
     if name == "os_getenv" { return true }
-    -- Game/terminal builtins
-    if name == "chr" or name == "flush" { return true }
-    if name == "read_key" or name == "read_key_nb" { return true }
-    if name == "time_ms" or name == "sleep_ms" { return true }
-    if name == "mem_mark" or name == "mem_sweep" { return true }
-    if name == "term_width" or name == "term_height" { return true }
     return false
 }
 
@@ -4835,12 +4874,6 @@ fn builtin_return_type(name: string) -> string {
     if name == "fs_remove" { return "i64" }
     -- OS builtins
     if name == "os_getenv" { return "string" }
-    -- Game/terminal builtins
-    if name == "chr" { return "string" }
-    if name == "read_key" or name == "read_key_nb" { return "i64" }
-    if name == "time_ms" or name == "mem_mark" { return "i64" }
-    if name == "term_width" or name == "term_height" { return "i64" }
-    if name == "flush" or name == "sleep_ms" or name == "mem_sweep" { return "void" }
     return "void"
 }
 
@@ -4877,9 +4910,29 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                 -- Store generic function for later monomorphization
                 g.generic_fn_decls.insert(fd.name, i)
             }
+            -- Track return type for all functions
+            let ret = if len(fd.return_type) > 0 {
+                parse_type_to_ir(fd.return_type)
+            } else {
+                "void"
+            }
+            g.fn_return_types.insert(fd.name, ret)
         } else if decl.kind == DECL_IMPL() {
             let ib = *decl.impl_block
             g = register_impl_methods(g, ib)
+            -- Track return types for impl methods
+            let mut mi = 0
+            while mi < ib.methods.len() {
+                let method = ib.methods[mi]
+                let method_name = ib.target_type + "_" + method.name
+                let mret = if len(method.return_type) > 0 {
+                    parse_type_to_ir(method.return_type)
+                } else {
+                    "void"
+                }
+                g.fn_return_types.insert(method_name, mret)
+                mi = mi + 1
+            }
         }
         i = i + 1
     }
@@ -5181,18 +5234,6 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- OS
     g = declare_extern(g, "dm_os_getenv", "string", "string")
-
-    -- Game/terminal builtins
-    g = declare_extern(g, "dm_chr", "i64", "string")
-    g = declare_extern0(g, "dm_flush", "void")
-    g = declare_extern0(g, "dm_read_key", "i64")
-    g = declare_extern0(g, "dm_read_key_nb", "i64")
-    g = declare_extern0(g, "dm_time_ms", "i64")
-    g = declare_extern(g, "dm_sleep_ms", "i64", "void")
-    g = declare_extern0(g, "dm_mem_mark", "i64")
-    g = declare_extern(g, "dm_mem_sweep", "i64", "void")
-    g = declare_extern0(g, "dm_term_width", "i64")
-    g = declare_extern0(g, "dm_term_height", "i64")
 
     -- String split
     g = declare_extern3(g, "dm_string_split", "ptr", "string", "string", "void")
@@ -5785,6 +5826,11 @@ fn estimate_type_size_gen(gen: IRGenerator, type_name: string) -> int {
 -- GenResult: return both generator and current block
 -- ============================================================
 
+
+-- ============================================================
+-- GenResult: return both generator and current block
+-- ============================================================
+
 struct GenResult {
     gen: IRGenerator,
     block: IRBasicBlock
@@ -5806,6 +5852,37 @@ struct ExprResult {
 
 fn expr_result(g: IRGenerator, b: IRBasicBlock, v: int) -> ExprResult {
     return ExprResult { gen: g, block: b, val_id: v }
+}
+
+-- ============================================================
+-- STATEMENT GENERATION
+-- ============================================================
+fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
+    let obj = *expr.object
+    let field = expr.field
+    let mut sname = ""
+    if obj.kind == EXPR_IDENTIFIER() {
+        if gen.var_struct_types.contains(obj.name) {
+            sname = gen.var_struct_types.get(obj.name)
+        }
+    }
+    if sname == "" {
+        let obj_type = infer_expr_type(gen, obj)
+        if gen.struct_defs.contains(obj_type) {
+            sname = obj_type
+        }
+    }
+    if sname != "" and gen.struct_defs.contains(sname) {
+        let sinfo = gen.struct_defs.get(sname)
+        let mut fi = 0
+        while fi < sinfo.field_names.len() {
+            if sinfo.field_names[fi] == field {
+                return sinfo.field_types[fi]
+            }
+            fi = fi + 1
+        }
+    }
+    return ""
 }
 
 -- ============================================================
@@ -7483,6 +7560,115 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
 -- Port of stage3/src/ir_gen.zig generateExpr
 -- ============================================================
 
+
+-- ============================================================
+-- EXPRESSION IR GENERATION
+-- Main dispatcher and all expression kind handlers
+-- Port of stage3/src/ir_gen.zig generateExpr
+-- ============================================================
+
+-- Parse the error type from a "Result[T, E]" type annotation string
+-- Returns the mapped IR type of E (e.g., "string" or "i64")
+fn parse_result_err_type(type_ann: string) -> string {
+    -- Find first "[" and last "]"
+    let open_bracket = string_find(type_ann, "[")
+    if open_bracket < 0 { return "i64" }
+    let close_bracket = len(type_ann) - 1
+    if char_at(type_ann, close_bracket) != "]" { return "i64" }
+    -- Extract inner: "int, string"
+    let inner = substr(type_ann, open_bracket + 1, close_bracket - open_bracket - 1)
+    -- Find the comma that separates T and E (handle nested brackets)
+    let mut depth = 0
+    let mut ci = 0
+    while ci < len(inner) {
+        let ch = char_at(inner, ci)
+        if ch == "[" { depth = depth + 1 }
+        if ch == "]" { depth = depth - 1 }
+        if ch == "," and depth == 0 {
+            let err_type = string_trim(substr(inner, ci + 1, len(inner) - ci - 1))
+            return map_type_name(err_type)
+        }
+        ci = ci + 1
+    }
+    return "i64"
+}
+
+-- Parse the ok type from a "Result[T, E]" type annotation string
+fn parse_result_ok_type(type_ann: string) -> string {
+    let open_bracket = string_find(type_ann, "[")
+    if open_bracket < 0 { return "i64" }
+    let close_bracket = len(type_ann) - 1
+    if char_at(type_ann, close_bracket) != "]" { return "i64" }
+    let inner = substr(type_ann, open_bracket + 1, close_bracket - open_bracket - 1)
+    -- Find the comma that separates T and E
+    let mut depth = 0
+    let mut ci = 0
+    while ci < len(inner) {
+        let ch = char_at(inner, ci)
+        if ch == "[" { depth = depth + 1 }
+        if ch == "]" { depth = depth - 1 }
+        if ch == "," and depth == 0 {
+            let ok_type = string_trim(substr(inner, 0, ci))
+            return map_type_name(ok_type)
+        }
+        ci = ci + 1
+    }
+    return "i64"
+}
+
+-- Extract Map value type from "Map[K, V]" annotation
+fn extract_map_value_type(map_type: string) -> string {
+    let inner = extract_inner_type(map_type, "Map[")
+    let comma_pos = string_find(inner, ",")
+    if comma_pos >= 0 {
+        let val_type = string_trim(substr(inner, comma_pos + 1, len(inner) - comma_pos - 1))
+        return val_type
+    }
+    return "i64"
+}
+
+-- Infer return type of a method call given the original collection type
+fn infer_collection_method_type(gen: IRGenerator, coll_type: string, method_name: string) -> string {
+    if starts_with(coll_type, "Map[") {
+        if method_name == "get" {
+            let val_type = extract_map_value_type(coll_type)
+            return map_type_name(val_type)
+        }
+        if method_name == "contains" { return "bool" }
+        if method_name == "len" { return "i64" }
+        if method_name == "keys" or method_name == "values" { return "list" }
+    }
+    if starts_with(coll_type, "List[") {
+        if method_name == "len" { return "i64" }
+        if method_name == "pop" {
+            let inner = extract_inner_type(coll_type, "List[")
+            return map_type_name(inner)
+        }
+    }
+    return ""
+}
+
+-- Parse the value type from an "Option[T]" type annotation string
+fn parse_option_value_type(type_ann: string) -> string {
+    let open_bracket = string_find(type_ann, "[")
+    if open_bracket < 0 { return "i64" }
+    let close_bracket = len(type_ann) - 1
+    if char_at(type_ann, close_bracket) != "]" { return "i64" }
+    let inner = substr(type_ann, open_bracket + 1, close_bracket - open_bracket - 1)
+    return map_type_name(string_trim(inner))
+}
+
+-- Look up the Result type annotation for a scrutinee expression
+fn get_scrutinee_type_annotation(gen: IRGenerator, scrut_expr: Expr) -> string {
+    if scrut_expr.kind == EXPR_IDENTIFIER() {
+        let name = scrut_expr.name
+        if gen.var_type_annotations.contains(name) {
+            return gen.var_type_annotations.get(name)
+        }
+    }
+    return ""
+}
+
 fn generate_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     if expr.kind == EXPR_LITERAL_INT() {
         return generate_literal_int(gen, block, expr)
@@ -7736,22 +7922,21 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 
     -- Check for "None" (Option None)
     if name == "None" {
-        -- Build Option { has_value: 0, value: undef }
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_ALLOCA())
-        inst.alloc_type = "i64"
-        inst.result_type = "ptr(i64)"
-        inst.has_result = true
-        b.instructions.push(inst)
-        g.builder.next_id = id + 1
-
-        let mut store = ir_inst_new(g.builder.next_id, OP_STORE())
-        store.store_ptr = ir_val_inst(id)
-        store.store_val = ir_val_int(0)
-        store.has_result = false
-        b.instructions.push(store)
+        -- Build Option { has_value: 0, value: undef } as an aggregate value
+        let mut opt_type = g.current_return_type
+        if starts_with(opt_type, "Option[") == false {
+            opt_type = "Option[i64]"
+        }
+        let insert_id = g.builder.next_id
+        let mut insert_tag = ir_inst_new(insert_id, OP_INSERT_FIELD())
+        insert_tag.field_base = ir_val_undef()
+        insert_tag.field_value = ir_val_int(0)
+        insert_tag.field_index = 0
+        insert_tag.result_type = opt_type
+        insert_tag.has_result = true
+        b.instructions.push(insert_tag)
         g.builder.next_id = g.builder.next_id + 1
-        return expr_result(g, b, id)
+        return expr_result(g, b, insert_id)
     }
 
     -- Look up variable in scope
@@ -9142,6 +9327,46 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
         return expr_result(g, b, id)
     }
 
+    if expr.op == UNOP_DEREF() {
+        -- Dereference Box[T]: load the struct value from the pointer
+        -- Try to determine the Box inner type from tracked info
+        let mut inner_type = "i64"
+
+        -- Check if operand is a variable with known Box inner type
+        let operand_expr = *expr.operand
+        if operand_expr.kind == EXPR_IDENTIFIER() {
+            if g.box_inner_types.contains(operand_expr.name) {
+                inner_type = g.box_inner_types.get(operand_expr.name)
+            }
+        }
+
+        -- Check if operand was a field access that produced a Box value
+        let inst_key = "_inst_" + int_to_string(operand_id)
+        if g.box_inner_types.contains(inst_key) {
+            inner_type = g.box_inner_types.get(inst_key)
+        }
+
+        -- Map the inner type to IR type
+        let load_type = map_type_name(inner_type)
+
+        let id = g.builder.next_id
+        let mut inst = ir_inst_new(id, OP_LOAD())
+        inst.load_ptr = ir_val_inst(operand_id)
+        inst.load_type = load_type
+        inst.result_type = load_type
+        inst.has_result = true
+        b.instructions.push(inst)
+        g.builder.next_id = id + 1
+
+        -- If inner type is a struct, track the result for subsequent field access
+        if g.struct_defs.contains(inner_type) {
+            let result_var = "_deref_" + int_to_string(id)
+            g.var_struct_types.insert(result_var, inner_type)
+        }
+
+        return expr_result(g, b, id)
+    }
+
     -- Unknown unary operator, return operand unchanged
     return expr_result(g, b, operand_id)
 }
@@ -9530,60 +9755,6 @@ fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name
 --   fn apply(f: fn(int) -> int, x: int) -> int { return f(x) }
 -- ============================================================
 
-fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, var_type: string, args: List[Expr]) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Load the function pointer value from the parameter's alloca
-    let alloca_id = g.variable_map.get(var_name)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(alloca_id)
-    load_inst.load_type = "ptr"
-    load_inst.result_type = "ptr"
-    load_inst.has_result = true
-    b.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Generate arguments
-    let mut call_args: List[IRValue] = []
-    let mut i = 0
-    while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
-        g = arg_result.gen
-        b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
-        i = i + 1
-    }
-
-    -- Parse return type from "fn(int, int) -> int"
-    let arrow_pos = string_find(var_type, " -> ")
-    let ret_type_str = if arrow_pos >= 0 {
-        substr(var_type, arrow_pos + 4, len(var_type) - arrow_pos - 4)
-    } else {
-        "void"
-    }
-    let ret_type = map_type_name(ret_type_str)
-    let has_result = ret_type != "void"
-
-    -- Emit OP_CALL_PTR instruction
-    let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL_PTR())
-    inst.callee_val = ir_val_inst(load_id)
-    inst.call_args = call_args
-    inst.result_type = ret_type
-    inst.has_result = has_result
-    b.instructions.push(inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, b, id)
-}
-
--- ============================================================
--- SOME CALL: Option constructor
--- Some(value) -> Option { has_value: 1, value: payload }
--- ============================================================
-
 fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -9912,18 +10083,6 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
 -- ============================================================
 
 -- Helper: join type names with "_" for mangled names
-fn join_types(types: List[string]) -> string {
-    let mut result = ""
-    let mut i = 0
-    while i < types.len() {
-        if i > 0 {
-            result = result + "_"
-        }
-        result = result + map_type_name(types[i])
-        i = i + 1
-    }
-    return result
-}
 
 fn resolve_type_substitution(gen: IRGenerator, type_name: string) -> string {
     -- Direct substitution
@@ -12044,22 +12203,6 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 -- MATCH RESULT TYPE INFERENCE
 -- ============================================================
 
-fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
-    -- Check the first arm's body to infer result type
-    if arms.len() == 0 {
-        return "i64"
-    }
-    let arm = arms[0]
-    if arm.is_expr_body {
-        return infer_expr_type(gen, *arm.body_expr)
-    }
-    return "i64"
-}
-
--- ============================================================
--- LITERAL MATCH (int, string, bool, wildcard)
--- ============================================================
-
 fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -12080,6 +12223,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
     g = gen_advance_label(g)
 
     -- Process each arm as cascading if-else
+    let mut final_block_pushed = false
     let mut arm_idx = 0
     while arm_idx < expr.match_arms.len() {
         let arm = expr.match_arms[arm_idx]
@@ -12177,6 +12321,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                     b.has_terminator = true
                 }
                 g.completed_blocks.push(b)
+                final_block_pushed = true
 
                 -- Wildcard/identifier without guard is the catch-all, break out of loop
                 arm_idx = expr.match_arms.len()
@@ -12261,7 +12406,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
-    g.completed_blocks.push(b)
+    if final_block_pushed == false { g.completed_blocks.push(b) }
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
@@ -12318,6 +12463,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     g = gen_advance_label(g)
 
     -- Process each arm
+    let mut final_block_pushed = false
     let mut arm_idx = 0
     while arm_idx < expr.match_arms.len() {
         let arm = expr.match_arms[arm_idx]
@@ -12373,6 +12519,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 b.has_terminator = true
             }
             g.completed_blocks.push(b)
+            final_block_pushed = true
             arm_idx = expr.match_arms.len()
         } else if pat.kind == PAT_ENUM_VARIANT() {
             -- Find variant tag value from enum definition
@@ -12487,7 +12634,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
         b.terminator = Box_new(term_br(join_label))
         b.has_terminator = true
     }
-    g.completed_blocks.push(b)
+    if final_block_pushed == false { g.completed_blocks.push(b) }
 
     -- Create join block and load result
     let mut join_block = ir_block_new(join_label)
@@ -13717,6 +13864,103 @@ fn generate_comptime_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 -- ============================================================
 
 -- Returns true if the function name is a SIMD builtin intrinsic
+
+fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, var_type: string, args: List[Expr]) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+
+    -- Load the function pointer value from the parameter's alloca
+    let alloca_id = g.variable_map.get(var_name)
+    let load_id = g.builder.next_id
+    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+    load_inst.load_ptr = ir_val_inst(alloca_id)
+    load_inst.load_type = "ptr"
+    load_inst.result_type = "ptr"
+    load_inst.has_result = true
+    b.instructions.push(load_inst)
+    g.builder.next_id = g.builder.next_id + 1
+
+    -- Generate arguments
+    let mut call_args: List[IRValue] = []
+    let mut i = 0
+    while i < args.len() {
+        let arg_result = generate_expr(g, b, args[i])
+        g = arg_result.gen
+        b = arg_result.block
+        call_args.push(ir_val_inst(arg_result.val_id))
+        i = i + 1
+    }
+
+    -- Parse return type from "fn(int, int) -> int"
+    let arrow_pos = string_find(var_type, " -> ")
+    let ret_type_str = if arrow_pos >= 0 {
+        substr(var_type, arrow_pos + 4, len(var_type) - arrow_pos - 4)
+    } else {
+        "void"
+    }
+    let ret_type = map_type_name(ret_type_str)
+    let has_result = ret_type != "void"
+
+    -- Emit OP_CALL_PTR instruction
+    let id = g.builder.next_id
+    let mut inst = ir_inst_new(id, OP_CALL_PTR())
+    inst.callee_val = ir_val_inst(load_id)
+    inst.call_args = call_args
+    inst.result_type = ret_type
+    inst.has_result = has_result
+    b.instructions.push(inst)
+    g.builder.next_id = g.builder.next_id + 1
+
+    return expr_result(g, b, id)
+}
+
+-- ============================================================
+-- SOME CALL: Option constructor
+-- Some(value) -> Option { has_value: 1, value: payload }
+-- ============================================================
+
+fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
+    -- Check the first arm's body to infer result type
+    if arms.len() == 0 {
+        return "i64"
+    }
+    let arm = arms[0]
+    if arm.is_expr_body {
+        return infer_expr_type(gen, *arm.body_expr)
+    }
+    return "i64"
+}
+
+-- ============================================================
+-- LITERAL MATCH (int, string, bool, wildcard)
+-- ============================================================
+
+fn join_types(types: List[string]) -> string {
+    let mut result = ""
+    let mut i = 0
+    while i < types.len() {
+        if i > 0 {
+            result = result + "_"
+        }
+        result = result + map_type_name(types[i])
+        i = i + 1
+    }
+    return result
+}
+
+
+-- ============================================================
+-- SIMD Builtin IR Generation
+-- Handles simd_splat_*, simd_set_*, simd_add/sub/mul/div,
+-- and simd_extract intrinsic function calls.
+-- Port of stage3/src/ir_gen.zig SIMD handling
+-- ============================================================
+
+-- ============================================================
+-- SIMD BUILTIN DETECTION
+-- ============================================================
+
+-- Returns true if the function name is a SIMD builtin intrinsic
 fn is_simd_builtin(name: string) -> bool {
     if starts_with(name, "simd_splat_") { return true }
     if starts_with(name, "simd_set_") { return true }
@@ -14348,136 +14592,6 @@ fn COMPTIME_MAX_DEPTH() -> int { return 64 }
 fn eval_comptime_expr(gen: IRGenerator, e: Expr) -> IRValue {
     return eval_comptime_expr_d(gen, e, 0)
 }
-
-fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
-    -- Integer literal
-    if e.kind == EXPR_LITERAL_INT() {
-        return ir_val_int(e.int_val)
-    }
-
-    -- Float literal
-    if e.kind == EXPR_LITERAL_FLOAT() {
-        return ir_val_float(e.float_val)
-    }
-
-    -- Bool literal
-    if e.kind == EXPR_LITERAL_BOOL() {
-        return ir_val_bool(e.bool_val)
-    }
-
-    -- String literal
-    if e.kind == EXPR_LITERAL_STRING() {
-        return ir_val_string(e.str_val)
-    }
-
-    -- Binary expression
-    if e.kind == EXPR_BINARY() {
-        let lv = eval_comptime_expr_d(gen, *e.left, depth)
-        let rv = eval_comptime_expr_d(gen, *e.right, depth)
-        return eval_binary_comptime_vals(gen, e.op, lv, rv)
-    }
-
-    -- Unary expression
-    if e.kind == EXPR_UNARY() {
-        return eval_unary_comptime(gen, e)
-    }
-
-    -- Identifier: look up in module globals (reverse search for correct scoping)
-    if e.kind == EXPR_IDENTIFIER() {
-        return eval_identifier_comptime(gen, e.name)
-    }
-
-    -- If expression
-    if e.kind == EXPR_IF() {
-        let cond = eval_comptime_expr_d(gen, *e.condition, depth)
-        if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
-            return eval_comptime_expr_d(gen, *e.then_branch, depth)
-        }
-        if e.has_else {
-            return eval_comptime_expr_d(gen, *e.else_branch, depth)
-        }
-        return ir_val_int(0)
-    }
-
-    -- Block expression
-    if e.kind == EXPR_BLOCK() {
-        return eval_block_comptime_d(gen, e, depth)
-    }
-
-    -- Function call
-    if e.kind == EXPR_FUNCTION_CALL() {
-        return eval_call_comptime(gen, e, depth)
-    }
-
-    -- Match expression
-    if e.kind == EXPR_MATCH() {
-        return eval_match_comptime(gen, e)
-    }
-
-    -- Grouped expression (parenthesized)
-    if e.kind == EXPR_GROUPED() {
-        let inner = *e.operand
-        return eval_comptime_expr_d(gen, inner, depth)
-    }
-
-    -- Comptime expression wrapper (e.g., `comptime expr`)
-    if e.kind == EXPR_COMPTIME() {
-        let inner = *e.operand
-        return eval_comptime_expr_d(gen, inner, depth)
-    }
-
-    -- Array literal: store elements as indexed globals (arr__0, arr__1, ..., arr__len)
-    if e.kind == EXPR_ARRAY_LITERAL() {
-        let arr_name = "__ct_arr_" + int_to_string(gen.builder.next_id)
-        let mut g = gen
-        let mut ei = 0
-        while ei < e.elements.len() {
-            let elem_val = eval_comptime_expr_d(g, e.elements[ei], depth)
-            let elem_name = arr_name + "__" + int_to_string(ei)
-            let mut gl = ir_global_new(elem_name, "i64")
-            gl.init_value = elem_val
-            gl.has_init = true
-            gl.is_const = true
-            g.ir_mod.globals.push(gl)
-            ei = ei + 1
-        }
-        -- Store array length
-        let len_name = arr_name + "__len"
-        let mut len_gl = ir_global_new(len_name, "i64")
-        len_gl.init_value = ir_val_int(e.elements.len())
-        len_gl.has_init = true
-        len_gl.is_const = true
-        g.ir_mod.globals.push(len_gl)
-        -- Store the array name marker so identifier lookup can find it
-        let mut marker = ir_global_new(arr_name, "i64")
-        marker.init_value = ir_val_string(arr_name)
-        marker.has_init = true
-        marker.is_const = true
-        g.ir_mod.globals.push(marker)
-        return ir_val_string(arr_name)
-    }
-
-    -- Index access: load from a comptime array at constant index
-    if e.kind == EXPR_INDEX_ACCESS() {
-        let obj_val = eval_comptime_expr_d(gen, *e.object, depth)
-        let idx_val = eval_comptime_expr_d(gen, *e.index, depth)
-        if obj_val.kind == VAL_CONST_STRING() and idx_val.kind == VAL_CONST_INT() {
-            -- obj_val.str_val is the array name, look up element
-            let elem_name = obj_val.str_val + "__" + int_to_string(idx_val.int_val)
-            return eval_identifier_comptime(gen, elem_name)
-        }
-        return ir_val_int(0)
-    }
-
-    -- Unsupported expression kind
-    return ir_val_int(0)
-}
-
--- ============================================================
--- IDENTIFIER LOOKUP
--- ============================================================
-
--- Look up an identifier in the module's global constants.
 fn eval_identifier_comptime(gen: IRGenerator, name: string) -> IRValue {
     -- Search in reverse order so innermost bindings (e.g. recursive call params) shadow outer ones
     let mut i = gen.ir_mod.globals.len() - 1
@@ -14596,56 +14710,6 @@ fn eval_binary_comptime(gen: IRGenerator, e: Expr) -> IRValue {
 }
 
 -- Binary comptime with pre-evaluated values
-fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
-    if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
-        let a = lhs.int_val
-        let b = rhs.int_val
-        if op == BINOP_ADD() { return ir_val_int(a + b) }
-        if op == BINOP_SUB() { return ir_val_int(a - b) }
-        if op == BINOP_MUL() { return ir_val_int(a * b) }
-        if op == BINOP_DIV() { if b != 0 { return ir_val_int(a / b) } return ir_val_int(0) }
-        if op == BINOP_MOD() { if b != 0 { return ir_val_int(a % b) } return ir_val_int(0) }
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-        if op == BINOP_LT() { return ir_val_bool(a < b) }
-        if op == BINOP_LE() { return ir_val_bool(a <= b) }
-        if op == BINOP_GT() { return ir_val_bool(a > b) }
-        if op == BINOP_GE() { return ir_val_bool(a >= b) }
-    }
-    if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_FLOAT() {
-        let a = lhs.float_val
-        let b = rhs.float_val
-        if op == BINOP_ADD() { return ir_val_float(a + b) }
-        if op == BINOP_SUB() { return ir_val_float(a - b) }
-        if op == BINOP_MUL() { return ir_val_float(a * b) }
-        if op == BINOP_DIV() { return ir_val_float(a / b) }
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-        if op == BINOP_LT() { return ir_val_bool(a < b) }
-        if op == BINOP_LE() { return ir_val_bool(a <= b) }
-        if op == BINOP_GT() { return ir_val_bool(a > b) }
-        if op == BINOP_GE() { return ir_val_bool(a >= b) }
-    }
-    if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
-        if op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
-        if op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
-        if op == BINOP_EQ() { return ir_val_bool(lhs.bool_val == rhs.bool_val) }
-        if op == BINOP_NE() { return ir_val_bool(lhs.bool_val != rhs.bool_val) }
-    }
-    if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
-        if op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
-        if op == BINOP_EQ() { return ir_val_bool(lhs.str_val == rhs.str_val) }
-        if op == BINOP_NE() { return ir_val_bool(lhs.str_val != rhs.str_val) }
-    }
-    return ir_val_int(0)
-}
-
--- ============================================================
--- UNARY EXPRESSION EVALUATION
--- ============================================================
-
--- Evaluate a unary expression at compile time.
--- Supports negation of int/float and logical not of bool.
 fn eval_unary_comptime(gen: IRGenerator, e: Expr) -> IRValue {
     let operand_val = eval_comptime_expr(gen, *e.operand)
 
@@ -14712,242 +14776,6 @@ fn eval_if_comptime(gen: IRGenerator, e: Expr) -> IRValue {
 fn eval_block_comptime(gen: IRGenerator, e: Expr) -> IRValue {
     return eval_block_comptime_d(gen, e, 0)
 }
-
-fn eval_block_comptime_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
-    -- Process statements in the block first
-    let mut g = gen
-    let mut last_val = ir_val_int(0)
-    let mut i = 0
-    while i < e.stmts.len() {
-        let stmt = e.stmts[i]
-
-        -- Handle return statements - return immediately
-        if stmt.kind == STMT_RETURN() and stmt.has_ret_value {
-            return eval_comptime_expr_d(g, *stmt.ret_value, depth)
-        }
-
-        -- Handle let bindings - store in globals for subsequent lookups
-        if stmt.kind == STMT_LET() {
-            let val_expr = *stmt.let_value
-            if val_expr.kind != EXPR_LITERAL_NULL() {
-                -- Array literal: inline element global creation on g directly
-                -- to avoid losing them in a by-value function call copy.
-                if val_expr.kind == EXPR_ARRAY_LITERAL() {
-                    let arr_name = "__ct_arr_" + int_to_string(g.builder.next_id)
-                    let mut ei = 0
-                    while ei < val_expr.elements.len() {
-                        let elem_val = eval_comptime_expr_d(g, val_expr.elements[ei], depth)
-                        let elem_name = arr_name + "__" + int_to_string(ei)
-                        let mut elem_gl = ir_global_new(elem_name, "i64")
-                        elem_gl.init_value = elem_val
-                        elem_gl.has_init = true
-                        elem_gl.is_const = true
-                        g.ir_mod.globals.push(elem_gl)
-                        ei = ei + 1
-                    }
-                    let len_name = arr_name + "__len"
-                    let mut len_gl = ir_global_new(len_name, "i64")
-                    len_gl.init_value = ir_val_int(val_expr.elements.len())
-                    len_gl.has_init = true
-                    len_gl.is_const = true
-                    g.ir_mod.globals.push(len_gl)
-                    let mut marker = ir_global_new(arr_name, "i64")
-                    marker.init_value = ir_val_string(arr_name)
-                    marker.has_init = true
-                    marker.is_const = true
-                    g.ir_mod.globals.push(marker)
-                    let mut global = ir_global_new(stmt.let_name, "i64")
-                    global.init_value = ir_val_string(arr_name)
-                    global.has_init = true
-                    global.is_const = true
-                    g.ir_mod.globals.push(global)
-                } else {
-                    let val = eval_comptime_expr_d(g, val_expr, depth)
-                    let mut global = ir_global_new(stmt.let_name, "i64")
-                    global.init_value = val
-                    global.has_init = true
-                    global.is_const = true
-                    g.ir_mod.globals.push(global)
-                }
-            }
-        }
-
-        -- Handle expression statements - last one is the block result
-        if stmt.kind == STMT_EXPRESSION() {
-            last_val = eval_comptime_expr_d(g, *stmt.expr, depth)
-        }
-
-        -- Handle assignment statements
-        if stmt.kind == STMT_ASSIGNMENT() {
-            let val = eval_comptime_expr_d(g, *stmt.assign_value, depth)
-            let target_expr = *stmt.assign_target
-            if target_expr.kind == EXPR_IDENTIFIER() {
-                let target_name = target_expr.name
-                let mut gi = g.ir_mod.globals.len() - 1
-                while gi >= 0 {
-                    if g.ir_mod.globals[gi].name == target_name {
-                        let mut glob = g.ir_mod.globals[gi]
-                        glob.init_value = val
-                        g.ir_mod.globals[gi] = glob
-                        gi = -1
-                    } else {
-                        gi = gi - 1
-                    }
-                }
-            }
-        }
-
-        -- Handle while loops
-        if stmt.kind == STMT_WHILE() {
-            let mut loop_count = 0
-            let mut looping = true
-            while looping and loop_count < 10000 {
-                let cond = eval_comptime_expr_d(g, *stmt.while_cond, depth)
-                let mut cond_true = false
-                if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
-                    cond_true = true
-                }
-                if cond.kind == VAL_CONST_INT() and cond.int_val != 0 {
-                    cond_true = true
-                }
-                if cond_true == false {
-                    looping = false
-                } else {
-                    let body_val = eval_comptime_stmts(g, stmt.while_body, depth + 1)
-                    if body_val.kind == VAL_BREAK_SENTINEL() {
-                        looping = false
-                    } else if body_val.kind != VAL_UNDEF() {
-                        return body_val
-                    }
-                    loop_count = loop_count + 1
-                }
-            }
-        }
-
-        -- Handle for loops (range-based and array-based)
-        if stmt.kind == STMT_FOR() {
-            let iter_expr = *stmt.for_iter
-            if iter_expr.kind == EXPR_RANGE() {
-                -- Range for loop: for v in start..end
-                let start_val = eval_comptime_expr_d(g, *iter_expr.left, depth)
-                let end_val = eval_comptime_expr_d(g, *iter_expr.right, depth)
-                if start_val.kind == VAL_CONST_INT() and end_val.kind == VAL_CONST_INT() {
-                    let mut fi = start_val.int_val
-                    while fi < end_val.int_val {
-                        let mut loop_var = ir_global_new(stmt.for_var, "i64")
-                        loop_var.init_value = ir_val_int(fi)
-                        loop_var.has_init = true
-                        loop_var.is_const = true
-                        g.ir_mod.globals.push(loop_var)
-                        let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
-                        if body_val.kind == VAL_BREAK_SENTINEL() {
-                            fi = end_val.int_val
-                        } else if body_val.kind != VAL_UNDEF() {
-                            return body_val
-                        }
-                        fi = fi + 1
-                    }
-                }
-            } else {
-                -- Array for loop: for v in arr
-                let arr_val = eval_comptime_expr_d(g, iter_expr, depth)
-                if arr_val.kind == VAL_CONST_STRING() {
-                    let arr_name = arr_val.str_val
-                    let len_val = eval_identifier_comptime(g, arr_name + "__len")
-                    if len_val.kind == VAL_CONST_INT() {
-                        let mut fi = 0
-                        while fi < len_val.int_val {
-                            let elem_val = eval_identifier_comptime(g, arr_name + "__" + int_to_string(fi))
-                            let mut loop_var = ir_global_new(stmt.for_var, "i64")
-                            loop_var.init_value = elem_val
-                            loop_var.has_init = true
-                            loop_var.is_const = true
-                            g.ir_mod.globals.push(loop_var)
-                            let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
-                            if body_val.kind == VAL_BREAK_SENTINEL() {
-                                fi = len_val.int_val
-                            } else if body_val.kind != VAL_UNDEF() {
-                                return body_val
-                            }
-                            fi = fi + 1
-                        }
-                    }
-                }
-            }
-        }
-
-        -- Handle match statements
-        if stmt.kind == STMT_MATCH() {
-            -- The parser stores the full EXPR_MATCH in stmt.match_expr
-            -- (match_stmt_arms is always empty). Evaluate the match expression
-            -- directly, which delegates to eval_match_comptime for correct
-            -- scrutinee/arm resolution.
-            let match_val = eval_comptime_expr_d(g, *stmt.match_expr, depth)
-            last_val = match_val
-        }
-
-        -- Handle if statements with potential returns
-        if stmt.kind == STMT_IF() {
-            let cond = eval_comptime_expr_d(g, *stmt.if_cond, depth)
-            if cond.kind == VAL_CONST_BOOL() {
-                if cond.bool_val {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                }
-            }
-            if cond.kind == VAL_CONST_INT() {
-                if cond.int_val != 0 {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                } else if stmt.has_else_branch {
-                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
-                    if branch_val.kind == VAL_BREAK_SENTINEL() {
-                        return branch_val
-                    }
-                    if branch_val.kind != VAL_UNDEF() {
-                        return branch_val
-                    }
-                }
-            }
-        }
-
-        i = i + 1
-    }
-
-    -- If the block has a result expression, evaluate it after processing statements
-    if e.has_result {
-        return eval_comptime_expr_d(g, *e.result, depth)
-    }
-
-    return last_val
-}
-
--- ============================================================
--- FUNCTION CALL EVALUATION
--- ============================================================
-
--- Evaluate a function call at compile time.
--- Looks up the function in the generator's declaration list,
--- substitutes parameters, and evaluates the body.
--- Supports recursion up to COMPTIME_MAX_DEPTH.
 fn eval_call_comptime(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
     -- Prevent infinite recursion
     if depth >= COMPTIME_MAX_DEPTH() {
@@ -15523,6 +15351,443 @@ fn comptime_value_type(val: IRValue) -> string {
 -- ============================================================
 
 -- Bridge functions declared in llvm_bridge.c but not yet in llvm.dm
+
+fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
+    if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
+        let a = lhs.int_val
+        let b = rhs.int_val
+        if op == BINOP_ADD() { return ir_val_int(a + b) }
+        if op == BINOP_SUB() { return ir_val_int(a - b) }
+        if op == BINOP_MUL() { return ir_val_int(a * b) }
+        if op == BINOP_DIV() { if b != 0 { return ir_val_int(a / b) } return ir_val_int(0) }
+        if op == BINOP_MOD() { if b != 0 { return ir_val_int(a % b) } return ir_val_int(0) }
+        if op == BINOP_EQ() { return ir_val_bool(a == b) }
+        if op == BINOP_NE() { return ir_val_bool(a != b) }
+        if op == BINOP_LT() { return ir_val_bool(a < b) }
+        if op == BINOP_LE() { return ir_val_bool(a <= b) }
+        if op == BINOP_GT() { return ir_val_bool(a > b) }
+        if op == BINOP_GE() { return ir_val_bool(a >= b) }
+    }
+    if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_FLOAT() {
+        let a = lhs.float_val
+        let b = rhs.float_val
+        if op == BINOP_ADD() { return ir_val_float(a + b) }
+        if op == BINOP_SUB() { return ir_val_float(a - b) }
+        if op == BINOP_MUL() { return ir_val_float(a * b) }
+        if op == BINOP_DIV() { return ir_val_float(a / b) }
+        if op == BINOP_EQ() { return ir_val_bool(a == b) }
+        if op == BINOP_NE() { return ir_val_bool(a != b) }
+        if op == BINOP_LT() { return ir_val_bool(a < b) }
+        if op == BINOP_LE() { return ir_val_bool(a <= b) }
+        if op == BINOP_GT() { return ir_val_bool(a > b) }
+        if op == BINOP_GE() { return ir_val_bool(a >= b) }
+    }
+    if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
+        if op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
+        if op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
+        if op == BINOP_EQ() { return ir_val_bool(lhs.bool_val == rhs.bool_val) }
+        if op == BINOP_NE() { return ir_val_bool(lhs.bool_val != rhs.bool_val) }
+    }
+    if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
+        if op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
+        if op == BINOP_EQ() { return ir_val_bool(lhs.str_val == rhs.str_val) }
+        if op == BINOP_NE() { return ir_val_bool(lhs.str_val != rhs.str_val) }
+    }
+    return ir_val_int(0)
+}
+
+-- ============================================================
+-- UNARY EXPRESSION EVALUATION
+-- ============================================================
+
+-- Evaluate a unary expression at compile time.
+-- Supports negation of int/float and logical not of bool.
+
+fn eval_block_comptime_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
+    -- Process statements in the block first
+    let mut g = gen
+    let mut last_val = ir_val_int(0)
+    let mut i = 0
+    while i < e.stmts.len() {
+        let stmt = e.stmts[i]
+
+        -- Handle return statements - return immediately
+        if stmt.kind == STMT_RETURN() and stmt.has_ret_value {
+            return eval_comptime_expr_d(g, *stmt.ret_value, depth)
+        }
+
+        -- Handle let bindings - store in globals for subsequent lookups
+        if stmt.kind == STMT_LET() {
+            let val_expr = *stmt.let_value
+            if val_expr.kind != EXPR_LITERAL_NULL() {
+                -- Array literal: inline element global creation on g directly
+                -- to avoid losing them in a by-value function call copy.
+                if val_expr.kind == EXPR_ARRAY_LITERAL() {
+                    let arr_name = "__ct_arr_" + int_to_string(g.builder.next_id)
+                    let mut ei = 0
+                    while ei < val_expr.elements.len() {
+                        let elem_val = eval_comptime_expr_d(g, val_expr.elements[ei], depth)
+                        let elem_name = arr_name + "__" + int_to_string(ei)
+                        let mut elem_gl = ir_global_new(elem_name, "i64")
+                        elem_gl.init_value = elem_val
+                        elem_gl.has_init = true
+                        elem_gl.is_const = true
+                        g.ir_mod.globals.push(elem_gl)
+                        ei = ei + 1
+                    }
+                    let len_name = arr_name + "__len"
+                    let mut len_gl = ir_global_new(len_name, "i64")
+                    len_gl.init_value = ir_val_int(val_expr.elements.len())
+                    len_gl.has_init = true
+                    len_gl.is_const = true
+                    g.ir_mod.globals.push(len_gl)
+                    let mut marker = ir_global_new(arr_name, "i64")
+                    marker.init_value = ir_val_string(arr_name)
+                    marker.has_init = true
+                    marker.is_const = true
+                    g.ir_mod.globals.push(marker)
+                    let mut global = ir_global_new(stmt.let_name, "i64")
+                    global.init_value = ir_val_string(arr_name)
+                    global.has_init = true
+                    global.is_const = true
+                    g.ir_mod.globals.push(global)
+                } else {
+                    let val = eval_comptime_expr_d(g, val_expr, depth)
+                    let mut global = ir_global_new(stmt.let_name, "i64")
+                    global.init_value = val
+                    global.has_init = true
+                    global.is_const = true
+                    g.ir_mod.globals.push(global)
+                }
+            }
+        }
+
+        -- Handle expression statements - last one is the block result
+        if stmt.kind == STMT_EXPRESSION() {
+            last_val = eval_comptime_expr_d(g, *stmt.expr, depth)
+        }
+
+        -- Handle assignment statements
+        if stmt.kind == STMT_ASSIGNMENT() {
+            let val = eval_comptime_expr_d(g, *stmt.assign_value, depth)
+            let target_expr = *stmt.assign_target
+            if target_expr.kind == EXPR_IDENTIFIER() {
+                let target_name = target_expr.name
+                let mut gi = g.ir_mod.globals.len() - 1
+                while gi >= 0 {
+                    if g.ir_mod.globals[gi].name == target_name {
+                        let mut glob = g.ir_mod.globals[gi]
+                        glob.init_value = val
+                        g.ir_mod.globals[gi] = glob
+                        gi = -1
+                    } else {
+                        gi = gi - 1
+                    }
+                }
+            }
+        }
+
+        -- Handle while loops
+        if stmt.kind == STMT_WHILE() {
+            let mut loop_count = 0
+            let mut looping = true
+            while looping and loop_count < 10000 {
+                let cond = eval_comptime_expr_d(g, *stmt.while_cond, depth)
+                let mut cond_true = false
+                if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
+                    cond_true = true
+                }
+                if cond.kind == VAL_CONST_INT() and cond.int_val != 0 {
+                    cond_true = true
+                }
+                if cond_true == false {
+                    looping = false
+                } else {
+                    let body_val = eval_comptime_stmts(g, stmt.while_body, depth + 1)
+                    if body_val.kind == VAL_BREAK_SENTINEL() {
+                        looping = false
+                    } else if body_val.kind != VAL_UNDEF() {
+                        return body_val
+                    }
+                    loop_count = loop_count + 1
+                }
+            }
+        }
+
+        -- Handle for loops (range-based and array-based)
+        if stmt.kind == STMT_FOR() {
+            let iter_expr = *stmt.for_iter
+            if iter_expr.kind == EXPR_RANGE() {
+                -- Range for loop: for v in start..end
+                let start_val = eval_comptime_expr_d(g, *iter_expr.left, depth)
+                let end_val = eval_comptime_expr_d(g, *iter_expr.right, depth)
+                if start_val.kind == VAL_CONST_INT() and end_val.kind == VAL_CONST_INT() {
+                    let mut fi = start_val.int_val
+                    while fi < end_val.int_val {
+                        let mut loop_var = ir_global_new(stmt.for_var, "i64")
+                        loop_var.init_value = ir_val_int(fi)
+                        loop_var.has_init = true
+                        loop_var.is_const = true
+                        g.ir_mod.globals.push(loop_var)
+                        let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
+                        if body_val.kind == VAL_BREAK_SENTINEL() {
+                            fi = end_val.int_val
+                        } else if body_val.kind != VAL_UNDEF() {
+                            return body_val
+                        }
+                        fi = fi + 1
+                    }
+                }
+            } else {
+                -- Array for loop: for v in arr
+                let arr_val = eval_comptime_expr_d(g, iter_expr, depth)
+                if arr_val.kind == VAL_CONST_STRING() {
+                    let arr_name = arr_val.str_val
+                    let len_val = eval_identifier_comptime(g, arr_name + "__len")
+                    if len_val.kind == VAL_CONST_INT() {
+                        let mut fi = 0
+                        while fi < len_val.int_val {
+                            let elem_val = eval_identifier_comptime(g, arr_name + "__" + int_to_string(fi))
+                            let mut loop_var = ir_global_new(stmt.for_var, "i64")
+                            loop_var.init_value = elem_val
+                            loop_var.has_init = true
+                            loop_var.is_const = true
+                            g.ir_mod.globals.push(loop_var)
+                            let body_val = eval_comptime_stmts(g, stmt.for_body, depth + 1)
+                            if body_val.kind == VAL_BREAK_SENTINEL() {
+                                fi = len_val.int_val
+                            } else if body_val.kind != VAL_UNDEF() {
+                                return body_val
+                            }
+                            fi = fi + 1
+                        }
+                    }
+                }
+            }
+        }
+
+        -- Handle match statements
+        if stmt.kind == STMT_MATCH() {
+            -- The parser stores the full EXPR_MATCH in stmt.match_expr
+            -- (match_stmt_arms is always empty). Evaluate the match expression
+            -- directly, which delegates to eval_match_comptime for correct
+            -- scrutinee/arm resolution.
+            let match_val = eval_comptime_expr_d(g, *stmt.match_expr, depth)
+            last_val = match_val
+        }
+
+        -- Handle if statements with potential returns
+        if stmt.kind == STMT_IF() {
+            let cond = eval_comptime_expr_d(g, *stmt.if_cond, depth)
+            if cond.kind == VAL_CONST_BOOL() {
+                if cond.bool_val {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                } else if stmt.has_else_branch {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                }
+            }
+            if cond.kind == VAL_CONST_INT() {
+                if cond.int_val != 0 {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_then, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                } else if stmt.has_else_branch {
+                    let branch_val = eval_comptime_stmts(g, stmt.if_else, depth)
+                    if branch_val.kind == VAL_BREAK_SENTINEL() {
+                        return branch_val
+                    }
+                    if branch_val.kind != VAL_UNDEF() {
+                        return branch_val
+                    }
+                }
+            }
+        }
+
+        i = i + 1
+    }
+
+    -- If the block has a result expression, evaluate it after processing statements
+    if e.has_result {
+        return eval_comptime_expr_d(g, *e.result, depth)
+    }
+
+    return last_val
+}
+
+-- ============================================================
+-- FUNCTION CALL EVALUATION
+-- ============================================================
+
+-- Evaluate a function call at compile time.
+-- Looks up the function in the generator's declaration list,
+-- substitutes parameters, and evaluates the body.
+-- Supports recursion up to COMPTIME_MAX_DEPTH.
+
+fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
+    -- Integer literal
+    if e.kind == EXPR_LITERAL_INT() {
+        return ir_val_int(e.int_val)
+    }
+
+    -- Float literal
+    if e.kind == EXPR_LITERAL_FLOAT() {
+        return ir_val_float(e.float_val)
+    }
+
+    -- Bool literal
+    if e.kind == EXPR_LITERAL_BOOL() {
+        return ir_val_bool(e.bool_val)
+    }
+
+    -- String literal
+    if e.kind == EXPR_LITERAL_STRING() {
+        return ir_val_string(e.str_val)
+    }
+
+    -- Binary expression
+    if e.kind == EXPR_BINARY() {
+        let lv = eval_comptime_expr_d(gen, *e.left, depth)
+        let rv = eval_comptime_expr_d(gen, *e.right, depth)
+        return eval_binary_comptime_vals(gen, e.op, lv, rv)
+    }
+
+    -- Unary expression
+    if e.kind == EXPR_UNARY() {
+        return eval_unary_comptime(gen, e)
+    }
+
+    -- Identifier: look up in module globals (reverse search for correct scoping)
+    if e.kind == EXPR_IDENTIFIER() {
+        return eval_identifier_comptime(gen, e.name)
+    }
+
+    -- If expression
+    if e.kind == EXPR_IF() {
+        let cond = eval_comptime_expr_d(gen, *e.condition, depth)
+        if cond.kind == VAL_CONST_BOOL() and cond.bool_val {
+            return eval_comptime_expr_d(gen, *e.then_branch, depth)
+        }
+        if e.has_else {
+            return eval_comptime_expr_d(gen, *e.else_branch, depth)
+        }
+        return ir_val_int(0)
+    }
+
+    -- Block expression
+    if e.kind == EXPR_BLOCK() {
+        return eval_block_comptime_d(gen, e, depth)
+    }
+
+    -- Function call
+    if e.kind == EXPR_FUNCTION_CALL() {
+        return eval_call_comptime(gen, e, depth)
+    }
+
+    -- Match expression
+    if e.kind == EXPR_MATCH() {
+        return eval_match_comptime(gen, e)
+    }
+
+    -- Grouped expression (parenthesized)
+    if e.kind == EXPR_GROUPED() {
+        let inner = *e.operand
+        return eval_comptime_expr_d(gen, inner, depth)
+    }
+
+    -- Comptime expression wrapper (e.g., `comptime expr`)
+    if e.kind == EXPR_COMPTIME() {
+        let inner = *e.operand
+        return eval_comptime_expr_d(gen, inner, depth)
+    }
+
+    -- Array literal: store elements as indexed globals (arr__0, arr__1, ..., arr__len)
+    if e.kind == EXPR_ARRAY_LITERAL() {
+        let arr_name = "__ct_arr_" + int_to_string(gen.builder.next_id)
+        let mut g = gen
+        let mut ei = 0
+        while ei < e.elements.len() {
+            let elem_val = eval_comptime_expr_d(g, e.elements[ei], depth)
+            let elem_name = arr_name + "__" + int_to_string(ei)
+            let mut gl = ir_global_new(elem_name, "i64")
+            gl.init_value = elem_val
+            gl.has_init = true
+            gl.is_const = true
+            g.ir_mod.globals.push(gl)
+            ei = ei + 1
+        }
+        -- Store array length
+        let len_name = arr_name + "__len"
+        let mut len_gl = ir_global_new(len_name, "i64")
+        len_gl.init_value = ir_val_int(e.elements.len())
+        len_gl.has_init = true
+        len_gl.is_const = true
+        g.ir_mod.globals.push(len_gl)
+        -- Store the array name marker so identifier lookup can find it
+        let mut marker = ir_global_new(arr_name, "i64")
+        marker.init_value = ir_val_string(arr_name)
+        marker.has_init = true
+        marker.is_const = true
+        g.ir_mod.globals.push(marker)
+        return ir_val_string(arr_name)
+    }
+
+    -- Index access: load from a comptime array at constant index
+    if e.kind == EXPR_INDEX_ACCESS() {
+        let obj_val = eval_comptime_expr_d(gen, *e.object, depth)
+        let idx_val = eval_comptime_expr_d(gen, *e.index, depth)
+        if obj_val.kind == VAL_CONST_STRING() and idx_val.kind == VAL_CONST_INT() {
+            -- obj_val.str_val is the array name, look up element
+            let elem_name = obj_val.str_val + "__" + int_to_string(idx_val.int_val)
+            return eval_identifier_comptime(gen, elem_name)
+        }
+        return ir_val_int(0)
+    }
+
+    -- Unsupported expression kind
+    return ir_val_int(0)
+}
+
+-- ============================================================
+-- IDENTIFIER LOOKUP
+-- ============================================================
+
+-- Look up an identifier in the module's global constants.
+
+
+-- ============================================================
+-- LLVM IR Generator
+-- Translates dAImond IR (from ir.dm) into LLVM IR using
+-- the LLVM-C bridge functions declared in llvm.dm.
+--
+-- Key design: All LLVM refs (context, module, builder, types,
+-- values, basic blocks) are represented as int (int64_t on C side).
+--
+-- String ABI: dm_string is { ptr, i64, i64 } (24 bytes) which
+-- exceeds the x86-64 SysV ABI 16-byte register threshold.
+-- Runtime functions using dm_string are called through thin
+-- C wrapper functions (llvm_dm_*) with pointer-based ABI:
+-- - Returns dm_string -> wrapper takes dm_string* as first param (sret)
+-- - Takes dm_string -> wrapper takes const dm_string* (pointer)
+-- String values in LLVM IR are pointers to stack-allocated dm_string structs.
+-- ============================================================
+
+-- Bridge functions declared in llvm_bridge.c but not yet in llvm.dm
 extern fn dm_llvm_struct_set_body(struct_ty: int, fields: int, field_count: int, is_packed: int)extern fn dm_llvm_add_incoming(phi: int, values: int, blocks: int, count: int)extern fn dm_llvm_const_struct(ctx: int, values: int, count: int, is_packed: int) -> int
 extern fn dm_llvm_const_array(elem_ty: int, values: int, count: int) -> int
 
@@ -15683,6 +15948,8 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
     if type_name == "ptr" { return dm_llvm_pointer_type(ctx) }
     -- Pointer types: ptr(...)
     if starts_with(type_name, "ptr(") { return dm_llvm_pointer_type(ctx) }
+    -- Box types are heap pointers
+    if starts_with(type_name, "Box[") { return dm_llvm_pointer_type(ctx) }
     -- List types: use dm_string type {ptr, i64, i64} since lists share the same layout
     if starts_with(type_name, "dm_list_") or starts_with(type_name, "list") or type_name == "list" or starts_with(type_name, "List[") {
         if gen.has_dm_string_type { return gen.dm_string_type }
@@ -15768,6 +16035,64 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
 -- ============================================================
 -- STRUCT TYPE DECLARATION
 -- ============================================================
+
+fn register_builtin_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
+    let mut g = gen
+    let ctx = g.context
+
+    -- Register Result type: { i64 tag, i64 ok_val, i64 err_val }
+    -- All fields are i64 for uniform insertvalue/extractvalue (avoids i32/i64 mismatch)
+    if g.struct_type_map.contains("result") == false {
+        let result_struct = dm_llvm_struct_create_named(ctx, "result")
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_struct_set_body_buf(result_struct, 0)
+        g.struct_type_map.insert("result", result_struct)
+        g.struct_type_map.insert("Result", result_struct)
+    }
+
+    -- Register Option type: { i64 has_value, i64 value }
+    if g.struct_type_map.contains("option") == false {
+        let option_struct = dm_llvm_struct_create_named(ctx, "option")
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+        dm_llvm_struct_set_body_buf(option_struct, 0)
+        g.struct_type_map.insert("option", option_struct)
+        g.struct_type_map.insert("Option", option_struct)
+    }
+
+    -- Register list and map runtime struct types: { ptr, i64, i64 }
+    -- All list types share one LLVM named struct, same for all map types.
+    -- This avoids type mismatches when list values move between contexts.
+    let list_struct = dm_llvm_struct_create_named(ctx, "dm_list")
+    dm_llvm_buf_clear()
+    dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_struct_set_body_buf(list_struct, 0)
+    g.struct_type_map.insert("dm_list", list_struct)
+    g.struct_type_map.insert("dm_list_int64", list_struct)
+    g.struct_type_map.insert("dm_list_double", list_struct)
+    g.struct_type_map.insert("dm_list_dm_string", list_struct)
+    g.struct_type_map.insert("dm_list_generic", list_struct)
+    g.struct_type_map.insert("list", list_struct)
+
+    let map_struct = dm_llvm_struct_create_named(ctx, "dm_map")
+    dm_llvm_buf_clear()
+    dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_buf_push(dm_llvm_int64_type(ctx))
+    dm_llvm_struct_set_body_buf(map_struct, 0)
+    g.struct_type_map.insert("dm_map", map_struct)
+    g.struct_type_map.insert("dm_map_string_int", map_struct)
+    g.struct_type_map.insert("dm_map_int_string", map_struct)
+    g.struct_type_map.insert("map", map_struct)
+
+    return g
+}
 
 fn declare_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
     let mut g = gen
@@ -15874,20 +16199,6 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- Check if a return type needs sret (struct return) convention.
 -- Result ({i32, i64, i64} = 20 bytes) and Option ({i32, i64} = 12 bytes)
 -- are too large for register return on x86_64 and cause LLVM errors.
-fn is_sret_return_type(ret_type: string) -> bool {
-    if ret_type == "string" {
-        return true
-    }
-    if ret_type == "result" or starts_with(ret_type, "Result[") or starts_with(ret_type, "result_") {
-        return true
-    }
-    if ret_type == "option" or starts_with(ret_type, "Option[") or starts_with(ret_type, "option_") {
-        return true
-    }
-    return false
-}
-
--- Check if an IR function involves dm_string in params or return type
 fn func_needs_wrapper(func: IRFunction) -> bool {
     if func.is_extern == false { return false }
     if func.return_type == "string" { return true }
@@ -15950,130 +16261,6 @@ fn declare_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
 -- For `extern fn getenv(name: string) -> string`:
 -- 1. Declare the real C function `getenv` as `ptr getenv(ptr)`
 -- 2. Generate a wrapper `llvm_getenv` that converts dm_string <-> char*
-fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
-    let mut g = gen
-    let ctx = g.context
-    let returns_string = func.return_type == "string"
-    let ptr_ty = dm_llvm_pointer_type(ctx)
-    let void_ty = dm_llvm_void_type(ctx)
-
-    -- Step 1: Declare the real C function with C types
-    let mut c_param_count = 0
-    dm_llvm_buf_clear()
-    let mut ci = 0
-    while ci < func.params.len() {
-        let p = func.params[ci]
-        if p.type_id == "string" {
-            dm_llvm_buf_push(ptr_ty)
-        } else {
-            dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
-        }
-        c_param_count = c_param_count + 1
-        ci = ci + 1
-    }
-    let c_ret_ty = if returns_string { ptr_ty } else { map_ir_type_to_llvm(g, func.return_type) }
-    let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
-    let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
-
-    -- Step 2: Declare the wrapper function with dm_string-based API
-    let mut w_param_count = 0
-    dm_llvm_buf_clear()
-    if returns_string {
-        dm_llvm_buf_push(ptr_ty)
-        w_param_count = w_param_count + 1
-    }
-    ci = 0
-    while ci < func.params.len() {
-        dm_llvm_buf_push(ptr_ty)
-        w_param_count = w_param_count + 1
-        ci = ci + 1
-    }
-    let w_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
-    let w_fn_ty = dm_llvm_function_type_buf(w_ret_ty, 0)
-    let wrapper_name = "llvm_" + func.name
-    let wrapper_fn = dm_llvm_module_add_function(g.llvm_module, wrapper_name, w_fn_ty)
-
-    -- Step 3: Generate the wrapper body
-    let saved_bb = dm_llvm_get_insert_block(g.builder)
-    let entry_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "entry")
-    dm_llvm_position_at_end(g.builder, entry_bb)
-
-    -- Convert string params: extract data field (field 0) from dm_string*
-    g = get_dm_string_type(g)
-    let mut w_param_idx = 0
-    if returns_string { w_param_idx = 1 }
-
-    dm_llvm_buf_clear()
-    ci = 0
-    while ci < func.params.len() {
-        let p = func.params[ci]
-        let wrapper_param = dm_llvm_get_param(wrapper_fn, w_param_idx)
-        if p.type_id == "string" {
-            let data_ptr = dm_llvm_build_struct_gep2(g.builder, g.dm_string_type, wrapper_param, 0, "data_ptr")
-            let data = dm_llvm_build_load2(g.builder, ptr_ty, data_ptr, "data")
-            dm_llvm_buf_push(data)
-        } else {
-            dm_llvm_buf_push(wrapper_param)
-        }
-        w_param_idx = w_param_idx + 1
-        ci = ci + 1
-    }
-    let call_name = if returns_string { "c_result" } else { "" }
-    let c_result = dm_llvm_build_call2_buf(g.builder, c_fn_ty, real_fn, call_name)
-
-    if returns_string {
-        let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)
-        -- Handle NULL return: call dm_string_new with empty string if NULL
-        let null_val = dm_llvm_const_null(ptr_ty)
-        let is_null = dm_llvm_build_icmp(g.builder, dm_llvm_int_eq(), c_result, null_val, "is_null")
-        let then_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "then_null")
-        let else_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "else_nonnull")
-        let merge_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "merge")
-        dm_llvm_build_cond_br(g.builder, is_null, then_bb, else_bb)
-
-        -- Null case: create empty string
-        dm_llvm_position_at_end(g.builder, then_bb)
-        let empty_str = dm_llvm_build_global_string_ptr(g.builder, "", "empty_str")
-        if g.function_map.contains("dm_string_new") {
-            let sn_fn = g.function_map.get("dm_string_new")
-            let sn_ty = g.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret_ptr)
-            dm_llvm_buf_push(empty_str)
-            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-        }
-        dm_llvm_build_br(g.builder, merge_bb)
-
-        -- Non-null case: create string from C result
-        dm_llvm_position_at_end(g.builder, else_bb)
-        if g.function_map.contains("dm_string_new") {
-            let sn_fn = g.function_map.get("dm_string_new")
-            let sn_ty = g.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret_ptr)
-            dm_llvm_buf_push(c_result)
-            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-        }
-        dm_llvm_build_br(g.builder, merge_bb)
-
-        dm_llvm_position_at_end(g.builder, merge_bb)
-        dm_llvm_build_ret_void(g.builder)
-    } else {
-        dm_llvm_build_ret(g.builder, c_result)
-    }
-
-    -- Restore builder position
-    if saved_bb != 0 {
-        dm_llvm_position_at_end(g.builder, saved_bb)
-    }
-
-    -- Store under ORIGINAL name for call resolution
-    g.function_map.insert(func.name, wrapper_fn)
-    g.fn_type_map.insert(func.name, w_fn_ty)
-    g.has_wrapper.insert(func.name, true)
-    g.wrapper_returns_string.insert(func.name, returns_string)
-    return g
-}
 
 fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     let mut g = gen
@@ -16383,6 +16570,59 @@ fn is_string_ptr(gen: LLVMGenerator, val: IRValue) -> bool {
     return false
 }
 
+-- Expected IR type of field `idx` of aggregate type `type_name`, or "".
+fn expected_field_ir_type(gen: LLVMGenerator, type_name: string, idx: int) -> string {
+    if gen.ir_module.struct_defs.contains(type_name) {
+        let ir_struct = gen.ir_module.struct_defs.get(type_name)
+        if idx < ir_struct.fields.len() {
+            return ir_struct.fields[idx].type_id
+        }
+        return ""
+    }
+    if idx == 0 and (type_name == "result" or type_name == "option" or starts_with(type_name, "Result[") or starts_with(type_name, "Option[") or starts_with(type_name, "result_") or starts_with(type_name, "option_")) {
+        return "i32"
+    }
+    if starts_with(type_name, "Result[") {
+        let inner = substr(type_name, 7, len(type_name) - 8)
+        let mut comma_pos = 0 - 1
+        let mut depth = 0
+        let mut ci = 0
+        while ci < len(inner) {
+            let ch = char_at(inner, ci)
+            if ch == "[" { depth = depth + 1 }
+            if ch == "]" { depth = depth - 1 }
+            if ch == "," and depth == 0 {
+                comma_pos = ci
+                ci = len(inner)
+            }
+            ci = ci + 1
+        }
+        if comma_pos >= 0 {
+            if idx == 1 {
+                return substr(inner, 0, comma_pos)
+            }
+            if idx == 2 {
+                let mut err_start = comma_pos + 1
+                if err_start < len(inner) and char_at(inner, err_start) == " " {
+                    err_start = err_start + 1
+                }
+                return substr(inner, err_start, len(inner) - err_start)
+            }
+        }
+        return "i64"
+    }
+    if starts_with(type_name, "Option[") {
+        if idx == 1 {
+            return substr(type_name, 7, len(type_name) - 8)
+        }
+        return "i64"
+    }
+    if type_name == "result" or type_name == "option" {
+        return "i64"
+    }
+    return ""
+}
+
 -- ============================================================
 -- INSTRUCTION GENERATION
 -- ============================================================
@@ -16499,9 +16739,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 }
             }
         }
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), lhs, rhs, "feq")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), fl, fr, "feq")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_eq(), lhs, rhs, "eq")
         }
@@ -16530,9 +16777,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 }
             }
         }
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_one(), lhs, rhs, "fne")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_one(), fl, fr, "fne")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_ne(), lhs, rhs, "ne")
         }
@@ -16544,9 +16798,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_olt(), lhs, rhs, "flt")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_olt(), fl, fr, "flt")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_slt(), lhs, rhs, "lt")
         }
@@ -16558,9 +16819,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_ole(), lhs, rhs, "fle")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_ole(), fl, fr, "fle")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_sle(), lhs, rhs, "le")
         }
@@ -16572,9 +16840,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_ogt(), lhs, rhs, "fgt")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_ogt(), fl, fr, "fgt")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_sgt(), lhs, rhs, "gt")
         }
@@ -16586,9 +16861,16 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let rhs = resolve_value(g, inst.rhs)
         g = resolve_value_with_counter(g, inst.lhs)
         g = resolve_value_with_counter(g, inst.rhs)
+        let lhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(lhs))
+        let rhs_kind_f = dm_llvm_get_type_kind(dm_llvm_type_of(rhs))
+        let is_float_cmp = lhs_kind_f == 2 or lhs_kind_f == 3 or rhs_kind_f == 2 or rhs_kind_f == 3
+        let mut fl = lhs
+        let mut fr = rhs
+        if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
+        if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
         let mut result = 0
-        if lg_is_float_type(inst.result_type) or lg_is_float_type(inst.lhs.str_val) {
-            result = dm_llvm_build_fcmp(b, dm_llvm_real_oge(), lhs, rhs, "fge")
+        if is_float_cmp {
+            result = dm_llvm_build_fcmp(b, dm_llvm_real_oge(), fl, fr, "fge")
         } else {
             result = dm_llvm_build_icmp(b, dm_llvm_int_sge(), lhs, rhs, "ge")
         }
@@ -16722,27 +17004,41 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         let mut val = resolve_value(g, inst.field_value)
         g = resolve_value_with_counter(g, inst.field_value)
-        -- Fix type mismatch: ir_val_int creates i64 constants, but some struct fields
-        -- (e.g., Result/Option/Enum tag at index 0) are i32. Look up the actual field
-        -- type from the IR struct definition and re-create the constant if needed.
-        if inst.field_value.kind == VAL_CONST_INT() {
-            let mut field_needs_i32 = false
-            -- Check result/option types (inline struct, not in struct_defs)
-            if is_sret_return_type(inst.result_type) and inst.field_index == 0 {
-                field_needs_i32 = true
-            }
-            -- Check named struct types (enums have i32 tag at field 0)
-            if g.ir_module.struct_defs.contains(inst.result_type) {
-                let ir_struct = g.ir_module.struct_defs.get(inst.result_type)
-                if inst.field_index < ir_struct.fields.len() {
-                    let ft = ir_struct.fields[inst.field_index].type_id
-                    if ft == "i32" or ft == "u32" {
-                        field_needs_i32 = true
+        -- Coerce the inserted value to the aggregate field's LLVM type.
+        -- IR emits i64 constants as placeholders for fields of other types
+        -- (i32 tags, the unused Result payload, Box ptr fields, ...).
+        let exp_ir_ty = expected_field_ir_type(g, inst.result_type, inst.field_index)
+        if exp_ir_ty != "" {
+            let exp_ty = map_ir_type_to_llvm(g, exp_ir_ty)
+            let val_ty = dm_llvm_type_of(val)
+            if val_ty != exp_ty {
+                let ek = dm_llvm_get_type_kind(exp_ty)
+                let vk = dm_llvm_get_type_kind(val_ty)
+                if inst.field_value.kind == VAL_UNDEF() {
+                    val = dm_llvm_get_undef(exp_ty)
+                } else if inst.field_value.kind == VAL_CONST_INT() {
+                    if ek == 8 {
+                        val = dm_llvm_const_int(exp_ty, inst.field_value.int_val, 1)
+                    } else if ek == 2 or ek == 3 {
+                        val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+                    } else {
+                        val = dm_llvm_const_null(exp_ty)
                     }
+                } else if ek == 8 and vk == 8 {
+                    if dm_llvm_get_int_type_width(val_ty) < dm_llvm_get_int_type_width(exp_ty) {
+                        val = dm_llvm_build_sext(b, val, exp_ty, "sext")
+                    } else {
+                        val = dm_llvm_build_trunc(b, val, exp_ty, "trunc")
+                    }
+                } else if (ek == 2 or ek == 3) and vk == 8 {
+                    val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+                } else if ek == 8 and (vk == 2 or vk == 3) {
+                    val = dm_llvm_build_fp_to_si(b, val, exp_ty, "ftoi")
+                } else if ek == 12 and vk == 8 {
+                    val = dm_llvm_build_int_to_ptr(b, val, exp_ty, "itop")
+                } else if ek == 8 and vk == 12 {
+                    val = dm_llvm_build_ptr_to_int(b, val, exp_ty, "ptoi")
                 }
-            }
-            if field_needs_i32 {
-                val = dm_llvm_const_int(dm_llvm_int32_type(g.context), inst.field_value.int_val, 1)
             }
         }
         -- If inserting a string value (pointer to dm_string), load the actual struct
@@ -17232,8 +17528,20 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
         return g
     }
     if term.kind == TERM_BR_COND() {
-        let cond = resolve_value(g, term.cond)
+        let mut cond = resolve_value(g, term.cond)
         g = resolve_value_with_counter(g, term.cond)
+        -- Coerce non-i1 conditions (e.g. Option/Result/Enum i32 tags) to i1
+        let cond_ty = dm_llvm_type_of(cond)
+        let cond_kind = dm_llvm_get_type_kind(cond_ty)
+        if cond_kind == 8 and dm_llvm_get_int_type_width(cond_ty) != 1 {
+            cond = dm_llvm_build_icmp(b, dm_llvm_int_ne(), cond, dm_llvm_const_int(cond_ty, 0, 0), "tobool")
+        }
+        if cond_kind == 2 or cond_kind == 3 {
+            cond = dm_llvm_build_fcmp(b, dm_llvm_real_one(), cond, dm_llvm_const_real(cond_ty, 0.0), "tobool")
+        }
+        if cond_kind == 12 {
+            cond = dm_llvm_build_icmp(b, dm_llvm_int_ne(), cond, dm_llvm_const_null(cond_ty), "tobool")
+        }
         if g.block_map.contains(term.true_label) and g.block_map.contains(term.false_label) {
             let true_bb = g.block_map.get(term.true_label)
             let false_bb = g.block_map.get(term.false_label)
@@ -17364,6 +17672,146 @@ fn emit_to_ir_file(gen: LLVMGenerator, filename: string) -> int {
 fn verify_module(gen: LLVMGenerator) -> int {
     return dm_llvm_module_verify(gen.llvm_module)
 }
+
+fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
+    let mut g = gen
+    let ctx = g.context
+    let returns_string = func.return_type == "string"
+    let ptr_ty = dm_llvm_pointer_type(ctx)
+    let void_ty = dm_llvm_void_type(ctx)
+
+    -- Step 1: Declare the real C function with C types
+    let mut c_param_count = 0
+    dm_llvm_buf_clear()
+    let mut ci = 0
+    while ci < func.params.len() {
+        let p = func.params[ci]
+        if p.type_id == "string" {
+            dm_llvm_buf_push(ptr_ty)
+        } else {
+            dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
+        }
+        c_param_count = c_param_count + 1
+        ci = ci + 1
+    }
+    let c_ret_ty = if returns_string { ptr_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+    let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
+    let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
+
+    -- Step 2: Declare the wrapper function with dm_string-based API
+    let mut w_param_count = 0
+    dm_llvm_buf_clear()
+    if returns_string {
+        dm_llvm_buf_push(ptr_ty)
+        w_param_count = w_param_count + 1
+    }
+    ci = 0
+    while ci < func.params.len() {
+        dm_llvm_buf_push(ptr_ty)
+        w_param_count = w_param_count + 1
+        ci = ci + 1
+    }
+    let w_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+    let w_fn_ty = dm_llvm_function_type_buf(w_ret_ty, 0)
+    let wrapper_name = "llvm_" + func.name
+    let wrapper_fn = dm_llvm_module_add_function(g.llvm_module, wrapper_name, w_fn_ty)
+
+    -- Step 3: Generate the wrapper body
+    let saved_bb = dm_llvm_get_insert_block(g.builder)
+    let entry_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "entry")
+    dm_llvm_position_at_end(g.builder, entry_bb)
+
+    -- Convert string params: extract data field (field 0) from dm_string*
+    g = get_dm_string_type(g)
+    let mut w_param_idx = 0
+    if returns_string { w_param_idx = 1 }
+
+    dm_llvm_buf_clear()
+    ci = 0
+    while ci < func.params.len() {
+        let p = func.params[ci]
+        let wrapper_param = dm_llvm_get_param(wrapper_fn, w_param_idx)
+        if p.type_id == "string" {
+            let data_ptr = dm_llvm_build_struct_gep2(g.builder, g.dm_string_type, wrapper_param, 0, "data_ptr")
+            let data = dm_llvm_build_load2(g.builder, ptr_ty, data_ptr, "data")
+            dm_llvm_buf_push(data)
+        } else {
+            dm_llvm_buf_push(wrapper_param)
+        }
+        w_param_idx = w_param_idx + 1
+        ci = ci + 1
+    }
+    let call_name = if returns_string { "c_result" } else { "" }
+    let c_result = dm_llvm_build_call2_buf(g.builder, c_fn_ty, real_fn, call_name)
+
+    if returns_string {
+        let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)
+        -- Handle NULL return: call dm_string_new with empty string if NULL
+        let null_val = dm_llvm_const_null(ptr_ty)
+        let is_null = dm_llvm_build_icmp(g.builder, dm_llvm_int_eq(), c_result, null_val, "is_null")
+        let then_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "then_null")
+        let else_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "else_nonnull")
+        let merge_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "merge")
+        dm_llvm_build_cond_br(g.builder, is_null, then_bb, else_bb)
+
+        -- Null case: create empty string
+        dm_llvm_position_at_end(g.builder, then_bb)
+        let empty_str = dm_llvm_build_global_string_ptr(g.builder, "", "empty_str")
+        if g.function_map.contains("dm_string_new") {
+            let sn_fn = g.function_map.get("dm_string_new")
+            let sn_ty = g.fn_type_map.get("dm_string_new")
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(sret_ptr)
+            dm_llvm_buf_push(empty_str)
+            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
+        }
+        dm_llvm_build_br(g.builder, merge_bb)
+
+        -- Non-null case: create string from C result
+        dm_llvm_position_at_end(g.builder, else_bb)
+        if g.function_map.contains("dm_string_new") {
+            let sn_fn = g.function_map.get("dm_string_new")
+            let sn_ty = g.fn_type_map.get("dm_string_new")
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(sret_ptr)
+            dm_llvm_buf_push(c_result)
+            dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
+        }
+        dm_llvm_build_br(g.builder, merge_bb)
+
+        dm_llvm_position_at_end(g.builder, merge_bb)
+        dm_llvm_build_ret_void(g.builder)
+    } else {
+        dm_llvm_build_ret(g.builder, c_result)
+    }
+
+    -- Restore builder position
+    if saved_bb != 0 {
+        dm_llvm_position_at_end(g.builder, saved_bb)
+    }
+
+    -- Store under ORIGINAL name for call resolution
+    g.function_map.insert(func.name, wrapper_fn)
+    g.fn_type_map.insert(func.name, w_fn_ty)
+    g.has_wrapper.insert(func.name, true)
+    g.wrapper_returns_string.insert(func.name, returns_string)
+    return g
+}
+
+fn is_sret_return_type(ret_type: string) -> bool {
+    if ret_type == "string" {
+        return true
+    }
+    if ret_type == "result" or starts_with(ret_type, "Result[") or starts_with(ret_type, "result_") {
+        return true
+    }
+    if ret_type == "option" or starts_with(ret_type, "Option[") or starts_with(ret_type, "option_") {
+        return true
+    }
+    return false
+}
+
+-- Check if an IR function involves dm_string in params or return type
 
 
 -- ============================================================
@@ -17522,61 +17970,6 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
 
 -- ============================================================
 -- SRET CALL (result/option return via output pointer)
--- ============================================================
-
-fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
-    let mut g = gen
-    let b = g.builder
-    let id_key = int_to_string(inst.id)
-    -- Allocate stack space for the result struct (sret pattern)
-    let sret_name = "sret." + int_to_string(g.sret_counter)
-    g.sret_counter = g.sret_counter + 1
-    -- Look up the IR function to get its return type for correct alloca sizing
-    let ir_func = find_ir_function(g, callee_name)
-    let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
-    let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
-    -- Build args: sret pointer first, then resolved args
-    let mut args: List[int] = []
-    args.push(sret)
-    let mut ai = 0
-    while ai < inst.call_args.len() {
-        let arg = inst.call_args[ai]
-        let mut val = resolve_value(g, arg)
-        g = resolve_value_with_counter(g, arg)
-        -- If arg is a string pointer and target function expects dm_string by value, load it
-        if is_string_ptr(g, arg) {
-            let expects_string = callee_param_is_string(g, callee_name, ai)
-            if expects_string {
-                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
-            }
-        }
-        args.push(val)
-        ai = ai + 1
-    }
-    -- Call function (returns void, result written to sret pointer)
-    dm_llvm_buf_clear()
-    let mut argi = 0
-    while argi < args.len() {
-        dm_llvm_buf_push(args[argi])
-        argi = argi + 1
-    }
-    dm_llvm_build_call2_buf(b, fn_ty, callee, "")
-    -- Load the result from the sret alloca
-    if inst.has_result {
-        -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
-        if ir_func.return_type == "string" {
-            g.string_ptrs.insert(id_key, true)
-            g.value_map.insert(id_key, sret)
-        } else {
-            let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
-            g.value_map.insert(id_key, loaded)
-        }
-    }
-    return g
-}
-
--- ============================================================
--- INDIRECT CALL (OP_CALL_PTR)
 -- ============================================================
 
 fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
@@ -17740,6 +18133,79 @@ fn is_runtime_string_fn(fn_name: string) -> bool {
     if fn_name == "dm_string_new" { return true }
     return false
 }
+
+
+-- ============================================================
+-- SIMD Instruction Handling for LLVM IR Generation
+--
+-- Translates OP_SIMD_* IR instructions to LLVM vector operations.
+-- SIMD types map to LLVM fixed-width vector types:
+--   f32x4 -> <4 x float>, f32x8 -> <8 x float>
+--   f64x2 -> <2 x double>, f64x4 -> <4 x double>
+--   i32x4 -> <4 x i32>,    i32x8 -> <8 x i32>
+--   i64x2 -> <2 x i64>,    i64x4 -> <4 x i64>
+-- ============================================================
+
+-- ============================================================
+-- SIMD TYPE HELPERS
+-- ============================================================
+
+-- Get the LLVM vector type for a SIMD type name
+
+fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int, callee_name: string) -> LLVMGenerator {
+    let mut g = gen
+    let b = g.builder
+    let id_key = int_to_string(inst.id)
+    -- Allocate stack space for the result struct (sret pattern)
+    let sret_name = "sret." + int_to_string(g.sret_counter)
+    g.sret_counter = g.sret_counter + 1
+    -- Look up the IR function to get its return type for correct alloca sizing
+    let ir_func = find_ir_function(g, callee_name)
+    let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
+    let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
+    -- Build args: sret pointer first, then resolved args
+    let mut args: List[int] = []
+    args.push(sret)
+    let mut ai = 0
+    while ai < inst.call_args.len() {
+        let arg = inst.call_args[ai]
+        let mut val = resolve_value(g, arg)
+        g = resolve_value_with_counter(g, arg)
+        -- If arg is a string pointer and target function expects dm_string by value, load it
+        if is_string_ptr(g, arg) {
+            let expects_string = callee_param_is_string(g, callee_name, ai)
+            if expects_string {
+                val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
+            }
+        }
+        args.push(val)
+        ai = ai + 1
+    }
+    -- Call function (returns void, result written to sret pointer)
+    dm_llvm_buf_clear()
+    let mut argi = 0
+    while argi < args.len() {
+        dm_llvm_buf_push(args[argi])
+        argi = argi + 1
+    }
+    dm_llvm_build_call2_buf(b, fn_ty, callee, "")
+    -- Load the result from the sret alloca
+    if inst.has_result {
+        -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
+        if ir_func.return_type == "string" {
+            g.string_ptrs.insert(id_key, true)
+            g.value_map.insert(id_key, sret)
+        } else {
+            let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
+            g.value_map.insert(id_key, loaded)
+        }
+    }
+    return g
+}
+
+-- ============================================================
+-- INDIRECT CALL (OP_CALL_PTR)
+-- ============================================================
 
 
 -- ============================================================
@@ -18051,6 +18517,20 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 --   -> Object File -> Linker -> Native Binary
 -- ============================================================
 
+
+-- ============================================================
+-- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
+--
+-- Compiles dAImond source to native binaries via LLVM.
+-- Uses its own frontend (lexer.dm, parser.dm) instead of
+-- reusing Stage 0's Zig frontend.
+--
+-- Pipeline:
+--   Source (.dm) -> Lexer -> Tokens -> Parser -> AST
+--   -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR
+--   -> Object File -> Linker -> Native Binary
+-- ============================================================
+
 fn VERSION() -> string { return "0.1.0" }
 
 -- ============================================================
@@ -18070,6 +18550,7 @@ fn print_usage() {
     println("  -O3           Aggressive optimization")
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
+    println("  --link-llvm   Link LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
     println("  --version     Show version")
@@ -18085,6 +18566,7 @@ struct CLIArgs {
     opt_level: int,
     emit_ir: bool,
     emit_llvm: bool,
+    link_llvm: bool,
     verbose: bool,
     show_help: bool,
     show_version: bool,
@@ -18099,6 +18581,7 @@ fn parse_cli_args() -> CLIArgs {
         opt_level: 0,
         emit_ir: false,
         emit_llvm: false,
+        link_llvm: false,
         verbose: false,
         show_help: false,
         show_version: false,
@@ -18144,6 +18627,8 @@ fn parse_cli_args() -> CLIArgs {
             args.emit_ir = true
         } else if arg == "--emit-llvm" {
             args.emit_llvm = true
+        } else if arg == "--link-llvm" {
+            args.link_llvm = true
         } else if arg == "-v" or arg == "--verbose" {
             args.verbose = true
         } else if starts_with(arg, "-") {
@@ -18232,32 +18717,29 @@ fn find_runtime_dir(input_dir: string) -> string {
     return "../stage0/runtime"
 }
 
--- Find the LLVM wrappers (llvm_wrappers.c) directory
--- Prefers stage4/runtime over stage3/runtime since Stage 4 has the full builtin set
+-- Find the Stage 3 runtime (llvm_wrappers.c) directory
 fn find_wrappers_dir(input_dir: string) -> string {
-    -- Strategy 1: Go up from input file dir (prefer stage4 first)
-    let try1b = input_dir + "/../stage4/runtime"
-    if file_exists(try1b + "/llvm_wrappers.c") {
-        return try1b
-    }
-
+    -- Strategy 1: Go up from input file dir
     let try1 = input_dir + "/../stage3/runtime"
     if file_exists(try1 + "/llvm_wrappers.c") {
         return try1
     }
 
-    -- Strategy 2: Relative (assume running from stage4/ or stage0/)
+    -- Also check stage4/runtime which may have its own copy
+    let try1b = input_dir + "/../stage4/runtime"
+    if file_exists(try1b + "/llvm_wrappers.c") {
+        return try1b
+    }
+
+    -- Strategy 2: Relative (assume running from stage4/)
     if file_exists("runtime/llvm_wrappers.c") {
         return "runtime"
-    }
-    if file_exists("../stage4/runtime/llvm_wrappers.c") {
-        return "../stage4/runtime"
     }
     if file_exists("../stage3/runtime/llvm_wrappers.c") {
         return "../stage3/runtime"
     }
 
-    -- Strategy 3: From project root (prefer stage4 first)
+    -- Strategy 3: From project root
     if file_exists("stage4/runtime/llvm_wrappers.c") {
         return "stage4/runtime"
     }
@@ -18267,6 +18749,32 @@ fn find_wrappers_dir(input_dir: string) -> string {
 
     -- Fallback
     return "runtime"
+}
+
+-- Find llvm_bridge.c for self-compilation (--link-llvm)
+fn find_bridge_file(input_dir: string) -> string {
+    -- Strategy 1: Same directory as input file
+    let try1 = input_dir + "/llvm_bridge.c"
+    if file_exists(try1) {
+        return try1
+    }
+
+    -- Strategy 2: src/ relative paths
+    if file_exists("src/llvm_bridge.c") {
+        return "src/llvm_bridge.c"
+    }
+
+    -- Strategy 3: stage4/ relative paths
+    if file_exists("stage4/llvm_bridge.c") {
+        return "stage4/llvm_bridge.c"
+    }
+
+    -- Strategy 4: Relative (assume running from stage4/)
+    if file_exists("llvm_bridge.c") {
+        return "llvm_bridge.c"
+    }
+
+    return ""
 }
 
 -- ============================================================
@@ -18367,43 +18875,298 @@ fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], 
 }
 
 -- ============================================================
--- POST-PARSE VALIDATION
+-- COMPILATION PIPELINE
 -- ============================================================
 
-fn validate_source_file(sf: SourceFile) -> List[string] {
-    let mut errors: List[string] = []
-    let mut i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            -- Check for params with empty type (sign of a parse error)
+fn compile(cli: CLIArgs) -> int {
+    let input_file = cli.input_file
+    let output_file = cli.output_file
+    let opt_level = cli.opt_level
+    let verbose = cli.verbose
+
+    if verbose {
+        println("dAImond Stage 4 Compiler (LLVM Backend)")
+        println("Input:  " + input_file)
+        println("Output: " + output_file)
+    }
+
+    -- Phase 1: Read source file
+    if verbose { println("  [1/6] Reading source...") }
+
+    if file_exists(input_file) == false {
+        eprintln("Error: file not found: " + input_file)
+        return 1
+    }
+
+    let source = file_read(input_file)
+
+    -- Phase 2: Tokenize
+    if verbose { println("  [2/6] Lexing...") }
+
+    let tokens = tokenize(source)
+
+    -- Phase 3: Parse
+    if verbose { println("  [3/6] Parsing...") }
+
+    let p = parser_new(tokens)
+    let mut sf = parse_source_file(p)
+
+    -- Check for parse errors
+    if p.errors.len() > 0 {
+        let mut ei = 0
+        while ei < p.errors.len() {
+            eprintln(p.errors[ei])
+            ei = ei + 1
+        }
+        exit(1)
+    }
+
+    -- Post-parse validation
+    let validation_errors = validate_source_file(sf)
+    if validation_errors.len() > 0 {
+        let mut vi = 0
+        while vi < validation_errors.len() {
+            eprintln(validation_errors[vi])
+            vi = vi + 1
+        }
+        exit(1)
+    }
+
+    -- Phase 3.5: Resolve imports
+    if sf.imports.len() > 0 {
+        if verbose { println("  [3.5/6] Resolving imports...") }
+        let input_dir = dirname(input_file)
+        sf = resolve_imports(sf, input_dir, verbose)
+    }
+
+    -- Effect system enforcement
+    let effect_errors = validate_effects(sf)
+    if effect_errors.len() > 0 {
+        let mut ei2 = 0
+        while ei2 < effect_errors.len() {
+            eprintln(effect_errors[ei2])
+            ei2 = ei2 + 1
+        }
+        exit(1)
+    }
+
+    -- Phase 4: Generate IR
+    if verbose { println("  [4/6] Generating IR...") }
+
+    let mut ir_gen = ir_generator_new()
+    ir_gen = generate_module(ir_gen, sf)
+
+    -- If --emit-ir, print the IR module and exit
+    if cli.emit_ir {
+        -- Print a summary of the IR module (functions and their basic blocks)
+        println("dAImond IR Module:")
+        println("  Functions: " + int_to_string(ir_gen.ir_mod.functions.len()))
+        println("  Globals:   " + int_to_string(ir_gen.ir_mod.globals.len()))
+        let mut fi = 0
+        while fi < ir_gen.ir_mod.functions.len() {
+            let func = ir_gen.ir_mod.functions[fi]
+            let mut sig = "  fn " + func.name + "("
             let mut pi = 0
-            while pi < fd.params.len() {
-                let param = fd.params[pi]
-                if param.name != "self" and param.name != "mut self" and len(param.type_name) == 0 {
-                    errors.push("Error: parameter '" + param.name + "' in function '" + fd.name + "' has no type")
-                }
+            while pi < func.params.len() {
+                if pi > 0 { sig = sig + ", " }
+                sig = sig + func.params[pi].name + ": " + func.params[pi].type_id
                 pi = pi + 1
             }
+            sig = sig + ") -> " + func.return_type
+            if func.is_extern { sig = sig + " [extern]" }
+            println(sig)
+            let mut bi = 0
+            while bi < func.blocks.len() {
+                let block = func.blocks[bi]
+                println("    " + block.label + ": (" + int_to_string(block.instructions.len()) + " instructions)")
+                bi = bi + 1
+            }
+            fi = fi + 1
         }
-        i = i + 1
+        return 0
     }
-    return errors
+
+    -- A binary needs an entry point
+    let mut has_main = false
+    let mut di = 0
+    while di < sf.declarations.len() {
+        let decl = sf.declarations[di]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.name == "main" {
+                has_main = true
+            }
+        }
+        di = di + 1
+    }
+    if has_main == false {
+        eprintln("Error: no main function found")
+        exit(1)
+    }
+
+    -- Phase 5: Generate LLVM IR
+    if verbose { println("  [5/6] Generating LLVM IR...") }
+
+    let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
+    lg = lg_generate_module(lg)
+
+    -- Verify LLVM module (fatal: invalid IR must not produce any output;
+    -- dm_llvm_module_verify in llvm_bridge.c prints the detailed diagnostic)
+    let verify_result = verify_module(lg)
+    if verify_result != 0 {
+        eprintln("Error: LLVM module verification failed")
+        llvm_gen_dispose(lg)
+        -- exit(1) as well as return: the Stage 0 C wrapper discards
+        -- dm_main()'s return value, so return alone would exit 0.
+        exit(1)
+        return 1
+    }
+
+    -- If --emit-llvm, emit LLVM IR file and exit
+    if cli.emit_llvm {
+        let ll_file = output_file + ".ll"
+        let ir_result = emit_to_ir_file(lg, ll_file)
+        if ir_result != 0 {
+            eprintln("Error: failed to emit LLVM IR to " + ll_file)
+            llvm_gen_dispose(lg)
+            return 1
+        }
+        if verbose {
+            println("  Emitted LLVM IR: " + ll_file)
+        } else {
+            println(ll_file)
+        }
+        llvm_gen_dispose(lg)
+        return 0
+    }
+
+    -- Phase 6: Emit object file and link
+    if verbose { println("  [6/6] Emitting binary...") }
+
+    let obj_file = output_file + ".o"
+    let emit_result = emit_to_object(lg, obj_file, opt_level)
+    if emit_result != 0 {
+        eprintln("Error: failed to emit object file")
+        llvm_gen_dispose(lg)
+        return 1
+    }
+
+    -- Dispose LLVM resources before linking
+    llvm_gen_dispose(lg)
+
+    -- Find runtime and wrapper source paths
+    let input_dir = dirname(input_file)
+    let runtime_dir = find_runtime_dir(input_dir)
+    let wrappers_dir = find_wrappers_dir(input_dir)
+
+    let runtime_c = runtime_dir + "/daimond_runtime.c"
+    let runtime_h_dir = runtime_dir
+    let wrappers_c = wrappers_dir + "/llvm_wrappers.c"
+
+    -- Build the link command
+    -- cc -o <output> <obj> <runtime.c> <wrappers.c> -I<runtime_dir> -lm -lpthread
+    let mut link_cmd = "cc"
+    link_cmd = link_cmd + " -o " + output_file
+    link_cmd = link_cmd + " " + obj_file
+
+    -- Add runtime source (compile inline)
+    if file_exists(runtime_c) {
+        link_cmd = link_cmd + " " + runtime_c
+    } else {
+        eprintln("Warning: runtime not found at " + runtime_c)
+    }
+
+    -- Add ABI wrappers source
+    if file_exists(wrappers_c) {
+        link_cmd = link_cmd + " " + wrappers_c
+    } else {
+        eprintln("Warning: LLVM wrappers not found at " + wrappers_c)
+    }
+
+    -- Include path for runtime headers
+    link_cmd = link_cmd + " -I" + runtime_h_dir
+
+    -- Link system libraries
+    link_cmd = link_cmd + " -lm -lpthread"
+
+    -- If --link-llvm, add llvm_bridge.c and LLVM libraries
+    if cli.link_llvm {
+        let bridge_file = find_bridge_file(input_dir)
+        if bridge_file != "" {
+            -- Compile bridge with LLVM cflags via a temp object
+            let bridge_obj = output_file + "_bridge.o"
+            let bridge_cmd = "cc -c " + bridge_file + " -o " + bridge_obj + " $(llvm-config --cflags) -I" + runtime_h_dir
+            if verbose {
+                println("  Bridge: " + bridge_cmd)
+            }
+            let bridge_result = system(bridge_cmd)
+            if bridge_result != 0 {
+                eprintln("Error: failed to compile llvm_bridge.c")
+                return 1
+            }
+            link_cmd = link_cmd + " " + bridge_obj
+        } else {
+            eprintln("Warning: llvm_bridge.c not found, LLVM functions will be unresolved")
+        }
+        -- Add LLVM link flags
+        link_cmd = link_cmd + " $(llvm-config --libs --ldflags --system-libs)"
+    }
+
+    if verbose {
+        println("  Link: " + link_cmd)
+    }
+
+    let link_result = system(link_cmd)
+    if link_result != 0 {
+        eprintln("Error: linking failed (exit code " + int_to_string(link_result) + ")")
+        -- Clean up object file on failure
+        system("rm -f " + obj_file)
+        return 1
+    }
+
+    -- Clean up temporary object file(s)
+    system("rm -f " + obj_file)
+    if cli.link_llvm {
+        system("rm -f " + output_file + "_bridge.o")
+    }
+
+    if verbose {
+        println("Successfully compiled: " + output_file)
+    }
+
+    return 0
 }
 
 -- ============================================================
--- EFFECT SYSTEM ENFORCEMENT
+-- ENTRY POINT
 -- ============================================================
+
+fn main() -> int {
+    let cli = parse_cli_args()
+
+    if cli.show_help {
+        print_usage()
+        return 0
+    }
+
+    if cli.show_version {
+        println("daimond-llvm " + VERSION())
+        return 0
+    }
+
+    if cli.has_error {
+        eprintln(cli.error_msg)
+        return 1
+    }
+
+    return compile(cli)
+}
 
 fn builtin_required_effect(name: string) -> string {
     if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
     if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
     if name == "args_get" or name == "args_len" { return "IO" }
     if name == "system" or name == "exit" { return "Process" }
-    if name == "flush" or name == "read_key" or name == "read_key_nb" { return "Console" }
-    if name == "time_ms" or name == "sleep_ms" { return "IO" }
-    if name == "term_width" or name == "term_height" { return "Console" }
     return ""
 }
 
@@ -18524,230 +19287,28 @@ fn validate_effects(sf: SourceFile) -> List[string] {
 -- COMPILATION PIPELINE
 -- ============================================================
 
-fn compile(cli: CLIArgs) -> int {
-    let input_file = cli.input_file
-    let output_file = cli.output_file
-    let opt_level = cli.opt_level
-    let verbose = cli.verbose
-
-    if verbose {
-        println("dAImond Stage 4 Compiler (LLVM Backend)")
-        println("Input:  " + input_file)
-        println("Output: " + output_file)
-    }
-
-    -- Phase 1: Read source file
-    if verbose { println("  [1/6] Reading source...") }
-
-    if file_exists(input_file) == false {
-        eprintln("Error: file not found: " + input_file)
-        return 1
-    }
-
-    let source = file_read(input_file)
-
-    -- Phase 2: Tokenize
-    if verbose { println("  [2/6] Lexing...") }
-
-    let tokens = tokenize(source)
-
-    -- Phase 3: Parse
-    if verbose { println("  [3/6] Parsing...") }
-
-    let p = parser_new(tokens)
-    let mut sf = parse_source_file(p)
-
-    -- Check for parse errors
-    if p.errors.len() > 0 {
-        let mut ei = 0
-        while ei < p.errors.len() {
-            eprintln(p.errors[ei])
-            ei = ei + 1
-        }
-        exit(1)
-    }
-
-    -- Post-parse validation
-    let validation_errors = validate_source_file(sf)
-    if validation_errors.len() > 0 {
-        let mut vi = 0
-        while vi < validation_errors.len() {
-            eprintln(validation_errors[vi])
-            vi = vi + 1
-        }
-        exit(1)
-    }
-
-    -- Phase 3.5: Resolve imports
-    if sf.imports.len() > 0 {
-        if verbose { println("  [3.5/6] Resolving imports...") }
-        let input_dir = dirname(input_file)
-        sf = resolve_imports(sf, input_dir, verbose)
-    }
-
-    -- Effect system enforcement
-    let effect_errors = validate_effects(sf)
-    if effect_errors.len() > 0 {
-        let mut ei2 = 0
-        while ei2 < effect_errors.len() {
-            eprintln(effect_errors[ei2])
-            ei2 = ei2 + 1
-        }
-        exit(1)
-    }
-
-    -- Phase 4: Generate IR
-    if verbose { println("  [4/6] Generating IR...") }
-
-    let mut ir_gen = ir_generator_new()
-    ir_gen = generate_module(ir_gen, sf)
-
-    -- If --emit-ir, print the IR module and exit
-    if cli.emit_ir {
-        -- Print a summary of the IR module (functions and their basic blocks)
-        println("dAImond IR Module:")
-        println("  Functions: " + int_to_string(ir_gen.ir_mod.functions.len()))
-        println("  Globals:   " + int_to_string(ir_gen.ir_mod.globals.len()))
-        let mut fi = 0
-        while fi < ir_gen.ir_mod.functions.len() {
-            let func = ir_gen.ir_mod.functions[fi]
-            let mut sig = "  fn " + func.name + "("
+fn validate_source_file(sf: SourceFile) -> List[string] {
+    let mut errors: List[string] = []
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            -- Check for params with empty type (sign of a parse error)
             let mut pi = 0
-            while pi < func.params.len() {
-                if pi > 0 { sig = sig + ", " }
-                sig = sig + func.params[pi].name + ": " + func.params[pi].type_id
+            while pi < fd.params.len() {
+                let param = fd.params[pi]
+                if param.name != "self" and param.name != "mut self" and len(param.type_name) == 0 {
+                    errors.push("Error: parameter '" + param.name + "' in function '" + fd.name + "' has no type")
+                }
                 pi = pi + 1
             }
-            sig = sig + ") -> " + func.return_type
-            if func.is_extern { sig = sig + " [extern]" }
-            println(sig)
-            let mut bi = 0
-            while bi < func.blocks.len() {
-                let block = func.blocks[bi]
-                println("    " + block.label + ": (" + int_to_string(block.instructions.len()) + " instructions)")
-                bi = bi + 1
-            }
-            fi = fi + 1
         }
-        return 0
+        i = i + 1
     }
-
-    -- Phase 5: Generate LLVM IR
-    if verbose { println("  [5/6] Generating LLVM IR...") }
-
-    let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
-    lg = lg_generate_module(lg)
-
-    -- If --emit-llvm, emit LLVM IR file BEFORE verification (for debugging)
-    if cli.emit_llvm {
-        let ll_file = output_file + ".ll"
-        let ir_result = emit_to_ir_file(lg, ll_file)
-        if ir_result != 0 {
-            eprintln("Error: failed to emit LLVM IR to " + ll_file)
-            llvm_gen_dispose(lg)
-            return 1
-        }
-        if verbose {
-            println("  Emitted LLVM IR: " + ll_file)
-        } else {
-            println(ll_file)
-        }
-        llvm_gen_dispose(lg)
-        return 0
-    }
-
-    -- Phase 6: Emit object file and link
-    if verbose { println("  [6/6] Emitting binary...") }
-
-    let obj_file = output_file + ".o"
-    let emit_result = emit_to_object(lg, obj_file, opt_level)
-    if emit_result != 0 {
-        eprintln("Error: failed to emit object file")
-        llvm_gen_dispose(lg)
-        return 1
-    }
-
-    -- Dispose LLVM resources before linking
-    llvm_gen_dispose(lg)
-
-    -- Find runtime and wrapper source paths
-    let input_dir = dirname(input_file)
-    let runtime_dir = find_runtime_dir(input_dir)
-    let wrappers_dir = find_wrappers_dir(input_dir)
-
-    let runtime_c = runtime_dir + "/daimond_runtime.c"
-    let runtime_h_dir = runtime_dir
-    let wrappers_c = wrappers_dir + "/llvm_wrappers.c"
-
-    -- Build the link command
-    -- cc -o <output> <obj> <runtime.c> <wrappers.c> -I<runtime_dir> -lm -lpthread
-    let mut link_cmd = "cc"
-    link_cmd = link_cmd + " -o " + output_file
-    link_cmd = link_cmd + " " + obj_file
-
-    -- Add runtime source (compile inline)
-    if file_exists(runtime_c) {
-        link_cmd = link_cmd + " " + runtime_c
-    } else {
-        eprintln("Warning: runtime not found at " + runtime_c)
-    }
-
-    -- Add ABI wrappers source
-    if file_exists(wrappers_c) {
-        link_cmd = link_cmd + " " + wrappers_c
-    } else {
-        eprintln("Warning: LLVM wrappers not found at " + wrappers_c)
-    }
-
-    -- Include path for runtime headers
-    link_cmd = link_cmd + " -I" + runtime_h_dir
-
-    -- Link system libraries
-    link_cmd = link_cmd + " -lm -lpthread"
-
-    if verbose {
-        println("  Link: " + link_cmd)
-    }
-
-    let link_result = system(link_cmd)
-    if link_result != 0 {
-        eprintln("Error: linking failed (exit code " + int_to_string(link_result) + ")")
-        -- Clean up object file on failure
-        system("rm -f " + obj_file)
-        return 1
-    }
-
-    -- Clean up temporary object file
-    system("rm -f " + obj_file)
-
-    if verbose {
-        println("Successfully compiled: " + output_file)
-    }
-
-    return 0
+    return errors
 }
 
 -- ============================================================
--- ENTRY POINT
+-- EFFECT SYSTEM ENFORCEMENT
 -- ============================================================
-
-fn main() -> int {
-    let cli = parse_cli_args()
-
-    if cli.show_help {
-        print_usage()
-        return 0
-    }
-
-    if cli.show_version {
-        println("daimond-llvm " + VERSION())
-        return 0
-    }
-
-    if cli.has_error {
-        eprintln(cli.error_msg)
-        return 1
-    }
-
-    return compile(cli)
-}

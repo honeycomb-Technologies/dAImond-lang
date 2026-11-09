@@ -755,7 +755,11 @@ struct Compiler {
     -- Whether current function has a with [...] clause (distinguishes "no clause" from "empty clause")
     current_fn_has_effects: bool,
     -- Current region arena variable name (empty when not in a region, e.g. "_region_arena0" when inside)
-    current_region_arena: string
+    current_region_arena: string,
+    -- Region escape check: vars let-declared inside the innermost region: "|mangled|..."
+    region_declared: string,
+    -- Region escape check: vars holding region-arena values: "|mangled|..."
+    region_born: string
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -806,7 +810,9 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         generic_bounds: "",
         current_fn_effects: "",
         current_fn_has_effects: false,
-        current_region_arena: ""
+        current_region_arena: "",
+        region_declared: "",
+        region_born: ""
     }
 }
 
@@ -2736,6 +2742,10 @@ fn compile_stmt(c: Compiler) -> Compiler {
             let val = compile_expr(cc)
             cc = val.c
             cc.expected_type = saved_expected
+            -- Region escape check: no returning region-arena values
+            if region_code_is_born(cc, val.code) {
+                cc = c_error(cc, "return of region-born value from inside a region (region escape)")
+            }
             -- If in async function, wrap return value with _ready()
             if cc.current_fn_is_async and cc.current_fn_async_inner_type != "" {
                 let future_t = "dm_future_" + cc.current_fn_async_inner_type
@@ -2785,6 +2795,17 @@ fn compile_stmt(c: Compiler) -> Compiler {
         cc = c_advance(cc)
         let rhs = compile_expr(cc)
         cc = rhs.c
+        -- Region escape check: no assigning region-arena values to
+        -- plain variables declared outside the innermost region.
+        -- (Field/index targets are not checked in Stage 1: lhs.code
+        -- is then not exactly a tracked variable name.)
+        if region_code_is_born(cc, rhs.code) {
+            if string_contains(cc.region_declared, "|" + lhs.code + "|") {
+                cc = region_track_born(cc, lhs.code)
+            } else if lookup_var_type(cc, lhs.code) != "" {
+                cc = c_error(cc, "assignment of region-born value to variable declared outside the region (region escape)")
+            }
+        }
         -- Check for map index assignment: dm_map_K_V_get(&dm_var, key) = val -> dm_map_K_V_insert(&dm_var, key, val)
         if starts_with(lhs.code, "dm_map_") and string_contains(lhs.code, "_get(") {
             let get_pos = string_find(lhs.code, "_get(")
@@ -3157,6 +3178,26 @@ fn infer_ternary_type(code: string, c: Compiler) -> string {
     return ""
 }
 
+-- Region escape check (syntactic; Stage 1 has no checker/scopes).
+-- Inside a region, string concat/interpolation compiles to
+-- dm_string_concat_arena(arena, ...), so generated code containing
+-- that call - or exactly naming a var already known region-born -
+-- denotes a value that dies with the region arena.
+fn region_code_is_born(c: Compiler, code: string) -> bool {
+    if c.current_region_arena == "" { return false }
+    if string_contains(code, "dm_string_concat_arena(") { return true }
+    if string_contains(c.region_born, "|" + code + "|") { return true }
+    return false
+}
+
+fn region_track_born(c: Compiler, mangled_name: string) -> Compiler {
+    let mut cc = c
+    if string_contains(cc.region_born, "|" + mangled_name + "|") == false {
+        cc.region_born = cc.region_born + "|" + mangled_name + "|"
+    }
+    return cc
+}
+
 fn track_str_var(c: Compiler, mangled_name: string, is_str: bool) -> Compiler {
     let mut cc = c
     if is_str == false { return cc }
@@ -3246,6 +3287,13 @@ fn compile_let_stmt(c: Compiler) -> Compiler {
     cc = track_list_elem_type(cc, type_str, var_name)
     -- Track variable type for inference
     cc = track_var_type(cc, dm_mangle(var_name), type_str)
+    -- Region escape check: record declarations and region-born values
+    if cc.current_region_arena != "" {
+        cc.region_declared = cc.region_declared + "|" + dm_mangle(var_name) + "|"
+        if region_code_is_born(cc, val.code) {
+            cc = region_track_born(cc, dm_mangle(var_name))
+        }
+    }
     -- Function pointer types need special declaration syntax: ret (*name)(params)
     let is_fptr = string_contains(type_str, "(*)")
     if is_fptr {
@@ -3882,6 +3930,12 @@ fn compile_region_stmt(c: Compiler) -> Compiler {
     -- Set current region arena for allocation redirection
     let saved_arena = cc.current_region_arena
     cc.current_region_arena = arena_name
+    -- Region escape check: fresh declared set for this region
+    -- (outer-region vars count as outside); born set is inherited
+    -- but restored on exit so inner-only names do not leak out.
+    let saved_declared = cc.region_declared
+    let saved_born = cc.region_born
+    cc.region_declared = ""
     cc = c_expect(cc, TK_LBRACE())
     cc.indent = cc.indent + 1
     cc = compile_block_body(cc)
@@ -3889,6 +3943,8 @@ fn compile_region_stmt(c: Compiler) -> Compiler {
     cc.indent = cc.indent - 1
     -- Restore previous region arena (supports nesting)
     cc.current_region_arena = saved_arena
+    cc.region_declared = saved_declared
+    cc.region_born = saved_born
     -- Emit arena destroy
     cc.output = cc.output + ind + "dm_arena_destroy(" + arena_name + ");\n"
     return cc
@@ -6984,8 +7040,13 @@ fn main() {
             return
         }
         println("Found " + int_to_string(test_names.len()) + " test(s)")
-        -- Compile the file normally then run it
-        -- (test functions use assert/assert_eq internally)
+        -- Compile, then rewrite the generated C like Stage 0's testFile:
+        -- (a) make dm_panic/dm_panic_cstr and the inline assert/assert_eq
+        --     failures longjmp to the runner instead of exit(1), and
+        -- (b) replace main() with a runner that calls each test_* function
+        --     under setjmp and reports real PASS/FAIL per test.
+        -- (Stage 1 assert expands inline without calling dm_panic, and its
+        -- dm_panic takes dm_string, so the needles differ from Stage 0's.)
         let mut comp = compiler_new(tokens)
         comp = compile_source(comp)
         if comp.errors.len() > 0 {
@@ -6997,28 +7058,76 @@ fn main() {
             }
             exit(1)
         }
-        let c_code = assemble_output(comp)
+        let mut test_code = assemble_output(comp)
+        -- (a) Test-aware panics (exact spellings from stage1/runtime.dm)
+        let panic_cstr_old = "static inline void dm_panic_cstr(const char* msg) { fprintf(stderr, \"PANIC: %s\\n\", msg); exit(1); }"
+        let panic_old = "static inline void dm_panic(dm_string msg) { fprintf(stderr, \"PANIC: \"); fwrite(msg.data, 1, msg.len, stderr); fputc('\\n', stderr); exit(1); }"
+        if string_contains(test_code, panic_cstr_old) == false or string_contains(test_code, panic_old) == false {
+            eprintln("Error: generated C has no recognizable dm_panic to rewrite for testing")
+            exit(1)
+        }
+        let mut panic_cstr_new = "#include <setjmp.h>\n"
+        panic_cstr_new = panic_cstr_new + "static jmp_buf __test_jmp;\n"
+        panic_cstr_new = panic_cstr_new + "static int __test_active = 0;\n"
+        panic_cstr_new = panic_cstr_new + "static const char* __test_fail_msg = NULL;\n"
+        panic_cstr_new = panic_cstr_new + "static char __test_fail_buf[512];\n"
+        panic_cstr_new = panic_cstr_new + "static inline void dm_panic_cstr(const char* msg) { if (__test_active) { __test_fail_msg = msg; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: %s\\n\", msg); exit(1); }"
+        test_code = string_replace(test_code, panic_cstr_old, panic_cstr_new)
+        let panic_new = "static inline void dm_panic(dm_string msg) { if (__test_active) { size_t __n = msg.len < 511 ? msg.len : 511; memcpy(__test_fail_buf, msg.data, __n); __test_fail_buf[__n] = '\\0'; __test_fail_msg = __test_fail_buf; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: \"); fwrite(msg.data, 1, msg.len, stderr); fputc('\\n', stderr); exit(1); }"
+        test_code = string_replace(test_code, panic_old, panic_new)
+        -- Inline assert/assert_eq failures (exact spellings from compile_expr.dm)
+        test_code = string_replace(test_code, "fprintf(stderr, \"PANIC: assertion failed\\n\"); exit(1);", "if (__test_active) { __test_fail_msg = \"assertion failed\"; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: assertion failed\\n\"); exit(1);")
+        test_code = string_replace(test_code, "fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1);", "if (__test_active) { __test_fail_msg = \"assert_eq failed\"; longjmp(__test_jmp, 1); } fprintf(stderr, \"PANIC: assert_eq failed\\n\"); exit(1);")
+        -- (b) Replace main() with the test runner
+        let main_pos = string_find(test_code, "int main(int argc, char** argv)")
+        if main_pos < 0 {
+            eprintln("Error: generated C has no main() to replace with the test runner")
+            exit(1)
+        }
+        let mut runner = substr(test_code, 0, main_pos)
+        runner = runner + "int main(int argc, char** argv) {\n"
+        runner = runner + "    dm_argc = argc;\n"
+        runner = runner + "    dm_argv = argv;\n"
+        runner = runner + "    int __passed = 0, __failed = 0;\n"
+        let mut ti2 = 0
+        while ti2 < test_names.len() {
+            let tname = test_names[ti2]
+            runner = runner + "    printf(\"  test " + tname + " ... \");\n"
+            runner = runner + "    fflush(stdout);\n"
+            runner = runner + "    __test_active = 1;\n"
+            runner = runner + "    __test_fail_msg = NULL;\n"
+            runner = runner + "    if (setjmp(__test_jmp) == 0) {\n"
+            runner = runner + "        dm_" + tname + "();\n"
+            runner = runner + "        __test_active = 0;\n"
+            runner = runner + "        printf(\"PASS\\n\"); __passed++;\n"
+            runner = runner + "    } else {\n"
+            runner = runner + "        __test_active = 0;\n"
+            runner = runner + "        if (__test_fail_msg) printf(\"FAIL: %s\\n\", __test_fail_msg);\n"
+            runner = runner + "        else printf(\"FAIL\\n\");\n"
+            runner = runner + "        __failed++;\n"
+            runner = runner + "    }\n"
+            ti2 = ti2 + 1
+        }
+        runner = runner + "    printf(\"\\n%d passed, %d failed\\n\", __passed, __failed);\n"
+        runner = runner + "    return __failed > 0 ? 1 : 0;\n"
+        runner = runner + "}\n"
         let c_file = string_replace(filename, ".dm", ".c")
         let bin_file = string_replace(filename, ".dm", "")
-        file_write(c_file, c_code)
+        file_write(c_file, runner)
         let compile_cmd = "cc -o " + bin_file + " " + c_file + " -lm"
         let cc_exit = system(compile_cmd)
         if cc_exit != 0 {
             eprintln("C compilation failed")
             exit(1)
         }
-        let run_exit = system("./" + bin_file)
+        let mut run_cmd = "./" + bin_file
+        if starts_with(bin_file, "/") {
+            run_cmd = bin_file
+        }
+        let run_exit = system(run_cmd)
         if run_exit != 0 {
-            eprintln("Tests failed")
             exit(1)
         }
-        -- Print results
-        let mut ti2 = 0
-        while ti2 < test_names.len() {
-            println("  PASS: " + test_names[ti2])
-            ti2 = ti2 + 1
-        }
-        println(int_to_string(test_names.len()) + " test(s) passed")
         return
     }
 

@@ -228,6 +228,7 @@ fn generate_simd_binary(gen: IRGenerator, block: IRBasicBlock, op: int, args: Li
     let mut inst = ir_inst_new(id, op)
     inst.lhs = ir_val_inst(lhs_result.val_id)
     inst.rhs = ir_val_inst(rhs_result.val_id)
+    inst.simd_vec_type = vec_type
     inst.result_type = vec_type
     inst.has_result = true
     b.instructions.push(inst)
@@ -261,7 +262,8 @@ fn generate_simd_extract(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 
     -- Infer the vector type from the first argument
     let vec_type = infer_simd_arg_type(g, args[0])
-    let scalar_type = simd_extract_scalar_type(vec_type)
+    -- Use dAImond-native types (f64 for float vectors, i64 for int vectors)
+    let scalar_type = if is_simd_float_type(vec_type) { "f64" } else { "i64" }
 
     -- Emit OP_SIMD_EXTRACT instruction
     let id = g.builder.next_id
@@ -333,6 +335,9 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
     let c_name = map_builtin_name(fn_name)
     let ret_type = builtin_return_type(fn_name)
 
+    -- Auto-convert print/println/eprint/eprintln args to string
+    let is_print_fn = fn_name == "println" or fn_name == "print" or fn_name == "eprintln" or fn_name == "eprint"
+
     -- Generate all argument expressions
     let mut call_args: List[IRValue] = []
     let mut i = 0
@@ -340,7 +345,54 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
         let arg_result = generate_expr(g, b, args[i])
         g = arg_result.gen
         b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
+
+        if is_print_fn {
+            let arg_type = infer_expr_type(g, args[i])
+            if arg_type == "i64" or arg_type == "i32" or arg_type == "i16" or arg_type == "i8" or arg_type == "u64" or arg_type == "u32" or arg_type == "u16" or arg_type == "u8" or arg_type == "int" {
+                -- Wrap with int_to_string
+                let conv_id = g.builder.next_id
+                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
+                conv_inst.callee = "dm_int_to_string"
+                let mut conv_args: List[IRValue] = []
+                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_inst.call_args = conv_args
+                conv_inst.result_type = "string"
+                conv_inst.has_result = true
+                b.instructions.push(conv_inst)
+                g.builder.next_id = g.builder.next_id + 1
+                call_args.push(ir_val_inst(conv_id))
+            } else if arg_type == "f64" or arg_type == "f32" or arg_type == "float" {
+                -- Wrap with float_to_string
+                let conv_id = g.builder.next_id
+                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
+                conv_inst.callee = "dm_float_to_string"
+                let mut conv_args: List[IRValue] = []
+                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_inst.call_args = conv_args
+                conv_inst.result_type = "string"
+                conv_inst.has_result = true
+                b.instructions.push(conv_inst)
+                g.builder.next_id = g.builder.next_id + 1
+                call_args.push(ir_val_inst(conv_id))
+            } else if arg_type == "bool" {
+                -- Wrap with bool_to_string
+                let conv_id = g.builder.next_id
+                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
+                conv_inst.callee = "dm_bool_to_string"
+                let mut conv_args: List[IRValue] = []
+                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_inst.call_args = conv_args
+                conv_inst.result_type = "string"
+                conv_inst.has_result = true
+                b.instructions.push(conv_inst)
+                g.builder.next_id = g.builder.next_id + 1
+                call_args.push(ir_val_inst(conv_id))
+            } else {
+                call_args.push(ir_val_inst(arg_result.val_id))
+            }
+        } else {
+            call_args.push(ir_val_inst(arg_result.val_id))
+        }
         i = i + 1
     }
 
@@ -469,8 +521,22 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     g = val_result.gen
     b = val_result.block
 
+    -- Compute allocation size based on the value being boxed
+    let mut size = 8  -- default pointer-sized allocation
+    let arg0 = args[0]
+    if arg0.kind == EXPR_STRUCT_LITERAL() {
+        let sname = arg0.type_name
+        if g.struct_defs.contains(sname) {
+            let sinfo = g.struct_defs.get(sname)
+            -- Each field is 8 bytes (i64/f64/ptr)
+            size = sinfo.field_names.len() * 8
+            if size < 8 {
+                size = 8
+            }
+        }
+    }
+
     -- Allocate memory via malloc
-    let size = 8  -- default pointer-sized allocation
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
     malloc_inst.callee = "malloc"
@@ -494,18 +560,17 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 }
 
 -- Generate a Box_null() call.
--- Returns a null pointer constant.
+-- Returns a null pointer constant via inttoptr(0).
 fn generate_box_null_call(gen: IRGenerator, block: IRBasicBlock) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Emit an alloca with null value (pointer set to 0)
+    -- Emit inttoptr(i64 0) to produce a true null pointer
     let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL())
-    inst.callee = "malloc"
-    let mut margs: List[IRValue] = []
-    margs.push(ir_val_int(0))
-    inst.call_args = margs
+    let mut inst = ir_inst_new(id, OP_CAST())
+    inst.cast_val = ir_val_int(0)
+    inst.cast_from = "i64"
+    inst.cast_to = "ptr"
     inst.result_type = "ptr"
     inst.has_result = true
     b.instructions.push(inst)

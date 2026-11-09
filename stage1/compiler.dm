@@ -229,7 +229,11 @@ struct Compiler {
     -- Whether current function has a with [...] clause (distinguishes "no clause" from "empty clause")
     current_fn_has_effects: bool,
     -- Current region arena variable name (empty when not in a region, e.g. "_region_arena0" when inside)
-    current_region_arena: string
+    current_region_arena: string,
+    -- Region escape check: vars let-declared inside the innermost region: "|mangled|..."
+    region_declared: string,
+    -- Region escape check: vars holding region-arena values: "|mangled|..."
+    region_born: string
 }
 
 fn compiler_new(tokens: List[Token]) -> Compiler {
@@ -280,7 +284,9 @@ fn compiler_new(tokens: List[Token]) -> Compiler {
         generic_bounds: "",
         current_fn_effects: "",
         current_fn_has_effects: false,
-        current_region_arena: ""
+        current_region_arena: "",
+        region_declared: "",
+        region_born: ""
     }
 }
 

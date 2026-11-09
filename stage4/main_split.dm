@@ -49,6 +49,7 @@ fn print_usage() {
     println("  -O3           Aggressive optimization")
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
+    println("  --link-llvm   Link LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
     println("  --version     Show version")
@@ -64,6 +65,7 @@ struct CLIArgs {
     opt_level: int,
     emit_ir: bool,
     emit_llvm: bool,
+    link_llvm: bool,
     verbose: bool,
     show_help: bool,
     show_version: bool,
@@ -78,6 +80,7 @@ fn parse_cli_args() -> CLIArgs {
         opt_level: 0,
         emit_ir: false,
         emit_llvm: false,
+        link_llvm: false,
         verbose: false,
         show_help: false,
         show_version: false,
@@ -123,6 +126,8 @@ fn parse_cli_args() -> CLIArgs {
             args.emit_ir = true
         } else if arg == "--emit-llvm" {
             args.emit_llvm = true
+        } else if arg == "--link-llvm" {
+            args.link_llvm = true
         } else if arg == "-v" or arg == "--verbose" {
             args.verbose = true
         } else if starts_with(arg, "-") {
@@ -243,6 +248,32 @@ fn find_wrappers_dir(input_dir: string) -> string {
 
     -- Fallback
     return "runtime"
+}
+
+-- Find llvm_bridge.c for self-compilation (--link-llvm)
+fn find_bridge_file(input_dir: string) -> string {
+    -- Strategy 1: Same directory as input file
+    let try1 = input_dir + "/llvm_bridge.c"
+    if file_exists(try1) {
+        return try1
+    }
+
+    -- Strategy 2: src/ relative paths
+    if file_exists("src/llvm_bridge.c") {
+        return "src/llvm_bridge.c"
+    }
+
+    -- Strategy 3: stage4/ relative paths
+    if file_exists("stage4/llvm_bridge.c") {
+        return "stage4/llvm_bridge.c"
+    }
+
+    -- Strategy 4: Relative (assume running from stage4/)
+    if file_exists("llvm_bridge.c") {
+        return "llvm_bridge.c"
+    }
+
+    return ""
 }
 
 -- ============================================================
@@ -386,7 +417,18 @@ fn compile(cli: CLIArgs) -> int {
             eprintln(p.errors[ei])
             ei = ei + 1
         }
-        return 1
+        exit(1)
+    }
+
+    -- Post-parse validation
+    let validation_errors = validate_source_file(sf)
+    if validation_errors.len() > 0 {
+        let mut vi = 0
+        while vi < validation_errors.len() {
+            eprintln(validation_errors[vi])
+            vi = vi + 1
+        }
+        exit(1)
     }
 
     -- Phase 3.5: Resolve imports
@@ -394,6 +436,17 @@ fn compile(cli: CLIArgs) -> int {
         if verbose { println("  [3.5/6] Resolving imports...") }
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
+    }
+
+    -- Effect system enforcement
+    let effect_errors = validate_effects(sf)
+    if effect_errors.len() > 0 {
+        let mut ei2 = 0
+        while ei2 < effect_errors.len() {
+            eprintln(effect_errors[ei2])
+            ei2 = ei2 + 1
+        }
+        exit(1)
     }
 
     -- Phase 4: Generate IR
@@ -432,17 +485,39 @@ fn compile(cli: CLIArgs) -> int {
         return 0
     }
 
+    -- A binary needs an entry point
+    let mut has_main = false
+    let mut di = 0
+    while di < sf.declarations.len() {
+        let decl = sf.declarations[di]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.name == "main" {
+                has_main = true
+            }
+        }
+        di = di + 1
+    }
+    if has_main == false {
+        eprintln("Error: no main function found")
+        exit(1)
+    }
+
     -- Phase 5: Generate LLVM IR
     if verbose { println("  [5/6] Generating LLVM IR...") }
 
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
     lg = lg_generate_module(lg)
 
-    -- Verify LLVM module
+    -- Verify LLVM module (fatal: invalid IR must not produce any output;
+    -- dm_llvm_module_verify in llvm_bridge.c prints the detailed diagnostic)
     let verify_result = verify_module(lg)
     if verify_result != 0 {
         eprintln("Error: LLVM module verification failed")
         llvm_gen_dispose(lg)
+        -- exit(1) as well as return: the Stage 0 C wrapper discards
+        -- dm_main()'s return value, so return alone would exit 0.
+        exit(1)
         return 1
     }
 
@@ -513,6 +588,29 @@ fn compile(cli: CLIArgs) -> int {
     -- Link system libraries
     link_cmd = link_cmd + " -lm -lpthread"
 
+    -- If --link-llvm, add llvm_bridge.c and LLVM libraries
+    if cli.link_llvm {
+        let bridge_file = find_bridge_file(input_dir)
+        if bridge_file != "" {
+            -- Compile bridge with LLVM cflags via a temp object
+            let bridge_obj = output_file + "_bridge.o"
+            let bridge_cmd = "cc -c " + bridge_file + " -o " + bridge_obj + " $(llvm-config --cflags) -I" + runtime_h_dir
+            if verbose {
+                println("  Bridge: " + bridge_cmd)
+            }
+            let bridge_result = system(bridge_cmd)
+            if bridge_result != 0 {
+                eprintln("Error: failed to compile llvm_bridge.c")
+                return 1
+            }
+            link_cmd = link_cmd + " " + bridge_obj
+        } else {
+            eprintln("Warning: llvm_bridge.c not found, LLVM functions will be unresolved")
+        }
+        -- Add LLVM link flags
+        link_cmd = link_cmd + " $(llvm-config --libs --ldflags --system-libs)"
+    }
+
     if verbose {
         println("  Link: " + link_cmd)
     }
@@ -525,8 +623,11 @@ fn compile(cli: CLIArgs) -> int {
         return 1
     }
 
-    -- Clean up temporary object file
+    -- Clean up temporary object file(s)
     system("rm -f " + obj_file)
+    if cli.link_llvm {
+        system("rm -f " + output_file + "_bridge.o")
+    }
 
     if verbose {
         println("Successfully compiled: " + output_file)
@@ -559,3 +660,154 @@ fn main() -> int {
 
     return compile(cli)
 }
+
+fn builtin_required_effect(name: string) -> string {
+    if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
+    if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
+    if name == "args_get" or name == "args_len" { return "IO" }
+    if name == "system" or name == "exit" { return "Process" }
+    return ""
+}
+
+fn collect_call_names_from_expr(e: Expr) -> List[string] {
+    let mut names: List[string] = []
+    if e.kind == EXPR_FUNCTION_CALL() {
+        let callee_expr = *e.callee
+        if len(callee_expr.name) > 0 {
+            names.push(callee_expr.name)
+        }
+    }
+    return names
+}
+
+fn collect_call_names_from_stmts(stmts: List[Stmt]) -> List[string] {
+    let mut names: List[string] = []
+    let mut i = 0
+    while i < stmts.len() {
+        let s = stmts[i]
+        if s.kind == STMT_EXPRESSION() {
+            let e = *s.expr
+            let sub = collect_call_names_from_expr(e)
+            let mut j = 0
+            while j < sub.len() {
+                names.push(sub[j])
+                j = j + 1
+            }
+        } else if s.kind == STMT_RETURN() {
+            if s.has_ret_value {
+                let e = *s.ret_value
+                let sub = collect_call_names_from_expr(e)
+                let mut j = 0
+                while j < sub.len() {
+                    names.push(sub[j])
+                    j = j + 1
+                }
+            }
+        } else if s.kind == STMT_LET() {
+            let e = *s.let_value
+            let sub = collect_call_names_from_expr(e)
+            let mut j = 0
+            while j < sub.len() {
+                names.push(sub[j])
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+fn list_contains_str(lst: List[string], val: string) -> bool {
+    let mut i = 0
+    while i < lst.len() {
+        if lst[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn validate_effects(sf: SourceFile) -> List[string] {
+    let mut errors: List[string] = []
+    -- Build map: function name -> declared effects
+    let mut fn_effects: Map[string, List[string]] = Map_new()
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.effects.len() > 0 {
+                fn_effects.insert(fd.name, fd.effects)
+            }
+        }
+        i = i + 1
+    }
+
+    -- For each function with effects, check its calls
+    i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.effects.len() > 0 {
+                let caller_effects = fd.effects
+                let call_names = collect_call_names_from_stmts(fd.body)
+                let mut ci = 0
+                while ci < call_names.len() {
+                    let callee = call_names[ci]
+                    -- Check builtin required effects
+                    let req = builtin_required_effect(callee)
+                    if len(req) > 0 {
+                        if list_contains_str(caller_effects, req) == false {
+                            errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
+                        }
+                    }
+                    -- Check callee's declared effects are subset of caller's
+                    if fn_effects.contains(callee) {
+                        let callee_effects = fn_effects.get(callee)
+                        let mut ei = 0
+                        while ei < callee_effects.len() {
+                            let eff = callee_effects[ei]
+                            if list_contains_str(caller_effects, eff) == false {
+                                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
+                            }
+                            ei = ei + 1
+                        }
+                    }
+                    ci = ci + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return errors
+}
+
+-- ============================================================
+-- COMPILATION PIPELINE
+-- ============================================================
+
+fn validate_source_file(sf: SourceFile) -> List[string] {
+    let mut errors: List[string] = []
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            -- Check for params with empty type (sign of a parse error)
+            let mut pi = 0
+            while pi < fd.params.len() {
+                let param = fd.params[pi]
+                if param.name != "self" and param.name != "mut self" and len(param.type_name) == 0 {
+                    errors.push("Error: parameter '" + param.name + "' in function '" + fd.name + "' has no type")
+                }
+                pi = pi + 1
+            }
+        }
+        i = i + 1
+    }
+    return errors
+}
+
+-- ============================================================
+-- EFFECT SYSTEM ENFORCEMENT
+-- ============================================================

@@ -57,6 +57,7 @@ pub const TokenType = enum {
     kw_expect,
     kw_async,
     kw_await,
+    kw_unsafe,
 
     // Operators
     plus, // +
@@ -396,6 +397,7 @@ pub const Lexer = struct {
             .{ "expect", .kw_expect },
             .{ "async", .kw_async },
             .{ "await", .kw_await },
+            .{ "unsafe", .kw_unsafe },
         });
         return keywords.get(text) orelse .identifier;
     }
