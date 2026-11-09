@@ -35,7 +35,7 @@
 #
 # The stage5 binary is built through the normal chain (Stage 0 build,
 # `daimond ../stage5/main.dm -c` with NO --skip-type-check, then the
-# stage4/run_parity.sh gcc recipe with stage5/ paths) and cached in /tmp;
+# stage5/run_parity.sh gcc recipe with stage5/ paths) and cached in /tmp;
 # it is rebuilt only when the md5 of stage5/main.dm (plus the C inputs to
 # the link) changes. Set STAGE5_PROBE_FORCE_BUILD=1 to force a rebuild.
 # Probes are compiled from stage5/ as CWD, mirroring parity invocation:

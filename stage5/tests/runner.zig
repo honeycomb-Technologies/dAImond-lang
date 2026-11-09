@@ -1,11 +1,11 @@
-//! dAImond Stage 4 (LLVM) Integration Test Runner
+//! dAImond Stage 5 (LLVM) Integration Test Runner
 //!
 //! Reuses test case definitions from Stage 0's runner, but invokes
-//! the Stage 4 LLVM compiler binary instead of the Stage 0 compiler.
-//! The compiler path is read from the DAIMOND_STAGE4_BIN environment
-//! variable, defaulting to "/tmp/stage4_bin" (see run_parity.sh).
+//! the Stage 5 LLVM compiler binary instead of the Stage 0 compiler.
+//! The compiler path is read from the DAIMOND_STAGE5_BIN environment
+//! variable, defaulting to "/tmp/stage5_bin" (see run_parity.sh).
 //!
-//! Run from the stage4/ directory so the Stage 4 compiler can locate
+//! Run from the stage5/ directory so the Stage 5 compiler can locate
 //! the C runtime and LLVM wrappers via its relative-path strategies.
 
 const std = @import("std");
@@ -22,8 +22,8 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Stage 4 compiler path (overridable via environment)
-    const compiler_path = std.process.getEnvVarOwned(allocator, "DAIMOND_STAGE4_BIN") catch "/tmp/stage4_bin";
+    // Stage 5 compiler path (overridable via environment)
+    const compiler_path = std.process.getEnvVarOwned(allocator, "DAIMOND_STAGE5_BIN") catch "/tmp/stage5_bin";
 
     const stdout = std.io.getStdOut().writer();
     var total_passed: usize = 0;
@@ -99,7 +99,7 @@ pub fn main() !void {
     };
 
     try stdout.print("\n============================================================\n", .{});
-    try stdout.print("  dAImond Stage 4 (LLVM) Integration Tests\n", .{});
+    try stdout.print("  dAImond Stage 5 (LLVM) Integration Tests\n", .{});
     try stdout.print("============================================================\n\n", .{});
 
     for (suites) |suite| {

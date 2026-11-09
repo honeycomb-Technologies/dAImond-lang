@@ -5315,7 +5315,7 @@ pub const len_unified_tests = [_]TestCase{
 /// Error-quality tests: diagnostics must name the types/variables an
 /// author (human or LLM) needs, report one root error instead of a
 /// cascade, and surface backend (C compiler) failures. Stage 0-only:
-/// stage3/stage4 runners enumerate their original suites by name.
+/// stage3/stage5 runners enumerate their original suites by name.
 pub const error_quality_tests = [_]TestCase{
     .{
         .name = "error_type_mismatch_names_both_types",
@@ -5399,7 +5399,7 @@ pub const error_quality_tests = [_]TestCase{
 
 /// Nested-List regression tests: an index assignment to one List
 /// must not mistype indexing into an unrelated List[List[...]].
-/// Stage 0-only (stage3/stage4 enumerate their original suites).
+/// Stage 0-only (stage3/stage5 enumerate their original suites).
 pub const nested_list_tests = [_]TestCase{
     .{
         .name = "nested_list_index_after_other_list_assign",

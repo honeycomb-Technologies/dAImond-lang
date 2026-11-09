@@ -1,7 +1,7 @@
 const std = @import("std");
 
-// Stage 4 build file: builds ONLY the integration test harness.
-// The harness spawns the Stage 4 compiler binary (built separately,
+// Stage 5 build file: builds ONLY the integration test harness.
+// The harness spawns the Stage 5 compiler binary (built separately,
 // see run_parity.sh), so it does not need LLVM.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -25,6 +25,6 @@ pub fn build(b: *std.Build) void {
     const run_integration = b.addRunArtifact(integration_exe);
     run_integration.step.dependOn(b.getInstallStep());
 
-    const integration_step = b.step("test-integration", "Run Stage 4 LLVM integration tests");
+    const integration_step = b.step("test-integration", "Run Stage 5 LLVM integration tests");
     integration_step.dependOn(&run_integration.step);
 }

@@ -1,9 +1,0 @@
-# Zig build artifacts (parity harness)
-.zig-cache/
-zig-out/
-
-# Compiled test binaries
-test_*
-*.o
-*.out
-*.ll

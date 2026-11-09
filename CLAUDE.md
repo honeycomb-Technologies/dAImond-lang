@@ -4,7 +4,7 @@
 
 dAImond is a systems programming language designed to be the fastest compiled language, the most AI-generatable language, self-compiling, memory-safe without garbage collection (region-based with full inference), and fully Turing-complete at compile time.
 
-The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 4 LLVM backend** (dAImond + LLVM) — achieving full self-hosting without any Zig dependency.
+The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 does not yet compile itself, so Stage 0 (Zig) is still needed to build it.
 
 ## Repository Structure
 
@@ -81,8 +81,8 @@ dAImond-lang/
 │   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
 │   └── tests/
 │       └── runner.zig         # Integration test harness (254 tests, mirrors Stage 0)
-├── stage4/                # Stage 4 LLVM backend (dAImond — no Zig dependency)
-│   ├── main.dm            # Monolithic bootstrap file (generated, ~18.7K lines)
+├── stage5/                # Stage 5 LLVM backend (dAImond; built by Stage 0)
+│   ├── main.dm            # Monolithic bootstrap file (generated, ~20.7K lines)
 │   ├── main_split.dm      # Entry point with imports (for modular development)
 │   ├── token.dm           # Token kinds, Token struct, keyword lookup
 │   ├── lexer.dm           # Lexer struct, tokenize, character helpers
@@ -103,6 +103,10 @@ dAImond-lang/
 │   ├── llvm_bridge.c      # C bridge to LLVM-C API (extern FFI)
 │   ├── runtime/
 │   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
+│   ├── build.zig          # Builds the integration test harness
+│   ├── tests/
+│   │   └── runner.zig     # Runs Stage 0's test cases against the Stage 5 binary
+│   ├── run_parity.sh      # Builds Stage 5 and runs the integration suite
 │   └── gen_bootstrap.sh   # Concatenates modules into main.dm
 └── tests/                 # Integration test programs (.dm files)
     ├── arithmetic.dm      # Arithmetic validation
@@ -130,7 +134,7 @@ Stage 3 (LLVM backend, Zig):
 Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR -> LLVM -> Native Binary
 ```
 
-Stage 4 (LLVM backend, dAImond):
+Stage 5 (LLVM backend, dAImond):
 ```
 Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Validation -> Effect Check -> IR Gen -> dAImond IR -> LLVM Gen (via llvm_bridge.c FFI) -> LLVM IR -> LLVM -> Native Binary
 ```
@@ -185,33 +189,36 @@ cd stage0 && ./zig-out/bin/daimond-lsp
 
 Stage 3 is frozen. See `docs/stage-history.md` for build commands.
 
-### Stage 4 (LLVM Backend in dAImond)
+### Stage 5 (LLVM Backend in dAImond)
 
-Stage 4 is compiled by Stage 0. It requires **LLVM 17+** development libraries and the C runtime.
+Stage 5 is compiled by Stage 0. It requires **LLVM 17+** development libraries and the C runtime.
 
 ```bash
-# Build Stage 4 compiler (Stage 0 compiles main.dm to C, then gcc produces binary)
-cd stage0 && ./zig-out/bin/daimond ../stage4/main.dm --skip-type-check -c -o /tmp/stage4.c
-gcc -c /tmp/stage4.c -o /tmp/stage4.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
-gcc -c ../stage4/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
-gcc -c ../stage4/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
+# Build Stage 5 compiler (Stage 0 compiles main.dm to C, then gcc produces binary)
+cd stage0 && ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
+gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
+gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
+gcc -c ../stage5/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
 gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
-gcc /tmp/stage4.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o -o /tmp/stage4_bin -lm -lpthread $(llvm-config --libs --ldflags)
+gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o -o /tmp/stage5_bin -lm -lpthread $(llvm-config --libs --ldflags)
 
-# Compile a dAImond program to native binary via Stage 4
-/tmp/stage4_bin <file.dm> -o output
+# Compile a dAImond program to native binary via Stage 5
+/tmp/stage5_bin <file.dm> -o output
 
 # Compile with optimization
-/tmp/stage4_bin <file.dm> -o output -O2
+/tmp/stage5_bin <file.dm> -o output -O2
 
 # Emit dAImond IR (debugging)
-/tmp/stage4_bin <file.dm> --emit-ir
+/tmp/stage5_bin <file.dm> --emit-ir
 
 # Emit LLVM IR (debugging)
-/tmp/stage4_bin <file.dm> --emit-llvm
+/tmp/stage5_bin <file.dm> --emit-llvm
 
 # Regenerate monolithic main.dm from modules
-cd stage4 && bash gen_bootstrap.sh
+cd stage5 && bash gen_bootstrap.sh
+
+# Run the integration suite against the Stage 5 binary (257 tests)
+bash stage5/run_parity.sh
 ```
 
 ## Testing Strategy
@@ -220,7 +227,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 254 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 286 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -282,7 +289,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond). All stages complete. Stage 4 achieves full self-hosting without Zig dependency (254/254 integration tests pass).
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 257/257 integration tests but cannot compile itself yet, so Stage 0 is still required.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -356,15 +363,15 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 **Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
 
 **Compiler stages** (all complete):
-- Stage 0 (Zig → C): Bootstrap compiler, 254/254 integration tests
+- Stage 0 (Zig → C): Bootstrap compiler, 286/286 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 4 (dAImond + LLVM): Full self-hosting, no Zig dependency, 254/254 tests
+- Stage 5 (dAImond + LLVM): built by Stage 0, 257/257 tests, 19/19 memory-safety probes; does not compile itself yet
 
 ### Not Yet Implemented
-- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 4)
+- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
 - Debug info (DWARF) in Stage 3/4
-- Stage 4 self-compilation (Stage 4 compiles itself)
+- Stage 5 self-compilation (Stage 5 compiles itself)
 
 ## Documentation Maintenance
 
@@ -507,11 +514,11 @@ fn is_alpha_char(ch: string) -> bool {
 
 ## Stage 1 & Stage 3 (Archived)
 
-Stage 1 (dAImond → C self-hosting) and Stage 3 (LLVM backend in Zig) are complete and frozen. Stage 1 achieved bootstrap fixed-point. Stage 3 achieved 254/254 test parity. Both are superseded by Stage 4. See `docs/stage-history.md` for detailed architecture, module layout, feature lists, and build commands.
+Stage 1 (dAImond → C self-hosting) and Stage 3 (LLVM backend in Zig) are complete and frozen. Stage 1 achieved bootstrap fixed-point. Stage 3 achieved 254/254 test parity. Both are superseded by Stage 5. See `docs/stage-history.md` for detailed architecture, module layout, feature lists, and build commands.
 
-## Stage 4 Compiler Architecture
+## Stage 5 Compiler Architecture
 
-Stage 4 is the LLVM backend rewritten entirely in dAImond. It is compiled by Stage 0 (to C), then gcc. It produces native binaries by calling LLVM-C API functions via extern FFI through `llvm_bridge.c`.
+Stage 5 is the LLVM backend rewritten entirely in dAImond. It is compiled by Stage 0 (to C), then gcc. It produces native binaries by calling LLVM-C API functions via extern FFI through `llvm_bridge.c`.
 
 ### Design Decisions
 - **Same architecture as Stage 3**: Lexer → Parser → AST → dAImond IR (SSA) → LLVM IR → native binary. The pipeline mirrors Stage 3 but is implemented in dAImond instead of Zig.
@@ -540,42 +547,42 @@ llvm_gen_call.dm   — LLVM call instruction generation
 llvm_gen_simd.dm   — LLVM SIMD instruction generation
 llvm_bridge.c      — C bridge: extern fn declarations for LLVM-C API
 main_split.dm      — Entry point with imports (for modular development)
-main.dm            — Monolithic bootstrap file (~18.7K lines, generated)
+main.dm            — Monolithic bootstrap file (~20.7K lines, generated)
 ```
 
 ### Error Detection
-Stage 4 includes compile-time error detection for:
+Stage 5 includes compile-time error detection for:
 - **Unterminated strings**: Lexer detects EOF inside string literals and exits with error
 - **Syntax errors**: Post-parse AST validation catches malformed function declarations (e.g., missing parameter types)
 - **Undefined functions**: IR generation checks a `known_functions` map before generating calls
 - **Effect violations**: Builtin-to-effect mapping (e.g., `file_read` → `FileSystem`) with callee effect subset checking ensures functions only call operations permitted by their `with [...]` declarations
 
-### Building Stage 4
+### Building Stage 5
 ```bash
-# Stage 0 compiles Stage 4 (from monolithic main.dm)
-cd stage0 && ./zig-out/bin/daimond ../stage4/main.dm --skip-type-check -c -o /tmp/stage4.c
+# Stage 0 compiles Stage 5 (from monolithic main.dm)
+cd stage0 && ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
 
 # Compile C output + LLVM bridge + runtime to binary
-gcc -c /tmp/stage4.c -o /tmp/stage4.o -I runtime
-gcc -c ../stage4/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
-gcc -c ../stage4/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
+gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
+gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
+gcc -c ../stage5/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
 gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
-gcc /tmp/stage4.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o \
-    -o /tmp/stage4_bin -lm -lpthread $(llvm-config --libs --ldflags)
+gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o \
+    -o /tmp/stage5_bin -lm -lpthread $(llvm-config --libs --ldflags)
 
-# Stage 4 compiles a test program
-/tmp/stage4_bin test_program.dm -o test_program
+# Stage 5 compiles a test program
+/tmp/stage5_bin test_program.dm -o test_program
 
 # Regenerate monolithic main.dm from modules
-cd stage4 && bash gen_bootstrap.sh
+cd stage5 && bash gen_bootstrap.sh
 ```
 
 ### Full Bootstrap Chain
 ```
 Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
 stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
-Stage 0 (Zig) compiles Stage 4 (dAImond→LLVM)   → stage4_bin
-stage4_bin compiles test programs                 → native binaries (254/254 tests pass)
+Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
+stage5_bin compiles test programs                 → native binaries (257/257 tests pass)
 ```
 
 ## Important Notes
@@ -583,4 +590,4 @@ stage4_bin compiles test programs                 → native binaries (254/254 t
 - The `.gitignore` in `stage0/` excludes `*.c` files (generated output) but includes `!src/*.c` to allow runtime C source files.
 - Zig version is pinned to 0.13.0 via `.mise.toml`. Do not upgrade without testing compatibility.
 - The largest source files are `codegen.zig` (~6830 lines), `parser.zig` (~3630 lines), and `checker.zig` (~3116 lines). Changes to these require careful testing.
-- Stage 4's `main.dm` is ~18.7K lines (the largest dAImond source file). The monolithic file is generated by `gen_bootstrap.sh` — edit the split module files for development.
+- Stage 5's `main.dm` is ~20.7K lines (the largest dAImond source file). The monolithic file is generated by `gen_bootstrap.sh` — edit the split module files for development.

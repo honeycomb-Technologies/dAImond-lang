@@ -193,7 +193,7 @@ fn dirname(path: string) -> string {
 -- Find the project root by looking for stage0/runtime/daimond_runtime.c
 -- relative to the executable's working directory. Tries several strategies:
 --   1. Relative to input file directory: ../stage0/runtime/
---   2. CWD-relative: ../stage0/runtime/ (if running from stage4/)
+--   2. CWD-relative: ../stage0/runtime/ (if running from stage5/)
 --   3. CWD-relative: stage0/runtime/ (if running from project root)
 fn find_runtime_dir(input_dir: string) -> string {
     -- Strategy 1: Go up from input file dir
@@ -202,7 +202,7 @@ fn find_runtime_dir(input_dir: string) -> string {
         return try1
     }
 
-    -- Strategy 2: Relative (assume running from stage4/)
+    -- Strategy 2: Relative (assume running from stage5/)
     if file_exists("../stage0/runtime/daimond_runtime.c") {
         return "../stage0/runtime"
     }
@@ -217,7 +217,7 @@ fn find_runtime_dir(input_dir: string) -> string {
 }
 
 -- Find the Stage 5 runtime (llvm_wrappers.c) directory. Stage5's own
--- wrappers must win over the stage3/stage4 copies: generated code calls
+-- wrappers must win over the stage3 copy: generated code calls
 -- stage5-only runtime helpers (checked arithmetic, cast checks, list
 -- set, mem builtins), so linking an older copy fails or misbehaves.
 fn find_wrappers_dir(input_dir: string) -> string {
@@ -245,15 +245,8 @@ fn find_wrappers_dir(input_dir: string) -> string {
     if file_exists(try1 + "/llvm_wrappers.c") {
         return try1
     }
-    let try1b = input_dir + "/../stage4/runtime"
-    if file_exists(try1b + "/llvm_wrappers.c") {
-        return try1b
-    }
     if file_exists("../stage3/runtime/llvm_wrappers.c") {
         return "../stage3/runtime"
-    }
-    if file_exists("stage4/runtime/llvm_wrappers.c") {
-        return "stage4/runtime"
     }
     if file_exists("stage3/runtime/llvm_wrappers.c") {
         return "stage3/runtime"
@@ -276,12 +269,12 @@ fn find_bridge_file(input_dir: string) -> string {
         return "src/llvm_bridge.c"
     }
 
-    -- Strategy 3: stage4/ relative paths
-    if file_exists("stage4/llvm_bridge.c") {
-        return "stage4/llvm_bridge.c"
+    -- Strategy 3: from project root
+    if file_exists("stage5/llvm_bridge.c") {
+        return "stage5/llvm_bridge.c"
     }
 
-    -- Strategy 4: Relative (assume running from stage4/)
+    -- Strategy 4: Relative (assume running from stage5/)
     if file_exists("llvm_bridge.c") {
         return "llvm_bridge.c"
     }

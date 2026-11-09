@@ -152,8 +152,8 @@ dAImond-lang/
 │   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
 │   └── tests/
 │       └── runner.zig         # Integration test harness (254 tests)
-├── stage4/                    # Stage 4 LLVM backend (written in dAImond, no Zig dependency)
-│   ├── main.dm                # Monolithic bootstrap file (18.7K lines, generated)
+├── stage5/                    # Stage 5 LLVM backend (written in dAImond; built by Stage 0 until it self-hosts)
+│   ├── main.dm                # Monolithic bootstrap file (20.7K lines, generated)
 │   ├── main_split.dm          # Entry point with imports (for modular development)
 │   ├── token.dm               # Token kinds, Token struct, keyword lookup
 │   ├── lexer.dm               # Lexer struct, tokenize, character helpers
@@ -415,14 +415,15 @@ Found 2 test(s) in my_tests.dm
 ## Bootstrap Path
 
 ```
-Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Zig) -> Stage 4 (LLVM/dAImond)
+Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Zig) -> Stage 4 (LLVM/dAImond) -> Stage 5 (Stage 4 + memory safety)
 ```
 
 1. **Stage 0** (Complete): Hand-written compiler in Zig, compiles dAImond -> C
 2. **Stage 1** (Complete): Compiler rewritten in dAImond, compiled by Stage 0
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
-5. **Stage 4** (Complete): LLVM backend rewritten entirely in dAImond -- full self-hosting without Zig dependency, 254/254 tests pass
+5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 257/257 tests pass, but it cannot compile itself yet, so Stage 0 (Zig) still builds it
 
 ## Current Status
 
@@ -492,18 +493,18 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Optimization passes via LLVM (`-O0` through `-O3`)
 - [x] Self-hosting: Stage 3 compiles Stage 1, verified fixed-point bootstrap
 
-### Stage 4 LLVM Backend in dAImond -- Complete
-- [x] Entire LLVM backend rewritten in dAImond (~18.7K lines monolithic, ~15 split modules)
-- [x] Full test parity with Stage 0 and Stage 3 (254/254 integration tests pass)
+### Stage 5 LLVM Backend in dAImond -- In Progress
+- [x] Entire LLVM backend written in dAImond (~20.7K lines monolithic, ~15 split modules)
+- [x] Passes the shared integration suite (257/257) and 19/19 memory-safety probes
 - [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
 - [x] LLVM-C bridge via extern FFI (llvm_bridge.c)
-- [x] Error detection: unterminated strings, syntax errors, undefined functions, effect enforcement
-- [x] No Zig dependency -- full self-hosting achieved
+- [x] Error detection: unterminated strings, syntax errors, undefined functions and variables, effect enforcement, untyped expressions reported at their source line
+- [ ] Self-hosting: Stage 5 cannot compile itself yet, so Stage 0 (Zig) is still required
 - [x] Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1)
 
 ### Upcoming
-- [ ] Debug info (DWARF) in Stage 3/4
-- [ ] Stage 4 self-compilation (Stage 4 compiles itself)
+- [ ] Debug info (DWARF) in Stage 5
+- [ ] Stage 5 self-compilation (Stage 5 compiles itself)
 
 ## Design Principles
 
