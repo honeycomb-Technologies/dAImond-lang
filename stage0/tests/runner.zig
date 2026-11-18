@@ -18,8 +18,8 @@ pub const TestCase = struct {
     expected_exit_code: u8 = 0,
     expect_compile_error: bool = false,
     /// For expect_compile_error cases: every substring must appear in
-    /// the compiler's stdout (diagnostics are printed there; stderr
-    /// may carry allocator leak traces and is not asserted on).
+    /// the compiler's stdout or stderr (Stage 0 prints diagnostics to
+    /// stdout, Stage 5 to stderr).
     expected_error_contains: []const []const u8 = &.{},
     /// For expect_compile_error cases: exact number of "Error["
     /// diagnostics expected in the compiler's stdout.
@@ -112,7 +112,7 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
             };
         }
         for (case.expected_error_contains) |needle| {
-            if (std.mem.indexOf(u8, compile_stdout, needle) == null) {
+            if (std.mem.indexOf(u8, compile_stdout, needle) == null and std.mem.indexOf(u8, compile_stderr, needle) == null) {
                 const msg = try std.fmt.allocPrint(allocator, "Compile error output missing expected text: '{s}'\nGot: '{s}'", .{ needle, compile_stdout });
                 return .{
                     .name = case.name,
@@ -1729,6 +1729,85 @@ pub const io_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "start\n3\n2\n6\ntrue\n2\n9\n",
+    },
+    .{
+        .name = "struct_list_elements_exact_size",
+        .source =
+            \\module test
+            \\struct Rec { name: string, a: List[int], b: List[string], n: int }
+            \\fn main() {
+            \\    let before = 11
+            \\    let mut rs: List[Rec] = []
+            \\    let mut r = Rec { name: "r0", a: [], b: [], n: 1 }
+            \\    r.a.push(10)
+            \\    r.b.push("x")
+            \\    rs.push(r)
+            \\    rs.push(Rec { name: "r1", a: [], b: [], n: 2 })
+            \\    let after = 22
+            \\    let first = rs[0]
+            \\    rs[1] = Rec { name: "r2", a: [], b: [], n: 3 }
+            \\    let mut total = 0
+            \\    for e in rs {
+            \\        total = total + e.n
+            \\    }
+            \\    println(first.name + " " + int_to_string(first.a[0]) + " " + first.b[0])
+            \\    println(rs[1].name)
+            \\    println(int_to_string(total))
+            \\    println(int_to_string(before) + " " + int_to_string(after))
+            \\}
+        ,
+        .expected_output = "r0 10 x\nr2\n4\n11 22\n",
+    },
+    .{
+        .name = "mut_receivers_and_args_in_place",
+        .source =
+            \\module test
+            \\struct Counter { n: int, log: List[int] }
+            \\impl Counter {
+            \\    fn bump(mut self) {
+            \\        self.n = self.n + 1
+            \\        self.log.push(self.n)
+            \\    }
+            \\}
+            \\struct Holder { c: Counter }
+            \\fn grow(mut c: Counter) {
+            \\    c.bump()
+            \\}
+            \\fn main() {
+            \\    let mut h = Holder { c: Counter { n: 0, log: [] } }
+            \\    h.c.bump()
+            \\    grow(h.c)
+            \\    let mut cs: List[Counter] = []
+            \\    cs.push(Counter { n: 10, log: [] })
+            \\    cs[0].bump()
+            \\    grow(cs[0])
+            \\    println(int_to_string(h.c.n) + " " + int_to_string(h.c.log.len()))
+            \\    println(int_to_string(cs[0].n) + " " + int_to_string(cs[0].log[1]))
+            \\}
+        ,
+        .expected_output = "2 2\n12 12\n",
+    },
+    .{
+        .name = "method_returns_string_list_element",
+        .source =
+            \\module test
+            \\struct Names { items: List[string] }
+            \\impl Names {
+            \\    fn last(self) -> string {
+            \\        return self.items[self.items.len() - 1]
+            \\    }
+            \\}
+            \\fn first_of(xs: List[string]) -> string {
+            \\    return xs[0]
+            \\}
+            \\fn main() {
+            \\    let mut ns = Names { items: [] }
+            \\    ns.items.push("a")
+            \\    ns.items.push("b")
+            \\    println(ns.last() + first_of(ns.items))
+            \\}
+        ,
+        .expected_output = "ba\n",
     },
     .{
         .name = "statements_after_panic",

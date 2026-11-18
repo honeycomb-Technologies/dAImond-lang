@@ -632,7 +632,7 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_FLOAT() { return "float" }
     if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
     if k == EXPR_LITERAL_BOOL() { return "bool" }
-    if k == EXPR_STRUCT_LITERAL() { return expr.type_name }
+    if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
     if k == EXPR_GROUPED() { return static_type(gen, *expr.operand) }
     if k == EXPR_IDENTIFIER() {
         if gen.var_src_types.contains(expr.name) { return gen.var_src_types.get(expr.name) }
@@ -676,6 +676,13 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_METHOD_CALL() {
         let recv_t = strip_box_type(static_type(gen, *expr.object))
         let m = expr.method
+        if gen.generic_instances.contains(recv_t) {
+            let base_key = gen.generic_instances.get(recv_t) + "_" + m
+            if gen.fn_src_return_types.contains(base_key) {
+                return instance_type(gen, recv_t, gen.fn_src_return_types.get(base_key))
+            }
+            return ""
+        }
         if gen.struct_defs.contains(recv_t) {
             let key = recv_t + "_" + m
             if gen.fn_src_return_types.contains(key) { return gen.fn_src_return_types.get(key) }
@@ -805,8 +812,6 @@ fn generate_addr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResul
         let chk = check_index_bounds(g, b, idx_result.val_id, ir_val_inst(len_id), "(list)")
         g = chk.gen
         b = chk.block
-        -- Same stride the runtime used to store the elements
-        let elem_size = estimate_type_size_gen(g, elem_ir)
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_GEP())
         inst.gep_base = h.ptr
@@ -814,7 +819,6 @@ fn generate_addr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResul
         gep_idx.push(ir_val_inst(idx_result.val_id))
         inst.gep_indices = gep_idx
         inst.alloc_type = elem_ir
-        inst.field_index = elem_size
         inst.field_type = elem_ir
         inst.result_type = "ptr(" + elem_ir + ")"
         inst.has_result = true
@@ -1150,7 +1154,7 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         return "i64"
     }
     if expr.kind == EXPR_STRUCT_LITERAL() {
-        return expr.type_name
+        return canon_type(gen, expr.type_name)
     }
     if expr.kind == EXPR_ENUM_LITERAL() {
         return expr.enum_name
@@ -1278,6 +1282,12 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
     }
     if expr.kind == EXPR_METHOD_CALL() {
         let method = expr.method
+        -- Methods of generic struct instances have exact signatures
+        if gen.generic_instances.contains(strip_box_type(static_type(gen, *expr.object))) {
+            let mc_src = static_type(gen, expr)
+            if mc_src == "" { return "void" }
+            return map_type_name(mc_src)
+        }
         if method == "len" { return "i64" }
         if method == "pop" { return "i64" }
         if method == "get" {
@@ -2467,25 +2477,16 @@ fn generate_normal_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
             false
         }
 
-        if is_mut_arg and args[i].kind == EXPR_IDENTIFIER() {
-            -- Pass the alloca pointer directly (pass-by-reference) for mut params
-            let arg_name = args[i].name
-            if g.variable_map.contains(arg_name) {
-                -- If the arg is itself a mut param, forward the param pointer
-                if g.param_ptr_map.contains(arg_name) {
-                    let pidx = g.param_ptr_map.get(arg_name)
-                    call_args.push(ir_val_param(pidx))
-                } else {
-                    let ptr_id = g.variable_map.get(arg_name)
-                    call_args.push(ir_val_inst(ptr_id))
-                }
-            } else {
-                -- Fallback: evaluate normally
-                let arg_result = generate_expr(g, b, args[i])
-                g = arg_result.gen
-                b = arg_result.block
-                call_args.push(ir_val_inst(arg_result.val_id))
-            }
+        let mut arg_addr = addr_fail(g, b)
+        if is_mut_arg {
+            -- A mut parameter takes the argument's address: a variable,
+            -- a mut parameter, a field, a list element or a boxed value
+            arg_addr = generate_addr(g, b, args[i])
+            g = arg_addr.gen
+            b = arg_addr.block
+        }
+        if arg_addr.ok {
+            call_args.push(arg_addr.ptr)
         } else if is_mut_arg {
             -- A mut parameter takes a pointer: spill a non-variable argument
             -- (e.g. a struct literal) to a temporary and pass its address
@@ -3217,6 +3218,14 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     }
 
     -- --------------------------------------------------------
+    -- Methods of a generic struct instance
+    -- --------------------------------------------------------
+    let instance_recv = strip_box_type(static_type(g, obj_expr))
+    if g.generic_instances.contains(instance_recv) {
+        return generate_struct_method_call(g, b, instance_recv, obj_expr, method_name, args)
+    }
+
+    -- --------------------------------------------------------
     -- Struct method calls (mangled name dispatch)
     -- --------------------------------------------------------
     let struct_type = if len(obj_var_name) > 0 and g.var_struct_types.contains(obj_var_name) {
@@ -3729,8 +3738,6 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
             } else {
                 "i64"
             }
-            let elem_size = estimate_type_size_gen(g, elem_type_name)
-
             -- Alloca temp for the value
             let temp_alloca_id = g.builder.next_id
             let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
@@ -3755,7 +3762,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
             let mut call_args: List[IRValue] = []
             call_args.push(ir_val_inst(list_ptr))
             call_args.push(ir_val_inst(temp_alloca_id))
-            call_args.push(ir_val_int(elem_size))
+            call_args.push(ir_val_sizeof(elem_type_name))
             inst.call_args = call_args
             inst.result_type = "void"
             inst.has_result = false
@@ -3863,6 +3870,87 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 -- self (first arg), and emits OP_CALL.
 -- Handles both self-by-value and mut self (pass-by-pointer).
 -- ============================================================
+
+-- Generate Instance_method for a generic struct instance from its
+-- generic impl, with the instance's type arguments substituted.
+-- Only signature-wide state survives; the caller's function state
+-- is restored.
+fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: string) -> IRGenerator {
+    let mangled = instance + "_" + method_name
+    if gen.mono_generated.contains(mangled) { return gen }
+    let base_mangled = gen.generic_instances.get(instance) + "_" + method_name
+    if gen.generic_fn_decls.contains(base_mangled) == false { return gen }
+    let decl_idx: int = gen.generic_fn_decls.get(base_mangled)
+    let decl = gen.declarations[decl_idx]
+    if decl.kind != DECL_FUNCTION() { return gen }
+    let fd = *decl.func_decl
+
+    let caller = gen
+    let mut g = gen
+    g.mono_generated.insert(mangled, true)
+    g.type_substitutions = instance_subs(g, instance)
+    g.current_impl_type = instance
+    g.has_impl_type = true
+
+    let mut mono_fd = fd
+    let empty_gp: List[string] = []
+    mono_fd.generic_params = empty_gp
+    let mut mono_params: List[FuncParam] = []
+    let mut pi = 0
+    while pi < fd.params.len() {
+        let p = fd.params[pi]
+        g = ensure_type_instances(g, p.type_name, fd.line)
+        let mut mp = func_param_new(p.name, canon_type(g, p.type_name))
+        mp.is_mut = p.is_mut
+        mp.is_ref = p.is_ref
+        mono_params.push(mp)
+        pi = pi + 1
+    }
+    mono_fd.params = mono_params
+    g = ensure_type_instances(g, fd.return_type, fd.line)
+    let ret_src = canon_type(g, fd.return_type)
+    mono_fd.return_type = ret_src
+    g.fn_src_return_types.insert(mangled, ret_src)
+    if len(ret_src) > 0 {
+        g.fn_return_types.insert(mangled, parse_type_to_ir(ret_src))
+    } else {
+        g.fn_return_types.insert(mangled, "void")
+    }
+    g.known_functions.insert(mangled, true)
+
+    g.var_src_types = Map_new()
+    g.var_struct_types = Map_new()
+    g.list_elem_kinds = Map_new()
+    g.list_elem_types = Map_new()
+    g.var_enum_types = Map_new()
+    g.map_var_kinds = Map_new()
+    g.box_inner_types = Map_new()
+    g.fn_ptr_vars = Map_new()
+    g.array_var_names = Map_new()
+    g = declare_function(g, mono_fd, mangled)
+    g = generate_function_body(g, mono_fd, mangled)
+
+    -- Back to the caller's function, keeping what the new function added
+    let mut out = caller
+    out.ir_mod = g.ir_mod
+    out.struct_defs = g.struct_defs
+    out.mono_generated = g.mono_generated
+    out.lambda_captures = g.lambda_captures
+    out.mut_param_fns = g.mut_param_fns
+    out.user_extern_fns = g.user_extern_fns
+    out.fn_return_types = g.fn_return_types
+    out.fn_src_return_types = g.fn_src_return_types
+    out.field_list_elem_kinds = g.field_list_elem_kinds
+    out.field_list_elem_types = g.field_list_elem_types
+    out.field_map_kinds = g.field_map_kinds
+    out.label_counter = g.label_counter
+    out.lambda_counter = g.lambda_counter
+    out.known_functions = g.known_functions
+    out.type_errors = g.type_errors
+    out.generic_instances = g.generic_instances
+    out.generic_instance_args = g.generic_instance_args
+    return out
+}
 
 fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_type: string, obj_expr: Expr, method_name: string, args: List[Expr]) -> ExprResult {
     let mut g = gen
@@ -4066,6 +4154,11 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
     -- NON-GENERIC IMPL METHOD: direct call
     -- --------------------------------------------------------
 
+    -- A method of a generic struct instance is generated on first use
+    if g.generic_instances.contains(struct_type) {
+        g = ensure_instance_method(g, struct_type, method_name)
+    }
+
     -- Check if this method takes a mut self parameter (pass-by-pointer)
     let mut takes_mut_self = false
     if g.mut_param_fns.contains(mangled) {
@@ -4075,23 +4168,33 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
 
     let mut call_args: List[IRValue] = []
 
-    if takes_mut_self and obj_expr.kind == EXPR_IDENTIFIER() {
-        -- Pass the alloca pointer directly for mut self
-        let obj_name = obj_expr.name
-        if g.variable_map.contains(obj_name) {
-            -- If the object is itself a mut param, forward the param pointer
-            if g.param_ptr_map.contains(obj_name) {
-                let pidx = g.param_ptr_map.get(obj_name)
-                call_args.push(ir_val_param(pidx))
-            } else {
-                let ptr_id = g.variable_map.get(obj_name)
-                call_args.push(ir_val_inst(ptr_id))
-            }
+    if takes_mut_self {
+        -- mut self takes the receiver's address: a variable, a mut
+        -- parameter, a field, a list element or a boxed value
+        let recv_addr = generate_addr(g, b, obj_expr)
+        g = recv_addr.gen
+        b = recv_addr.block
+        if recv_addr.ok {
+            call_args.push(recv_addr.ptr)
         } else {
+            -- A temporary receiver: its changes are lost, as with a copy
+            let recv_type = infer_expr_type(g, obj_expr)
             let obj_result = generate_expr(g, b, obj_expr)
             g = obj_result.gen
             b = obj_result.block
-            call_args.push(ir_val_inst(obj_result.val_id))
+            let tmp_id = g.builder.next_id
+            let mut tmp_inst = ir_inst_new(tmp_id, OP_ALLOCA())
+            tmp_inst.alloc_type = recv_type
+            tmp_inst.result_type = "ptr(" + recv_type + ")"
+            tmp_inst.has_result = true
+            b.instructions.push(tmp_inst)
+            g.builder.next_id = tmp_id + 1
+            let mut st_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+            st_inst.store_ptr = ir_val_inst(tmp_id)
+            st_inst.store_val = ir_val_inst(obj_result.val_id)
+            b.instructions.push(st_inst)
+            g.builder.next_id = g.builder.next_id + 1
+            call_args.push(ir_val_inst(tmp_id))
         }
     } else {
         -- Pass the object value (self by value)
@@ -4931,7 +5034,6 @@ fn generate_list_index_get(gen: IRGenerator, block: IRBasicBlock, elem_kind: int
 
     if elem_kind == LIST_ELEM_OTHER() {
         -- Generic list get: alloca temp, call dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
-        let elem_size = estimate_type_size_gen(g, elem_type)
         let temp_alloca_id = g.builder.next_id
         let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
         temp_inst.alloc_type = elem_type
@@ -4947,7 +5049,7 @@ fn generate_list_index_get(gen: IRGenerator, block: IRBasicBlock, elem_kind: int
         call_args.push(ir_val_inst(temp_alloca_id))
         call_args.push(ir_val_inst(obj_id))
         call_args.push(ir_val_inst(idx_id))
-        call_args.push(ir_val_int(elem_size))
+        call_args.push(ir_val_sizeof(elem_type))
         inst.call_args = call_args
         inst.result_type = "void"
         inst.has_result = false
@@ -5133,8 +5235,12 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
     let mut g = gen
     let mut b = block
 
-    -- Resolve the struct type through type_substitutions for monomorphization
-    let type_name = resolve_type_substitution(g, expr.type_name)
+    -- Resolve type parameters and generic struct instances
+    g = ensure_type_instances(g, expr.type_name, expr.line)
+    let type_name = canon_type(g, expr.type_name)
+    if g.generic_struct_params.contains(type_name) {
+        g = ir_type_error(g, "generic struct '" + type_name + "' needs type arguments, e.g. " + type_name + "[int] { ... }", expr.line)
+    }
 
     -- Look up the struct definition
     if g.struct_defs.contains(type_name) == false {

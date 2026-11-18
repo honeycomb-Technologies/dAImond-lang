@@ -619,7 +619,19 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             }
             pp = p_expect(pp, TK_RBRACE())
             let mut e = expr_new(EXPR_STRUCT_LITERAL(), tok.line, tok.col)
-            e.type_name = name
+            -- A generic struct literal keeps its type arguments: Table[string, int]
+            let mut lit_type = name
+            if generics.len() > 0 {
+                lit_type = name + "["
+                let mut gi = 0
+                while gi < generics.len() {
+                    if gi > 0 { lit_type = lit_type + ", " }
+                    lit_type = lit_type + generics[gi]
+                    gi = gi + 1
+                }
+                lit_type = lit_type + "]"
+            }
+            e.type_name = lit_type
             e.field_names = field_names
             e.field_values = field_values
             return ParseExprResult { p: pp, expr: e }

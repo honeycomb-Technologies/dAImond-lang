@@ -539,7 +539,7 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     let mut size = 8  -- default pointer-sized allocation
     let arg0 = args[0]
     if arg0.kind == EXPR_STRUCT_LITERAL() {
-        let sname = arg0.type_name
+        let sname = canon_type(g, arg0.type_name)
         if g.struct_defs.contains(sname) {
             let sinfo = g.struct_defs.get(sname)
             -- Each field is 8 bytes (i64/f64/ptr)

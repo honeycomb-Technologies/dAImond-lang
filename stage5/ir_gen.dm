@@ -163,7 +163,15 @@ struct IRGenerator {
     fn_src_return_types: Map[string, string],
     -- Source type of each variable in the current function, as written
     -- or as resolved by static_type; reset per function
-    var_src_types: Map[string, string]
+    var_src_types: Map[string, string],
+    -- Generic struct name -> index of its StructDecl in declarations
+    generic_struct_decls: Map[string, int],
+    -- Generic struct name -> "|"-joined type parameter names
+    generic_struct_params: Map[string, string],
+    -- Instance struct name (e.g. Table_string_i64) -> generic struct name
+    generic_instances: Map[string, string],
+    -- Instance struct name -> "|"-joined source type arguments
+    generic_instance_args: Map[string, string]
 }
 
 fn ir_generator_new() -> IRGenerator {
@@ -221,7 +229,11 @@ fn ir_generator_new() -> IRGenerator {
         all_extern_fns: Map_new(),
         type_errors: [],
         fn_src_return_types: Map_new(),
-        var_src_types: Map_new()
+        var_src_types: Map_new(),
+        generic_struct_decls: Map_new(),
+        generic_struct_params: Map_new(),
+        generic_instances: Map_new(),
+        generic_instance_args: Map_new()
     }
 }
 
@@ -293,6 +305,110 @@ fn map_type_name(name: string) -> string {
     }
     -- Default: return as-is (struct name, enum name, etc.)
     return name
+}
+
+-- ============================================================
+-- GENERIC STRUCT INSTANCES
+-- Each use of a generic struct with concrete type arguments,
+-- such as Table[string, int], is an ordinary struct named
+-- Table_string_i64 with the arguments substituted into its
+-- fields. canon_type rewrites source types to those names;
+-- ensure_type_instances (ir_gen_decl.dm) registers them.
+-- ============================================================
+
+-- Split "A, B[C, D], E" at its top-level commas
+fn split_type_args(inner: string) -> List[string] {
+    let mut out: List[string] = []
+    let mut depth = 0
+    let mut start = 0
+    let mut i = 0
+    while i < len(inner) {
+        let c = char_at(inner, i)
+        if c == "[" or c == "(" { depth = depth + 1 }
+        if c == "]" or c == ")" { depth = depth - 1 }
+        if c == "," and depth == 0 {
+            out.push(string_trim(substr(inner, start, i - start)))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    let last = string_trim(substr(inner, start, len(inner) - start))
+    if len(last) > 0 { out.push(last) }
+    return out
+}
+
+-- A type argument as part of an instance name: List[int] -> List_i64
+fn mangle_type_arg(t: string) -> string {
+    let m = map_type_name(t)
+    return string_replace(string_replace(string_replace(string_replace(m, ", ", "_"), ",", "_"), "[", "_"), "]", "")
+}
+
+fn generic_instance_name(base: string, args: List[string]) -> string {
+    let mut name = base
+    let mut i = 0
+    while i < args.len() {
+        name = name + "_" + mangle_type_arg(args[i])
+        i = i + 1
+    }
+    return name
+}
+
+-- A source type with type parameters substituted and generic struct
+-- instances named: Table[K, List[V]] -> Table_string_List_i64
+fn canon_type(gen: IRGenerator, t: string) -> string {
+    if gen.type_substitutions.contains(t) {
+        return gen.type_substitutions.get(t)
+    }
+    let bracket = string_find(t, "[")
+    if bracket <= 0 or ends_with(t, "]") == false {
+        return t
+    }
+    let base = substr(t, 0, bracket)
+    let raw_args = split_type_args(substr(t, bracket + 1, len(t) - bracket - 2))
+    let mut args: List[string] = []
+    let mut i = 0
+    while i < raw_args.len() {
+        args.push(canon_type(gen, raw_args[i]))
+        i = i + 1
+    }
+    if gen.generic_struct_params.contains(base) {
+        return generic_instance_name(base, args)
+    }
+    let mut out = base + "["
+    i = 0
+    while i < args.len() {
+        if i > 0 { out = out + ", " }
+        out = out + args[i]
+        i = i + 1
+    }
+    return out + "]"
+}
+
+-- Substitute an instance's type arguments into a type written inside
+-- its generic struct or impl: K -> string, Self -> Table_string_i64
+fn instance_type(gen: IRGenerator, instance: string, t: string) -> string {
+    if gen.generic_instances.contains(instance) == false {
+        return canon_type(gen, t)
+    }
+    let mut g = gen
+    g.type_substitutions = instance_subs(gen, instance)
+    return canon_type(g, t)
+}
+
+-- Type parameter -> argument map of a generic struct instance
+fn instance_subs(gen: IRGenerator, instance: string) -> Map[string, string] {
+    let mut subs: Map[string, string] = Map_new()
+    let base = gen.generic_instances.get(instance)
+    let params = string_split(gen.generic_struct_params.get(base), "|")
+    let args = string_split(gen.generic_instance_args.get(instance), "|")
+    let mut i = 0
+    while i < params.len() and i < args.len() {
+        subs.insert(params[i], args[i])
+        i = i + 1
+    }
+    subs.insert("Self", instance)
+    subs.insert(base, instance)
+    return subs
 }
 
 fn is_integer_type(name: string) -> bool {
@@ -804,13 +920,36 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
     let mut g = gen
     g.declarations = source.declarations
 
-    -- Phase 1: Register all struct and enum definitions
+    -- Phase 1: Register all struct and enum definitions. Generic structs
+    -- are recorded first; each use with type arguments registers an
+    -- instance (ensure_type_instances).
     let mut i = 0
     while i < source.declarations.len() {
         let decl = source.declarations[i]
         if decl.kind == DECL_STRUCT() {
             let sd = *decl.struct_decl
-            g = register_struct(g, sd)
+            if sd.generic_params.len() > 0 {
+                g.generic_struct_decls.insert(sd.name, i)
+                let mut params = ""
+                let mut pi = 0
+                while pi < sd.generic_params.len() {
+                    if pi > 0 { params = params + "|" }
+                    params = params + sd.generic_params[pi]
+                    pi = pi + 1
+                }
+                g.generic_struct_params.insert(sd.name, params)
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < source.declarations.len() {
+        let decl = source.declarations[i]
+        if decl.kind == DECL_STRUCT() {
+            let sd = *decl.struct_decl
+            if sd.generic_params.len() == 0 {
+                g = register_struct(g, sd)
+            }
         } else if decl.kind == DECL_ENUM() {
             let ed = *decl.enum_decl
             g = register_enum(g, ed)
@@ -832,14 +971,25 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                 -- Store generic function for later monomorphization
                 g.generic_fn_decls.insert(fd.name, i)
             }
+            -- Generic struct instances in the signature
+            let mut ret_src = fd.return_type
+            if fd.generic_params.len() == 0 {
+                g = ensure_type_instances(g, ret_src, fd.line)
+                ret_src = canon_type(g, ret_src)
+                let mut si = 0
+                while si < fd.params.len() {
+                    g = ensure_type_instances(g, fd.params[si].type_name, fd.line)
+                    si = si + 1
+                }
+            }
             -- Track return type for all functions
-            let ret = if len(fd.return_type) > 0 {
-                parse_type_to_ir(fd.return_type)
+            let ret = if len(ret_src) > 0 {
+                parse_type_to_ir(ret_src)
             } else {
                 "void"
             }
             g.fn_return_types.insert(fd.name, ret)
-            g.fn_src_return_types.insert(fd.name, fd.return_type)
+            g.fn_src_return_types.insert(fd.name, ret_src)
             -- Mut params change how callers pass arguments, so calls that
             -- precede the declaration must know about them too
             let mut mut_flags = ""
@@ -864,13 +1014,22 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
             while mi < ib.methods.len() {
                 let method = ib.methods[mi]
                 let method_name = ib.target_type + "_" + method.name
-                let mret = if len(method.return_type) > 0 {
-                    parse_type_to_ir(method.return_type)
+                let mut msrc = if method.return_type == "Self" { ib.target_type } else { method.return_type }
+                if ib.generic_params.len() == 0 {
+                    g = ensure_type_instances(g, msrc, method.line)
+                    msrc = canon_type(g, msrc)
+                    let mut si = 0
+                    while si < method.params.len() {
+                        g = ensure_type_instances(g, method.params[si].type_name, method.line)
+                        si = si + 1
+                    }
+                }
+                let mret = if len(msrc) > 0 {
+                    parse_type_to_ir(msrc)
                 } else {
                     "void"
                 }
                 g.fn_return_types.insert(method_name, mret)
-                let msrc = if method.return_type == "Self" { ib.target_type } else { method.return_type }
                 g.fn_src_return_types.insert(method_name, msrc)
                 mi = mi + 1
             }

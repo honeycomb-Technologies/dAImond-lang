@@ -215,6 +215,12 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
 
+    -- Generic struct instances and type parameters in the annotation
+    if len(type_str) > 0 {
+        g = ensure_type_instances(g, type_str, stmt.line)
+        type_str = canon_type(g, type_str)
+    }
+
     -- Record the variable's source type: the annotation, else the type
     -- resolved from the value expression
     let src_type = if len(type_str) > 0 { type_str } else { static_type(g, *stmt.let_value) }
@@ -385,7 +391,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
                 concrete = g.var_struct_types.get(val_expr.name)
             }
         } else if val_expr.kind == EXPR_STRUCT_LITERAL() {
-            concrete = val_expr.type_name
+            concrete = canon_type(g, val_expr.type_name)
         }
 
         -- Use concrete struct type for alloca so the struct is stored directly
@@ -560,7 +566,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
 
         -- Track struct type
         if val_expr.kind == EXPR_STRUCT_LITERAL() {
-            g.var_struct_types.insert(var_name, val_expr.type_name)
+            g.var_struct_types.insert(var_name, canon_type(g, val_expr.type_name))
         }
         -- Track struct type from index access on a list of structs
         if val_expr.kind == EXPR_INDEX_ACCESS() {
@@ -1011,14 +1017,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     -- Get element from list
     if list_kind == LIST_ELEM_OTHER() {
         -- Generic list: dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
-        let elem_size = estimate_type_size_gen(g, elem_type)
         let mut get_inst = ir_inst_new(g.builder.next_id, OP_CALL())
         get_inst.callee = "dm_list_generic_get"
         let mut get_args: List[IRValue] = []
         get_args.push(ir_val_inst(elem_alloca_id))
         get_args.push(ir_val_inst(list_ptr))
         get_args.push(ir_val_inst(idx_val2_id))
-        get_args.push(ir_val_int(elem_size))
+        get_args.push(ir_val_sizeof(elem_type))
         get_inst.call_args = get_args
         get_inst.result_type = "void"
         get_inst.has_result = false
@@ -1768,7 +1773,6 @@ fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_
     if ek == LIST_ELEM_OTHER() {
         -- Generic set: alloca temp, store value, pass pointer + elem_size
         let set_elem_type = elem_type
-        let set_elem_size = estimate_type_size_gen(g, set_elem_type)
         let set_temp_id = g.builder.next_id
         let mut set_temp_inst = ir_inst_new(set_temp_id, OP_ALLOCA())
         set_temp_inst.alloc_type = set_elem_type
@@ -1790,7 +1794,7 @@ fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_
         set_args.push(list_ptr)
         set_args.push(ir_val_inst(set_temp_id))
         set_args.push(ir_val_inst(idx_result.val_id))
-        set_args.push(ir_val_int(set_elem_size))
+        set_args.push(ir_val_sizeof(set_elem_type))
         set_inst.call_args = set_args
         set_inst.result_type = "void"
         set_inst.has_result = false

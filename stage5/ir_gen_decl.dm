@@ -19,7 +19,8 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
     while i < sd.fields.len() {
         let f = sd.fields[i]
         let fname = f.name
-        let ftype = f.type_name
+        g = ensure_type_instances(g, f.type_name, sd.line)
+        let ftype = canon_type(g, f.type_name)
         let ir_type_name = map_type_name(ftype)
 
         info.field_names.push(fname)
@@ -50,6 +51,79 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
     g.struct_defs.insert(sd.name, info)
     g.ir_mod.struct_defs.insert(sd.name, ir_ty)
 
+    return g
+}
+
+-- Register every generic struct instance a source type names,
+-- including instances nested in its type arguments and fields.
+-- line locates errors in the type.
+fn ensure_type_instances(gen: IRGenerator, t: string, line: int) -> IRGenerator {
+    let mut g = gen
+    if g.type_substitutions.contains(t) {
+        return g
+    }
+    let bracket = string_find(t, "[")
+    if bracket <= 0 or ends_with(t, "]") == false {
+        return g
+    }
+    let base = substr(t, 0, bracket)
+    let raw_args = split_type_args(substr(t, bracket + 1, len(t) - bracket - 2))
+    let mut args: List[string] = []
+    let mut i = 0
+    while i < raw_args.len() {
+        g = ensure_type_instances(g, raw_args[i], line)
+        args.push(canon_type(g, raw_args[i]))
+        i = i + 1
+    }
+    if g.generic_struct_decls.contains(base) == false {
+        return g
+    }
+    let instance = generic_instance_name(base, args)
+    if g.struct_defs.contains(instance) {
+        return g
+    }
+    let sd_idx: int = g.generic_struct_decls.get(base)
+    let decl = g.declarations[sd_idx]
+    let generic_sd = *decl.struct_decl
+    if args.len() != generic_sd.generic_params.len() {
+        g = ir_type_error(g, "'" + base + "' takes " + int_to_string(generic_sd.generic_params.len()) + " type arguments, got " + int_to_string(args.len()) + " in '" + t + "'", line)
+        return g
+    }
+    let mut arg_list = ""
+    i = 0
+    while i < args.len() {
+        if i > 0 { arg_list = arg_list + "|" }
+        arg_list = arg_list + args[i]
+        i = i + 1
+    }
+    g.generic_instances.insert(instance, base)
+    g.generic_instance_args.insert(instance, arg_list)
+
+    -- The instance is the generic struct with its arguments substituted
+    let mut sd = generic_sd
+    sd.name = instance
+    let empty_params: List[string] = []
+    sd.generic_params = empty_params
+    let mut fields: List[StructField] = []
+    i = 0
+    while i < generic_sd.fields.len() {
+        let mut f = generic_sd.fields[i]
+        f.type_name = instance_type(g, instance, f.type_name)
+        fields.push(f)
+        i = i + 1
+    }
+    sd.fields = fields
+    g = register_struct(g, sd)
+
+    -- Field types can name further instances
+    let saved_subs = g.type_substitutions
+    g.type_substitutions = instance_subs(g, instance)
+    i = 0
+    while i < generic_sd.fields.len() {
+        g = ensure_type_instances(g, generic_sd.fields[i].type_name, generic_sd.line)
+        i = i + 1
+    }
+    g.type_substitutions = saved_subs
     return g
 }
 
@@ -388,8 +462,9 @@ fn generate_function(gen: IRGenerator, fd: FunctionDecl) -> IRGenerator {
 fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGenerator {
     let mut g = gen
 
-    let ret_type = if len(fd.return_type) > 0 {
-        map_type_name(fd.return_type)
+    let ret_src = canon_type(g, fd.return_type)
+    let ret_type = if len(ret_src) > 0 {
+        map_type_name(ret_src)
     } else {
         "void"
     }
@@ -409,6 +484,7 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
         } else {
             p.type_name
         }
+        ptype_str = canon_type(g, ptype_str)
         -- Resolve dyn Trait to concrete implementor type
         if starts_with(ptype_str, "dyn ") {
             let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
@@ -486,8 +562,9 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     }
 
     -- Set current return type
-    let ret_type = if len(fd.return_type) > 0 {
-        map_type_name(fd.return_type)
+    let ret_src = canon_type(g, fd.return_type)
+    let ret_type = if len(ret_src) > 0 {
+        map_type_name(ret_src)
     } else {
         "void"
     }
@@ -526,6 +603,7 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         } else {
             p.type_name
         }
+        ptype_str = canon_type(g, ptype_str)
         -- Resolve dyn Trait to concrete implementor type
         if starts_with(ptype_str, "dyn ") {
             let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
@@ -850,44 +928,6 @@ fn eval_const_value(gen: IRGenerator, expr_box: Box[Expr]) -> IRValue {
     }
     return ir_val_int(0)
 }
-
--- ============================================================
--- ESTIMATE TYPE SIZE (for malloc/generic list operations)
--- ============================================================
-
-fn estimate_type_size(type_name: string) -> int {
-    if type_name == "i8" or type_name == "u8" or type_name == "bool" { return 1 }
-    if type_name == "i16" or type_name == "u16" { return 2 }
-    if type_name == "i32" or type_name == "u32" or type_name == "f32" { return 4 }
-    if type_name == "i64" or type_name == "u64" or type_name == "f64" or type_name == "ptr" { return 8 }
-    if type_name == "string" { return 24 }
-    -- Struct size: rough estimate of 8 bytes per field
-    return 64
-}
-
-fn estimate_type_size_gen(gen: IRGenerator, type_name: string) -> int {
-    if type_name == "i8" or type_name == "u8" or type_name == "bool" { return 1 }
-    if type_name == "i16" or type_name == "u16" { return 2 }
-    if type_name == "i32" or type_name == "u32" or type_name == "f32" { return 4 }
-    if type_name == "i64" or type_name == "u64" or type_name == "f64" or type_name == "ptr" { return 8 }
-    if type_name == "string" { return 24 }
-    -- Look up struct definition
-    if gen.struct_defs.contains(type_name) {
-        let info = gen.struct_defs.get(type_name)
-        let mut size = 0
-        let mut fi = 0
-        while fi < info.field_names.len() {
-            let field_type = info.field_types[fi]
-            let fs = estimate_type_size(field_type)
-            let aligned = if fs < 8 { 8 } else { fs }
-            size = size + aligned
-            fi = fi + 1
-        }
-        return size
-    }
-    return 64
-}
-
 
 -- ============================================================
 -- GenResult: return both generator and current block

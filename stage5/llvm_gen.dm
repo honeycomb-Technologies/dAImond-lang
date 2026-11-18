@@ -863,6 +863,9 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
         if val.kind == VAL_UNDEF() {
             return dm_llvm_const_null(dm_llvm_int64_type(ctx))
         }
+        if val.kind == VAL_SIZEOF() {
+            return dm_llvm_sizeof_type(map_ir_type_to_llvm(gen, val.str_val))
+        }
         return dm_llvm_const_null(dm_llvm_int64_type(ctx))
     }
 }
@@ -1324,15 +1327,13 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let mut addr = 0
             if inst.gep_indices.len() > 0 {
                 -- List element: base points to { data, len, capacity }, and
-                -- elements are field_index bytes apart from data
+                -- data is an array of the element type
                 g = get_dm_string_type(g)
                 let ptr_ty = dm_llvm_pointer_type(g.context)
-                let i64_ty = dm_llvm_int64_type(g.context)
                 let data_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, base, 0, "list.data.addr")
                 let data = dm_llvm_build_load2(b, ptr_ty, data_slot, "list.data")
                 let idx = resolve_value(g, inst.gep_indices[0])
-                let offset = dm_llvm_build_mul(b, idx, dm_llvm_const_int(i64_ty, inst.field_index, 0), "elem.offset")
-                addr = dm_llvm_build_gep2_one(b, dm_llvm_int8_type(g.context), data, offset, "elem.addr")
+                addr = dm_llvm_build_gep2_one(b, map_ir_type_to_llvm(g, inst.field_type), data, idx, "elem.addr")
             } else {
                 let struct_ty = map_ir_type_to_llvm(g, inst.alloc_type)
                 addr = dm_llvm_build_struct_gep2(b, struct_ty, base, inst.field_index, "field.addr")
@@ -1715,7 +1716,10 @@ fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 dm_llvm_buf_push(idx_val)
                 g = check_call_args(g, fn_ty, func)
                 dm_llvm_build_call2_buf(b, fn_ty, func, "")
-                if inst.has_result { g.value_map.insert(id_key, sret) }
+                if inst.has_result {
+                    g.value_map.insert(id_key, sret)
+                    g.string_ptrs.insert(id_key, true)
+                }
             } else {
                 dm_llvm_buf_clear()
                 dm_llvm_buf_push(list_val)

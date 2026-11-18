@@ -17,6 +17,126 @@ const TestFile = stage0_runner.TestFile;
 const TestResult = stage0_runner.TestResult;
 const runTest = stage0_runner.runTest;
 
+/// Generic structs are a Stage 5 feature: Stage 0 cannot parse a
+/// generic struct literal, so these cases are not shared.
+const generic_struct_tests = [_]TestCase{
+    .{
+        .name = "generic_struct_instances",
+        .source =
+            \\module test
+            \\
+            \\struct Pair[A, B] {
+            \\    first: A,
+            \\    second: B
+            \\}
+            \\
+            \\struct Bag[T] {
+            \\    items: List[T],
+            \\    pairs: List[Pair[T, int]]
+            \\}
+            \\
+            \\impl Bag[T] {
+            \\    fn add(mut self, x: T) {
+            \\        self.items.push(x)
+            \\        let p = Pair[T, int] { first: x, second: self.items.len() }
+            \\        self.pairs.push(p)
+            \\    }
+            \\    fn last(self) -> T {
+            \\        return self.items[self.items.len() - 1]
+            \\    }
+            \\    fn count(self) -> int {
+            \\        return self.items.len()
+            \\    }
+            \\    fn twice(mut self, x: T) -> int {
+            \\        self.add(x)
+            \\        self.add(x)
+            \\        return self.count()
+            \\    }
+            \\    fn copy_of(self) -> Self {
+            \\        let mut out = Bag[T] { items: [], pairs: [] }
+            \\        for it in self.items {
+            \\            out.add(it)
+            \\        }
+            \\        return out
+            \\    }
+            \\}
+            \\
+            \\struct Holder {
+            \\    names: Bag[string],
+            \\    nums: Bag[int]
+            \\}
+            \\
+            \\fn make_bag() -> Bag[string] {
+            \\    let mut b = Bag[string] { items: [], pairs: [] }
+            \\    b.add("x")
+            \\    return b
+            \\}
+            \\
+            \\fn total(b: Bag[int]) -> int {
+            \\    let mut s = 0
+            \\    for v in b.items { s = s + v }
+            \\    return s
+            \\}
+            \\
+            \\fn grow(mut b: Bag[int], n: int) {
+            \\    b.add(n)
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut h = Holder { names: make_bag(), nums: Bag[int] { items: [], pairs: [] } }
+            \\    h.names.add("y")
+            \\    h.nums.add(10)
+            \\    h.nums.add(32)
+            \\    grow(h.nums, 100)
+            \\    println(h.names.last())
+            \\    println(int_to_string(h.names.count()))
+            \\    println(int_to_string(total(h.nums)))
+            \\    println(int_to_string(h.nums.pairs[2].second))
+            \\    println(h.names.pairs[1].first)
+            \\    let n = h.names.twice("z")
+            \\    println(int_to_string(n))
+            \\    let c = h.names.copy_of()
+            \\    println(int_to_string(c.count()) + " " + c.last())
+            \\    let mut bags: List[Bag[int]] = []
+            \\    bags.push(h.nums)
+            \\    bags[0].add(7)
+            \\    println(int_to_string(bags[0].count()) + " " + int_to_string(h.nums.count()))
+            \\    let p: Pair[string, Bag[int]] = Pair[string, Bag[int]] { first: "k", second: bags[0] }
+            \\    println(p.first + int_to_string(p.second.last()))
+            \\}
+        ,
+        .expected_output = "y\n2\n142\n3\ny\n4\n4 z\n4 3\nk7\n",
+    },
+    .{
+        .name = "generic_struct_without_type_args",
+        .source =
+            \\module test
+            \\struct Box2[T] { v: T }
+            \\fn main() {
+            \\    let b = Box2 { v: 1 }
+            \\    println(int_to_string(b.v))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"generic struct 'Box2' needs type arguments"},
+    },
+    .{
+        .name = "generic_struct_wrong_arg_count",
+        .source =
+            \\module test
+            \\struct Pair[A, B] { a: A, b: B }
+            \\fn main() {
+            \\    let p = Pair[int] { a: 1, b: 2 }
+            \\    println(int_to_string(p.a))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"'Pair' takes 2 type arguments, got 1"},
+    },
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -96,6 +216,7 @@ pub fn main() !void {
         .{ .name = "Closures Extended", .tests = &stage0_runner.closure_extended_tests },
         .{ .name = "Op Overload Extended", .tests = &stage0_runner.op_overload_extended_tests },
         .{ .name = "Comprehensive", .tests = &stage0_runner.comprehensive_test },
+        .{ .name = "Generic Structs", .tests = &generic_struct_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

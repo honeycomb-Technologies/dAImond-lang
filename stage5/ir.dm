@@ -240,6 +240,13 @@ fn ir_val_global(name: string) -> IRValue {
     return IRValue { kind: VAL_GLOBAL_REF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: name, ref_id: 0 }
 }
 
+-- The ABI size in bytes of an IR type, resolved by LLVM
+fn VAL_SIZEOF() -> int { return 10 }
+
+fn ir_val_sizeof(type_name: string) -> IRValue {
+    return IRValue { kind: VAL_SIZEOF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: type_name, ref_id: 0 }
+}
+
 fn ir_val_undef() -> IRValue {
     return IRValue { kind: VAL_UNDEF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
 }

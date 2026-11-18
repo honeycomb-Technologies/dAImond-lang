@@ -423,7 +423,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 257/257 tests pass, but it cannot compile itself yet, so Stage 0 (Zig) still builds it
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 267/267 tests pass, but it cannot compile itself yet, so Stage 0 (Zig) still builds it
 
 ## Current Status
 
@@ -457,6 +457,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Package registry download
 - [x] Compile-time array sizes
 - [x] Map iteration (for-in on maps)
+- [x] Generic structs with generic impl blocks (Stage 5 only; type arguments are written explicitly, as in `Table[string, int] { ... }`)
 
 ### Stage 1 Self-Hosting Compiler -- Complete
 - [x] Compiler rewritten in dAImond (~10 modules)
@@ -495,7 +496,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 
 ### Stage 5 LLVM Backend in dAImond -- In Progress
 - [x] Entire LLVM backend written in dAImond (~20.7K lines monolithic, ~15 split modules)
-- [x] Passes the shared integration suite (257/257) and 19/19 memory-safety probes
+- [x] Passes the integration suite (267/267) and 19/19 memory-safety probes
 - [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
 - [x] LLVM-C bridge via extern FFI (llvm_bridge.c)
 - [x] Error detection: unterminated strings, syntax errors, undefined functions and variables, effect enforcement, untyped expressions reported at their source line
