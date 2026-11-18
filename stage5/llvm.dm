@@ -89,6 +89,7 @@ extern fn dm_llvm_build_alloca(b: int, ty: int, name: string) -> int
 extern fn dm_llvm_build_load2(b: int, ty: int, ptr: int, name: string) -> int
 extern fn dm_llvm_build_store(b: int, val: int, ptr: int) -> int
 extern fn dm_llvm_build_struct_gep2(b: int, ty: int, ptr: int, idx: int, name: string) -> int
+extern fn dm_llvm_build_gep2_one(b: int, ty: int, ptr: int, idx: int, name: string) -> int
 extern fn dm_llvm_build_extract_value(b: int, agg: int, idx: int, name: string) -> int
 extern fn dm_llvm_build_insert_value(b: int, agg: int, val: int, idx: int, name: string) -> int
 

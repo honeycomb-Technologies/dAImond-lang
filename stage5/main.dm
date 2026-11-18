@@ -2439,6 +2439,7 @@ extern fn dm_llvm_build_alloca(b: int, ty: int, name: string) -> int
 extern fn dm_llvm_build_load2(b: int, ty: int, ptr: int, name: string) -> int
 extern fn dm_llvm_build_store(b: int, val: int, ptr: int) -> int
 extern fn dm_llvm_build_struct_gep2(b: int, ty: int, ptr: int, idx: int, name: string) -> int
+extern fn dm_llvm_build_gep2_one(b: int, ty: int, ptr: int, idx: int, name: string) -> int
 extern fn dm_llvm_build_extract_value(b: int, agg: int, idx: int, name: string) -> int
 extern fn dm_llvm_build_insert_value(b: int, agg: int, val: int, idx: int, name: string) -> int
 
@@ -7091,15 +7092,23 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     }
 
     -- Default: List iteration
-    -- Generate the iterator expression to get the list value
-    let iter_result = generate_expr(g, b, iter_expr)
-    g = iter_result.gen
-    b = iter_result.block
-    let list_ptr = iter_result.val_id
+    -- A list variable's value is a pointer to it; any other list
+    -- (a field, a call result) is iterated through a handle to it
+    let iter_static = if iter_expr.kind == EXPR_IDENTIFIER() { "" } else { static_type(g, iter_expr) }
+    let iter_handle = generate_list_handle(g, b, iter_expr)
+    g = iter_handle.gen
+    b = iter_handle.block
+    let list_ptr = iter_handle.ptr.ref_id
+    let iter_elem_src = if starts_with(iter_static, "List[") { extract_inner_type(iter_static, "List[") } else { "" }
+    if iter_expr.kind != EXPR_IDENTIFIER() and iter_elem_src == "" {
+        g = ir_type_error(g, "cannot determine the type of the value iterated over", stmt.line)
+    }
 
-    -- Determine list kind from iterator name or default
+    -- Determine list kind from iterator name or static type
     let list_kind = if iter_expr.kind == EXPR_IDENTIFIER() and g.list_elem_kinds.contains(iter_expr.name) {
         g.list_elem_kinds.get(iter_expr.name)
+    } else if iter_elem_src != "" {
+        classify_list_elem(iter_elem_src)
     } else {
         LIST_ELEM_INT()
     }
@@ -7145,6 +7154,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     else if list_kind == LIST_ELEM_OTHER() and len(iter_name) > 0 and g.list_elem_types.contains(iter_name) {
         g.list_elem_types.get(iter_name)
     }
+    else if list_kind == LIST_ELEM_OTHER() and iter_elem_src != "" { iter_elem_src }
     else { "i64" }
 
     -- Create element variable
@@ -7158,6 +7168,14 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
 
     g.variable_map.insert(var_name, elem_alloca_id)
     g.variable_types.insert(var_name, elem_type)
+    let loop_list_src = static_type(g, iter_expr)
+    if starts_with(loop_list_src, "List[") {
+        let loop_elem_src = extract_inner_type(loop_list_src, "List[")
+        g.var_src_types.insert(var_name, loop_elem_src)
+        if g.struct_defs.contains(loop_elem_src) {
+            g.var_struct_types.insert(var_name, loop_elem_src)
+        }
+    }
 
     -- Labels
     let header_label = gen_next_label(g, "for_header")
@@ -7895,6 +7913,134 @@ fn generate_continue(gen: IRGenerator, block: IRBasicBlock) -> GenResult {
 -- ASSIGNMENT
 -- ============================================================
 
+-- Compound assignment (+=, -=, *=, /=, %=): load the current value of
+-- type ty from ptr_val and combine it with val_id. Signed integer
+-- add/sub/mul are overflow-checked. Returns the new value.
+fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRValue, ty: string, assign_op: int, val_id: int, value_expr: Expr) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    -- Load current value
+    let mut load_inst = ir_inst_new(g.builder.next_id, OP_LOAD())
+    load_inst.load_ptr = ptr_val
+    load_inst.load_type = ty
+    load_inst.result_type = ty
+    load_inst.has_result = true
+    b.instructions.push(load_inst)
+    let old_val_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+
+    -- Compute new value (checked for signed int add/sub/mul)
+    let op = if assign_op == ASSIGN_ADD() { OP_ADD() }
+    else if assign_op == ASSIGN_SUB() { OP_SUB() }
+    else if assign_op == ASSIGN_MUL() { OP_MUL() }
+    else if assign_op == ASSIGN_DIV() { OP_DIV() }
+    else { OP_MOD() }
+
+    let mut new_val_id = 0
+    let cmp_val_type = infer_expr_type(g, value_expr)
+    if (assign_op == ASSIGN_ADD() or assign_op == ASSIGN_SUB() or assign_op == ASSIGN_MUL()) and is_signed_int_type(ty) and is_signed_int_type(cmp_val_type) {
+        let cmp_callee = if assign_op == ASSIGN_ADD() { "dm_checked_add_i64" }
+        else if assign_op == ASSIGN_SUB() { "dm_checked_sub_i64" }
+        else { "dm_checked_mul_i64" }
+        let mut cmp_fit = ""
+        if type_bit_width(ty) < 64 { cmp_fit = ty }
+        let cmp_chk = emit_checked_int_arith(g, b, cmp_callee, ir_val_inst(old_val_id), ty, ir_val_inst(val_id), cmp_val_type, cmp_fit)
+        g = cmp_chk.gen
+        b = cmp_chk.block
+        new_val_id = cmp_chk.val_id
+    } else {
+        let mut arith_inst = ir_inst_new(g.builder.next_id, op)
+        arith_inst.lhs = ir_val_inst(old_val_id)
+        arith_inst.rhs = ir_val_inst(val_id)
+        arith_inst.result_type = ty
+        arith_inst.has_result = true
+        b.instructions.push(arith_inst)
+        new_val_id = g.builder.next_id
+        g.builder.next_id = g.builder.next_id + 1
+    }
+
+    return expr_result(g, b, new_val_id)
+}
+
+-- list[index] = value for the list at list_ptr, with a bounds check
+fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_type: string, list_ptr: IRValue, index_expr: Expr, val_id: int, set_ctx: string) -> GenResult {
+    let mut g = gen
+    let mut b = block
+    -- Generate the index expression
+    let idx_result = generate_expr(g, b, index_expr)
+    g = idx_result.gen
+    b = idx_result.block
+
+    -- Length for the bounds check
+    let set_len_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_len" }
+    else if ek == LIST_ELEM_FLOAT() { "dm_list_double_len" }
+    else if ek == LIST_ELEM_STRING() { "dm_list_string_len" }
+    else { "dm_list_generic_len" }
+    let set_len_id = g.builder.next_id
+    let mut set_len_inst = ir_inst_new(set_len_id, OP_CALL())
+    set_len_inst.callee = set_len_fn
+    let mut set_len_args: List[IRValue] = []
+    set_len_args.push(list_ptr)
+    set_len_inst.call_args = set_len_args
+    set_len_inst.result_type = "i64"
+    set_len_inst.has_result = true
+    b.instructions.push(set_len_inst)
+    g.builder.next_id = set_len_id + 1
+
+    let set_chk = check_index_bounds(g, b, idx_result.val_id, ir_val_inst(set_len_id), set_ctx)
+    g = set_chk.gen
+    b = set_chk.block
+
+    if ek == LIST_ELEM_OTHER() {
+        -- Generic set: alloca temp, store value, pass pointer + elem_size
+        let set_elem_type = elem_type
+        let set_elem_size = estimate_type_size_gen(g, set_elem_type)
+        let set_temp_id = g.builder.next_id
+        let mut set_temp_inst = ir_inst_new(set_temp_id, OP_ALLOCA())
+        set_temp_inst.alloc_type = set_elem_type
+        set_temp_inst.result_type = "ptr(" + set_elem_type + ")"
+        set_temp_inst.has_result = true
+        b.instructions.push(set_temp_inst)
+        g.builder.next_id = g.builder.next_id + 1
+
+        let mut set_store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+        set_store_inst.store_ptr = ir_val_inst(set_temp_id)
+        set_store_inst.store_val = ir_val_inst(val_id)
+        set_store_inst.has_result = false
+        b.instructions.push(set_store_inst)
+        g.builder.next_id = g.builder.next_id + 1
+
+        let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+        set_inst.callee = "dm_list_generic_set"
+        let mut set_args: List[IRValue] = []
+        set_args.push(list_ptr)
+        set_args.push(ir_val_inst(set_temp_id))
+        set_args.push(ir_val_inst(idx_result.val_id))
+        set_args.push(ir_val_int(set_elem_size))
+        set_inst.call_args = set_args
+        set_inst.result_type = "void"
+        set_inst.has_result = false
+        b.instructions.push(set_inst)
+        g.builder.next_id = g.builder.next_id + 1
+    } else {
+        let set_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_set" }
+        else if ek == LIST_ELEM_FLOAT() { "dm_list_double_set" }
+        else { "dm_list_string_set" }
+        let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+        set_inst.callee = set_fn
+        let mut set_args: List[IRValue] = []
+        set_args.push(list_ptr)
+        set_args.push(ir_val_inst(idx_result.val_id))
+        set_args.push(ir_val_inst(val_id))
+        set_inst.call_args = set_args
+        set_inst.result_type = "void"
+        set_inst.has_result = false
+        b.instructions.push(set_inst)
+        g.builder.next_id = g.builder.next_id + 1
+    }
+    return gen_result(g, b)
+}
+
 fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
     let mut g = gen
     let mut b = block
@@ -8000,45 +8146,10 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     ptr_val = ir_val_param(pidx)
                 }
 
-                -- Load current value
-                let mut load_inst = ir_inst_new(g.builder.next_id, OP_LOAD())
-                load_inst.load_ptr = ptr_val
-                load_inst.load_type = ty
-                load_inst.result_type = ty
-                load_inst.has_result = true
-                b.instructions.push(load_inst)
-                let old_val_id = g.builder.next_id
-                g.builder.next_id = g.builder.next_id + 1
-
-                -- Compute new value (checked for signed int add/sub/mul)
-                let op = if assign_op == ASSIGN_ADD() { OP_ADD() }
-                else if assign_op == ASSIGN_SUB() { OP_SUB() }
-                else if assign_op == ASSIGN_MUL() { OP_MUL() }
-                else if assign_op == ASSIGN_DIV() { OP_DIV() }
-                else { OP_MOD() }
-
-                let mut new_val_id = 0
-                let cmp_val_type = infer_expr_type(g, *stmt.assign_value)
-                if (assign_op == ASSIGN_ADD() or assign_op == ASSIGN_SUB() or assign_op == ASSIGN_MUL()) and is_signed_int_type(ty) and is_signed_int_type(cmp_val_type) {
-                    let cmp_callee = if assign_op == ASSIGN_ADD() { "dm_checked_add_i64" }
-                    else if assign_op == ASSIGN_SUB() { "dm_checked_sub_i64" }
-                    else { "dm_checked_mul_i64" }
-                    let mut cmp_fit = ""
-                    if type_bit_width(ty) < 64 { cmp_fit = ty }
-                    let cmp_chk = emit_checked_int_arith(g, b, cmp_callee, ir_val_inst(old_val_id), ty, ir_val_inst(val_result.val_id), cmp_val_type, cmp_fit)
-                    g = cmp_chk.gen
-                    b = cmp_chk.block
-                    new_val_id = cmp_chk.val_id
-                } else {
-                    let mut arith_inst = ir_inst_new(g.builder.next_id, op)
-                    arith_inst.lhs = ir_val_inst(old_val_id)
-                    arith_inst.rhs = ir_val_inst(val_result.val_id)
-                    arith_inst.result_type = ty
-                    arith_inst.has_result = true
-                    b.instructions.push(arith_inst)
-                    new_val_id = g.builder.next_id
-                    g.builder.next_id = g.builder.next_id + 1
-                }
+                let compound = generate_compound_value(g, b, ptr_val, ty, assign_op, val_result.val_id, *stmt.assign_value)
+                g = compound.gen
+                b = compound.block
+                let new_val_id = compound.val_id
 
                 -- Store new value
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
@@ -8050,73 +8161,46 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             }
         }
     } else if target.kind == EXPR_FIELD_ACCESS() {
-        -- Field assignment: obj.field = value
-        -- Generate the target field access as an lvalue (get struct ptr + field index)
-        -- For now, generate full struct load, insert_field, store back
-        let obj = *target.object
-        if obj.kind == EXPR_IDENTIFIER() and g.variable_map.contains(obj.name) {
-            let ptr = g.variable_map.get(obj.name)
-            let struct_name = if g.var_struct_types.contains(obj.name) {
-                g.var_struct_types.get(obj.name)
-            } else {
-                ""
-            }
-            if len(struct_name) > 0 and g.struct_defs.contains(struct_name) {
-                let info = g.struct_defs.get(struct_name)
-                let field_name = target.field
-                let mut field_idx = -1
-                let mut fi = 0
-                while fi < info.field_names.len() {
-                    if info.field_names[fi] == field_name {
-                        field_idx = fi
-                    }
-                    fi = fi + 1
-                }
-                if field_idx >= 0 {
-                    -- Determine the struct pointer source:
-                    -- For mut pointer params (mut self): use param ref directly
-                    -- For regular vars: use the alloca instruction ref
-                    let mut load_ptr_val = ir_val_inst(ptr)
-                    if g.param_ptr_map.contains(obj.name) {
-                        let pidx = g.param_ptr_map.get(obj.name)
-                        load_ptr_val = ir_val_param(pidx)
-                    }
-
-                    -- Load current struct value
-                    let mut load_inst = ir_inst_new(g.builder.next_id, OP_LOAD())
-                    load_inst.load_ptr = load_ptr_val
-                    load_inst.load_type = struct_name
-                    load_inst.result_type = struct_name
-                    load_inst.has_result = true
-                    b.instructions.push(load_inst)
-                    let struct_val_id = g.builder.next_id
-                    g.builder.next_id = g.builder.next_id + 1
-
-                    -- Insert new field value
-                    let mut insert_inst = ir_inst_new(g.builder.next_id, OP_INSERT_FIELD())
-                    insert_inst.field_base = ir_val_inst(struct_val_id)
-                    insert_inst.field_value = ir_val_inst(val_result.val_id)
-                    insert_inst.field_index = field_idx
-                    insert_inst.result_type = struct_name
-                    insert_inst.has_result = true
-                    b.instructions.push(insert_inst)
-                    let new_struct_id = g.builder.next_id
-                    g.builder.next_id = g.builder.next_id + 1
-
-                    -- Store back through the pointer
-                    let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                    store_inst.store_ptr = load_ptr_val
-                    store_inst.store_val = ir_val_inst(new_struct_id)
-                    store_inst.has_result = false
-                    b.instructions.push(store_inst)
-                    g.builder.next_id = g.builder.next_id + 1
-                }
-            }
+        -- Field assignment: store through the field's address, so nested
+        -- fields, boxed structs and mut parameters change in place
+        let fa = generate_addr(g, b, target)
+        g = fa.gen
+        b = fa.block
+        if fa.ok == false {
+            g = ir_type_error(g, "cannot assign to field '." + target.field + "': its struct is not a variable, field or box", stmt.line)
+            return gen_result(g, b)
         }
+        let mut store_val_id = val_result.val_id
+        if assign_op != ASSIGN_EQ() {
+            let compound = generate_compound_value(g, b, fa.ptr, map_type_name(fa.src_type), assign_op, val_result.val_id, *stmt.assign_value)
+            g = compound.gen
+            b = compound.block
+            store_val_id = compound.val_id
+        }
+        let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+        store_inst.store_ptr = fa.ptr
+        store_inst.store_val = ir_val_inst(store_val_id)
+        store_inst.has_result = false
+        b.instructions.push(store_inst)
+        g.builder.next_id = g.builder.next_id + 1
     } else if target.kind == EXPR_INDEX_ACCESS() {
         -- Index assignment: arr[i] = value or map[key] = value
         -- Delegate to list_push or map_insert depending on type
         let obj = *target.object
+        let obj_static = if obj.kind == EXPR_IDENTIFIER() { "" } else { static_type(g, obj) }
+        if starts_with(obj_static, "List[") {
+            -- A list in a field or box: set the element in place
+            let h = generate_list_handle(g, b, obj)
+            g = h.gen
+            b = h.block
+            if h.ok == false {
+                g = ir_type_error(g, "element assignment would change a temporary copy of this list; store the list in a variable or field first", stmt.line)
+            }
+            let elem_src = extract_inner_type(obj_static, "List[")
+            let set_res = generate_list_index_set(g, b, classify_list_elem(elem_src), list_elem_ir_type(elem_src), h.ptr, *target.index, val_result.val_id, "(list)")
+            g = set_res.gen
+            b = set_res.block
+        }
         if obj.kind == EXPR_IDENTIFIER() {
             let obj_name = obj.name
             -- Map index assignment
@@ -8147,84 +8231,11 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             if g.list_elem_kinds.contains(obj_name) {
                 let ek = g.list_elem_kinds.get(obj_name)
                 let list_ptr = g.variable_map.get(obj_name)
-
-                -- Generate the index expression
-                let idx_result = generate_expr(g, b, *target.index)
-                g = idx_result.gen
-                b = idx_result.block
-
-                -- Length for the bounds check
-                let set_len_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_len" }
-                else if ek == LIST_ELEM_FLOAT() { "dm_list_double_len" }
-                else if ek == LIST_ELEM_STRING() { "dm_list_string_len" }
-                else { "dm_list_generic_len" }
-                let set_len_id = g.builder.next_id
-                let mut set_len_inst = ir_inst_new(set_len_id, OP_CALL())
-                set_len_inst.callee = set_len_fn
-                let mut set_len_args: List[IRValue] = []
-                set_len_args.push(ir_val_inst(list_ptr))
-                set_len_inst.call_args = set_len_args
-                set_len_inst.result_type = "i64"
-                set_len_inst.has_result = true
-                b.instructions.push(set_len_inst)
-                g.builder.next_id = set_len_id + 1
-
+                let set_elem_type = if g.list_elem_types.contains(obj_name) { g.list_elem_types.get(obj_name) } else { "i64" }
                 let set_ctx = if g.array_var_names.contains(obj_name) { "(array)" } else { "(list)" }
-                let set_chk = check_index_bounds(g, b, idx_result.val_id, ir_val_inst(set_len_id), set_ctx)
-                g = set_chk.gen
-                b = set_chk.block
-
-                if ek == LIST_ELEM_OTHER() {
-                    -- Generic set: alloca temp, store value, pass pointer + elem_size
-                    let set_elem_type = if g.list_elem_types.contains(obj_name) {
-                        g.list_elem_types.get(obj_name)
-                    } else {
-                        "i64"
-                    }
-                    let set_elem_size = estimate_type_size_gen(g, set_elem_type)
-                    let set_temp_id = g.builder.next_id
-                    let mut set_temp_inst = ir_inst_new(set_temp_id, OP_ALLOCA())
-                    set_temp_inst.alloc_type = set_elem_type
-                    set_temp_inst.result_type = "ptr(" + set_elem_type + ")"
-                    set_temp_inst.has_result = true
-                    b.instructions.push(set_temp_inst)
-                    g.builder.next_id = g.builder.next_id + 1
-
-                    let mut set_store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-                    set_store_inst.store_ptr = ir_val_inst(set_temp_id)
-                    set_store_inst.store_val = ir_val_inst(val_result.val_id)
-                    set_store_inst.has_result = false
-                    b.instructions.push(set_store_inst)
-                    g.builder.next_id = g.builder.next_id + 1
-
-                    let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-                    set_inst.callee = "dm_list_generic_set"
-                    let mut set_args: List[IRValue] = []
-                    set_args.push(ir_val_inst(list_ptr))
-                    set_args.push(ir_val_inst(set_temp_id))
-                    set_args.push(ir_val_inst(idx_result.val_id))
-                    set_args.push(ir_val_int(set_elem_size))
-                    set_inst.call_args = set_args
-                    set_inst.result_type = "void"
-                    set_inst.has_result = false
-                    b.instructions.push(set_inst)
-                    g.builder.next_id = g.builder.next_id + 1
-                } else {
-                    let set_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_set" }
-                    else if ek == LIST_ELEM_FLOAT() { "dm_list_double_set" }
-                    else { "dm_list_string_set" }
-                    let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-                    set_inst.callee = set_fn
-                    let mut set_args: List[IRValue] = []
-                    set_args.push(ir_val_inst(list_ptr))
-                    set_args.push(ir_val_inst(idx_result.val_id))
-                    set_args.push(ir_val_inst(val_result.val_id))
-                    set_inst.call_args = set_args
-                    set_inst.result_type = "void"
-                    set_inst.has_result = false
-                    b.instructions.push(set_inst)
-                    g.builder.next_id = g.builder.next_id + 1
-                }
+                let set_res = generate_list_index_set(g, b, ek, set_elem_type, ir_val_inst(list_ptr), *target.index, val_result.val_id, set_ctx)
+                g = set_res.gen
+                b = set_res.block
             }
         }
     }
@@ -8870,6 +8881,7 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_GROUPED() { return static_type(gen, *expr.operand) }
     if k == EXPR_IDENTIFIER() {
         if gen.var_src_types.contains(expr.name) { return gen.var_src_types.get(expr.name) }
+        if gen.var_struct_types.contains(expr.name) { return gen.var_struct_types.get(expr.name) }
         return ""
     }
     if k == EXPR_FIELD_ACCESS() {
@@ -8932,6 +8944,222 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
         return ""
     }
     return ""
+}
+
+-- ============================================================
+-- ADDRESSES
+-- Storage an expression names, so that assignments and list
+-- operations change the value in place rather than a copy.
+-- ============================================================
+
+struct AddrResult {
+    gen: IRGenerator,
+    block: IRBasicBlock,
+    -- Pointer to the storage
+    ptr: IRValue,
+    -- Source type of the value stored there
+    src_type: string,
+    -- false when the expression names no storage
+    ok: bool
+}
+
+fn addr_result(g: IRGenerator, b: IRBasicBlock, ptr: IRValue, src_type: string) -> AddrResult {
+    return AddrResult { gen: g, block: b, ptr: ptr, src_type: src_type, ok: true }
+}
+
+fn addr_fail(g: IRGenerator, b: IRBasicBlock) -> AddrResult {
+    return AddrResult { gen: g, block: b, ptr: ir_val_undef(), src_type: "", ok: false }
+}
+
+fn struct_field_index(gen: IRGenerator, struct_name: string, field: string) -> int {
+    if gen.struct_defs.contains(struct_name) == false { return -1 }
+    let info = gen.struct_defs.get(struct_name)
+    let mut i = 0
+    while i < info.field_names.len() {
+        if info.field_names[i] == field { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+-- Address of a variable, a field of an addressable or boxed struct, or `*box`.
+fn generate_addr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResult {
+    let mut g = gen
+    let mut b = block
+    if expr.kind == EXPR_GROUPED() {
+        return generate_addr(g, b, *expr.operand)
+    }
+    if expr.kind == EXPR_IDENTIFIER() {
+        let var_t = static_type(g, expr)
+        -- mut parameters are pointers to the caller's storage
+        if g.param_ptr_map.contains(expr.name) {
+            return addr_result(g, b, ir_val_param(g.param_ptr_map.get(expr.name)), var_t)
+        }
+        if g.variable_map.contains(expr.name) {
+            let slot = g.variable_map.get(expr.name)
+            if slot >= 0 {
+                return addr_result(g, b, ir_val_inst(slot), var_t)
+            }
+        }
+        return addr_fail(g, b)
+    }
+    if expr.kind == EXPR_UNARY() and expr.op == UNOP_DEREF() {
+        let box_t = static_type(g, *expr.operand)
+        if starts_with(box_t, "Box[") == false {
+            return addr_fail(g, b)
+        }
+        let box_result = generate_expr(g, b, *expr.operand)
+        g = box_result.gen
+        b = box_result.block
+        let chk = check_box_not_null(g, b, box_result.val_id)
+        g = chk.gen
+        b = chk.block
+        return addr_result(g, b, ir_val_inst(box_result.val_id), extract_inner_type(box_t, "Box["))
+    }
+    if expr.kind == EXPR_INDEX_ACCESS() {
+        let list_t = static_type(g, *expr.object)
+        if starts_with(list_t, "List[") == false {
+            return addr_fail(g, b)
+        }
+        let h = generate_list_handle(g, b, *expr.object)
+        g = h.gen
+        b = h.block
+        if h.ok == false {
+            return addr_fail(g, b)
+        }
+        let elem_src = extract_inner_type(list_t, "List[")
+        let elem_ir = list_elem_ir_type(elem_src)
+        let ek = classify_list_elem(elem_src)
+        let idx_result = generate_expr(g, b, *expr.index)
+        g = idx_result.gen
+        b = idx_result.block
+        let len_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_len" }
+        else if ek == LIST_ELEM_FLOAT() { "dm_list_double_len" }
+        else if ek == LIST_ELEM_STRING() { "dm_list_string_len" }
+        else { "dm_list_generic_len" }
+        let len_id = g.builder.next_id
+        let mut len_inst = ir_inst_new(len_id, OP_CALL())
+        len_inst.callee = len_fn
+        let mut len_args: List[IRValue] = []
+        len_args.push(h.ptr)
+        len_inst.call_args = len_args
+        len_inst.result_type = "i64"
+        len_inst.has_result = true
+        b.instructions.push(len_inst)
+        g.builder.next_id = len_id + 1
+        let chk = check_index_bounds(g, b, idx_result.val_id, ir_val_inst(len_id), "(list)")
+        g = chk.gen
+        b = chk.block
+        -- Same stride the runtime used to store the elements
+        let elem_size = estimate_type_size_gen(g, elem_ir)
+        let id = g.builder.next_id
+        let mut inst = ir_inst_new(id, OP_GEP())
+        inst.gep_base = h.ptr
+        let mut gep_idx: List[IRValue] = []
+        gep_idx.push(ir_val_inst(idx_result.val_id))
+        inst.gep_indices = gep_idx
+        inst.alloc_type = elem_ir
+        inst.field_index = elem_size
+        inst.field_type = elem_ir
+        inst.result_type = "ptr(" + elem_ir + ")"
+        inst.has_result = true
+        b.instructions.push(inst)
+        g.builder.next_id = id + 1
+        return addr_result(g, b, ir_val_inst(id), elem_src)
+    }
+    if expr.kind == EXPR_FIELD_ACCESS() {
+        let obj = *expr.object
+        let obj_t = static_type(g, obj)
+        let mut struct_name = obj_t
+        let mut base = ir_val_undef()
+        if starts_with(obj_t, "Box[") {
+            -- A boxed struct lives on the heap: the box value is its address
+            struct_name = extract_inner_type(obj_t, "Box[")
+            let box_result = generate_expr(g, b, obj)
+            g = box_result.gen
+            b = box_result.block
+            let chk = check_box_not_null(g, b, box_result.val_id)
+            g = chk.gen
+            b = chk.block
+            base = ir_val_inst(box_result.val_id)
+        } else {
+            let obj_addr = generate_addr(g, b, obj)
+            g = obj_addr.gen
+            b = obj_addr.block
+            if obj_addr.ok == false {
+                return addr_fail(g, b)
+            }
+            base = obj_addr.ptr
+        }
+        let fidx = struct_field_index(g, struct_name, expr.field)
+        if fidx < 0 {
+            return addr_fail(g, b)
+        }
+        let field_src = struct_field_src_type(g, struct_name, expr.field)
+        let field_ir = map_type_name(field_src)
+        let id = g.builder.next_id
+        let mut inst = ir_inst_new(id, OP_GEP())
+        inst.gep_base = base
+        inst.alloc_type = struct_name
+        inst.field_index = fidx
+        inst.field_type = field_ir
+        inst.result_type = "ptr(" + field_ir + ")"
+        inst.has_result = true
+        b.instructions.push(inst)
+        g.builder.next_id = id + 1
+        return addr_result(g, b, ir_val_inst(id), field_src)
+    }
+    return addr_fail(g, b)
+}
+
+-- Pointer to a list for the runtime's list functions. A list variable
+-- or field is used in place. Any other list value (a call result, a
+-- list element) is copied to a temporary and `ok` is false, because
+-- changes to that copy would be lost.
+fn generate_list_handle(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResult {
+    let mut g = gen
+    let mut b = block
+    let list_t = static_type(g, expr)
+    if expr.kind == EXPR_IDENTIFIER() {
+        -- A list variable's value is already a pointer to its storage
+        let var_result = generate_expr(g, b, expr)
+        return addr_result(var_result.gen, var_result.block, ir_val_inst(var_result.val_id), list_t)
+    }
+    if expr.kind == EXPR_FIELD_ACCESS() or expr.kind == EXPR_INDEX_ACCESS() or expr.kind == EXPR_UNARY() or expr.kind == EXPR_GROUPED() {
+        let a = generate_addr(g, b, expr)
+        g = a.gen
+        b = a.block
+        if a.ok {
+            return a
+        }
+    }
+    let val_result = generate_expr(g, b, expr)
+    g = val_result.gen
+    b = val_result.block
+    let tmp_id = g.builder.next_id
+    let mut tmp_inst = ir_inst_new(tmp_id, OP_ALLOCA())
+    tmp_inst.alloc_type = list_t
+    tmp_inst.result_type = "ptr(" + list_t + ")"
+    tmp_inst.has_result = true
+    b.instructions.push(tmp_inst)
+    g.builder.next_id = tmp_id + 1
+    let mut st_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+    st_inst.store_ptr = ir_val_inst(tmp_id)
+    st_inst.store_val = ir_val_inst(val_result.val_id)
+    b.instructions.push(st_inst)
+    g.builder.next_id = g.builder.next_id + 1
+    let mut copy = addr_result(g, b, ir_val_inst(tmp_id), list_t)
+    copy.ok = false
+    return copy
+}
+
+-- IR element type of a list whose elements have source type elem_src
+fn list_elem_ir_type(elem_src: string) -> string {
+    let kind = classify_list_elem(elem_src)
+    if kind == LIST_ELEM_INT() { return "i64" }
+    if kind == LIST_ELEM_FLOAT() { return "f64" }
+    if kind == LIST_ELEM_STRING() { return "string" }
+    return elem_src
 }
 
 -- ============================================================
@@ -9006,6 +9234,10 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
     if expr.kind == EXPR_UNARY() {
         if expr.op == UNOP_NOT() {
             return "bool"
+        }
+        if expr.op == UNOP_DEREF() {
+            let deref_src = static_type(gen, expr)
+            if deref_src != "" { return map_type_name(deref_src) }
         }
         -- Negation preserves the operand type
         return infer_expr_type(gen, *expr.operand)
@@ -9252,6 +9484,8 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
                 }
             }
         }
+        let field_src = static_type(gen, expr)
+        if field_src != "" { return map_type_name(field_src) }
         return "i64"
     }
     if expr.kind == EXPR_INDEX_ACCESS() {
@@ -9280,6 +9514,10 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
                 if idx_mk == MAP_KIND_STRING_INT() { return "i64" }
                 if idx_mk == MAP_KIND_INT_STRING() { return "string" }
             }
+        }
+        let idx_src = static_type(gen, expr)
+        if idx_src != "" {
+            return list_elem_ir_type(idx_src)
         }
         return "i64"
     }
@@ -10193,6 +10431,16 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
         let inst_key = "_inst_" + int_to_string(operand_id)
         if g.box_inner_types.contains(inst_key) {
             inner_type = g.box_inner_types.get(inst_key)
+        }
+
+        -- Otherwise use the operand's source type (a field, a call, ...)
+        if inner_type == "i64" {
+            let operand_src = static_type(g, operand_expr)
+            if starts_with(operand_src, "Box[") {
+                inner_type = extract_inner_type(operand_src, "Box[")
+            } else {
+                g = ir_type_error(g, "cannot determine the type of the box being dereferenced", expr.line)
+            }
         }
 
         -- Map the inner type to IR type
@@ -11169,28 +11417,22 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     }
 
     -- --------------------------------------------------------
-    -- List method calls on struct field access (e.g., p.tokens.push(x))
+    -- List methods on any other list-typed receiver: a field
+    -- (p.tokens.push(x)), a boxed value, a call result, ...
     -- --------------------------------------------------------
-    if obj_expr.kind == EXPR_FIELD_ACCESS() {
-        let field_obj = *obj_expr.object
-        if field_obj.kind == EXPR_IDENTIFIER() {
-            let field_obj_name = field_obj.name
-            let field_name = obj_expr.field
-            let field_key = if g.var_struct_types.contains(field_obj_name) {
-                g.var_struct_types.get(field_obj_name) + "." + field_name
-            } else {
-                ""
-            }
-            if len(field_key) > 0 and g.field_list_elem_kinds.contains(field_key) {
-                let ek = g.field_list_elem_kinds.get(field_key)
-                -- Generate the field access to get the list pointer
-                let obj_result = generate_expr(g, b, obj_expr)
-                g = obj_result.gen
-                b = obj_result.block
-                let list_ptr = obj_result.val_id
-                return generate_list_method_call(g, b, ek, list_ptr, "", method_name, args)
-            }
+    let recv_list_type = if g.list_elem_kinds.contains(obj_var_name) { "" } else { static_type(g, obj_expr) }
+    if starts_with(recv_list_type, "List[") {
+        let recv_elem = extract_inner_type(recv_list_type, "List[")
+        let h = generate_list_handle(g, b, obj_expr)
+        g = h.gen
+        b = h.block
+        if h.ok == false and (method_name == "push" or method_name == "pop") {
+            g = ir_type_error(g, "'." + method_name + "()' would change a temporary copy of this list; store the list in a variable or field first", expr.line)
         }
+        -- Generic list methods look up the element type by name
+        let recv_key = "_listrecv_" + int_to_string(h.ptr.ref_id)
+        g.list_elem_types.insert(recv_key, recv_elem)
+        return generate_list_method_call(g, b, classify_list_elem(recv_elem), h.ptr.ref_id, recv_key, method_name, args)
     }
 
     -- --------------------------------------------------------
@@ -11240,16 +11482,6 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let recv_type = static_type(g, obj_expr)
     if g.struct_defs.contains(recv_type) {
         return generate_struct_method_call(g, b, recv_type, obj_expr, method_name, args)
-    }
-    if starts_with(recv_type, "List[") {
-        let recv_elem = extract_inner_type(recv_type, "List[")
-        let recv_result = generate_expr(g, b, obj_expr)
-        g = recv_result.gen
-        b = recv_result.block
-        -- Generic list methods look up the element type by name
-        let recv_key = "_listrecv_" + int_to_string(recv_result.val_id)
-        g.list_elem_types.insert(recv_key, recv_elem)
-        return generate_list_method_call(g, b, classify_list_elem(recv_elem), recv_result.val_id, recv_key, method_name, args)
     }
 
     -- --------------------------------------------------------
@@ -12918,12 +13150,110 @@ fn generate_field_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
 -- Index Access: expr.object[expr.index]
 -- ============================================================
 
+-- Read element idx_id of the list at list_id (a pointer to the list),
+-- with a bounds check that panics with bounds_ctx in its message.
+fn generate_list_index_get(gen: IRGenerator, block: IRBasicBlock, elem_kind: int, elem_type: string, obj_id: int, idx_id: int, bounds_ctx: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    -- Bounds check: panic unless 0 <= idx < len
+    let bounds_len_fn = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_len" }
+    else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_len" }
+    else if elem_kind == LIST_ELEM_STRING() { "dm_list_string_len" }
+    else { "dm_list_generic_len" }
+    let bounds_len_id = g.builder.next_id
+    let mut bounds_len_inst = ir_inst_new(bounds_len_id, OP_CALL())
+    bounds_len_inst.callee = bounds_len_fn
+    let mut bounds_len_args: List[IRValue] = []
+    bounds_len_args.push(ir_val_inst(obj_id))
+    bounds_len_inst.call_args = bounds_len_args
+    bounds_len_inst.result_type = "i64"
+    bounds_len_inst.has_result = true
+    b.instructions.push(bounds_len_inst)
+    g.builder.next_id = bounds_len_id + 1
+    let bounds_chk = check_index_bounds(g, b, idx_id, ir_val_inst(bounds_len_id), bounds_ctx)
+    g = bounds_chk.gen
+    b = bounds_chk.block
+
+    if elem_kind == LIST_ELEM_OTHER() {
+        -- Generic list get: alloca temp, call dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
+        let elem_size = estimate_type_size_gen(g, elem_type)
+        let temp_alloca_id = g.builder.next_id
+        let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
+        temp_inst.alloc_type = elem_type
+        temp_inst.result_type = "ptr(" + elem_type + ")"
+        temp_inst.has_result = true
+        b.instructions.push(temp_inst)
+        g.builder.next_id = g.builder.next_id + 1
+
+        let id = g.builder.next_id
+        let mut inst = ir_inst_new(id, OP_CALL())
+        inst.callee = "dm_list_generic_get"
+        let mut call_args: List[IRValue] = []
+        call_args.push(ir_val_inst(temp_alloca_id))
+        call_args.push(ir_val_inst(obj_id))
+        call_args.push(ir_val_inst(idx_id))
+        call_args.push(ir_val_int(elem_size))
+        inst.call_args = call_args
+        inst.result_type = "void"
+        inst.has_result = false
+        b.instructions.push(inst)
+        g.builder.next_id = id + 1
+
+        -- Load the struct from temp alloca
+        let load_id = g.builder.next_id
+        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+        load_inst.load_ptr = ir_val_inst(temp_alloca_id)
+        load_inst.load_type = elem_type
+        load_inst.result_type = elem_type
+        load_inst.has_result = true
+        b.instructions.push(load_inst)
+        g.builder.next_id = load_id + 1
+
+        -- Track struct type for subsequent field access
+        if g.struct_defs.contains(elem_type) {
+            g.var_struct_types.insert("_listget_" + int_to_string(load_id), elem_type)
+        }
+
+        return expr_result(g, b, load_id)
+    }
+
+    let id = g.builder.next_id
+    let mut inst = ir_inst_new(id, OP_LIST_GET())
+    inst.lhs = ir_val_inst(obj_id)
+    inst.rhs = ir_val_inst(idx_id)
+    inst.result_type = map_type_name(elem_type)
+    inst.has_result = true
+    b.instructions.push(inst)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
 fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
 
     let object = *expr.object
     let index = *expr.index
+
+    -- A list reached through a field, a box, a call, ...: index its storage
+    let obj_static = if object.kind == EXPR_IDENTIFIER() { "" } else { static_type(g, object) }
+    if starts_with(obj_static, "List[") {
+        let h = generate_list_handle(g, b, object)
+        g = h.gen
+        b = h.block
+        let list_idx = generate_expr(g, b, index)
+        g = list_idx.gen
+        b = list_idx.block
+        let list_elem_src = extract_inner_type(obj_static, "List[")
+        let list_get = generate_list_index_get(g, b, classify_list_elem(list_elem_src), list_elem_ir_type(list_elem_src), h.ptr.ref_id, list_idx.val_id, "(list)")
+        -- Track struct elements for subsequent field access
+        if g.struct_defs.contains(list_elem_src) {
+            let mut lg = list_get.gen
+            lg.var_struct_types.insert("_listget_" + int_to_string(list_get.val_id), list_elem_src)
+            return expr_result(lg, list_get.block, list_get.val_id)
+        }
+        return list_get
+    }
 
     -- Generate the object expression
     let obj_result = generate_expr(g, b, object)
@@ -12937,41 +13267,39 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     b = idx_result.block
     let idx_id = idx_result.val_id
 
-    -- Check if the object is a string variable (s[i] -> char_at)
-    if object.kind == EXPR_IDENTIFIER() {
-        let str_var_name = object.name
-        if g.variable_types.contains(str_var_name) {
-            let vtype = g.variable_types.get(str_var_name)
-            if vtype == "string" {
-                -- Bounds check: panic unless 0 <= idx < strlen
-                let str_len_id = g.builder.next_id
-                let mut str_len_inst = ir_inst_new(str_len_id, OP_CALL())
-                str_len_inst.callee = "dm_string_len"
-                let mut str_len_args: List[IRValue] = []
-                str_len_args.push(ir_val_inst(obj_id))
-                str_len_inst.call_args = str_len_args
-                str_len_inst.result_type = "i64"
-                str_len_inst.has_result = true
-                b.instructions.push(str_len_inst)
-                g.builder.next_id = str_len_id + 1
-                let str_chk = check_index_bounds(g, b, idx_id, ir_val_inst(str_len_id), "(string)")
-                g = str_chk.gen
-                b = str_chk.block
+    -- Check if the object is a string (s[i] -> char_at)
+    let mut obj_is_string = obj_static == "string"
+    if object.kind == EXPR_IDENTIFIER() and g.variable_types.contains(object.name) {
+        obj_is_string = g.variable_types.get(object.name) == "string"
+    }
+    if obj_is_string {
+        -- Bounds check: panic unless 0 <= idx < strlen
+        let str_len_id = g.builder.next_id
+        let mut str_len_inst = ir_inst_new(str_len_id, OP_CALL())
+        str_len_inst.callee = "dm_string_len"
+        let mut str_len_args: List[IRValue] = []
+        str_len_args.push(ir_val_inst(obj_id))
+        str_len_inst.call_args = str_len_args
+        str_len_inst.result_type = "i64"
+        str_len_inst.has_result = true
+        b.instructions.push(str_len_inst)
+        g.builder.next_id = str_len_id + 1
+        let str_chk = check_index_bounds(g, b, idx_id, ir_val_inst(str_len_id), "(string)")
+        g = str_chk.gen
+        b = str_chk.block
 
-                let id = g.builder.next_id
-                let mut inst = ir_inst_new(id, OP_CALL())
-                inst.callee = "dm_char_at"
-                let mut call_args: List[IRValue] = []
-                call_args.push(ir_val_inst(obj_id))
-                call_args.push(ir_val_inst(idx_id))
-                inst.call_args = call_args
-                inst.result_type = "string"
-                inst.has_result = true
-                b.instructions.push(inst)
-                g.builder.next_id = id + 1
-                return expr_result(g, b, id)
-            }
-        }
+        let id = g.builder.next_id
+        let mut inst = ir_inst_new(id, OP_CALL())
+        inst.callee = "dm_char_at"
+        let mut call_args: List[IRValue] = []
+        call_args.push(ir_val_inst(obj_id))
+        call_args.push(ir_val_inst(idx_id))
+        inst.call_args = call_args
+        inst.result_type = "string"
+        inst.has_result = true
+        b.instructions.push(inst)
+        g.builder.next_id = id + 1
+        return expr_result(g, b, id)
     }
 
     -- Check if the object is a known list variable
@@ -12996,78 +13324,8 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                 }
             }
 
-            -- Bounds check: panic unless 0 <= idx < len
-            let bounds_len_fn = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_len" }
-            else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_len" }
-            else if elem_kind == LIST_ELEM_STRING() { "dm_list_string_len" }
-            else { "dm_list_generic_len" }
-            let bounds_len_id = g.builder.next_id
-            let mut bounds_len_inst = ir_inst_new(bounds_len_id, OP_CALL())
-            bounds_len_inst.callee = bounds_len_fn
-            let mut bounds_len_args: List[IRValue] = []
-            bounds_len_args.push(ir_val_inst(obj_id))
-            bounds_len_inst.call_args = bounds_len_args
-            bounds_len_inst.result_type = "i64"
-            bounds_len_inst.has_result = true
-            b.instructions.push(bounds_len_inst)
-            g.builder.next_id = bounds_len_id + 1
             let bounds_ctx = if g.array_var_names.contains(var_name) { "(array)" } else { "(list)" }
-            let bounds_chk = check_index_bounds(g, b, idx_id, ir_val_inst(bounds_len_id), bounds_ctx)
-            g = bounds_chk.gen
-            b = bounds_chk.block
-
-            if elem_kind == LIST_ELEM_OTHER() {
-                -- Generic list get: alloca temp, call dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
-                let elem_size = estimate_type_size_gen(g, elem_type)
-                let temp_alloca_id = g.builder.next_id
-                let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
-                temp_inst.alloc_type = elem_type
-                temp_inst.result_type = "ptr(" + elem_type + ")"
-                temp_inst.has_result = true
-                b.instructions.push(temp_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                let id = g.builder.next_id
-                let mut inst = ir_inst_new(id, OP_CALL())
-                inst.callee = "dm_list_generic_get"
-                let mut call_args: List[IRValue] = []
-                call_args.push(ir_val_inst(temp_alloca_id))
-                call_args.push(ir_val_inst(obj_id))
-                call_args.push(ir_val_inst(idx_id))
-                call_args.push(ir_val_int(elem_size))
-                inst.call_args = call_args
-                inst.result_type = "void"
-                inst.has_result = false
-                b.instructions.push(inst)
-                g.builder.next_id = id + 1
-
-                -- Load the struct from temp alloca
-                let load_id = g.builder.next_id
-                let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-                load_inst.load_ptr = ir_val_inst(temp_alloca_id)
-                load_inst.load_type = elem_type
-                load_inst.result_type = elem_type
-                load_inst.has_result = true
-                b.instructions.push(load_inst)
-                g.builder.next_id = load_id + 1
-
-                -- Track struct type for subsequent field access
-                if g.struct_defs.contains(elem_type) {
-                    g.var_struct_types.insert("_listget_" + int_to_string(load_id), elem_type)
-                }
-
-                return expr_result(g, b, load_id)
-            }
-
-            let id = g.builder.next_id
-            let mut inst = ir_inst_new(id, OP_LIST_GET())
-            inst.lhs = ir_val_inst(obj_id)
-            inst.rhs = ir_val_inst(idx_id)
-            inst.result_type = map_type_name(elem_type)
-            inst.has_result = true
-            b.instructions.push(inst)
-            g.builder.next_id = id + 1
-            return expr_result(g, b, id)
+            return generate_list_index_get(g, b, elem_kind, elem_type, obj_id, idx_id, bounds_ctx)
         }
 
         -- Map variable index access
@@ -13099,46 +13357,8 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
         }
     }
 
-    -- Check for field access list indexing: obj.field[i]
-    if object.kind == EXPR_FIELD_ACCESS() {
-        let field_obj = *object.object
-        let field_name = object.field
-
-        if field_obj.kind == EXPR_IDENTIFIER() {
-            let parent_var = field_obj.name
-            if g.var_struct_types.contains(parent_var) {
-                let parent_struct = g.var_struct_types.get(parent_var)
-                let key = parent_struct + "." + field_name
-                if g.field_list_elem_kinds.contains(key) {
-                    let elem_kind = g.field_list_elem_kinds.get(key)
-                    let mut elem_type = "i64"
-                    if elem_kind == LIST_ELEM_INT() {
-                        elem_type = "i64"
-                    } else if elem_kind == LIST_ELEM_FLOAT() {
-                        elem_type = "f64"
-                    } else if elem_kind == LIST_ELEM_STRING() {
-                        elem_type = "string"
-                    } else if elem_kind == LIST_ELEM_OTHER() {
-                        if g.field_list_elem_types.contains(key) {
-                            elem_type = g.field_list_elem_types.get(key)
-                        }
-                    }
-
-                    let id = g.builder.next_id
-                    let mut inst = ir_inst_new(id, OP_LIST_GET())
-                    inst.lhs = ir_val_inst(obj_id)
-                    inst.rhs = ir_val_inst(idx_id)
-                    inst.result_type = map_type_name(elem_type)
-                    inst.has_result = true
-                    b.instructions.push(inst)
-                    g.builder.next_id = id + 1
-                    return expr_result(g, b, id)
-                }
-            }
-        }
-    }
-
-    -- Default: treat as a list of i64
+    -- Unknown object type: report it, then emit an i64 list read to continue
+    g = ir_type_error(g, "cannot determine the type of the indexed value", expr.line)
     let id = g.builder.next_id
     let mut inst = ir_inst_new(id, OP_LIST_GET())
     inst.lhs = ir_val_inst(obj_id)
@@ -17424,6 +17644,10 @@ fn check_call_args(gen: LLVMGenerator, fn_ty: int, callee: int) -> LLVMGenerator
     }
 }
 
+fn is_list_ir_type(type_name: string) -> bool {
+    return starts_with(type_name, "List[") or starts_with(type_name, "dm_list_")
+}
+
 fn is_int_type(type_name: string) -> bool {
     if type_name == "i8" { return true }
     if type_name == "i16" { return true }
@@ -18544,6 +18768,34 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
         }
+        -- Struct: address of a field (base is a pointer to the struct).
+        -- A string or list field's address is that value's handle, like
+        -- any other string or list value.
+        if op == OP_GEP() {
+            let base = resolve_value(g, inst.gep_base)
+            g = resolve_value_with_counter(g, inst.gep_base)
+            let mut addr = 0
+            if inst.gep_indices.len() > 0 {
+                -- List element: base points to { data, len, capacity }, and
+                -- elements are field_index bytes apart from data
+                g = get_dm_string_type(g)
+                let ptr_ty = dm_llvm_pointer_type(g.context)
+                let i64_ty = dm_llvm_int64_type(g.context)
+                let data_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, base, 0, "list.data.addr")
+                let data = dm_llvm_build_load2(b, ptr_ty, data_slot, "list.data")
+                let idx = resolve_value(g, inst.gep_indices[0])
+                let offset = dm_llvm_build_mul(b, idx, dm_llvm_const_int(i64_ty, inst.field_index, 0), "elem.offset")
+                addr = dm_llvm_build_gep2_one(b, dm_llvm_int8_type(g.context), data, offset, "elem.addr")
+            } else {
+                let struct_ty = map_ir_type_to_llvm(g, inst.alloc_type)
+                addr = dm_llvm_build_struct_gep2(b, struct_ty, base, inst.field_index, "field.addr")
+            }
+            if inst.field_type == "string" or is_list_ir_type(inst.field_type) {
+                g.string_ptrs.insert(id_key, true)
+            }
+            if inst.has_result { g.value_map.insert(id_key, addr) }
+            return g
+        }
         -- Struct: insert field
         if op == OP_INSERT_FIELD() {
             let mut base_val = 0
@@ -18851,15 +19103,10 @@ fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let id_key = int_to_string(inst.id)
-        -- Call dm_list_new() runtime function
-        if g.function_map.contains("dm_list_new") {
-            let func = g.function_map.get("dm_list_new")
-            let fn_ty = g.fn_type_map.get("dm_list_new")
-            dm_llvm_buf_clear()
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "list")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
+        -- Every runtime list is { data, len, capacity }; the empty list
+        -- is all zeros, and push allocates on first use
+        g = get_dm_string_type(g)
+        if inst.has_result { g.value_map.insert(id_key, dm_llvm_const_null(g.dm_string_type)) }
         return g
     }
 }

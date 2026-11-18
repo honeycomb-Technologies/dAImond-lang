@@ -191,6 +191,10 @@ fn check_call_args(gen: LLVMGenerator, fn_ty: int, callee: int) -> LLVMGenerator
     }
 }
 
+fn is_list_ir_type(type_name: string) -> bool {
+    return starts_with(type_name, "List[") or starts_with(type_name, "dm_list_")
+}
+
 fn is_int_type(type_name: string) -> bool {
     if type_name == "i8" { return true }
     if type_name == "i16" { return true }
@@ -1311,6 +1315,34 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
         }
+        -- Struct: address of a field (base is a pointer to the struct).
+        -- A string or list field's address is that value's handle, like
+        -- any other string or list value.
+        if op == OP_GEP() {
+            let base = resolve_value(g, inst.gep_base)
+            g = resolve_value_with_counter(g, inst.gep_base)
+            let mut addr = 0
+            if inst.gep_indices.len() > 0 {
+                -- List element: base points to { data, len, capacity }, and
+                -- elements are field_index bytes apart from data
+                g = get_dm_string_type(g)
+                let ptr_ty = dm_llvm_pointer_type(g.context)
+                let i64_ty = dm_llvm_int64_type(g.context)
+                let data_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, base, 0, "list.data.addr")
+                let data = dm_llvm_build_load2(b, ptr_ty, data_slot, "list.data")
+                let idx = resolve_value(g, inst.gep_indices[0])
+                let offset = dm_llvm_build_mul(b, idx, dm_llvm_const_int(i64_ty, inst.field_index, 0), "elem.offset")
+                addr = dm_llvm_build_gep2_one(b, dm_llvm_int8_type(g.context), data, offset, "elem.addr")
+            } else {
+                let struct_ty = map_ir_type_to_llvm(g, inst.alloc_type)
+                addr = dm_llvm_build_struct_gep2(b, struct_ty, base, inst.field_index, "field.addr")
+            }
+            if inst.field_type == "string" or is_list_ir_type(inst.field_type) {
+                g.string_ptrs.insert(id_key, true)
+            }
+            if inst.has_result { g.value_map.insert(id_key, addr) }
+            return g
+        }
         -- Struct: insert field
         if op == OP_INSERT_FIELD() {
             let mut base_val = 0
@@ -1618,15 +1650,10 @@ fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let id_key = int_to_string(inst.id)
-        -- Call dm_list_new() runtime function
-        if g.function_map.contains("dm_list_new") {
-            let func = g.function_map.get("dm_list_new")
-            let fn_ty = g.fn_type_map.get("dm_list_new")
-            dm_llvm_buf_clear()
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "list")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
+        -- Every runtime list is { data, len, capacity }; the empty list
+        -- is all zeros, and push allocates on first use
+        g = get_dm_string_type(g)
+        if inst.has_result { g.value_map.insert(id_key, dm_llvm_const_null(g.dm_string_type)) }
         return g
     }
 }

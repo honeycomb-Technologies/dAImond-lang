@@ -422,6 +422,12 @@ int64_t dm_llvm_build_gep2(int64_t b, int64_t ty, int64_t ptr,
                                  (unsigned)num_indices, name));
 }
 
+int64_t dm_llvm_build_gep2_one(int64_t b, int64_t ty, int64_t ptr, int64_t idx, const char* name) {
+    LLVMValueRef index = TO_PTR(LLVMValueRef, idx);
+    return TO_INT(LLVMBuildInBoundsGEP2(TO_PTR(LLVMBuilderRef, b), TO_PTR(LLVMTypeRef, ty),
+                                        TO_PTR(LLVMValueRef, ptr), &index, 1, name));
+}
+
 int64_t dm_llvm_build_struct_gep2(int64_t b, int64_t ty, int64_t ptr, int64_t idx, const char* name) {
     return TO_INT(LLVMBuildStructGEP2(TO_PTR(LLVMBuilderRef, b),
                                        TO_PTR(LLVMTypeRef, ty),
