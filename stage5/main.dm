@@ -1028,6 +1028,9 @@ struct FunctionDecl {
     is_extern: bool,
     -- An extern fn declared with a trailing `...`, like C's printf
     is_variadic: bool,
+    -- The C symbol an extern fn is bound to with `= "symbol"`; "" binds
+    -- the function's own name
+    link_name: string,
     is_async: bool,
     is_comptime: bool,
     line: int,
@@ -1044,6 +1047,7 @@ fn func_decl_new(name: string, line: int, col: int) -> FunctionDecl {
         effects: [],
         is_extern: false,
         is_variadic: false,
+        link_name: "",
         is_async: false,
         is_comptime: false,
         line: line,
@@ -1768,6 +1772,8 @@ struct IRFunction {
     is_extern: bool,
     -- A C function that takes further arguments after its parameters
     is_variadic: bool,
+    -- The C symbol an extern function is bound to; "" means its name
+    link_name: string,
     is_comptime: bool
 }
 
@@ -1775,7 +1781,7 @@ fn ir_function_new(name: string, ret_type: string) -> IRFunction {
     return IRFunction {
         name: name, params: [], return_type: ret_type,
         blocks: [],
-        is_async: false, is_extern: false, is_variadic: false, is_comptime: false
+        is_async: false, is_extern: false, is_variadic: false, link_name: "", is_comptime: false
     }
 }
 
@@ -2402,6 +2408,9 @@ extern fn dm_llvm_build_sub(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_mul(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_sdiv(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_srem(b: int, lhs: int, rhs: int, name: string) -> int
+-- libc: the bytes of a string up to its first NUL, which is what a
+-- string passed to LLVM as a C string holds
+extern fn strlen(s: string) -> u64
 extern fn dm_llvm_build_udiv(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_urem(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_neg(b: int, val: int, name: string) -> int
@@ -3102,7 +3111,14 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             -- like a generic arg list here. Generic args in expression
             -- position only occur in calls `name[T](...)` and struct
             -- literals `Name[T] { ... }`; anything else is index access.
-            if p_peek(p_skip_newlines(pp)) != TK_LPAREN() and p_peek(p_skip_newlines(pp)) != TK_LBRACE() {
+            -- A struct literal needs a capitalized name, as below, so that
+            -- `if a == xs[i] { ... }` indexes `xs`.
+            let after_args = p_peek(p_skip_newlines(pp))
+            let mut is_generic = after_args == TK_LPAREN()
+            if after_args == TK_LBRACE() and len(name) > 0 and char_at(name, 0) >= "A" and char_at(name, 0) <= "Z" {
+                is_generic = true
+            }
+            if not is_generic {
                 generics = []
                 pp = saved
             }
@@ -4207,6 +4223,18 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
         let rty = parse_type(pp)
         pp = rty.p
         fd.return_type = rty.type_name
+    }
+
+    -- `= "symbol"` binds the function to a C symbol of another name, so
+    -- that two declarations can name the same C function
+    if p_peek(pp) == TK_EQ() {
+        pp = p_advance(pp)
+        if p_peek(pp) != TK_STRING() or p_cur(pp).value == "" {
+            eprintln("Error: expected a C symbol name in quotes after `=` in extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+            exit(1)
+        }
+        fd.link_name = p_cur(pp).value
+        pp = p_advance(pp)
     }
 
     return ParseDeclResult { p: pp, decl: decl_function(fd) }
@@ -5785,7 +5813,6 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_parse_float", "string", "f64")
 
     -- String operations
-    g = declare_extern(g, "dm_string_new", "ptr", "string")
     g = declare_extern2(g, "dm_string_concat", "string", "string", "string")
     g = declare_extern2(g, "dm_string_eq", "string", "string", "bool")
     g = declare_extern(g, "dm_string_len", "string", "i64")
@@ -5993,6 +6020,7 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     let mut func = ir_function_new(name, ret_type)
     func.is_extern = fd.is_extern
     func.is_variadic = fd.is_variadic
+    func.link_name = fd.link_name
     if fd.is_variadic and ret_type == "string" {
         g = ir_type_error(g, "variadic extern fn '" + name + "' cannot return string; declare it as returning int, the address of the C string", fd.line)
     }
@@ -6113,6 +6141,26 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     g.variable_types = Map_new()
     g.mut_ptr_vars = Map_new()
     g.param_ptr_map = Map_new()
+    -- What is known about each variable is keyed by its name, so it must
+    -- not outlive the function: a `c: Color` in one function says nothing
+    -- about a `c` in the next. The caller's are put back at the end, for
+    -- a function generated in the middle of another (a generic instance).
+    let outer_var_src_types = g.var_src_types
+    let outer_var_struct_types = g.var_struct_types
+    let outer_var_enum_types = g.var_enum_types
+    let outer_box_inner_types = g.box_inner_types
+    let outer_list_elem_kinds = g.list_elem_kinds
+    let outer_list_elem_types = g.list_elem_types
+    let outer_fn_ptr_vars = g.fn_ptr_vars
+    let outer_array_var_names = g.array_var_names
+    g.var_src_types = Map_new()
+    g.var_struct_types = Map_new()
+    g.var_enum_types = Map_new()
+    g.box_inner_types = Map_new()
+    g.list_elem_kinds = Map_new()
+    g.list_elem_types = Map_new()
+    g.fn_ptr_vars = Map_new()
+    g.array_var_names = Map_new()
     -- Safety-check state is per-function (Stage 0 checker resets likewise)
     g.unsafe_depth = 0
     g.region_depth = 0
@@ -6297,6 +6345,15 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     -- Then push the final block (if it's the entry and no blocks, push it; otherwise push as last)
     func.blocks.push(blk)
     g.ir_mod.functions[func_idx] = func
+
+    g.var_src_types = outer_var_src_types
+    g.var_struct_types = outer_var_struct_types
+    g.var_enum_types = outer_var_enum_types
+    g.box_inner_types = outer_box_inner_types
+    g.list_elem_kinds = outer_list_elem_kinds
+    g.list_elem_types = outer_list_elem_types
+    g.fn_ptr_vars = outer_fn_ptr_vars
+    g.array_var_names = outer_array_var_names
 
     return g
 }
@@ -17741,6 +17798,13 @@ struct LLVMGenerator {
     has_wrapper: Map[string, bool],
     -- Track which functions use sret return convention (result/option types)
     returns_sret: Map[string, bool],
+    -- The LLVM function of each C symbol declared so far. Extern
+    -- functions bound to the same symbol share it; each keeps its own
+    -- function type in fn_type_map.
+    c_symbols: Map[string, int],
+    -- Runtime functions written in dAImond: "dm_X" is here when the
+    -- program defines rt_X, which then stands in for the C function
+    rt_ports: Map[string, bool],
     -- Reference to IR module for type lookups
     ir_module: IRModule,
     -- Current function being generated (for param lookups)
@@ -17779,6 +17843,8 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             wrapper_returns_string: Map_new(),
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
+            c_symbols: Map_new(),
+            rt_ports: Map_new(),
             ir_module: ir_mod,
             current_func_name: "",
             current_line: 0,
@@ -18182,6 +18248,112 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- Check if a return type needs sret (struct return) convention.
 -- Result ({i32, i64, i64} = 20 bytes) and Option ({i32, i64} = 12 bytes)
 -- are too large for register return on x86_64 and cause LLVM errors.
+-- ============================================================
+-- RUNTIME FUNCTIONS
+-- The IR names a runtime function dm_X. It is one of three things:
+--   inline: lowered to instructions here, with no function behind it
+--     (is_inline_runtime_fn);
+--   ported: the dAImond function rt_X, which stage5/runtime/*.dm
+--     defines with the same signature and which is called like any
+--     other dAImond function (strings by value, result through sret);
+--   otherwise the C function llvm_dm_X in runtime/llvm_wrappers.c,
+--     which takes strings by pointer.
+-- Porting a function is writing rt_X and deleting llvm_dm_X.
+-- ============================================================
+
+fn is_inline_runtime_fn(name: string) -> bool {
+    return name == "dm_string_len"
+}
+
+-- Record which dm_X functions the module defines as rt_X
+fn find_runtime_ports(gen: LLVMGenerator) -> LLVMGenerator {
+    let mut g = gen
+    let mut i = 0
+    while i < g.ir_module.functions.len() {
+        let f = g.ir_module.functions[i]
+        if f.is_extern == false and starts_with(f.name, "rt_") {
+            g.rt_ports.insert("dm_" + substr(f.name, 3, len(f.name) - 3), true)
+        }
+        i = i + 1
+    }
+    return g
+}
+
+-- After rt_X is declared: calls to dm_X go to it. Its signature must
+-- be the one the IR generator calls dm_X with.
+fn bind_runtime_port(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
+    let mut g = gen
+    let c_name = "dm_" + substr(func.name, 3, len(func.name) - 3)
+    if g.rt_ports.contains(c_name) == false { return g }
+    let mut decl = ir_function_new("", "void")
+    let mut found = false
+    let mut i = 0
+    while i < g.ir_module.functions.len() {
+        if g.ir_module.functions[i].name == c_name and g.ir_module.functions[i].is_extern {
+            decl = g.ir_module.functions[i]
+            found = true
+        }
+        i = i + 1
+    }
+    -- No such runtime function: rt_X is a helper of the runtime's own
+    if found == false { return g }
+    let mut same = decl.return_type == func.return_type and decl.params.len() == func.params.len()
+    i = 0
+    while same and i < decl.params.len() {
+        if decl.params[i].type_id != func.params[i].type_id { same = false }
+        i = i + 1
+    }
+    if same == false {
+        g.type_errors.push("Error: runtime function '" + func.name + "' does not have the signature the compiler calls '" + c_name + "' with")
+        return g
+    }
+    g.function_map.insert(c_name, g.function_map.get(func.name))
+    g.fn_type_map.insert(c_name, g.fn_type_map.get(func.name))
+    if g.returns_sret.contains(func.name) {
+        g.returns_sret.insert(c_name, true)
+    }
+    return g
+}
+
+-- Fill the string at `dst` with { data, len, 0 }: a string that does
+-- not own its bytes, such as a literal
+fn store_borrowed_string(gen: LLVMGenerator, dst: int, data: int, str_len: int) {
+    unsafe {
+        let b = gen.builder
+        let i64_ty = dm_llvm_int64_type(gen.context)
+        dm_llvm_build_store(b, data, dm_llvm_build_struct_gep2(b, gen.dm_string_type, dst, 0, "str.data"))
+        dm_llvm_build_store(b, str_len, dm_llvm_build_struct_gep2(b, gen.dm_string_type, dst, 1, "str.len"))
+        dm_llvm_build_store(b, dm_llvm_const_int(i64_ty, 0, 0), dm_llvm_build_struct_gep2(b, gen.dm_string_type, dst, 2, "str.cap"))
+    }
+}
+
+-- The length of string literal `val` as an LLVM constant. LLVM stores
+-- the literal as a C string, so its length is strlen's.
+fn literal_len_const(gen: LLVMGenerator, val: IRValue) -> int {
+    unsafe {
+        return dm_llvm_const_int(dm_llvm_int64_type(gen.context), strlen(val.str_val) as int, 0)
+    }
+}
+
+-- The C symbol an extern function names
+fn c_symbol_of(func: IRFunction) -> string {
+    if func.link_name != "" { return func.link_name }
+    return func.name
+}
+
+-- Declare C symbol `symbol` with type `fn_ty` unless it already is;
+-- afterwards gen.c_symbols.get(symbol) is its LLVM function. A later
+-- declaration with another type calls the same function with its own type.
+fn declare_c_symbol(gen: LLVMGenerator, symbol: string, fn_ty: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.c_symbols.contains(symbol) == false {
+            g.c_symbols.insert(symbol, dm_llvm_module_add_function(g.llvm_module, symbol, fn_ty))
+        }
+        return g
+    }
+}
+
 fn func_needs_wrapper(func: IRFunction) -> bool {
     if func.is_extern == false { return false }
     if func.return_type == "string" { return true }
@@ -18251,6 +18423,11 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let ctx = g.context
+        -- Runtime functions that are inline or written in dAImond have no
+        -- C function to declare
+        if func.is_extern and (is_inline_runtime_fn(func.name) or g.rt_ports.contains(func.name)) {
+            return g
+        }
         -- A variadic C function is called directly: a wrapper could not pass
         -- on its varargs. Call sites pass strings as char*.
         if func.is_variadic {
@@ -18269,7 +18446,8 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                 vi = vi + 1
             }
             let vfn_ty = dm_llvm_function_type_buf(vret_ty, 1)
-            let vfn = dm_llvm_module_add_function(g.llvm_module, func.name, vfn_ty)
+            g = declare_c_symbol(g, c_symbol_of(func), vfn_ty)
+            let vfn = g.c_symbols.get(c_symbol_of(func))
             g.function_map.insert(func.name, vfn)
             g.fn_type_map.insert(func.name, vfn_ty)
             return g
@@ -18320,6 +18498,16 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             i = i + 1
         }
         let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
+        if func.is_extern {
+            -- A C function: shared with any other declaration of its symbol
+            g = declare_c_symbol(g, c_symbol_of(func), fn_ty)
+            g.function_map.insert(func.name, g.c_symbols.get(c_symbol_of(func)))
+            g.fn_type_map.insert(func.name, fn_ty)
+            if needs_sret {
+                g.returns_sret.insert(func.name, true)
+            }
+            return g
+        }
         let llvm_fn = dm_llvm_module_add_function(g.llvm_module, func.name, fn_ty)
         g.function_map.insert(func.name, llvm_fn)
         g.fn_type_map.insert(func.name, fn_ty)
@@ -18343,6 +18531,9 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                 dm_llvm_set_value_name(param_val, func.params[i].name)
                 i = i + 1
             }
+        }
+        if starts_with(func.name, "rt_") {
+            g = bind_runtime_port(g, func)
         }
         return g
     }
@@ -18999,21 +19190,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let dst = resolve_value(g, inst.store_ptr)
             g = resolve_value_with_counter(g, inst.store_ptr)
             -- Special case: storing const_string into a string alloca
-            -- Must call dm_string_new to properly init {data, length, capacity}
+            -- fills in { data, length, capacity }
             if inst.store_val.kind == VAL_CONST_STRING() {
                 let raw_ptr = resolve_value(g, inst.store_val)
                 g = resolve_value_with_counter(g, inst.store_val)
-                if g.function_map.contains("dm_string_new") {
-                    let func = g.function_map.get("dm_string_new")
-                    let fn_ty = g.fn_type_map.get("dm_string_new")
-                    dm_llvm_buf_clear()
-                    dm_llvm_buf_push(dst)
-                    dm_llvm_buf_push(raw_ptr)
-                    g = check_call_args(g, fn_ty, func)
-                    dm_llvm_build_call2_buf(b, fn_ty, func, "")
-                } else {
-                    dm_llvm_build_store(b, raw_ptr, dst)
-                }
+                store_borrowed_string(g, dst, raw_ptr, literal_len_const(g, inst.store_val))
                 return g
             }
             let src = resolve_value(g, inst.store_val)
@@ -19286,15 +19467,11 @@ fn generate_string_concat(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let sret_name = "sret." + int_to_string(g.sret_counter)
             g.sret_counter = g.sret_counter + 1
             let sret = dm_llvm_build_alloca(b, g.dm_string_type, sret_name)
-            -- Create dm_string allocas for const string args if needed
-            let mut lhs_ptr = lhs
-            if inst.lhs.kind == VAL_CONST_STRING() {
-                lhs_ptr = create_dm_string(g, lhs)
-            }
-            let mut rhs_ptr = rhs
-            if inst.rhs.kind == VAL_CONST_STRING() {
-                rhs_ptr = create_dm_string(g, rhs)
-            }
+            -- The C wrapper takes the strings' addresses, rt_string_concat
+            -- their values
+            let by_value = g.has_wrapper.contains("dm_string_concat") == false
+            let lhs_ptr = string_operand(g, inst.lhs, lhs, by_value)
+            let rhs_ptr = string_operand(g, inst.rhs, rhs, by_value)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(sret)
             dm_llvm_buf_push(lhs_ptr)
@@ -19321,14 +19498,9 @@ fn generate_string_eq(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if g.function_map.contains("dm_string_eq") {
             let func = g.function_map.get("dm_string_eq")
             let fn_ty = g.fn_type_map.get("dm_string_eq")
-            let mut lhs_ptr = lhs
-            if inst.lhs.kind == VAL_CONST_STRING() {
-                lhs_ptr = create_dm_string(g, lhs)
-            }
-            let mut rhs_ptr = rhs
-            if inst.rhs.kind == VAL_CONST_STRING() {
-                rhs_ptr = create_dm_string(g, rhs)
-            }
+            let by_value = g.has_wrapper.contains("dm_string_eq") == false
+            let lhs_ptr = string_operand(g, inst.lhs, lhs, by_value)
+            let rhs_ptr = string_operand(g, inst.rhs, rhs, by_value)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(lhs_ptr)
             dm_llvm_buf_push(rhs_ptr)
@@ -19341,22 +19513,29 @@ fn generate_string_eq(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 }
 
 -- Create a dm_string on the stack from a raw C string pointer
-fn create_dm_string(gen: LLVMGenerator, raw_str: int) -> int {
+-- A string on the stack for string literal `val`, whose bytes are at
+-- `raw_str`; returns its address
+fn create_dm_string(gen: LLVMGenerator, val: IRValue, raw_str: int) -> int {
     unsafe {
-        let b = gen.builder
-        -- Allocate dm_string on stack
         let sret_name = "sret." + int_to_string(gen.sret_counter)
-        let sret = dm_llvm_build_alloca(b, gen.dm_string_type, sret_name)
-        -- Call dm_string_new wrapper
-        if gen.function_map.contains("dm_string_new") {
-            let func = gen.function_map.get("dm_string_new")
-            let fn_ty = gen.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret)
-            dm_llvm_buf_push(raw_str)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
+        let sret = dm_llvm_build_alloca(gen.builder, gen.dm_string_type, sret_name)
+        store_borrowed_string(gen, sret, raw_str, literal_len_const(gen, val))
         return sret
+    }
+}
+
+-- A string operand of a runtime call: its address, or its value where
+-- the callee takes strings by value (a dAImond function)
+fn string_operand(gen: LLVMGenerator, val: IRValue, resolved: int, by_value: bool) -> int {
+    unsafe {
+        let mut p = resolved
+        if val.kind == VAL_CONST_STRING() {
+            p = create_dm_string(gen, val, resolved)
+        }
+        if by_value and dm_llvm_get_type_kind(dm_llvm_type_of(p)) == 12 {
+            return dm_llvm_build_load2(gen.builder, gen.dm_string_type, p, "str.val")
+        }
+        return p
     }
 }
 
@@ -19517,7 +19696,7 @@ fn generate_panic(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             -- If operand is const_string, wrap in dm_string
             let mut msg_val = msg
             if inst.operand.kind == VAL_CONST_STRING() {
-                msg_val = create_dm_string(g, msg)
+                msg_val = create_dm_string(g, inst.operand, msg)
             }
             dm_llvm_buf_clear()
             dm_llvm_buf_push(msg_val)
@@ -19631,6 +19810,7 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     -- Phase 2: Generate global variables
     g = generate_globals(g)
     -- Phase 3: Declare all functions
+    g = find_runtime_ports(g)
     let mut i = 0
     while i < g.ir_module.functions.len() {
         g = lg_declare_function(g, g.ir_module.functions[i])
@@ -19731,7 +19911,8 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
         }
         let c_ret_ty = if returns_string { ptr_ty } else { other_ret_ty }
         let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
-        let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
+        g = declare_c_symbol(g, c_symbol_of(func), c_fn_ty)
+        let real_fn = g.c_symbols.get(c_symbol_of(func))
 
         -- Step 2: Declare the wrapper function with dm_string-based API
         dm_llvm_buf_clear()
@@ -19779,7 +19960,7 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
 
         if returns_string {
             let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)
-            -- Handle NULL return: call dm_string_new with empty string if NULL
+            -- A NULL result is the empty string
             let null_val = dm_llvm_const_null(ptr_ty)
             let is_null = dm_llvm_build_icmp(g.builder, dm_llvm_int_eq(), c_result, null_val, "is_null")
             let then_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "then_null")
@@ -19789,29 +19970,21 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
 
             -- Null case: create empty string
             dm_llvm_position_at_end(g.builder, then_bb)
+            let i64_ty = dm_llvm_int64_type(ctx)
             let empty_str = dm_llvm_build_global_string_ptr(g.builder, "", "empty_str")
-            if g.function_map.contains("dm_string_new") {
-                let sn_fn = g.function_map.get("dm_string_new")
-                let sn_ty = g.fn_type_map.get("dm_string_new")
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(sret_ptr)
-                dm_llvm_buf_push(empty_str)
-                g = check_call_args(g, sn_ty, sn_fn)
-                dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-            }
+            store_borrowed_string(g, sret_ptr, empty_str, dm_llvm_const_int(i64_ty, 0, 0))
             dm_llvm_build_br(g.builder, merge_bb)
 
-            -- Non-null case: create string from C result
+            -- Non-null case: the C string, measured with strlen
             dm_llvm_position_at_end(g.builder, else_bb)
-            if g.function_map.contains("dm_string_new") {
-                let sn_fn = g.function_map.get("dm_string_new")
-                let sn_ty = g.fn_type_map.get("dm_string_new")
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(sret_ptr)
-                dm_llvm_buf_push(c_result)
-                g = check_call_args(g, sn_ty, sn_fn)
-                dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-            }
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(ptr_ty)
+            let strlen_ty = dm_llvm_function_type_buf(i64_ty, 0)
+            g = declare_c_symbol(g, "strlen", strlen_ty)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(c_result)
+            let c_len = dm_llvm_build_call2_buf(g.builder, strlen_ty, g.c_symbols.get("strlen"), "c_len")
+            store_borrowed_string(g, sret_ptr, c_result, c_len)
             dm_llvm_build_br(g.builder, merge_bb)
 
             dm_llvm_position_at_end(g.builder, merge_bb)
@@ -19865,15 +20038,24 @@ fn is_sret_return_type(ret_type: string) -> bool {
 -- DIRECT CALL (OP_CALL)
 -- ============================================================
 
+-- The type of parameter `idx` of function type `fn_ty`, or 0 past its
+-- parameters. Calls take parameter types from their own function type:
+-- the LLVM function of a C symbol may have been declared with another.
+fn call_param_type(fn_ty: int, idx: int) -> int {
+    unsafe {
+        if idx >= dm_llvm_count_param_types(fn_ty) { return 0 }
+        return dm_llvm_param_type_at(fn_ty, idx)
+    }
+}
+
 -- Coerce an integer call argument to the callee's parameter width
 -- (sext when narrower, trunc when wider). Non-integer pairs and
 -- unknown callees/params pass through unchanged.
-fn coerce_int_call_arg(gen: LLVMGenerator, callee: int, fn_name: string, user_idx: int, llvm_idx: int, val: int) -> int {
+fn coerce_int_call_arg(gen: LLVMGenerator, fn_ty: int, fn_name: string, user_idx: int, llvm_idx: int, val: int) -> int {
     unsafe {
         if func_param_type_at(gen, fn_name, user_idx) == "" { return val }
-        let param = dm_llvm_get_param(callee, llvm_idx)
-        if param == 0 { return val }
-        let param_ty = dm_llvm_type_of(param)
+        let param_ty = call_param_type(fn_ty, llvm_idx)
+        if param_ty == 0 { return val }
         let val_ty = dm_llvm_type_of(val)
         if dm_llvm_get_type_kind(param_ty) != 8 or dm_llvm_get_type_kind(val_ty) != 8 { return val }
         let param_w = dm_llvm_get_int_type_width(param_ty)
@@ -19936,6 +20118,23 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let b = g.builder
         let id_key = int_to_string(inst.id)
         let callee_name = inst.callee
+        -- len(s) reads the string's length field
+        if callee_name == "dm_string_len" and inst.call_args.len() == 1 {
+            let s_arg = inst.call_args[0]
+            let s_res = resolve_value(g, s_arg)
+            g = resolve_value_with_counter(g, s_arg)
+            let mut s_len = 0
+            if s_arg.kind == VAL_CONST_STRING() {
+                s_len = literal_len_const(g, s_arg)
+            } else if dm_llvm_get_type_kind(dm_llvm_type_of(s_res)) == 12 {
+                let len_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, s_res, 1, "str.len.addr")
+                s_len = dm_llvm_build_load2(b, dm_llvm_int64_type(g.context), len_slot, "str.len")
+            } else {
+                s_len = dm_llvm_build_extract_value(b, s_res, 1, "str.len")
+            }
+            if inst.has_result { g.value_map.insert(id_key, s_len) }
+            return g
+        }
         -- Look up function in function_map
         if g.function_map.contains(callee_name) == false {
             -- Unknown function: skip
@@ -19973,10 +20172,12 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 val = promote_vararg(g, val)
             }
             if ai < nparams and (is_variadic and is_string_arg) == false {
+                if arg.kind == VAL_CONST_STRING() and call_param_type(fn_ty, ai) == g.dm_string_type {
+                    val = string_operand(g, arg, val, true)
+                }
                 -- A string or list pointer passed by value: pass the value
-                let param = dm_llvm_get_param(callee, ai)
-                val = load_handle_as(g, arg, val, dm_llvm_type_of(param))
-                val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
+                val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
+                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
                 if is_source_extern {
                     val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
                 }
@@ -20041,12 +20242,12 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                 if arg.kind == VAL_CONST_STRING() {
                     let param_is_str = orig_param_is_string(g, callee_name, ai)
                     if param_is_str {
-                        val = create_dm_string_for_call(g, val)
+                        val = create_dm_string(g, arg, val)
                     }
                 }
-                val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
-                let wparam = dm_llvm_get_param(callee, ai + 1)
-                if wparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(wparam)) }
+                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
+                let wparam_ty = call_param_type(fn_ty, ai + 1)
+                if wparam_ty != 0 { val = load_handle_as(g, arg, val, wparam_ty) }
                 args.push(val)
                 ai = ai + 1
             }
@@ -20075,12 +20276,12 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
             if arg.kind == VAL_CONST_STRING() {
                 let param_is_str = orig_param_is_string(g, callee_name, ai)
                 if param_is_str {
-                    val = create_dm_string_for_call(g, val)
+                    val = create_dm_string(g, arg, val)
                 }
             }
-            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
-            let wparam = dm_llvm_get_param(callee, ai)
-            if wparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(wparam)) }
+            val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
+            let wparam_ty = call_param_type(fn_ty, ai)
+            if wparam_ty != 0 { val = load_handle_as(g, arg, val, wparam_ty) }
             args.push(val)
             ai = ai + 1
         }
@@ -20205,24 +20406,6 @@ fn orig_param_is_string(gen: LLVMGenerator, fn_name: string, param_idx: int) -> 
     return callee_param_is_string(gen, fn_name, param_idx)
 }
 
--- Create a dm_string on the stack from a raw C string pointer (for call args)
-fn create_dm_string_for_call(gen: LLVMGenerator, raw_str: int) -> int {
-    unsafe {
-        let b = gen.builder
-        let sret_name = "sret.arg." + int_to_string(gen.sret_counter)
-        let sret = dm_llvm_build_alloca(b, gen.dm_string_type, sret_name)
-        if gen.function_map.contains("dm_string_new") {
-            let func = gen.function_map.get("dm_string_new")
-            let fn_ty = gen.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret)
-            dm_llvm_buf_push(raw_str)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
-        return sret
-    }
-}
-
 -- Find an IR function by name for type info lookups
 fn find_ir_function(gen: LLVMGenerator, name: string) -> IRFunction {
     let mut i = 0
@@ -20309,9 +20492,12 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
             let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
             -- A string or list pointer passed by value: pass the value
-            let sparam = dm_llvm_get_param(callee, ai + 1)
-            if sparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(sparam)) }
-            val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
+            let sparam_ty = call_param_type(fn_ty, ai + 1)
+            if arg.kind == VAL_CONST_STRING() and sparam_ty == g.dm_string_type {
+                val = string_operand(g, arg, val, true)
+            }
+            if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
+            val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
             args.push(val)
             ai = ai + 1
         }
@@ -20667,11 +20853,11 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 --   -> Object File -> Linker -> Native Binary
 -- ============================================================
 
--- Generated by gen_bootstrap.sh from runtime/map.dm; edit that file instead.
+-- Generated by gen_bootstrap.sh from runtime/string.dm runtime/map.dm; edit those files instead.
 -- The compiler parses this source into every program it compiles.
 
 fn prelude_source() -> string {
-    return "module map\n\n-- ============================================================\n-- Map[K, V]\n-- The hash map behind Map[K, V] in every program Stage 5\n-- compiles. gen_bootstrap.sh embeds this file in the compiler\n-- (prelude.dm), which adds it to each program's declarations.\n-- Keys are strings or integers; hash_key picks the hash.\n--\n-- Entries are kept in insertion order in entry_keys,\n-- entry_vals and entry_hashes, so keys() and values() return\n-- them in that order. slots is an open-addressing table of\n-- indexes into those lists: -1 marks an empty slot and -2 a\n-- removed entry. A removed entry's hash is -1 until rebuild()\n-- drops it.\n--\n-- Copying a map copies its list headers, so a copy shares the\n-- slot table with the original until either one rebuilds. A slot\n-- that names an entry past this map's own entries was written by\n-- another copy; lookups skip it and inserts may take it.\n-- ============================================================\n\nstruct Map[K, V] {\n    entry_keys: List[K],\n    entry_vals: List[V],\n    entry_hashes: List[int],\n    slots: List[int],\n    count: int\n}\n\nimpl Map[K, V] {\n    fn insert(mut self, k: K, v: V) {\n        let h = hash_key(k)\n        let s = self.find_slot(k, h)\n        if s >= 0 {\n            self.entry_vals[self.slots[s]] = v\n            return\n        }\n        -- Keep at least a quarter of the slots empty so probes end\n        if (self.entry_keys.len() + 1) * 4 > self.slots.len() * 3 {\n            self.rebuild()\n        }\n        let cap = self.slots.len()\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 and self.slots[i] < n {\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        self.slots[i] = n\n        self.entry_keys.push(k)\n        self.entry_vals.push(v)\n        self.entry_hashes.push(h)\n        self.count = self.count + 1\n    }\n\n    fn set(mut self, k: K, v: V) {\n        self.insert(k, v)\n    }\n\n    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries and size the table for twice the live ones\n    fn rebuild(mut self) {\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n"
+    return "\n-- ============================================================\n-- Strings\n-- The string functions behind every program Stage 5 compiles.\n-- gen_bootstrap.sh embeds this file in the compiler (prelude.dm),\n-- which adds it to each program's declarations.\n--\n-- A string is { data, len, cap }: the address of its bytes, their\n-- count, and the size of the allocation that holds them. cap is 0\n-- when the string does not own its bytes, as a literal doesn't.\n-- Every string built here is followed by a NUL byte, so its data\n-- can go to C as a char*.\n--\n-- The compiler calls rt_X wherever its IR names the runtime\n-- function dm_X (see RUNTIME FUNCTIONS in llvm_gen.dm), so each\n-- rt_X keeps the signature that dm_X is declared with in\n-- ir_gen_decl.dm. len(s) and string literals are inline and call\n-- nothing. Code here must not use the string operators it\n-- implements: no +, == or < on strings, and no char_at or substr.\n-- ============================================================\n\n-- libc, under names that a program's own extern declarations of\n-- the same C functions cannot collide with\nextern fn libc_malloc(n: int) -> int = \"malloc\"\nextern fn libc_memcpy(dst: int, src: int, n: int) -> int = \"memcpy\"\nextern fn libc_memcmp(a: int, b: int, n: int) -> i32 = \"memcmp\"\n\n-- A new string holding the n bytes at address src\nfn rt_string_copy(src: int, n: int) -> string {\n    if n <= 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, src, n)\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a + b\nfn rt_string_concat(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    let n = na + nb\n    if n == 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        if na > 0 {\n            libc_memcpy(buf, string_data(a), na)\n        }\n        if nb > 0 {\n            libc_memcpy(buf + na, string_data(b), nb)\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a == b\nfn rt_string_eq(a: string, b: string) -> bool {\n    let n = len(a)\n    if n != len(b) {\n        return false\n    }\n    if n == 0 {\n        return true\n    }\n    unsafe {\n        return libc_memcmp(string_data(a), string_data(b), n) == 0\n    }\n}\n\n-- Byte order of a and b: negative when a sorts first, 0 when they\n-- are equal, positive when b sorts first. A prefix sorts before\n-- the longer string.\nfn rt_string_cmp(a: string, b: string) -> int {\n    let na = len(a)\n    let nb = len(b)\n    let mut n = na\n    if nb < na {\n        n = nb\n    }\n    if n > 0 {\n        unsafe {\n            let c = libc_memcmp(string_data(a), string_data(b), n)\n            if c != 0 {\n                return c as int\n            }\n        }\n    }\n    if na < nb {\n        return -1\n    }\n    if na > nb {\n        return 1\n    }\n    return 0\n}\n\n-- char_at(s, i): the byte at index i as a one-byte string, or \"\"\n-- when i is outside s\nfn rt_char_at(s: string, i: int) -> string {\n    if i < 0 or i >= len(s) {\n        return \"\"\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + i, 1)\n    }\n}\n\n-- substr(s, start, length): up to length bytes of s from index\n-- start. The range is clamped to s: a start outside s or a length\n-- below 1 gives \"\", and a length past the end stops at the end.\nfn rt_substr(s: string, start: int, length: int) -> string {\n    let n = len(s)\n    if start < 0 or start >= n {\n        return \"\"\n    }\n    let mut count = length\n    if count > n - start {\n        count = n - start\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + start, count)\n    }\n}\n\n-- ============================================================\n-- Map[K, V]\n-- The hash map behind Map[K, V] in every program Stage 5\n-- compiles. gen_bootstrap.sh embeds this file in the compiler\n-- (prelude.dm), which adds it to each program's declarations.\n-- Keys are strings or integers; hash_key picks the hash.\n--\n-- Entries are kept in insertion order in entry_keys,\n-- entry_vals and entry_hashes, so keys() and values() return\n-- them in that order. slots is an open-addressing table of\n-- indexes into those lists: -1 marks an empty slot and -2 a\n-- removed entry. A removed entry's hash is -1 until rebuild()\n-- drops it.\n--\n-- Copying a map copies its list headers, so a copy shares the\n-- slot table with the original until either one rebuilds. A slot\n-- that names an entry past this map's own entries was written by\n-- another copy; lookups skip it and inserts may take it.\n-- ============================================================\n\nstruct Map[K, V] {\n    entry_keys: List[K],\n    entry_vals: List[V],\n    entry_hashes: List[int],\n    slots: List[int],\n    count: int\n}\n\nimpl Map[K, V] {\n    fn insert(mut self, k: K, v: V) {\n        let h = hash_key(k)\n        let s = self.find_slot(k, h)\n        if s >= 0 {\n            self.entry_vals[self.slots[s]] = v\n            return\n        }\n        -- Keep at least a quarter of the slots empty so probes end\n        if (self.entry_keys.len() + 1) * 4 > self.slots.len() * 3 {\n            self.rebuild()\n        }\n        let cap = self.slots.len()\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 and self.slots[i] < n {\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        self.slots[i] = n\n        self.entry_keys.push(k)\n        self.entry_vals.push(v)\n        self.entry_hashes.push(h)\n        self.count = self.count + 1\n    }\n\n    fn set(mut self, k: K, v: V) {\n        self.insert(k, v)\n    }\n\n    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries and size the table for twice the live ones\n    fn rebuild(mut self) {\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n"
 }
 
 

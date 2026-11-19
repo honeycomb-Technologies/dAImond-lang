@@ -52,6 +52,13 @@ struct LLVMGenerator {
     has_wrapper: Map[string, bool],
     -- Track which functions use sret return convention (result/option types)
     returns_sret: Map[string, bool],
+    -- The LLVM function of each C symbol declared so far. Extern
+    -- functions bound to the same symbol share it; each keeps its own
+    -- function type in fn_type_map.
+    c_symbols: Map[string, int],
+    -- Runtime functions written in dAImond: "dm_X" is here when the
+    -- program defines rt_X, which then stands in for the C function
+    rt_ports: Map[string, bool],
     -- Reference to IR module for type lookups
     ir_module: IRModule,
     -- Current function being generated (for param lookups)
@@ -90,6 +97,8 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             wrapper_returns_string: Map_new(),
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
+            c_symbols: Map_new(),
+            rt_ports: Map_new(),
             ir_module: ir_mod,
             current_func_name: "",
             current_line: 0,
@@ -493,6 +502,112 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- Check if a return type needs sret (struct return) convention.
 -- Result ({i32, i64, i64} = 20 bytes) and Option ({i32, i64} = 12 bytes)
 -- are too large for register return on x86_64 and cause LLVM errors.
+-- ============================================================
+-- RUNTIME FUNCTIONS
+-- The IR names a runtime function dm_X. It is one of three things:
+--   inline: lowered to instructions here, with no function behind it
+--     (is_inline_runtime_fn);
+--   ported: the dAImond function rt_X, which stage5/runtime/*.dm
+--     defines with the same signature and which is called like any
+--     other dAImond function (strings by value, result through sret);
+--   otherwise the C function llvm_dm_X in runtime/llvm_wrappers.c,
+--     which takes strings by pointer.
+-- Porting a function is writing rt_X and deleting llvm_dm_X.
+-- ============================================================
+
+fn is_inline_runtime_fn(name: string) -> bool {
+    return name == "dm_string_len"
+}
+
+-- Record which dm_X functions the module defines as rt_X
+fn find_runtime_ports(gen: LLVMGenerator) -> LLVMGenerator {
+    let mut g = gen
+    let mut i = 0
+    while i < g.ir_module.functions.len() {
+        let f = g.ir_module.functions[i]
+        if f.is_extern == false and starts_with(f.name, "rt_") {
+            g.rt_ports.insert("dm_" + substr(f.name, 3, len(f.name) - 3), true)
+        }
+        i = i + 1
+    }
+    return g
+}
+
+-- After rt_X is declared: calls to dm_X go to it. Its signature must
+-- be the one the IR generator calls dm_X with.
+fn bind_runtime_port(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
+    let mut g = gen
+    let c_name = "dm_" + substr(func.name, 3, len(func.name) - 3)
+    if g.rt_ports.contains(c_name) == false { return g }
+    let mut decl = ir_function_new("", "void")
+    let mut found = false
+    let mut i = 0
+    while i < g.ir_module.functions.len() {
+        if g.ir_module.functions[i].name == c_name and g.ir_module.functions[i].is_extern {
+            decl = g.ir_module.functions[i]
+            found = true
+        }
+        i = i + 1
+    }
+    -- No such runtime function: rt_X is a helper of the runtime's own
+    if found == false { return g }
+    let mut same = decl.return_type == func.return_type and decl.params.len() == func.params.len()
+    i = 0
+    while same and i < decl.params.len() {
+        if decl.params[i].type_id != func.params[i].type_id { same = false }
+        i = i + 1
+    }
+    if same == false {
+        g.type_errors.push("Error: runtime function '" + func.name + "' does not have the signature the compiler calls '" + c_name + "' with")
+        return g
+    }
+    g.function_map.insert(c_name, g.function_map.get(func.name))
+    g.fn_type_map.insert(c_name, g.fn_type_map.get(func.name))
+    if g.returns_sret.contains(func.name) {
+        g.returns_sret.insert(c_name, true)
+    }
+    return g
+}
+
+-- Fill the string at `dst` with { data, len, 0 }: a string that does
+-- not own its bytes, such as a literal
+fn store_borrowed_string(gen: LLVMGenerator, dst: int, data: int, str_len: int) {
+    unsafe {
+        let b = gen.builder
+        let i64_ty = dm_llvm_int64_type(gen.context)
+        dm_llvm_build_store(b, data, dm_llvm_build_struct_gep2(b, gen.dm_string_type, dst, 0, "str.data"))
+        dm_llvm_build_store(b, str_len, dm_llvm_build_struct_gep2(b, gen.dm_string_type, dst, 1, "str.len"))
+        dm_llvm_build_store(b, dm_llvm_const_int(i64_ty, 0, 0), dm_llvm_build_struct_gep2(b, gen.dm_string_type, dst, 2, "str.cap"))
+    }
+}
+
+-- The length of string literal `val` as an LLVM constant. LLVM stores
+-- the literal as a C string, so its length is strlen's.
+fn literal_len_const(gen: LLVMGenerator, val: IRValue) -> int {
+    unsafe {
+        return dm_llvm_const_int(dm_llvm_int64_type(gen.context), strlen(val.str_val) as int, 0)
+    }
+}
+
+-- The C symbol an extern function names
+fn c_symbol_of(func: IRFunction) -> string {
+    if func.link_name != "" { return func.link_name }
+    return func.name
+}
+
+-- Declare C symbol `symbol` with type `fn_ty` unless it already is;
+-- afterwards gen.c_symbols.get(symbol) is its LLVM function. A later
+-- declaration with another type calls the same function with its own type.
+fn declare_c_symbol(gen: LLVMGenerator, symbol: string, fn_ty: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.c_symbols.contains(symbol) == false {
+            g.c_symbols.insert(symbol, dm_llvm_module_add_function(g.llvm_module, symbol, fn_ty))
+        }
+        return g
+    }
+}
+
 fn func_needs_wrapper(func: IRFunction) -> bool {
     if func.is_extern == false { return false }
     if func.return_type == "string" { return true }
@@ -562,6 +677,11 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let ctx = g.context
+        -- Runtime functions that are inline or written in dAImond have no
+        -- C function to declare
+        if func.is_extern and (is_inline_runtime_fn(func.name) or g.rt_ports.contains(func.name)) {
+            return g
+        }
         -- A variadic C function is called directly: a wrapper could not pass
         -- on its varargs. Call sites pass strings as char*.
         if func.is_variadic {
@@ -580,7 +700,8 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                 vi = vi + 1
             }
             let vfn_ty = dm_llvm_function_type_buf(vret_ty, 1)
-            let vfn = dm_llvm_module_add_function(g.llvm_module, func.name, vfn_ty)
+            g = declare_c_symbol(g, c_symbol_of(func), vfn_ty)
+            let vfn = g.c_symbols.get(c_symbol_of(func))
             g.function_map.insert(func.name, vfn)
             g.fn_type_map.insert(func.name, vfn_ty)
             return g
@@ -631,6 +752,16 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             i = i + 1
         }
         let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
+        if func.is_extern {
+            -- A C function: shared with any other declaration of its symbol
+            g = declare_c_symbol(g, c_symbol_of(func), fn_ty)
+            g.function_map.insert(func.name, g.c_symbols.get(c_symbol_of(func)))
+            g.fn_type_map.insert(func.name, fn_ty)
+            if needs_sret {
+                g.returns_sret.insert(func.name, true)
+            }
+            return g
+        }
         let llvm_fn = dm_llvm_module_add_function(g.llvm_module, func.name, fn_ty)
         g.function_map.insert(func.name, llvm_fn)
         g.fn_type_map.insert(func.name, fn_ty)
@@ -654,6 +785,9 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                 dm_llvm_set_value_name(param_val, func.params[i].name)
                 i = i + 1
             }
+        }
+        if starts_with(func.name, "rt_") {
+            g = bind_runtime_port(g, func)
         }
         return g
     }
@@ -1310,21 +1444,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let dst = resolve_value(g, inst.store_ptr)
             g = resolve_value_with_counter(g, inst.store_ptr)
             -- Special case: storing const_string into a string alloca
-            -- Must call dm_string_new to properly init {data, length, capacity}
+            -- fills in { data, length, capacity }
             if inst.store_val.kind == VAL_CONST_STRING() {
                 let raw_ptr = resolve_value(g, inst.store_val)
                 g = resolve_value_with_counter(g, inst.store_val)
-                if g.function_map.contains("dm_string_new") {
-                    let func = g.function_map.get("dm_string_new")
-                    let fn_ty = g.fn_type_map.get("dm_string_new")
-                    dm_llvm_buf_clear()
-                    dm_llvm_buf_push(dst)
-                    dm_llvm_buf_push(raw_ptr)
-                    g = check_call_args(g, fn_ty, func)
-                    dm_llvm_build_call2_buf(b, fn_ty, func, "")
-                } else {
-                    dm_llvm_build_store(b, raw_ptr, dst)
-                }
+                store_borrowed_string(g, dst, raw_ptr, literal_len_const(g, inst.store_val))
                 return g
             }
             let src = resolve_value(g, inst.store_val)
@@ -1597,15 +1721,11 @@ fn generate_string_concat(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let sret_name = "sret." + int_to_string(g.sret_counter)
             g.sret_counter = g.sret_counter + 1
             let sret = dm_llvm_build_alloca(b, g.dm_string_type, sret_name)
-            -- Create dm_string allocas for const string args if needed
-            let mut lhs_ptr = lhs
-            if inst.lhs.kind == VAL_CONST_STRING() {
-                lhs_ptr = create_dm_string(g, lhs)
-            }
-            let mut rhs_ptr = rhs
-            if inst.rhs.kind == VAL_CONST_STRING() {
-                rhs_ptr = create_dm_string(g, rhs)
-            }
+            -- The C wrapper takes the strings' addresses, rt_string_concat
+            -- their values
+            let by_value = g.has_wrapper.contains("dm_string_concat") == false
+            let lhs_ptr = string_operand(g, inst.lhs, lhs, by_value)
+            let rhs_ptr = string_operand(g, inst.rhs, rhs, by_value)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(sret)
             dm_llvm_buf_push(lhs_ptr)
@@ -1632,14 +1752,9 @@ fn generate_string_eq(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if g.function_map.contains("dm_string_eq") {
             let func = g.function_map.get("dm_string_eq")
             let fn_ty = g.fn_type_map.get("dm_string_eq")
-            let mut lhs_ptr = lhs
-            if inst.lhs.kind == VAL_CONST_STRING() {
-                lhs_ptr = create_dm_string(g, lhs)
-            }
-            let mut rhs_ptr = rhs
-            if inst.rhs.kind == VAL_CONST_STRING() {
-                rhs_ptr = create_dm_string(g, rhs)
-            }
+            let by_value = g.has_wrapper.contains("dm_string_eq") == false
+            let lhs_ptr = string_operand(g, inst.lhs, lhs, by_value)
+            let rhs_ptr = string_operand(g, inst.rhs, rhs, by_value)
             dm_llvm_buf_clear()
             dm_llvm_buf_push(lhs_ptr)
             dm_llvm_buf_push(rhs_ptr)
@@ -1652,22 +1767,29 @@ fn generate_string_eq(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 }
 
 -- Create a dm_string on the stack from a raw C string pointer
-fn create_dm_string(gen: LLVMGenerator, raw_str: int) -> int {
+-- A string on the stack for string literal `val`, whose bytes are at
+-- `raw_str`; returns its address
+fn create_dm_string(gen: LLVMGenerator, val: IRValue, raw_str: int) -> int {
     unsafe {
-        let b = gen.builder
-        -- Allocate dm_string on stack
         let sret_name = "sret." + int_to_string(gen.sret_counter)
-        let sret = dm_llvm_build_alloca(b, gen.dm_string_type, sret_name)
-        -- Call dm_string_new wrapper
-        if gen.function_map.contains("dm_string_new") {
-            let func = gen.function_map.get("dm_string_new")
-            let fn_ty = gen.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret)
-            dm_llvm_buf_push(raw_str)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
+        let sret = dm_llvm_build_alloca(gen.builder, gen.dm_string_type, sret_name)
+        store_borrowed_string(gen, sret, raw_str, literal_len_const(gen, val))
         return sret
+    }
+}
+
+-- A string operand of a runtime call: its address, or its value where
+-- the callee takes strings by value (a dAImond function)
+fn string_operand(gen: LLVMGenerator, val: IRValue, resolved: int, by_value: bool) -> int {
+    unsafe {
+        let mut p = resolved
+        if val.kind == VAL_CONST_STRING() {
+            p = create_dm_string(gen, val, resolved)
+        }
+        if by_value and dm_llvm_get_type_kind(dm_llvm_type_of(p)) == 12 {
+            return dm_llvm_build_load2(gen.builder, gen.dm_string_type, p, "str.val")
+        }
+        return p
     }
 }
 
@@ -1828,7 +1950,7 @@ fn generate_panic(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             -- If operand is const_string, wrap in dm_string
             let mut msg_val = msg
             if inst.operand.kind == VAL_CONST_STRING() {
-                msg_val = create_dm_string(g, msg)
+                msg_val = create_dm_string(g, inst.operand, msg)
             }
             dm_llvm_buf_clear()
             dm_llvm_buf_push(msg_val)
@@ -1942,6 +2064,7 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     -- Phase 2: Generate global variables
     g = generate_globals(g)
     -- Phase 3: Declare all functions
+    g = find_runtime_ports(g)
     let mut i = 0
     while i < g.ir_module.functions.len() {
         g = lg_declare_function(g, g.ir_module.functions[i])
@@ -2042,7 +2165,8 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
         }
         let c_ret_ty = if returns_string { ptr_ty } else { other_ret_ty }
         let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
-        let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
+        g = declare_c_symbol(g, c_symbol_of(func), c_fn_ty)
+        let real_fn = g.c_symbols.get(c_symbol_of(func))
 
         -- Step 2: Declare the wrapper function with dm_string-based API
         dm_llvm_buf_clear()
@@ -2090,7 +2214,7 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
 
         if returns_string {
             let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)
-            -- Handle NULL return: call dm_string_new with empty string if NULL
+            -- A NULL result is the empty string
             let null_val = dm_llvm_const_null(ptr_ty)
             let is_null = dm_llvm_build_icmp(g.builder, dm_llvm_int_eq(), c_result, null_val, "is_null")
             let then_bb = dm_llvm_append_basic_block(ctx, wrapper_fn, "then_null")
@@ -2100,29 +2224,21 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
 
             -- Null case: create empty string
             dm_llvm_position_at_end(g.builder, then_bb)
+            let i64_ty = dm_llvm_int64_type(ctx)
             let empty_str = dm_llvm_build_global_string_ptr(g.builder, "", "empty_str")
-            if g.function_map.contains("dm_string_new") {
-                let sn_fn = g.function_map.get("dm_string_new")
-                let sn_ty = g.fn_type_map.get("dm_string_new")
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(sret_ptr)
-                dm_llvm_buf_push(empty_str)
-                g = check_call_args(g, sn_ty, sn_fn)
-                dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-            }
+            store_borrowed_string(g, sret_ptr, empty_str, dm_llvm_const_int(i64_ty, 0, 0))
             dm_llvm_build_br(g.builder, merge_bb)
 
-            -- Non-null case: create string from C result
+            -- Non-null case: the C string, measured with strlen
             dm_llvm_position_at_end(g.builder, else_bb)
-            if g.function_map.contains("dm_string_new") {
-                let sn_fn = g.function_map.get("dm_string_new")
-                let sn_ty = g.fn_type_map.get("dm_string_new")
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(sret_ptr)
-                dm_llvm_buf_push(c_result)
-                g = check_call_args(g, sn_ty, sn_fn)
-                dm_llvm_build_call2_buf(g.builder, sn_ty, sn_fn, "")
-            }
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(ptr_ty)
+            let strlen_ty = dm_llvm_function_type_buf(i64_ty, 0)
+            g = declare_c_symbol(g, "strlen", strlen_ty)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(c_result)
+            let c_len = dm_llvm_build_call2_buf(g.builder, strlen_ty, g.c_symbols.get("strlen"), "c_len")
+            store_borrowed_string(g, sret_ptr, c_result, c_len)
             dm_llvm_build_br(g.builder, merge_bb)
 
             dm_llvm_position_at_end(g.builder, merge_bb)

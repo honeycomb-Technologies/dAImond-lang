@@ -3181,6 +3181,41 @@ pub const list_method_tests = [_]TestCase{
         ,
         .expected_output = "true\nfalse\n",
     },
+    // `xs[i] {` at the end of a condition is an index, not a generic struct literal.
+    .{
+        .name = "index_before_block_brace",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let mut words: List[string] = []
+            \\    words.push("b")
+            \\    words.push("a")
+            \\    words.push("b")
+            \\    let mut nums: List[int] = []
+            \\    nums.push(3)
+            \\    nums.push(1)
+            \\    let mut eqs = 0
+            \\    let mut lts = 0
+            \\    let mut i = 0
+            \\    while i < 3 {
+            \\        let mut j = 0
+            \\        while j < 3 {
+            \\            if words[i] == words[j] { eqs = eqs + 1 }
+            \\            if words[i] < words[j] {
+            \\                lts = lts + 1
+            \\            }
+            \\            j = j + 1
+            \\        }
+            \\        i = i + 1
+            \\    }
+            \\    let k = 1
+            \\    if nums[0] > nums[k] { println("gt") }
+            \\    while nums[k] < nums[0] { nums[k] = nums[k] + 1 }
+            \\    println(int_to_string(eqs) + " " + int_to_string(lts) + " " + int_to_string(nums[k]))
+            \\}
+        ,
+        .expected_output = "gt\n5 2 3\n",
+    },
 };
 
 pub const match_option_result_tests = [_]TestCase{
@@ -3698,6 +3733,47 @@ pub const enum_dot_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "25\n16\n",
+    },
+    // A parameter's type must not carry over to a same-named variable in a later function.
+    .{
+        .name = "variable_types_stay_in_their_function",
+        .source =
+            \\module test
+            \\enum Color {
+            \\    Red,
+            \\    Green
+            \\}
+            \\struct P {
+            \\    v: int
+            \\}
+            \\fn f(c: Color, s: P, xs: List[string]) -> int {
+            \\    if c == Color::Red {
+            \\        return 1 + s.v + xs.len()
+            \\    }
+            \\    return 2
+            \\}
+            \\fn g(c: int, s: string, xs: int) -> bool {
+            \\    return c == 0 and len(s) == 1 and xs == 2
+            \\}
+            \\fn h() -> bool {
+            \\    let c = 5
+            \\    let s = 7
+            \\    let xs = "x"
+            \\    return c != 0 and s == 7 and len(xs) == 1
+            \\}
+            \\fn k() -> bool {
+            \\    let c: int = 5
+            \\    let s: int = 7
+            \\    return c != 0 and s == 7
+            \\}
+            \\fn main() {
+            \\    let mut names: List[string] = []
+            \\    names.push("a")
+            \\    println(int_to_string(f(Color::Red, P { v: 3 }, names)))
+            \\    println(bool_to_string(g(0, "s", 2)) + " " + bool_to_string(h()) + " " + bool_to_string(k()))
+            \\}
+        ,
+        .expected_output = "5\ntrue true true\n",
     },
 };
 
@@ -5112,6 +5188,52 @@ pub const string_edge_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "true\ntrue\n",
+    },
+    .{
+        .name = "string_core_operations",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let a = "hello"
+            \\    let b = a + ", " + "world"
+            \\    println(b + " " + int_to_string(len(b)) + " " + int_to_string(len("lit")) + " " + int_to_string(len("")))
+            \\    println(bool_to_string(a == "hello") + " " + bool_to_string(a == "hellp") + " " + bool_to_string(a != b) + " " + bool_to_string("" == "") + " " + bool_to_string("a" == ""))
+            \\    println(bool_to_string("abc" < "abd") + " " + bool_to_string("abc" < "ab") + " " + bool_to_string("ab" < "abc") + " " + bool_to_string("b" >= "abc") + " " + bool_to_string("" < "a") + " " + bool_to_string("x" <= "x"))
+            \\    println(char_at(b, 0) + char_at(b, 4) + "|" + substr(b, 7, 5) + "|" + substr(b, 7, 500) + "|" + substr(b, 50, 2) + "|" + substr(b, 3, 0))
+            \\    let mut acc = ""
+            \\    let mut i = 0
+            \\    while i < 1000 {
+            \\        acc = acc + char_at("abcdefghij", i % 10)
+            \\        i = i + 1
+            \\    }
+            \\    println(int_to_string(len(acc)) + " " + substr(acc, 995, 10) + " " + bool_to_string(substr(acc, 0, 10) == "abcdefghij"))
+            \\    let e = "" + ""
+            \\    println("[" + e + "]" + int_to_string(len(e)))
+            \\    println("tab\there \"q\" \\ end" + int_to_string(len("tab\there \"q\" \\ end")))
+            \\}
+        ,
+        .expected_output = "hello, world 12 3 0\ntrue false true true false\ntrue false true true true true\nho|world|world||\n1000 fghij true\n[]0\ntab\there \"q\" \\ end18\n",
+    },
+    // String temporaries must not take new stack space on every iteration.
+    .{
+        .name = "string_temporaries_in_long_loop",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let mut total = 0
+            \\    let mut i = 0
+            \\    while i < 400000 {
+            \\        let s = "key_" + int_to_string(i) + "_suffix"
+            \\        let t = s + "!" + int_to_string(i % 7)
+            \\        if substr(t, 0, 4) == "key_" and char_at(s, len(s) - 1) == "x" {
+            \\            total = total + len(s)
+            \\        }
+            \\        i = i + 1
+            \\    }
+            \\    println(int_to_string(total))
+            \\}
+        ,
+        .expected_output = "6688890\n",
     },
 };
 

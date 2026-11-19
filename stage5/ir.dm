@@ -505,6 +505,8 @@ struct IRFunction {
     is_extern: bool,
     -- A C function that takes further arguments after its parameters
     is_variadic: bool,
+    -- The C symbol an extern function is bound to; "" means its name
+    link_name: string,
     is_comptime: bool
 }
 
@@ -512,7 +514,7 @@ fn ir_function_new(name: string, ret_type: string) -> IRFunction {
     return IRFunction {
         name: name, params: [], return_type: ret_type,
         blocks: [],
-        is_async: false, is_extern: false, is_variadic: false, is_comptime: false
+        is_async: false, is_extern: false, is_variadic: false, link_name: "", is_comptime: false
     }
 }
 

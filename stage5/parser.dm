@@ -547,7 +547,14 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             -- like a generic arg list here. Generic args in expression
             -- position only occur in calls `name[T](...)` and struct
             -- literals `Name[T] { ... }`; anything else is index access.
-            if p_peek(p_skip_newlines(pp)) != TK_LPAREN() and p_peek(p_skip_newlines(pp)) != TK_LBRACE() {
+            -- A struct literal needs a capitalized name, as below, so that
+            -- `if a == xs[i] { ... }` indexes `xs`.
+            let after_args = p_peek(p_skip_newlines(pp))
+            let mut is_generic = after_args == TK_LPAREN()
+            if after_args == TK_LBRACE() and len(name) > 0 and char_at(name, 0) >= "A" and char_at(name, 0) <= "Z" {
+                is_generic = true
+            }
+            if not is_generic {
                 generics = []
                 pp = saved
             }
@@ -1652,6 +1659,18 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
         let rty = parse_type(pp)
         pp = rty.p
         fd.return_type = rty.type_name
+    }
+
+    -- `= "symbol"` binds the function to a C symbol of another name, so
+    -- that two declarations can name the same C function
+    if p_peek(pp) == TK_EQ() {
+        pp = p_advance(pp)
+        if p_peek(pp) != TK_STRING() or p_cur(pp).value == "" {
+            eprintln("Error: expected a C symbol name in quotes after `=` in extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+            exit(1)
+        }
+        fd.link_name = p_cur(pp).value
+        pp = p_advance(pp)
     }
 
     return ParseDeclResult { p: pp, decl: decl_function(fd) }

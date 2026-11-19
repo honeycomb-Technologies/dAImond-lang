@@ -448,6 +448,9 @@ struct FunctionDecl {
     is_extern: bool,
     -- An extern fn declared with a trailing `...`, like C's printf
     is_variadic: bool,
+    -- The C symbol an extern fn is bound to with `= "symbol"`; "" binds
+    -- the function's own name
+    link_name: string,
     is_async: bool,
     is_comptime: bool,
     line: int,
@@ -464,6 +467,7 @@ fn func_decl_new(name: string, line: int, col: int) -> FunctionDecl {
         effects: [],
         is_extern: false,
         is_variadic: false,
+        link_name: "",
         is_async: false,
         is_comptime: false,
         line: line,

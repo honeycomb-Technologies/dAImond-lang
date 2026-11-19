@@ -17,15 +17,24 @@ import llvm_gen
 -- DIRECT CALL (OP_CALL)
 -- ============================================================
 
+-- The type of parameter `idx` of function type `fn_ty`, or 0 past its
+-- parameters. Calls take parameter types from their own function type:
+-- the LLVM function of a C symbol may have been declared with another.
+fn call_param_type(fn_ty: int, idx: int) -> int {
+    unsafe {
+        if idx >= dm_llvm_count_param_types(fn_ty) { return 0 }
+        return dm_llvm_param_type_at(fn_ty, idx)
+    }
+}
+
 -- Coerce an integer call argument to the callee's parameter width
 -- (sext when narrower, trunc when wider). Non-integer pairs and
 -- unknown callees/params pass through unchanged.
-fn coerce_int_call_arg(gen: LLVMGenerator, callee: int, fn_name: string, user_idx: int, llvm_idx: int, val: int) -> int {
+fn coerce_int_call_arg(gen: LLVMGenerator, fn_ty: int, fn_name: string, user_idx: int, llvm_idx: int, val: int) -> int {
     unsafe {
         if func_param_type_at(gen, fn_name, user_idx) == "" { return val }
-        let param = dm_llvm_get_param(callee, llvm_idx)
-        if param == 0 { return val }
-        let param_ty = dm_llvm_type_of(param)
+        let param_ty = call_param_type(fn_ty, llvm_idx)
+        if param_ty == 0 { return val }
         let val_ty = dm_llvm_type_of(val)
         if dm_llvm_get_type_kind(param_ty) != 8 or dm_llvm_get_type_kind(val_ty) != 8 { return val }
         let param_w = dm_llvm_get_int_type_width(param_ty)
@@ -88,6 +97,23 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let b = g.builder
         let id_key = int_to_string(inst.id)
         let callee_name = inst.callee
+        -- len(s) reads the string's length field
+        if callee_name == "dm_string_len" and inst.call_args.len() == 1 {
+            let s_arg = inst.call_args[0]
+            let s_res = resolve_value(g, s_arg)
+            g = resolve_value_with_counter(g, s_arg)
+            let mut s_len = 0
+            if s_arg.kind == VAL_CONST_STRING() {
+                s_len = literal_len_const(g, s_arg)
+            } else if dm_llvm_get_type_kind(dm_llvm_type_of(s_res)) == 12 {
+                let len_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, s_res, 1, "str.len.addr")
+                s_len = dm_llvm_build_load2(b, dm_llvm_int64_type(g.context), len_slot, "str.len")
+            } else {
+                s_len = dm_llvm_build_extract_value(b, s_res, 1, "str.len")
+            }
+            if inst.has_result { g.value_map.insert(id_key, s_len) }
+            return g
+        }
         -- Look up function in function_map
         if g.function_map.contains(callee_name) == false {
             -- Unknown function: skip
@@ -125,10 +151,12 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 val = promote_vararg(g, val)
             }
             if ai < nparams and (is_variadic and is_string_arg) == false {
+                if arg.kind == VAL_CONST_STRING() and call_param_type(fn_ty, ai) == g.dm_string_type {
+                    val = string_operand(g, arg, val, true)
+                }
                 -- A string or list pointer passed by value: pass the value
-                let param = dm_llvm_get_param(callee, ai)
-                val = load_handle_as(g, arg, val, dm_llvm_type_of(param))
-                val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
+                val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
+                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
                 if is_source_extern {
                     val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
                 }
@@ -193,12 +221,12 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                 if arg.kind == VAL_CONST_STRING() {
                     let param_is_str = orig_param_is_string(g, callee_name, ai)
                     if param_is_str {
-                        val = create_dm_string_for_call(g, val)
+                        val = create_dm_string(g, arg, val)
                     }
                 }
-                val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
-                let wparam = dm_llvm_get_param(callee, ai + 1)
-                if wparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(wparam)) }
+                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
+                let wparam_ty = call_param_type(fn_ty, ai + 1)
+                if wparam_ty != 0 { val = load_handle_as(g, arg, val, wparam_ty) }
                 args.push(val)
                 ai = ai + 1
             }
@@ -227,12 +255,12 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
             if arg.kind == VAL_CONST_STRING() {
                 let param_is_str = orig_param_is_string(g, callee_name, ai)
                 if param_is_str {
-                    val = create_dm_string_for_call(g, val)
+                    val = create_dm_string(g, arg, val)
                 }
             }
-            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
-            let wparam = dm_llvm_get_param(callee, ai)
-            if wparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(wparam)) }
+            val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
+            let wparam_ty = call_param_type(fn_ty, ai)
+            if wparam_ty != 0 { val = load_handle_as(g, arg, val, wparam_ty) }
             args.push(val)
             ai = ai + 1
         }
@@ -357,24 +385,6 @@ fn orig_param_is_string(gen: LLVMGenerator, fn_name: string, param_idx: int) -> 
     return callee_param_is_string(gen, fn_name, param_idx)
 }
 
--- Create a dm_string on the stack from a raw C string pointer (for call args)
-fn create_dm_string_for_call(gen: LLVMGenerator, raw_str: int) -> int {
-    unsafe {
-        let b = gen.builder
-        let sret_name = "sret.arg." + int_to_string(gen.sret_counter)
-        let sret = dm_llvm_build_alloca(b, gen.dm_string_type, sret_name)
-        if gen.function_map.contains("dm_string_new") {
-            let func = gen.function_map.get("dm_string_new")
-            let fn_ty = gen.fn_type_map.get("dm_string_new")
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(sret)
-            dm_llvm_buf_push(raw_str)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
-        return sret
-    }
-}
-
 -- Find an IR function by name for type info lookups
 fn find_ir_function(gen: LLVMGenerator, name: string) -> IRFunction {
     let mut i = 0
@@ -461,9 +471,12 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
             let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
             -- A string or list pointer passed by value: pass the value
-            let sparam = dm_llvm_get_param(callee, ai + 1)
-            if sparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(sparam)) }
-            val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
+            let sparam_ty = call_param_type(fn_ty, ai + 1)
+            if arg.kind == VAL_CONST_STRING() and sparam_ty == g.dm_string_type {
+                val = string_operand(g, arg, val, true)
+            }
+            if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
+            val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
             args.push(val)
             ai = ai + 1
         }

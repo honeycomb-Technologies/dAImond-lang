@@ -250,7 +250,6 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_parse_float", "string", "f64")
 
     -- String operations
-    g = declare_extern(g, "dm_string_new", "ptr", "string")
     g = declare_extern2(g, "dm_string_concat", "string", "string", "string")
     g = declare_extern2(g, "dm_string_eq", "string", "string", "bool")
     g = declare_extern(g, "dm_string_len", "string", "i64")
@@ -458,6 +457,7 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     let mut func = ir_function_new(name, ret_type)
     func.is_extern = fd.is_extern
     func.is_variadic = fd.is_variadic
+    func.link_name = fd.link_name
     if fd.is_variadic and ret_type == "string" {
         g = ir_type_error(g, "variadic extern fn '" + name + "' cannot return string; declare it as returning int, the address of the C string", fd.line)
     }
@@ -578,6 +578,26 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     g.variable_types = Map_new()
     g.mut_ptr_vars = Map_new()
     g.param_ptr_map = Map_new()
+    -- What is known about each variable is keyed by its name, so it must
+    -- not outlive the function: a `c: Color` in one function says nothing
+    -- about a `c` in the next. The caller's are put back at the end, for
+    -- a function generated in the middle of another (a generic instance).
+    let outer_var_src_types = g.var_src_types
+    let outer_var_struct_types = g.var_struct_types
+    let outer_var_enum_types = g.var_enum_types
+    let outer_box_inner_types = g.box_inner_types
+    let outer_list_elem_kinds = g.list_elem_kinds
+    let outer_list_elem_types = g.list_elem_types
+    let outer_fn_ptr_vars = g.fn_ptr_vars
+    let outer_array_var_names = g.array_var_names
+    g.var_src_types = Map_new()
+    g.var_struct_types = Map_new()
+    g.var_enum_types = Map_new()
+    g.box_inner_types = Map_new()
+    g.list_elem_kinds = Map_new()
+    g.list_elem_types = Map_new()
+    g.fn_ptr_vars = Map_new()
+    g.array_var_names = Map_new()
     -- Safety-check state is per-function (Stage 0 checker resets likewise)
     g.unsafe_depth = 0
     g.region_depth = 0
@@ -762,6 +782,15 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     -- Then push the final block (if it's the entry and no blocks, push it; otherwise push as last)
     func.blocks.push(blk)
     g.ir_mod.functions[func_idx] = func
+
+    g.var_src_types = outer_var_src_types
+    g.var_struct_types = outer_var_struct_types
+    g.var_enum_types = outer_var_enum_types
+    g.box_inner_types = outer_box_inner_types
+    g.list_elem_kinds = outer_list_elem_kinds
+    g.list_elem_types = outer_list_elem_types
+    g.fn_ptr_vars = outer_fn_ptr_vars
+    g.array_var_names = outer_array_var_names
 
     return g
 }

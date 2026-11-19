@@ -408,9 +408,22 @@ int64_t dm_llvm_build_fcmp(int64_t b, int64_t pred, int64_t lhs, int64_t rhs, co
 }
 
 /* Memory */
+/* Every alloca goes after the allocas already at the top of the function's
+ * entry block, wherever the builder is. An alloca inside a loop body takes
+ * new stack space on each iteration and is never released before the
+ * function returns, so a long loop overflows the stack; mem2reg also only
+ * promotes entry-block allocas. */
 int64_t dm_llvm_build_alloca(int64_t b, int64_t ty, const char* name) {
-    return TO_INT(LLVMBuildAlloca(TO_PTR(LLVMBuilderRef, b),
-                                   TO_PTR(LLVMTypeRef, ty), name));
+    LLVMBuilderRef builder = TO_PTR(LLVMBuilderRef, b);
+    LLVMBasicBlockRef cur = LLVMGetInsertBlock(builder);
+    LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(cur));
+    LLVMValueRef at = LLVMGetFirstInstruction(entry);
+    while (at && LLVMIsAAllocaInst(at)) at = LLVMGetNextInstruction(at);
+    if (at) LLVMPositionBuilderBefore(builder, at);
+    else LLVMPositionBuilderAtEnd(builder, entry);
+    LLVMValueRef result = LLVMBuildAlloca(builder, TO_PTR(LLVMTypeRef, ty), name);
+    LLVMPositionBuilderAtEnd(builder, cur);
+    return TO_INT(result);
 }
 
 int64_t dm_llvm_build_load2(int64_t b, int64_t ty, int64_t ptr, const char* name) {
@@ -498,13 +511,29 @@ int64_t dm_llvm_build_unreachable(int64_t b) {
 }
 
 /* Function calls */
+/* A C function reads a bool argument as a whole byte, so the caller has to
+ * zero-extend it. LLVM leaves the upper bits of an i1 argument undefined
+ * unless the call marks it zeroext. */
+static LLVMValueRef dm_call_zeroext_bools(LLVMValueRef call) {
+    unsigned zeroext = LLVMGetEnumAttributeKindForName("zeroext", 7);
+    unsigned n = LLVMGetNumArgOperands(call);
+    for (unsigned i = 0; i < n; i++) {
+        LLVMTypeRef ty = LLVMTypeOf(LLVMGetOperand(call, i));
+        if (LLVMGetTypeKind(ty) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(ty) == 1) {
+            LLVMAddCallSiteAttribute(call, i + 1,
+                LLVMCreateEnumAttribute(LLVMGetTypeContext(ty), zeroext, 0));
+        }
+    }
+    return call;
+}
+
 int64_t dm_llvm_build_call2(int64_t b, int64_t fn_ty, int64_t func,
                              int64_t* args, int64_t arg_count, const char* name) {
-    return TO_INT(LLVMBuildCall2(TO_PTR(LLVMBuilderRef, b),
+    return TO_INT(dm_call_zeroext_bools(LLVMBuildCall2(TO_PTR(LLVMBuilderRef, b),
                                   TO_PTR(LLVMTypeRef, fn_ty),
                                   TO_PTR(LLVMValueRef, func),
                                   (LLVMValueRef*)(uintptr_t)args,
-                                  (unsigned)arg_count, name));
+                                  (unsigned)arg_count, name)));
 }
 
 /* Phi */
@@ -859,9 +888,9 @@ int64_t dm_llvm_build_call2_buf(int64_t b, int64_t fn_ty, int64_t func, const ch
     for (int i = 0; i < dm_llvm_buf_count; i++) {
         args[i] = TO_PTR(LLVMValueRef, dm_llvm_buf[i]);
     }
-    int64_t result = TO_INT(LLVMBuildCall2(
+    int64_t result = TO_INT(dm_call_zeroext_bools(LLVMBuildCall2(
         TO_PTR(LLVMBuilderRef, b), TO_PTR(LLVMTypeRef, fn_ty),
-        TO_PTR(LLVMValueRef, func), args, dm_llvm_buf_count, name));
+        TO_PTR(LLVMValueRef, func), args, dm_llvm_buf_count, name)));
     dm_llvm_buf_count = 0;
     return result;
 }

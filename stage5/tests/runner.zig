@@ -345,6 +345,59 @@ const stage5_primitive_tests = [_]TestCase{
         .expect_compile_error = true,
         .expected_error_contains = &.{"a variable holds the result of a call that returns no value"},
     },
+    // Out-of-range arguments give "", and every runtime-built string is NUL-terminated for C.
+    .{
+        .name = "string_core_bounds_and_nul_termination",
+        .source =
+            \\module test
+            \\extern fn getenv(name: string) -> string
+            \\extern fn strlen(s: string) -> int
+            \\fn main() {
+            \\    let b = "hello, world"
+            \\    println("[" + substr(b, 3, 0 - 2) + "|" + substr(b, 0 - 1, 2) + "|" + char_at(b, 99) + "|" + char_at(b, 0 - 1) + "|" + b[1] + "]")
+            \\    unsafe {
+            \\        println(bool_to_string(len(getenv("DM_NOT_SET_XYZ")) == 0) + " " + int_to_string(strlen(b + "!")) + " " + int_to_string(strlen(substr(b, 0, 5))) + " " + int_to_string(strlen(char_at(b, 4))))
+            \\    }
+            \\}
+        ,
+        .expected_output = "[||||e]\ntrue 13 5 1\n",
+    },
+    // `= "symbol"` binds an extern to a C symbol of another name; several externs may share one.
+    .{
+        .name = "extern_link_names",
+        .source =
+            \\module test
+            \\-- A program's own declarations of C functions the runtime also uses,
+            \\-- with other signatures
+            \\extern fn memcmp(a: string, b: string, n: int) -> i32
+            \\extern fn malloc(n: int) -> int
+            \\extern fn my_len(s: string) -> u64 = "strlen"
+            \\extern fn other_len(p: int) -> int = "strlen"
+            \\fn main() {
+            \\    unsafe {
+            \\        let p = malloc(16)
+            \\        store_u8(p, 104)
+            \\        store_u8(p + 1, 105)
+            \\        store_u8(p + 2, 0)
+            \\        println(int_to_string(memcmp("abc", "abd", 3) as int) + " " + int_to_string(memcmp("same", "same", 4) as int))
+            \\        println(int_to_string(my_len("four") as int) + " " + int_to_string(other_len(p)) + " " + string_from_raw(p, 2, 0) + "!" + " " + bool_to_string("x" + "y" == "xy"))
+            \\    }
+            \\}
+        ,
+        .expected_output = "-1 0\n4 2 hi! true\n",
+    },
+    .{
+        .name = "extern_link_name_error",
+        .source =
+            \\module test
+            \\extern fn bad(x: int) -> int = 5
+            \\fn main() {
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"expected a C symbol name in quotes after `=` in extern fn 'bad' at line 2"},
+    },
 };
 
 pub fn main() !void {

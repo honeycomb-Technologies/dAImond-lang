@@ -38,15 +38,6 @@ char** dm_argv = NULL;
 // String creation (return via output pointer)
 // =====================================================================
 
-void llvm_dm_string_new(dm_string* out, const char* s) {
-    *out = dm_string_new(s);
-}
-
-void llvm_dm_string_concat(dm_string* out, const dm_string* a, const dm_string* b) {
-    *out = dm_string_concat(*a, *b);
-    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
-}
-
 void llvm_dm_int_to_string(dm_string* out, int64_t n) {
     *out = dm_int_to_string(n);
     if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
@@ -150,14 +141,6 @@ double llvm_dm_parse_float(const dm_string* s) {
     return atof(buf);
 }
 
-int64_t llvm_dm_string_len(const dm_string* s) {
-    return (int64_t)s->len;
-}
-
-int llvm_dm_string_eq(const dm_string* a, const dm_string* b) {
-    return dm_string_eq(*a, *b);
-}
-
 int llvm_dm_string_contains(const dm_string* a, const dm_string* b) {
     if (b->len == 0) return 1;
     if (b->len > a->len) return 0;
@@ -168,29 +151,8 @@ int llvm_dm_string_contains(const dm_string* a, const dm_string* b) {
 }
 
 // =====================================================================
-// String comparison (ordering) — calls runtime dm_string_cmp
-// =====================================================================
-
-int64_t llvm_dm_string_cmp(const dm_string* a, const dm_string* b) {
-    return (int64_t)dm_string_cmp(*a, *b);
-}
-
-// =====================================================================
 // Character/substring operations
 // =====================================================================
-
-// char_at(s, i) -> single-character string
-void llvm_dm_char_at(dm_string* out, const dm_string* s, int64_t idx) {
-    if (idx < 0 || (size_t)idx >= s->len) {
-        *out = (dm_string){ .data = "", .len = 0, .cap = 0 };
-        return;
-    }
-    char* buf = (char*)malloc(2);
-    buf[0] = s->data[idx];
-    buf[1] = '\0';
-    _dm_str_track(buf);
-    *out = (dm_string){ .data = buf, .len = 1, .cap = 1 };
-}
 
 // char_to_string(s) -> identity for string (Stage 3 char_at already returns string)
 void llvm_dm_char_to_string(dm_string* out, const dm_string* s) {
@@ -223,21 +185,6 @@ int64_t llvm_dm_is_alnum(const dm_string* s) {
     if (s->len == 0) return 0;
     char c = s->data[0];
     return ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) ? 1 : 0;
-}
-
-// substr(s, start, length) -> substring
-void llvm_dm_substr(dm_string* out, const dm_string* s, int64_t start, int64_t length) {
-    if (start < 0 || (size_t)start >= s->len) {
-        *out = (dm_string){ .data = "", .len = 0, .cap = 0 };
-        return;
-    }
-    size_t actual_len = (size_t)length;
-    if ((size_t)start + actual_len > s->len) actual_len = s->len - (size_t)start;
-    char* buf = (char*)malloc(actual_len + 1);
-    memcpy(buf, s->data + start, actual_len);
-    buf[actual_len] = '\0';
-    _dm_str_track(buf);
-    *out = (dm_string){ .data = buf, .len = actual_len, .cap = actual_len };
 }
 
 // =====================================================================

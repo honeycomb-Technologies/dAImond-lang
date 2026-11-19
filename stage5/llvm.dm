@@ -72,6 +72,9 @@ extern fn dm_llvm_build_sub(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_mul(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_sdiv(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_srem(b: int, lhs: int, rhs: int, name: string) -> int
+-- libc: the bytes of a string up to its first NUL, which is what a
+-- string passed to LLVM as a C string holds
+extern fn strlen(s: string) -> u64
 extern fn dm_llvm_build_udiv(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_urem(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_neg(b: int, val: int, name: string) -> int
