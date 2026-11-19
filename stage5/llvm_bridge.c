@@ -685,6 +685,14 @@ void dm_llvm_initialize_all_targets(void) {
     dm_llvm_initialize_aarch64();
 }
 
+/* Add an attribute that is only a name, such as "optnone", to a function */
+void dm_llvm_add_function_attr(int64_t func, const char* name) {
+    LLVMValueRef f = TO_PTR(LLVMValueRef, func);
+    unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+    LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(LLVMGetModuleContext(LLVMGetGlobalParent(f)), kind, 0));
+}
+
 /* Returns a C string owned by LLVM (caller must free with dm_llvm_dispose_message) */
 int64_t dm_llvm_get_default_target_triple(void) {
     return TO_INT(LLVMGetDefaultTargetTriple());

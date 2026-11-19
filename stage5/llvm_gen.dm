@@ -59,6 +59,9 @@ struct LLVMGenerator {
     -- Runtime functions written in dAImond: "dm_X" is here when the
     -- program defines rt_X, which then stands in for the C function
     rt_ports: Map[string, bool],
+    -- The blocks of the function being generated that report a failed
+    -- runtime check and exit, by message
+    panic_blocks: Map[string, int],
     -- Reference to IR module for type lookups
     ir_module: IRModule,
     -- Current function being generated (for param lookups)
@@ -99,6 +102,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             returns_sret: Map_new(),
             c_symbols: Map_new(),
             rt_ports: Map_new(),
+            panic_blocks: Map_new(),
             ir_module: ir_mod,
             current_func_name: "",
             current_line: 0,
@@ -506,7 +510,8 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- RUNTIME FUNCTIONS
 -- The IR names a runtime function dm_X. It is one of three things:
 --   inline: lowered to instructions here, with no function behind it
---     (is_inline_runtime_fn);
+--     (is_inline_runtime_fn): len(s) and the integer overflow and
+--     range checks;
 --   ported: the dAImond function rt_X, which stage5/runtime/*.dm
 --     defines with the same signature and which is called like any
 --     other dAImond function (strings by value, result through sret);
@@ -516,7 +521,7 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- ============================================================
 
 fn is_inline_runtime_fn(name: string) -> bool {
-    return name == "dm_string_len"
+    return name == "dm_string_len" or overflow_intrinsic_of(name) != "" or is_range_check_fn(name)
 }
 
 -- Record which dm_X functions the module defines as rt_X
@@ -817,6 +822,7 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         -- Clear value_map and string_ptrs for this function
         g.value_map = Map_new()
         g.string_ptrs = Map_new()
+        g.panic_blocks = Map_new()
         -- ALLOCA HOISTING: Generate all allocas in the entry block first.
         -- This ensures all allocas are available regardless of block processing order.
         -- Standard LLVM practice: all allocas belong in the entry block.
@@ -2086,6 +2092,31 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
 -- EMIT: Object file, LLVM IR, verification
 -- ============================================================
 
+-- Whether a function belongs to the runtime written in dAImond
+-- (stage5/runtime/*.dm): the rt_ functions and the methods of Map
+fn is_runtime_function(name: string) -> bool {
+    return starts_with(name, "rt_") or starts_with(name, "Map_")
+}
+
+-- At -O0 the program's own functions are left as written, but the
+-- runtime is optimized all the same: it stands where optimized C
+-- library code stood, and nobody steps through it. Marking every other
+-- function optnone makes the optimizer pass over it.
+fn keep_program_unoptimized(gen: LLVMGenerator) {
+    unsafe {
+        let mut i = 0
+        while i < gen.ir_module.functions.len() {
+            let f = gen.ir_module.functions[i]
+            if f.is_extern == false and is_runtime_function(f.name) == false and gen.function_map.contains(f.name) {
+                let llvm_fn = gen.function_map.get(f.name)
+                dm_llvm_add_function_attr(llvm_fn, "noinline")
+                dm_llvm_add_function_attr(llvm_fn, "optnone")
+            }
+            i = i + 1
+        }
+    }
+}
+
 fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
     unsafe {
         dm_llvm_initialize_all_targets()
@@ -2105,13 +2136,13 @@ fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
         let layout = dm_llvm_c_str_to_string(layout_ptr)
         dm_llvm_free_c_string(layout_ptr)
         dm_llvm_module_set_data_layout(gen.llvm_module, layout)
-        -- Run optimization passes if opt_level > 0
-        if opt_level > 0 {
-            let mut passes = "default<O1>"
-            if opt_level == 2 { let passes = "default<O2>" }
-            if opt_level >= 3 { let passes = "default<O3>" }
-            dm_llvm_run_passes(gen.llvm_module, passes, tm)
-        }
+        -- Optimize: the whole program at -O1 and above, the runtime alone
+        -- at -O0
+        let mut passes = "default<O2>"
+        if opt_level == 0 { keep_program_unoptimized(gen) }
+        if opt_level == 1 { passes = "default<O1>" }
+        if opt_level >= 3 { passes = "default<O3>" }
+        dm_llvm_run_passes(gen.llvm_module, passes, tm)
         -- Emit object file
         let result = dm_llvm_target_machine_emit_to_file(tm, gen.llvm_module, filename, dm_llvm_object_file())
         dm_llvm_dispose_target_machine(tm)

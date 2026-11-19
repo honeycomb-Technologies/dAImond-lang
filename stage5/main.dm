@@ -2478,6 +2478,7 @@ extern fn dm_llvm_build_global_string_ptr(b: int, str: string, name: string) -> 
 -- ============================================================
 extern fn dm_llvm_initialize_all_targets()extern fn dm_llvm_initialize_x86()extern fn dm_llvm_initialize_aarch64()extern fn dm_llvm_get_default_target_triple() -> int
 extern fn dm_llvm_create_target_machine(triple: string, opt_level: int) -> int
+extern fn dm_llvm_add_function_attr(func: int, name: string)
 extern fn dm_llvm_dispose_target_machine(tm: int)extern fn dm_llvm_target_machine_emit_to_file(tm: int, mod: int, filename: string, file_type: int) -> int
 extern fn dm_llvm_get_target_data_layout(tm: int) -> int
 
@@ -17805,6 +17806,9 @@ struct LLVMGenerator {
     -- Runtime functions written in dAImond: "dm_X" is here when the
     -- program defines rt_X, which then stands in for the C function
     rt_ports: Map[string, bool],
+    -- The blocks of the function being generated that report a failed
+    -- runtime check and exit, by message
+    panic_blocks: Map[string, int],
     -- Reference to IR module for type lookups
     ir_module: IRModule,
     -- Current function being generated (for param lookups)
@@ -17845,6 +17849,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             returns_sret: Map_new(),
             c_symbols: Map_new(),
             rt_ports: Map_new(),
+            panic_blocks: Map_new(),
             ir_module: ir_mod,
             current_func_name: "",
             current_line: 0,
@@ -18252,7 +18257,8 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- RUNTIME FUNCTIONS
 -- The IR names a runtime function dm_X. It is one of three things:
 --   inline: lowered to instructions here, with no function behind it
---     (is_inline_runtime_fn);
+--     (is_inline_runtime_fn): len(s) and the integer overflow and
+--     range checks;
 --   ported: the dAImond function rt_X, which stage5/runtime/*.dm
 --     defines with the same signature and which is called like any
 --     other dAImond function (strings by value, result through sret);
@@ -18262,7 +18268,7 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- ============================================================
 
 fn is_inline_runtime_fn(name: string) -> bool {
-    return name == "dm_string_len"
+    return name == "dm_string_len" or overflow_intrinsic_of(name) != "" or is_range_check_fn(name)
 }
 
 -- Record which dm_X functions the module defines as rt_X
@@ -18563,6 +18569,7 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         -- Clear value_map and string_ptrs for this function
         g.value_map = Map_new()
         g.string_ptrs = Map_new()
+        g.panic_blocks = Map_new()
         -- ALLOCA HOISTING: Generate all allocas in the entry block first.
         -- This ensures all allocas are available regardless of block processing order.
         -- Standard LLVM practice: all allocas belong in the entry block.
@@ -19832,6 +19839,31 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
 -- EMIT: Object file, LLVM IR, verification
 -- ============================================================
 
+-- Whether a function belongs to the runtime written in dAImond
+-- (stage5/runtime/*.dm): the rt_ functions and the methods of Map
+fn is_runtime_function(name: string) -> bool {
+    return starts_with(name, "rt_") or starts_with(name, "Map_")
+}
+
+-- At -O0 the program's own functions are left as written, but the
+-- runtime is optimized all the same: it stands where optimized C
+-- library code stood, and nobody steps through it. Marking every other
+-- function optnone makes the optimizer pass over it.
+fn keep_program_unoptimized(gen: LLVMGenerator) {
+    unsafe {
+        let mut i = 0
+        while i < gen.ir_module.functions.len() {
+            let f = gen.ir_module.functions[i]
+            if f.is_extern == false and is_runtime_function(f.name) == false and gen.function_map.contains(f.name) {
+                let llvm_fn = gen.function_map.get(f.name)
+                dm_llvm_add_function_attr(llvm_fn, "noinline")
+                dm_llvm_add_function_attr(llvm_fn, "optnone")
+            }
+            i = i + 1
+        }
+    }
+}
+
 fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
     unsafe {
         dm_llvm_initialize_all_targets()
@@ -19851,13 +19883,13 @@ fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
         let layout = dm_llvm_c_str_to_string(layout_ptr)
         dm_llvm_free_c_string(layout_ptr)
         dm_llvm_module_set_data_layout(gen.llvm_module, layout)
-        -- Run optimization passes if opt_level > 0
-        if opt_level > 0 {
-            let mut passes = "default<O1>"
-            if opt_level == 2 { let passes = "default<O2>" }
-            if opt_level >= 3 { let passes = "default<O3>" }
-            dm_llvm_run_passes(gen.llvm_module, passes, tm)
-        }
+        -- Optimize: the whole program at -O1 and above, the runtime alone
+        -- at -O0
+        let mut passes = "default<O2>"
+        if opt_level == 0 { keep_program_unoptimized(gen) }
+        if opt_level == 1 { passes = "default<O1>" }
+        if opt_level >= 3 { passes = "default<O3>" }
+        dm_llvm_run_passes(gen.llvm_module, passes, tm)
         -- Emit object file
         let result = dm_llvm_target_machine_emit_to_file(tm, gen.llvm_module, filename, dm_llvm_object_file())
         dm_llvm_dispose_target_machine(tm)
@@ -20112,12 +20144,145 @@ fn promote_vararg(gen: LLVMGenerator, val: int) -> int {
     }
 }
 
+-- ============================================================
+-- INLINE RUNTIME CHECKS
+-- Signed integer arithmetic and narrowing casts are checked: the IR
+-- calls dm_checked_* and dm_cast_check_*, which are lowered here to
+-- a test and a branch to a block that reports the failure and exits.
+-- ============================================================
+
+-- The LLVM intrinsic that performs checked operation `name` and
+-- reports whether it overflowed; "" when `name` is not one
+fn overflow_intrinsic_of(name: string) -> string {
+    if name == "dm_checked_add_i64" { return "llvm.sadd.with.overflow.i64" }
+    if name == "dm_checked_sub_i64" { return "llvm.ssub.with.overflow.i64" }
+    if name == "dm_checked_mul_i64" { return "llvm.smul.with.overflow.i64" }
+    return ""
+}
+
+fn is_range_check_fn(name: string) -> bool {
+    return name == "dm_checked_range_i64" or name == "dm_cast_check_i64" or name == "dm_cast_check_u64"
+}
+
+-- Operand `idx` of a check as a 64-bit integer
+fn check_operand(gen: LLVMGenerator, inst: IRInst, idx: int) -> int {
+    unsafe {
+        let i64_ty = dm_llvm_int64_type(gen.context)
+        let val = resolve_value(gen, inst.call_args[idx])
+        if dm_llvm_type_of(val) == i64_ty { return val }
+        return dm_llvm_build_int_cast2(gen.builder, val, i64_ty, 1, "check.arg")
+    }
+}
+
+-- Make gen.panic_blocks hold the block of the current function that
+-- prints `message` and exits. A function has one such block per
+-- message, however many checks branch to it.
+fn need_panic_block(gen: LLVMGenerator, message: string) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.panic_blocks.contains(message) { return g }
+        let resume_at = dm_llvm_get_insert_block(g.builder)
+        let bb = dm_llvm_append_basic_block(g.context, g.function_map.get(g.current_func_name), "check_failed")
+        dm_llvm_position_at_end(g.builder, bb)
+        let mut panic_call = ir_inst_new(0, OP_CALL())
+        panic_call.callee = "dm_panic"
+        let mut panic_args: List[IRValue] = []
+        panic_args.push(ir_val_string(message))
+        panic_call.call_args = panic_args
+        panic_call.result_type = "void"
+        panic_call.has_result = false
+        g = generate_call(g, panic_call)
+        dm_llvm_build_unreachable(g.builder)
+        dm_llvm_position_at_end(g.builder, resume_at)
+        g.panic_blocks.insert(message, bb)
+        return g
+    }
+}
+
+-- Branch to the panic block for `message` when `failed` is true, and
+-- carry on in a new block otherwise
+fn branch_on_failed_check(gen: LLVMGenerator, failed: int, message: string) -> LLVMGenerator {
+    unsafe {
+        let mut g = need_panic_block(gen, message)
+        let ok_bb = dm_llvm_append_basic_block(g.context, g.function_map.get(g.current_func_name), "check_ok")
+        dm_llvm_build_cond_br(g.builder, failed, g.panic_blocks.get(message), ok_bb)
+        dm_llvm_position_at_end(g.builder, ok_bb)
+        return g
+    }
+}
+
+-- dm_checked_add_i64(a, b) and its sub and mul counterparts: the
+-- result, or a panic when it does not fit in 64 bits
+fn generate_checked_arith(gen: LLVMGenerator, inst: IRInst, intrinsic: string) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let i64_ty = dm_llvm_int64_type(g.context)
+        if g.function_map.contains(intrinsic) == false {
+            -- { i64 result, i1 overflowed } (i64, i64)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(i64_ty)
+            dm_llvm_buf_push(dm_llvm_int1_type(g.context))
+            let pair_ty = dm_llvm_struct_type_buf(g.context, 2, 0)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(i64_ty)
+            dm_llvm_buf_push(i64_ty)
+            let intrinsic_ty = dm_llvm_function_type_buf(pair_ty, 0)
+            g.function_map.insert(intrinsic, dm_llvm_module_add_function(g.llvm_module, intrinsic, intrinsic_ty))
+            g.fn_type_map.insert(intrinsic, intrinsic_ty)
+        }
+        let lhs = check_operand(g, inst, 0)
+        let rhs = check_operand(g, inst, 1)
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(lhs)
+        dm_llvm_buf_push(rhs)
+        let pair = dm_llvm_build_call2_buf(b, g.fn_type_map.get(intrinsic), g.function_map.get(intrinsic), "checked")
+        let result = dm_llvm_build_extract_value(b, pair, 0, "arith")
+        let overflowed = dm_llvm_build_extract_value(b, pair, 1, "overflowed")
+        g = branch_on_failed_check(g, overflowed, "PANIC: integer overflow")
+        if inst.has_result { g.value_map.insert(int_to_string(inst.id), result) }
+        return g
+    }
+}
+
+-- dm_checked_range_i64(v, lo, hi) and dm_cast_check_i64(v, lo, hi)
+-- give v when lo <= v <= hi; dm_cast_check_u64(v, hi) gives v when
+-- v <= hi, unsigned. Otherwise they panic.
+fn generate_range_check(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let v = check_operand(g, inst, 0)
+        let mut failed = 0
+        if inst.callee == "dm_cast_check_u64" {
+            -- 34 is LLVM's unsigned greater-than
+            failed = dm_llvm_build_icmp(b, 34, v, check_operand(g, inst, 1), "above")
+        } else {
+            let below = dm_llvm_build_icmp(b, dm_llvm_int_slt(), v, check_operand(g, inst, 1), "below")
+            let above = dm_llvm_build_icmp(b, dm_llvm_int_sgt(), v, check_operand(g, inst, 2), "above")
+            failed = dm_llvm_build_or(b, below, above, "out_of_range")
+        }
+        let mut message = "PANIC: integer cast out of range"
+        if inst.callee == "dm_checked_range_i64" { message = "PANIC: integer overflow" }
+        g = branch_on_failed_check(g, failed, message)
+        if inst.has_result { g.value_map.insert(int_to_string(inst.id), v) }
+        return g
+    }
+}
+
 fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let b = g.builder
         let id_key = int_to_string(inst.id)
         let callee_name = inst.callee
+        let intrinsic = overflow_intrinsic_of(callee_name)
+        if intrinsic != "" and inst.call_args.len() == 2 {
+            return generate_checked_arith(g, inst, intrinsic)
+        }
+        if is_range_check_fn(callee_name) and inst.call_args.len() >= 2 {
+            return generate_range_check(g, inst)
+        }
         -- len(s) reads the string's length field
         if callee_name == "dm_string_len" and inst.call_args.len() == 1 {
             let s_arg = inst.call_args[0]
@@ -20853,11 +21018,11 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 --   -> Object File -> Linker -> Native Binary
 -- ============================================================
 
--- Generated by gen_bootstrap.sh from runtime/string.dm runtime/map.dm; edit those files instead.
+-- Generated by gen_bootstrap.sh from runtime/string.dm runtime/convert.dm runtime/map.dm; edit those files instead.
 -- The compiler parses this source into every program it compiles.
 
 fn prelude_source() -> string {
-    return "\n-- ============================================================\n-- Strings\n-- The string functions behind every program Stage 5 compiles.\n-- gen_bootstrap.sh embeds this file in the compiler (prelude.dm),\n-- which adds it to each program's declarations.\n--\n-- A string is { data, len, cap }: the address of its bytes, their\n-- count, and the size of the allocation that holds them. cap is 0\n-- when the string does not own its bytes, as a literal doesn't.\n-- Every string built here is followed by a NUL byte, so its data\n-- can go to C as a char*.\n--\n-- The compiler calls rt_X wherever its IR names the runtime\n-- function dm_X (see RUNTIME FUNCTIONS in llvm_gen.dm), so each\n-- rt_X keeps the signature that dm_X is declared with in\n-- ir_gen_decl.dm. len(s) and string literals are inline and call\n-- nothing. Code here must not use the string operators it\n-- implements: no +, == or < on strings, and no char_at or substr.\n-- ============================================================\n\n-- libc, under names that a program's own extern declarations of\n-- the same C functions cannot collide with\nextern fn libc_malloc(n: int) -> int = \"malloc\"\nextern fn libc_memcpy(dst: int, src: int, n: int) -> int = \"memcpy\"\nextern fn libc_memcmp(a: int, b: int, n: int) -> i32 = \"memcmp\"\n\n-- A new string holding the n bytes at address src\nfn rt_string_copy(src: int, n: int) -> string {\n    if n <= 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, src, n)\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a + b\nfn rt_string_concat(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    let n = na + nb\n    if n == 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        if na > 0 {\n            libc_memcpy(buf, string_data(a), na)\n        }\n        if nb > 0 {\n            libc_memcpy(buf + na, string_data(b), nb)\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a == b\nfn rt_string_eq(a: string, b: string) -> bool {\n    let n = len(a)\n    if n != len(b) {\n        return false\n    }\n    if n == 0 {\n        return true\n    }\n    unsafe {\n        return libc_memcmp(string_data(a), string_data(b), n) == 0\n    }\n}\n\n-- Byte order of a and b: negative when a sorts first, 0 when they\n-- are equal, positive when b sorts first. A prefix sorts before\n-- the longer string.\nfn rt_string_cmp(a: string, b: string) -> int {\n    let na = len(a)\n    let nb = len(b)\n    let mut n = na\n    if nb < na {\n        n = nb\n    }\n    if n > 0 {\n        unsafe {\n            let c = libc_memcmp(string_data(a), string_data(b), n)\n            if c != 0 {\n                return c as int\n            }\n        }\n    }\n    if na < nb {\n        return -1\n    }\n    if na > nb {\n        return 1\n    }\n    return 0\n}\n\n-- char_at(s, i): the byte at index i as a one-byte string, or \"\"\n-- when i is outside s\nfn rt_char_at(s: string, i: int) -> string {\n    if i < 0 or i >= len(s) {\n        return \"\"\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + i, 1)\n    }\n}\n\n-- substr(s, start, length): up to length bytes of s from index\n-- start. The range is clamped to s: a start outside s or a length\n-- below 1 gives \"\", and a length past the end stops at the end.\nfn rt_substr(s: string, start: int, length: int) -> string {\n    let n = len(s)\n    if start < 0 or start >= n {\n        return \"\"\n    }\n    let mut count = length\n    if count > n - start {\n        count = n - start\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + start, count)\n    }\n}\n\n-- ============================================================\n-- Map[K, V]\n-- The hash map behind Map[K, V] in every program Stage 5\n-- compiles. gen_bootstrap.sh embeds this file in the compiler\n-- (prelude.dm), which adds it to each program's declarations.\n-- Keys are strings or integers; hash_key picks the hash.\n--\n-- Entries are kept in insertion order in entry_keys,\n-- entry_vals and entry_hashes, so keys() and values() return\n-- them in that order. slots is an open-addressing table of\n-- indexes into those lists: -1 marks an empty slot and -2 a\n-- removed entry. A removed entry's hash is -1 until rebuild()\n-- drops it.\n--\n-- Copying a map copies its list headers, so a copy shares the\n-- slot table with the original until either one rebuilds. A slot\n-- that names an entry past this map's own entries was written by\n-- another copy; lookups skip it and inserts may take it.\n-- ============================================================\n\nstruct Map[K, V] {\n    entry_keys: List[K],\n    entry_vals: List[V],\n    entry_hashes: List[int],\n    slots: List[int],\n    count: int\n}\n\nimpl Map[K, V] {\n    fn insert(mut self, k: K, v: V) {\n        let h = hash_key(k)\n        let s = self.find_slot(k, h)\n        if s >= 0 {\n            self.entry_vals[self.slots[s]] = v\n            return\n        }\n        -- Keep at least a quarter of the slots empty so probes end\n        if (self.entry_keys.len() + 1) * 4 > self.slots.len() * 3 {\n            self.rebuild()\n        }\n        let cap = self.slots.len()\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 and self.slots[i] < n {\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        self.slots[i] = n\n        self.entry_keys.push(k)\n        self.entry_vals.push(v)\n        self.entry_hashes.push(h)\n        self.count = self.count + 1\n    }\n\n    fn set(mut self, k: K, v: V) {\n        self.insert(k, v)\n    }\n\n    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries and size the table for twice the live ones\n    fn rebuild(mut self) {\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n"
+    return "\n-- ============================================================\n-- Strings\n-- The string functions behind every program Stage 5 compiles.\n-- gen_bootstrap.sh embeds this file in the compiler (prelude.dm),\n-- which adds it to each program's declarations.\n--\n-- A string is { data, len, cap }: the address of its bytes, their\n-- count, and the size of the allocation that holds them. cap is 0\n-- when the string does not own its bytes, as a literal doesn't.\n-- Every string built here is followed by a NUL byte, so its data\n-- can go to C as a char*.\n--\n-- The compiler calls rt_X wherever its IR names the runtime\n-- function dm_X (see RUNTIME FUNCTIONS in llvm_gen.dm), so each\n-- rt_X keeps the signature that dm_X is declared with in\n-- ir_gen_decl.dm. len(s) and string literals are inline and call\n-- nothing. Code here must not use the string operators it\n-- implements: no +, == or < on strings, and no char_at or substr.\n-- ============================================================\n\n-- libc, under names that a program's own extern declarations of\n-- the same C functions cannot collide with\nextern fn libc_malloc(n: int) -> int = \"malloc\"\nextern fn libc_memcpy(dst: int, src: int, n: int) -> int = \"memcpy\"\nextern fn libc_memcmp(a: int, b: int, n: int) -> i32 = \"memcmp\"\n\n-- A new string holding the n bytes at address src\nfn rt_string_copy(src: int, n: int) -> string {\n    if n <= 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, src, n)\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a + b\nfn rt_string_concat(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    let n = na + nb\n    if n == 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        if na > 0 {\n            libc_memcpy(buf, string_data(a), na)\n        }\n        if nb > 0 {\n            libc_memcpy(buf + na, string_data(b), nb)\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a == b\nfn rt_string_eq(a: string, b: string) -> bool {\n    let n = len(a)\n    if n != len(b) {\n        return false\n    }\n    if n == 0 {\n        return true\n    }\n    unsafe {\n        return libc_memcmp(string_data(a), string_data(b), n) == 0\n    }\n}\n\n-- Byte order of a and b: negative when a sorts first, 0 when they\n-- are equal, positive when b sorts first. A prefix sorts before\n-- the longer string.\nfn rt_string_cmp(a: string, b: string) -> int {\n    let na = len(a)\n    let nb = len(b)\n    let mut n = na\n    if nb < na {\n        n = nb\n    }\n    if n > 0 {\n        unsafe {\n            let c = libc_memcmp(string_data(a), string_data(b), n)\n            if c != 0 {\n                return c as int\n            }\n        }\n    }\n    if na < nb {\n        return -1\n    }\n    if na > nb {\n        return 1\n    }\n    return 0\n}\n\n-- char_at(s, i): the byte at index i as a one-byte string, or \"\"\n-- when i is outside s\nfn rt_char_at(s: string, i: int) -> string {\n    if i < 0 or i >= len(s) {\n        return \"\"\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + i, 1)\n    }\n}\n\n-- substr(s, start, length): up to length bytes of s from index\n-- start. The range is clamped to s: a start outside s or a length\n-- below 1 gives \"\", and a length past the end stops at the end.\nfn rt_substr(s: string, start: int, length: int) -> string {\n    let n = len(s)\n    if start < 0 or start >= n {\n        return \"\"\n    }\n    let mut count = length\n    if count > n - start {\n        count = n - start\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + start, count)\n    }\n}\n\n-- ============================================================\n-- Conversions between numbers, booleans and strings\n-- int_to_string, float_to_string, bool_to_string, parse_int and\n-- parse_float. See runtime/string.dm for how rt_X functions\n-- replace the C runtime and for the layout of a string.\n--\n-- Integers are formatted and parsed here. Floats go through\n-- libc (snprintf \"%g\" and strtod), which round correctly.\n-- ============================================================\n\nextern fn libc_free(p: int) = \"free\"\nextern fn libc_memmove(dst: int, src: int, n: int) -> int = \"memmove\"\nextern fn libc_snprintf(buf: int, n: int, fmt: string, ...) -> i32 = \"snprintf\"\nextern fn libc_strtod(s: int, end: int) -> float = \"strtod\"\n\n-- int_to_string(n): n in decimal, with a leading \"-\" when negative\nfn rt_int_to_string(n: int) -> string {\n    -- The two digits of every number below 100, side by side\n    let pairs = \"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899\"\n    -- Work on -|n|: every int has a negative counterpart, but the\n    -- lowest int has no positive one\n    let mut v = n\n    if n > 0 {\n        v = 0 - n\n    }\n    unsafe {\n        let table = string_data(pairs)\n        -- The longest result, \"-9223372036854775808\", is 20 bytes\n        let size = 21\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        -- Digits come out lowest first, two per division, so they are\n        -- written from the end of the buffer backwards\n        let end = buf + size - 1\n        store_u8(end, 0)\n        let mut at = end\n        while v <= 0 - 100 {\n            let rest = v / 100\n            let pair = table + (rest * 100 - v) * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n            v = rest\n        }\n        if v <= 0 - 10 {\n            let pair = table - v * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n        } else {\n            at = at - 1\n            store_u8(at, 48 - v)\n        }\n        if n < 0 {\n            at = at - 1\n            store_u8(at, 45)\n        }\n        -- Move the text, with its NUL, to the start of the buffer\n        let length = end - at\n        if at != buf {\n            libc_memmove(buf, at, length + 1)\n        }\n        return string_from_raw(buf, length, size)\n    }\n}\n\n-- float_to_string(f): f as C's \"%g\" prints it, with up to six\n-- significant digits (\"3.14159\", \"1e+20\", \"inf\", \"nan\")\nfn rt_float_to_string(f: float) -> string {\n    unsafe {\n        -- The longest \"%g\" output is 13 bytes, such as \"-1.79769e+308\"\n        let size = 32\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        let n = libc_snprintf(buf, size, \"%g\", f) as int\n        if n < 0 or n >= size {\n            libc_free(buf)\n            return \"\"\n        }\n        return string_from_raw(buf, n, size)\n    }\n}\n\n-- bool_to_string(b): \"true\" or \"false\"\nfn rt_bool_to_string(b: bool) -> string {\n    if b {\n        return \"true\"\n    }\n    return \"false\"\n}\n\n-- Whether byte c is whitespace to C's isspace: space, or tab\n-- through carriage return\nfn rt_is_space(c: int) -> bool {\n    return c == 32 or (c >= 9 and c <= 13)\n}\n\n-- parse_int(s): the decimal integer at the start of s, as C's\n-- atoll reads it. Leading whitespace is skipped, a \"+\" or \"-\" may\n-- come first, and the number ends at the first byte that is not a\n-- digit. Without a digit the result is 0. A number outside the\n-- range of int gives the nearest int.\nfn rt_parse_int(s: string) -> int {\n    let n = len(s)\n    let int_max = 9223372036854775807\n    -- The lowest int is lowest_tenth * 10 - 8\n    let lowest_tenth = 0 - 922337203685477580\n    unsafe {\n        let p = string_data(s)\n        let mut i = 0\n        while i < n and rt_is_space(load_u8(p + i)) {\n            i = i + 1\n        }\n        let mut negative = false\n        if i < n {\n            let c = load_u8(p + i)\n            if c == 45 {\n                negative = true\n                i = i + 1\n            } else if c == 43 {\n                i = i + 1\n            }\n        }\n        -- Accumulate -|value|, which can hold the lowest int\n        let mut v = 0\n        let mut in_range = true\n        while i < n {\n            let d = load_u8(p + i) - 48\n            if d < 0 or d > 9 {\n                i = n\n            } else {\n                if v < lowest_tenth or (v == lowest_tenth and d > 8) {\n                    in_range = false\n                    i = n\n                } else {\n                    v = v * 10 - d\n                    i = i + 1\n                }\n            }\n        }\n        if negative {\n            if in_range {\n                return v\n            }\n            return 0 - int_max - 1\n        }\n        if in_range and v >= 0 - int_max {\n            return 0 - v\n        }\n        return int_max\n    }\n}\n\n-- parse_float(s): the number at the start of s, as C's strtod\n-- reads it (\"3.5\", \"-1e3\", \"inf\"); 0.0 when s does not start with\n-- a number. Leading whitespace is skipped.\nfn rt_parse_float(s: string) -> float {\n    let n = len(s)\n    if n == 0 {\n        return 0.0\n    }\n    unsafe {\n        -- strtod reads up to a NUL byte, which s need not end with\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, string_data(s), n)\n        store_u8(buf + n, 0)\n        let value = libc_strtod(buf, 0)\n        libc_free(buf)\n        return value\n    }\n}\n\n-- ============================================================\n-- Map[K, V]\n-- The hash map behind Map[K, V] in every program Stage 5\n-- compiles. gen_bootstrap.sh embeds this file in the compiler\n-- (prelude.dm), which adds it to each program's declarations.\n-- Keys are strings or integers; hash_key picks the hash.\n--\n-- Entries are kept in insertion order in entry_keys,\n-- entry_vals and entry_hashes, so keys() and values() return\n-- them in that order. slots is an open-addressing table of\n-- indexes into those lists: -1 marks an empty slot and -2 a\n-- removed entry. A removed entry's hash is -1 until rebuild()\n-- drops it.\n--\n-- Copying a map copies its list headers, so a copy shares the\n-- slot table with the original until either one rebuilds. A slot\n-- that names an entry past this map's own entries was written by\n-- another copy; lookups skip it and inserts may take it.\n-- ============================================================\n\nstruct Map[K, V] {\n    entry_keys: List[K],\n    entry_vals: List[V],\n    entry_hashes: List[int],\n    slots: List[int],\n    count: int\n}\n\nimpl Map[K, V] {\n    fn insert(mut self, k: K, v: V) {\n        let h = hash_key(k)\n        let s = self.find_slot(k, h)\n        if s >= 0 {\n            self.entry_vals[self.slots[s]] = v\n            return\n        }\n        -- Keep at least a quarter of the slots empty so probes end\n        if (self.entry_keys.len() + 1) * 4 > self.slots.len() * 3 {\n            self.rebuild()\n        }\n        let cap = self.slots.len()\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 and self.slots[i] < n {\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        self.slots[i] = n\n        self.entry_keys.push(k)\n        self.entry_vals.push(v)\n        self.entry_hashes.push(h)\n        self.count = self.count + 1\n    }\n\n    fn set(mut self, k: K, v: V) {\n        self.insert(k, v)\n    }\n\n    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries and size the table for twice the live ones\n    fn rebuild(mut self) {\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n"
 }
 
 

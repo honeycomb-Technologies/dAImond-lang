@@ -398,6 +398,17 @@ const stage5_primitive_tests = [_]TestCase{
         .expect_compile_error = true,
         .expected_error_contains = &.{"expected a C symbol name in quotes after `=` in extern fn 'bad' at line 2"},
     },
+    // Stage 0 reads at most 31 bytes of an integer and 63 of a float.
+    .{
+        .name = "parse_numbers_of_any_length",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    println(int_to_string(parse_int("000000000000000000000000000000000042")) + " " + int_to_string(parse_int("                                        5")) + " " + float_to_string(parse_float("0000000000000000000000000000000000000000000000000000000000000000002.5")))
+            \\}
+        ,
+        .expected_output = "42 5 2.5\n",
+    },
 };
 
 pub fn main() !void {

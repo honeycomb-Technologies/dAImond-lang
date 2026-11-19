@@ -91,12 +91,145 @@ fn promote_vararg(gen: LLVMGenerator, val: int) -> int {
     }
 }
 
+-- ============================================================
+-- INLINE RUNTIME CHECKS
+-- Signed integer arithmetic and narrowing casts are checked: the IR
+-- calls dm_checked_* and dm_cast_check_*, which are lowered here to
+-- a test and a branch to a block that reports the failure and exits.
+-- ============================================================
+
+-- The LLVM intrinsic that performs checked operation `name` and
+-- reports whether it overflowed; "" when `name` is not one
+fn overflow_intrinsic_of(name: string) -> string {
+    if name == "dm_checked_add_i64" { return "llvm.sadd.with.overflow.i64" }
+    if name == "dm_checked_sub_i64" { return "llvm.ssub.with.overflow.i64" }
+    if name == "dm_checked_mul_i64" { return "llvm.smul.with.overflow.i64" }
+    return ""
+}
+
+fn is_range_check_fn(name: string) -> bool {
+    return name == "dm_checked_range_i64" or name == "dm_cast_check_i64" or name == "dm_cast_check_u64"
+}
+
+-- Operand `idx` of a check as a 64-bit integer
+fn check_operand(gen: LLVMGenerator, inst: IRInst, idx: int) -> int {
+    unsafe {
+        let i64_ty = dm_llvm_int64_type(gen.context)
+        let val = resolve_value(gen, inst.call_args[idx])
+        if dm_llvm_type_of(val) == i64_ty { return val }
+        return dm_llvm_build_int_cast2(gen.builder, val, i64_ty, 1, "check.arg")
+    }
+}
+
+-- Make gen.panic_blocks hold the block of the current function that
+-- prints `message` and exits. A function has one such block per
+-- message, however many checks branch to it.
+fn need_panic_block(gen: LLVMGenerator, message: string) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.panic_blocks.contains(message) { return g }
+        let resume_at = dm_llvm_get_insert_block(g.builder)
+        let bb = dm_llvm_append_basic_block(g.context, g.function_map.get(g.current_func_name), "check_failed")
+        dm_llvm_position_at_end(g.builder, bb)
+        let mut panic_call = ir_inst_new(0, OP_CALL())
+        panic_call.callee = "dm_panic"
+        let mut panic_args: List[IRValue] = []
+        panic_args.push(ir_val_string(message))
+        panic_call.call_args = panic_args
+        panic_call.result_type = "void"
+        panic_call.has_result = false
+        g = generate_call(g, panic_call)
+        dm_llvm_build_unreachable(g.builder)
+        dm_llvm_position_at_end(g.builder, resume_at)
+        g.panic_blocks.insert(message, bb)
+        return g
+    }
+}
+
+-- Branch to the panic block for `message` when `failed` is true, and
+-- carry on in a new block otherwise
+fn branch_on_failed_check(gen: LLVMGenerator, failed: int, message: string) -> LLVMGenerator {
+    unsafe {
+        let mut g = need_panic_block(gen, message)
+        let ok_bb = dm_llvm_append_basic_block(g.context, g.function_map.get(g.current_func_name), "check_ok")
+        dm_llvm_build_cond_br(g.builder, failed, g.panic_blocks.get(message), ok_bb)
+        dm_llvm_position_at_end(g.builder, ok_bb)
+        return g
+    }
+}
+
+-- dm_checked_add_i64(a, b) and its sub and mul counterparts: the
+-- result, or a panic when it does not fit in 64 bits
+fn generate_checked_arith(gen: LLVMGenerator, inst: IRInst, intrinsic: string) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let i64_ty = dm_llvm_int64_type(g.context)
+        if g.function_map.contains(intrinsic) == false {
+            -- { i64 result, i1 overflowed } (i64, i64)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(i64_ty)
+            dm_llvm_buf_push(dm_llvm_int1_type(g.context))
+            let pair_ty = dm_llvm_struct_type_buf(g.context, 2, 0)
+            dm_llvm_buf_clear()
+            dm_llvm_buf_push(i64_ty)
+            dm_llvm_buf_push(i64_ty)
+            let intrinsic_ty = dm_llvm_function_type_buf(pair_ty, 0)
+            g.function_map.insert(intrinsic, dm_llvm_module_add_function(g.llvm_module, intrinsic, intrinsic_ty))
+            g.fn_type_map.insert(intrinsic, intrinsic_ty)
+        }
+        let lhs = check_operand(g, inst, 0)
+        let rhs = check_operand(g, inst, 1)
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(lhs)
+        dm_llvm_buf_push(rhs)
+        let pair = dm_llvm_build_call2_buf(b, g.fn_type_map.get(intrinsic), g.function_map.get(intrinsic), "checked")
+        let result = dm_llvm_build_extract_value(b, pair, 0, "arith")
+        let overflowed = dm_llvm_build_extract_value(b, pair, 1, "overflowed")
+        g = branch_on_failed_check(g, overflowed, "PANIC: integer overflow")
+        if inst.has_result { g.value_map.insert(int_to_string(inst.id), result) }
+        return g
+    }
+}
+
+-- dm_checked_range_i64(v, lo, hi) and dm_cast_check_i64(v, lo, hi)
+-- give v when lo <= v <= hi; dm_cast_check_u64(v, hi) gives v when
+-- v <= hi, unsigned. Otherwise they panic.
+fn generate_range_check(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let v = check_operand(g, inst, 0)
+        let mut failed = 0
+        if inst.callee == "dm_cast_check_u64" {
+            -- 34 is LLVM's unsigned greater-than
+            failed = dm_llvm_build_icmp(b, 34, v, check_operand(g, inst, 1), "above")
+        } else {
+            let below = dm_llvm_build_icmp(b, dm_llvm_int_slt(), v, check_operand(g, inst, 1), "below")
+            let above = dm_llvm_build_icmp(b, dm_llvm_int_sgt(), v, check_operand(g, inst, 2), "above")
+            failed = dm_llvm_build_or(b, below, above, "out_of_range")
+        }
+        let mut message = "PANIC: integer cast out of range"
+        if inst.callee == "dm_checked_range_i64" { message = "PANIC: integer overflow" }
+        g = branch_on_failed_check(g, failed, message)
+        if inst.has_result { g.value_map.insert(int_to_string(inst.id), v) }
+        return g
+    }
+}
+
 fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let b = g.builder
         let id_key = int_to_string(inst.id)
         let callee_name = inst.callee
+        let intrinsic = overflow_intrinsic_of(callee_name)
+        if intrinsic != "" and inst.call_args.len() == 2 {
+            return generate_checked_arith(g, inst, intrinsic)
+        }
+        if is_range_check_fn(callee_name) and inst.call_args.len() >= 2 {
+            return generate_range_check(g, inst)
+        }
         -- len(s) reads the string's length field
         if callee_name == "dm_string_len" and inst.call_args.len() == 1 {
             let s_arg = inst.call_args[0]

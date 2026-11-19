@@ -8,7 +8,7 @@ OUTPUT="main.dm"
 
 # Embed the dAImond runtime sources (runtime/*.dm) in the compiler as one
 # string, so compiled programs need no runtime files on disk
-RUNTIME_SOURCES="runtime/string.dm runtime/map.dm"
+RUNTIME_SOURCES="runtime/string.dm runtime/convert.dm runtime/map.dm"
 {
     echo "module prelude"
     echo ""

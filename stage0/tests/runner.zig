@@ -5145,6 +5145,46 @@ pub const numeric_cast_tests = [_]TestCase{
         ,
         .expected_output = "255\n",
     },
+    // Signed arithmetic that overflows stops the program with exit code 1.
+    .{
+        .name = "integer_overflow_panics",
+        .source =
+            \\module test
+            \\fn grow(start: int, steps: int) -> int {
+            \\    let mut x = start
+            \\    let mut i = 0
+            \\    while i < steps {
+            \\        x = x * 3 + 1
+            \\        i = i + 1
+            \\    }
+            \\    return x
+            \\}
+            \\fn main() {
+            \\    println(int_to_string(grow(1, 30)))
+            \\    println(int_to_string(grow(1, 60)))
+            \\    println("not reached")
+            \\}
+        ,
+        .expected_output = "308836698141973\n",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "narrow_integer_overflow_panics",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let small: i32 = 2000000000 as i32
+            \\    println(int_to_string((small + 5) as int))
+            \\    let wide = 250
+            \\    let b = wide as u8
+            \\    println(int_to_string(b as int))
+            \\    println(int_to_string((small + small) as int))
+            \\    println("not reached")
+            \\}
+        ,
+        .expected_output = "2000000005\n250\n",
+        .expected_exit_code = 1,
+    },
 };
 
 pub const string_edge_tests = [_]TestCase{
@@ -5234,6 +5274,92 @@ pub const string_edge_tests = [_]TestCase{
             \\}
         ,
         .expected_output = "6688890\n",
+    },
+    .{
+        .name = "number_string_conversions",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    println(int_to_string(0) + " " + int_to_string(7) + " " + int_to_string(0 - 7) + " " + int_to_string(10) + " " + int_to_string(99) + " " + int_to_string(100) + " " + int_to_string(0 - 1000))
+            \\    let big = 9223372036854775807
+            \\    let low = 0 - big - 1
+            \\    println(int_to_string(big) + " " + int_to_string(low) + " " + int_to_string(1000000000000000000) + " " + int_to_string(999999999999999999) + " " + int_to_string(0 - 1000000000000000000))
+            \\    println(int_to_string(len(int_to_string(low))) + " " + int_to_string(len(int_to_string(big))) + " " + int_to_string(len(int_to_string(0))))
+            \\    println(float_to_string(3.14159) + " " + float_to_string(0.0) + " " + float_to_string(0.0 - 2.5) + " " + float_to_string(100000000000000000000.0) + " " + float_to_string(0.000001234) + " " + float_to_string(1234567.0) + " " + float_to_string(1.0 / 3.0))
+            \\    println(bool_to_string(true) + " " + bool_to_string(false) + " " + bool_to_string(1 > 2) + int_to_string(len(bool_to_string(false))))
+            \\    println(int_to_string(parse_int("42")) + " " + int_to_string(parse_int("-17")) + " " + int_to_string(parse_int("+8")) + " " + int_to_string(parse_int("  \t12abc")) + " " + int_to_string(parse_int("abc")) + " " + int_to_string(parse_int("")) + " " + int_to_string(parse_int("-")) + " " + int_to_string(parse_int("007")) + " " + int_to_string(parse_int("- 5")) + " " + int_to_string(parse_int("3.9")))
+            \\    println(int_to_string(parse_int("9223372036854775807")) + " " + int_to_string(parse_int("-9223372036854775808")) + " " + int_to_string(parse_int("9223372036854775808")) + " " + int_to_string(parse_int("-9223372036854775809")) + " " + int_to_string(parse_int("99999999999999999999")) + " " + int_to_string(parse_int("-99999999999999999999")) + " " + int_to_string(parse_int("9223372036854775806")))
+            \\    println(float_to_string(parse_float("3.5")) + " " + float_to_string(parse_float("-1e3")) + " " + float_to_string(parse_float("  2.25xyz")) + " " + float_to_string(parse_float("abc")) + " " + float_to_string(parse_float("")) + " " + float_to_string(parse_float(".5")) + " " + float_to_string(parse_float(substr("x12.75y", 1, 5))))
+            \\    let mut sum = 0
+            \\    let mut i = 0 - 5000
+            \\    while i < 5000 {
+            \\        sum = sum + parse_int(int_to_string(i * 7919)) - i * 7919 + len(int_to_string(i))
+            \\        i = i + 1
+            \\    }
+            \\    println(int_to_string(sum))
+            \\}
+        ,
+        .expected_output = "0 7 -7 10 99 100 -1000\n9223372036854775807 -9223372036854775808 1000000000000000000 999999999999999999 -1000000000000000000\n20 19 1\n3.14159 0 -2.5 1e+20 1.234e-06 1.23457e+06 0.333333\ntrue false false5\n42 -17 8 12 0 0 0 7 0 3\n9223372036854775807 -9223372036854775808 9223372036854775807 -9223372036854775808 9223372036854775807 -9223372036854775808 9223372036854775806\n3.5 -1000 2.25 0 0 0.5 12.75\n42783\n",
+    },
+    // parse_int and parse_float read the number at the start of a string, as C's atoll and strtod do.
+    .{
+        .name = "parse_number_prefixes",
+        .source =
+            \\module test
+            \\fn show(s: string) {
+            \\    println("[" + s + "] " + int_to_string(parse_int(s)) + " " + float_to_string(parse_float(s)))
+            \\}
+            \\fn main() {
+            \\    show("1")
+            \\    show("-0")
+            \\    show("+0")
+            \\    show("+-3")
+            \\    show("--3")
+            \\    show(" \n\r\t 77 ")
+            \\    show("12 34")
+            \\    show("1e3")
+            \\    show("0x1F")
+            \\    show("1,000")
+            \\    show("-9223372036854775807")
+            \\    show("9223372036854775799")
+            \\    show("-9223372036854775800")
+            \\    show("92233720368547758070")
+            \\    show("922337203685477580")
+            \\    show("-922337203685477581")
+            \\    show("1234567890123456789")
+            \\    show("12345678901234567890")
+            \\    show("0000000000000000000012")
+            \\    show("inf")
+            \\    show("-inf")
+            \\    show("nan")
+            \\    show("1.5e")
+            \\    show(".e5")
+            \\    show("1e400")
+            \\    show("4.9e-324")
+            \\    show("0.1")
+            \\    show("123456789.123456789")
+            \\    show("x")
+            \\    show(" ")
+            \\    show("5 ")
+            \\    show("٣")
+            \\    let whole = "id=4821;rest"
+            \\    show(substr(whole, 3, 4))
+            \\    show(substr(whole, 3, 2))
+            \\    show(char_at(whole, 5))
+            \\    println(int_to_string(string_to_int("31")))
+            \\    let fs = 0.1 + 0.2
+            \\    println(float_to_string(fs) + " " + float_to_string(10000000000.0 * 10000000000.0) + " " + float_to_string(0.0 - 0.0) + " " + float_to_string(123456.0) + " " + float_to_string(0.0001) + " " + float_to_string(0.00001))
+            \\    println(f"n={42} f={2.5} b={true} s={whole}")
+            \\    print(7)
+            \\    print(1.25)
+            \\    print(false)
+            \\    println("")
+            \\    println(12)
+            \\    println(0.5)
+            \\    println(true)
+            \\}
+        ,
+        .expected_output = "[1] 1 1\n[-0] 0 -0\n[+0] 0 0\n[+-3] 0 0\n[--3] 0 0\n[ \n\r\t 77 ] 77 77\n[12 34] 12 12\n[1e3] 1 1000\n[0x1F] 0 31\n[1,000] 1 1\n[-9223372036854775807] -9223372036854775807 -9.22337e+18\n[9223372036854775799] 9223372036854775799 9.22337e+18\n[-9223372036854775800] -9223372036854775800 -9.22337e+18\n[92233720368547758070] 9223372036854775807 9.22337e+19\n[922337203685477580] 922337203685477580 9.22337e+17\n[-922337203685477581] -922337203685477581 -9.22337e+17\n[1234567890123456789] 1234567890123456789 1.23457e+18\n[12345678901234567890] 9223372036854775807 1.23457e+19\n[0000000000000000000012] 12 12\n[inf] 0 inf\n[-inf] 0 -inf\n[nan] 0 nan\n[1.5e] 1 1.5\n[.e5] 0 0\n[1e400] 1 inf\n[4.9e-324] 4 4.94066e-324\n[0.1] 0 0.1\n[123456789.123456789] 123456789 1.23457e+08\n[x] 0 0\n[ ] 0 0\n[5 ] 5 5\n[٣] 0 0\n[4821] 4821 4821\n[48] 48 48\n[2] 2 2\n31\n0.3 1e+20 0 123456 0.0001 1e-05\nn=42 f=2.5 b=true s=id=4821;rest\n71.25false\n12\n0.5\ntrue\n",
     },
 };
 

@@ -38,21 +38,6 @@ char** dm_argv = NULL;
 // String creation (return via output pointer)
 // =====================================================================
 
-void llvm_dm_int_to_string(dm_string* out, int64_t n) {
-    *out = dm_int_to_string(n);
-    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
-}
-
-void llvm_dm_float_to_string(dm_string* out, double n) {
-    *out = dm_float_to_string(n);
-    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
-}
-
-void llvm_dm_bool_to_string(dm_string* out, int b) {
-    *out = b ? dm_string_new("true") : dm_string_new("false");
-    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
-}
-
 void llvm_dm_read_line(dm_string* out) {
     *out = dm_read_line();
     if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
@@ -85,61 +70,9 @@ void llvm_dm_panic(const dm_string* s) {
     exit(1);
 }
 
-// Checked signed arithmetic (defined integer overflow: panic), mirroring
-// Stage 0 codegen helpers. Unsigned arithmetic does not use these.
-int64_t dm_checked_add_i64(int64_t a, int64_t b) {
-    int64_t r;
-    if (__builtin_add_overflow(a, b, &r)) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
-    return r;
-}
-
-int64_t dm_checked_sub_i64(int64_t a, int64_t b) {
-    int64_t r;
-    if (__builtin_sub_overflow(a, b, &r)) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
-    return r;
-}
-
-int64_t dm_checked_mul_i64(int64_t a, int64_t b) {
-    int64_t r;
-    if (__builtin_mul_overflow(a, b, &r)) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
-    return r;
-}
-
-int64_t dm_checked_range_i64(int64_t v, int64_t lo, int64_t hi) {
-    if (v < lo || v > hi) { fprintf(stderr, "PANIC: integer overflow\n"); exit(1); }
-    return v;
-}
-
-// Checked narrowing-cast helpers, mirroring Stage 0 codegen.
-int64_t dm_cast_check_i64(int64_t v, int64_t lo, int64_t hi) {
-    if (v < lo || v > hi) { fprintf(stderr, "PANIC: integer cast out of range\n"); exit(1); }
-    return v;
-}
-
-uint64_t dm_cast_check_u64(uint64_t v, uint64_t hi) {
-    if (v > hi) { fprintf(stderr, "PANIC: integer cast out of range\n"); exit(1); }
-    return v;
-}
-
 // =====================================================================
 // String queries (take string via pointer, return scalar)
 // =====================================================================
-
-int64_t llvm_dm_parse_int(const dm_string* s) {
-    char buf[32];
-    size_t copy_len = s->len < 31 ? s->len : 31;
-    memcpy(buf, s->data, copy_len);
-    buf[copy_len] = '\0';
-    return (int64_t)atoll(buf);
-}
-
-double llvm_dm_parse_float(const dm_string* s) {
-    char buf[64];
-    size_t copy_len = s->len < 63 ? s->len : 63;
-    memcpy(buf, s->data, copy_len);
-    buf[copy_len] = '\0';
-    return atof(buf);
-}
 
 int llvm_dm_string_contains(const dm_string* a, const dm_string* b) {
     if (b->len == 0) return 1;
