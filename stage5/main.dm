@@ -1507,6 +1507,11 @@ fn ir_val_sizeof(type_name: string) -> IRValue {
     return IRValue { kind: VAL_SIZEOF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: type_name, ref_id: 0 }
 }
 
+-- The ABI size in bytes of the type of instruction value `id`
+fn ir_val_sizeof_value(id: int) -> IRValue {
+    return IRValue { kind: VAL_SIZEOF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: id }
+}
+
 fn ir_val_undef() -> IRValue {
     return IRValue { kind: VAL_UNDEF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
 }
@@ -5973,13 +5978,12 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
         i = i + 1
     }
 
-    -- Track user extern functions
+    -- An extern fn declared in source is a C function: its string
+    -- parameters and return are char*, whatever its name (Stage 0 does
+    -- the same). The compiler's own runtime declarations don't come here.
     if fd.is_extern {
-        let is_runtime = starts_with(name, "dm_") or name == "malloc" or name == "free" or name == "exit"
-        if is_runtime == false {
-            g.user_extern_fns.insert(name, true)
-            g.ir_mod.user_extern_fns.insert(name, true)
-        }
+        g.user_extern_fns.insert(name, true)
+        g.ir_mod.user_extern_fns.insert(name, true)
     }
 
     -- Track mut params
@@ -9367,10 +9371,18 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         return expr.enum_name
     }
     if expr.kind == EXPR_IF() {
-        -- Return type of then branch (then_branch is Box[Expr] to EXPR_BLOCK)
-        let tb = *expr.then_branch
-        if tb.kind == EXPR_BLOCK() and tb.stmts.len() > 0 {
-            let last = tb.stmts[tb.stmts.len() - 1]
+        -- Type of the then branch's trailing expression, else the else branch's
+        -- (a branch may end in `return` instead)
+        let then_t = infer_expr_type(gen, *expr.then_branch)
+        if then_t != "void" or expr.has_else == false {
+            return then_t
+        }
+        return infer_expr_type(gen, *expr.else_branch)
+    }
+    if expr.kind == EXPR_BLOCK() {
+        -- Type of the block's trailing expression statement
+        if expr.stmts.len() > 0 {
+            let last = expr.stmts[expr.stmts.len() - 1]
             if last.kind == STMT_EXPRESSION() {
                 return infer_expr_type(gen, *last.expr)
             }
@@ -13475,8 +13487,11 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
     let join_label = gen_next_label(g, "if_join")
     g = gen_advance_label(g)
 
-    -- Infer result type from then-branch expression
-    let if_result_type = infer_expr_type(g, *expr.then_branch)
+    -- Infer result type from the branches' trailing expressions
+    let mut if_result_type = infer_expr_type(g, expr)
+    if if_result_type == "void" {
+        if_result_type = "i64"
+    }
 
     -- Allocate a result slot before branching so both branches can store into it
     let result_alloca_id = g.builder.next_id
@@ -14537,6 +14552,28 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+
+    -- A block whose last statement is a non-void expression, such as an
+    -- `if` branch `{ a }`, has that expression's value
+    let n = expr.stmts.len()
+    if expr.has_result == false and n > 0 {
+        let last = expr.stmts[n - 1]
+        if last.kind == STMT_EXPRESSION() and infer_expr_type(g, *last.expr) != "void" {
+            let mut lead: List[Stmt] = []
+            let mut li = 0
+            while li < n - 1 {
+                lead.push(expr.stmts[li])
+                li = li + 1
+            }
+            let lead_result = generate_block_stmts(g, b, lead)
+            g = lead_result.gen
+            b = lead_result.block
+            if b.has_terminator {
+                return expr_result(g, b, g.builder.next_id - 1)
+            }
+            return generate_expr(g, b, *last.expr)
+        }
+    }
 
     -- Generate all statements in the block
     let stmts_result = generate_block_stmts(g, b, expr.stmts)
@@ -15936,27 +15973,12 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     g = val_result.gen
     b = val_result.block
 
-    -- Compute allocation size based on the value being boxed
-    let mut size = 8  -- default pointer-sized allocation
-    let arg0 = args[0]
-    if arg0.kind == EXPR_STRUCT_LITERAL() {
-        let sname = canon_type(g, arg0.type_name)
-        if g.struct_defs.contains(sname) {
-            let sinfo = g.struct_defs.get(sname)
-            -- Each field is 8 bytes (i64/f64/ptr)
-            size = sinfo.field_names.len() * 8
-            if size < 8 {
-                size = 8
-            }
-        }
-    }
-
-    -- Allocate memory via malloc
+    -- Allocate as many bytes as the boxed value's LLVM type needs
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
     malloc_inst.callee = "malloc"
     let mut margs: List[IRValue] = []
-    margs.push(ir_val_int(size))
+    margs.push(ir_val_sizeof_value(val_result.val_id))
     malloc_inst.call_args = margs
     malloc_inst.result_type = "ptr"
     malloc_inst.has_result = true
@@ -18088,6 +18110,10 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
             return dm_llvm_const_null(dm_llvm_int64_type(ctx))
         }
         if val.kind == VAL_SIZEOF() {
+            if val.str_val == "" {
+                let sized = resolve_value(gen, ir_val_inst(val.ref_id))
+                return dm_llvm_sizeof_type(dm_llvm_type_of(sized))
+            }
             return dm_llvm_sizeof_type(map_ir_type_to_llvm(gen, val.str_val))
         }
         return dm_llvm_const_null(dm_llvm_int64_type(ctx))
@@ -19207,38 +19233,45 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
         let ptr_ty = dm_llvm_pointer_type(ctx)
         let void_ty = dm_llvm_void_type(ctx)
 
-        -- Step 1: Declare the real C function with C types
-        let mut c_param_count = 0
-        dm_llvm_buf_clear()
+        -- Parameter types, computed before the shared buffer is filled
+        -- (map_ir_type_to_llvm may use it). A string is char* for the C
+        -- function and a pointer to the string for the wrapper; any other
+        -- parameter has its own type in both.
+        let mut param_tys: List[int] = []
         let mut ci = 0
         while ci < func.params.len() {
             let p = func.params[ci]
             if p.type_id == "string" {
-                dm_llvm_buf_push(ptr_ty)
+                param_tys.push(ptr_ty)
             } else {
-                dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
+                param_tys.push(map_ir_type_to_llvm(g, p.type_id))
             }
-            c_param_count = c_param_count + 1
             ci = ci + 1
         }
-        let c_ret_ty = if returns_string { ptr_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+        let other_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+
+        -- Step 1: Declare the real C function with C types
+        dm_llvm_buf_clear()
+        ci = 0
+        while ci < param_tys.len() {
+            dm_llvm_buf_push(param_tys[ci])
+            ci = ci + 1
+        }
+        let c_ret_ty = if returns_string { ptr_ty } else { other_ret_ty }
         let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
         let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
 
         -- Step 2: Declare the wrapper function with dm_string-based API
-        let mut w_param_count = 0
         dm_llvm_buf_clear()
         if returns_string {
             dm_llvm_buf_push(ptr_ty)
-            w_param_count = w_param_count + 1
         }
         ci = 0
-        while ci < func.params.len() {
-            dm_llvm_buf_push(ptr_ty)
-            w_param_count = w_param_count + 1
+        while ci < param_tys.len() {
+            dm_llvm_buf_push(param_tys[ci])
             ci = ci + 1
         }
-        let w_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+        let w_ret_ty = other_ret_ty
         let w_fn_ty = dm_llvm_function_type_buf(w_ret_ty, 0)
         let wrapper_name = "llvm_" + func.name
         let wrapper_fn = dm_llvm_module_add_function(g.llvm_module, wrapper_name, w_fn_ty)
@@ -19310,6 +19343,8 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
             dm_llvm_build_br(g.builder, merge_bb)
 
             dm_llvm_position_at_end(g.builder, merge_bb)
+            dm_llvm_build_ret_void(g.builder)
+        } else if func.return_type == "void" {
             dm_llvm_build_ret_void(g.builder)
         } else {
             dm_llvm_build_ret(g.builder, c_result)

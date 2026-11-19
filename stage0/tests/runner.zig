@@ -363,6 +363,36 @@ pub const variable_tests = [_]TestCase{
 // Tests for control flow
 pub const control_flow_tests = [_]TestCase{
     .{
+        .name = "if_expression_values",
+        .source =
+            \\module test
+            \\struct P {
+            \\    a: string,
+            \\    b: int
+            \\}
+            \\fn label(n: int) -> string {
+            \\    return "n" + int_to_string(n)
+            \\}
+            \\fn pick(t: string, n: int) -> string {
+            \\    let s = if len(t) > 0 { t } else { label(n) }
+            \\    return s
+            \\}
+            \\fn grade(n: int) -> string {
+            \\    return if n > 10 { "big" } else if n > 5 { label(n) } else { "small" }
+            \\}
+            \\fn main() {
+            \\    println(pick("", 3))
+            \\    println(pick("given", 3))
+            \\    println(grade(20) + " " + grade(7) + " " + grade(1))
+            \\    let p = if pick("", 2) == "n2" { P { a: "x", b: 2 } } else { P { a: "y", b: 3 } }
+            \\    println(p.a + int_to_string(p.b))
+            \\    let k = if pick("", 1) == "n1" { 40 + 2 } else { 0 }
+            \\    println(int_to_string(k))
+            \\}
+        ,
+        .expected_output = "n3\ngiven\nbig n7 small\nx2\n42\n",
+    },
+    .{
         .name = "if_true",
         .source =
         \\module test
@@ -2246,6 +2276,48 @@ pub const forward_ref_tests = [_]TestCase{
 
 // Tests for Box[T] heap-allocated pointer types
 pub const box_tests = [_]TestCase{
+    .{
+        .name = "box_new_of_large_struct_values",
+        .source =
+            \\module test
+            \\struct Big {
+            \\    a: string,
+            \\    b: string,
+            \\    c: string,
+            \\    d: int,
+            \\    e: int
+            \\}
+            \\struct Node {
+            \\    big: Big,
+            \\    next: Box[Node],
+            \\    has_next: bool
+            \\}
+            \\fn make(i: int) -> Big {
+            \\    return Big { a: "a" + int_to_string(i), b: "b", c: "c", d: i, e: i * 2 }
+            \\}
+            \\fn main() {
+            \\    let mut head = Node { big: make(0), next: Box_null(), has_next: false }
+            \\    let mut i = 1
+            \\    while i < 50 {
+            \\        let prev = head
+            \\        head = Node { big: make(i), next: Box_new(prev), has_next: true }
+            \\        i = i + 1
+            \\    }
+            \\    let mut total = 0
+            \\    let mut cur = head
+            \\    let mut more = true
+            \\    while more {
+            \\        total = total + cur.big.d + cur.big.e + len(cur.big.a)
+            \\        more = cur.has_next
+            \\        if more {
+            \\            cur = *cur.next
+            \\        }
+            \\    }
+            \\    println(int_to_string(total))
+            \\}
+        ,
+        .expected_output = "3815\n",
+    },
     .{
         .name = "box_struct_access",
         .source =

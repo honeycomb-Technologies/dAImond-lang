@@ -4,7 +4,7 @@
 
 dAImond is a systems programming language designed to be the fastest compiled language, the most AI-generatable language, self-compiling, memory-safe without garbage collection (region-based with full inference), and fully Turing-complete at compile time.
 
-The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 does not yet compile itself, so Stage 0 (Zig) is still needed to build it.
+The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, but its first build still comes from Stage 0 (Zig), and its link step still compiles the C runtime and LLVM bridge with `cc`.
 
 ## Repository Structure
 
@@ -219,7 +219,10 @@ gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o
 # Regenerate monolithic main.dm from modules
 cd stage5 && bash gen_bootstrap.sh
 
-# Run the integration suite against the Stage 5 binary (275 tests)
+# Compile Stage 5 with itself (--link-llvm links the LLVM bridge)
+cd stage5 && /tmp/stage5_bin main.dm -o /tmp/stage5_self --link-llvm
+
+# Run the integration suite against the Stage 5 binary (277 tests)
 bash stage5/run_parity.sh
 ```
 
@@ -229,7 +232,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 286 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results. It handles temporary file creation and cleanup. Currently 300 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -291,7 +294,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 275/275 integration tests but cannot compile itself yet, so Stage 0 is still required.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 277/277 integration tests and compiles itself, but Stage 0 is still required for its first build.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -365,15 +368,15 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 **Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
 
 **Compiler stages** (all complete):
-- Stage 0 (Zig → C): Bootstrap compiler, 298/298 integration tests
+- Stage 0 (Zig → C): Bootstrap compiler, 300/300 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): built by Stage 0, 275/275 tests, 19/19 memory-safety probes; does not compile itself yet (it now type-checks and verifies its own source, and fails at link time on the LLVM bridge's string ABI). Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+- Stage 5 (dAImond + LLVM): first built by Stage 0, 277/277 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 277/277. Its link step still compiles the C runtime, wrappers and LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
 - Debug info (DWARF) in Stage 3/4
-- Stage 5 self-compilation (Stage 5 compiles itself)
+- Bootstrapping Stage 5 without Stage 0 (Zig) or C (runtime, wrappers and LLVM bridge in dAImond)
 
 ## Documentation Maintenance
 
@@ -588,7 +591,8 @@ cd stage5 && bash gen_bootstrap.sh
 Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
 stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
 Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
-stage5_bin compiles test programs                 → native binaries (275/275 tests pass)
+stage5_bin compiles test programs                 → native binaries (277/277 tests pass)
+stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓)
 ```
 
 ## Important Notes

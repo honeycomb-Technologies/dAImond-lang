@@ -247,6 +247,11 @@ fn ir_val_sizeof(type_name: string) -> IRValue {
     return IRValue { kind: VAL_SIZEOF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: type_name, ref_id: 0 }
 }
 
+-- The ABI size in bytes of the type of instruction value `id`
+fn ir_val_sizeof_value(id: int) -> IRValue {
+    return IRValue { kind: VAL_SIZEOF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: id }
+}
+
 fn ir_val_undef() -> IRValue {
     return IRValue { kind: VAL_UNDEF(), int_val: 0, float_val: 0.0, bool_val: false, str_val: "", ref_id: 0 }
 }

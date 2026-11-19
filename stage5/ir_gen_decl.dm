@@ -510,13 +510,12 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
         i = i + 1
     }
 
-    -- Track user extern functions
+    -- An extern fn declared in source is a C function: its string
+    -- parameters and return are char*, whatever its name (Stage 0 does
+    -- the same). The compiler's own runtime declarations don't come here.
     if fd.is_extern {
-        let is_runtime = starts_with(name, "dm_") or name == "malloc" or name == "free" or name == "exit"
-        if is_runtime == false {
-            g.user_extern_fns.insert(name, true)
-            g.ir_mod.user_extern_fns.insert(name, true)
-        }
+        g.user_extern_fns.insert(name, true)
+        g.ir_mod.user_extern_fns.insert(name, true)
     }
 
     -- Track mut params

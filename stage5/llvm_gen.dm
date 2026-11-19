@@ -849,6 +849,10 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
             return dm_llvm_const_null(dm_llvm_int64_type(ctx))
         }
         if val.kind == VAL_SIZEOF() {
+            if val.str_val == "" {
+                let sized = resolve_value(gen, ir_val_inst(val.ref_id))
+                return dm_llvm_sizeof_type(dm_llvm_type_of(sized))
+            }
             return dm_llvm_sizeof_type(map_ir_type_to_llvm(gen, val.str_val))
         }
         return dm_llvm_const_null(dm_llvm_int64_type(ctx))
@@ -1968,38 +1972,45 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
         let ptr_ty = dm_llvm_pointer_type(ctx)
         let void_ty = dm_llvm_void_type(ctx)
 
-        -- Step 1: Declare the real C function with C types
-        let mut c_param_count = 0
-        dm_llvm_buf_clear()
+        -- Parameter types, computed before the shared buffer is filled
+        -- (map_ir_type_to_llvm may use it). A string is char* for the C
+        -- function and a pointer to the string for the wrapper; any other
+        -- parameter has its own type in both.
+        let mut param_tys: List[int] = []
         let mut ci = 0
         while ci < func.params.len() {
             let p = func.params[ci]
             if p.type_id == "string" {
-                dm_llvm_buf_push(ptr_ty)
+                param_tys.push(ptr_ty)
             } else {
-                dm_llvm_buf_push(map_ir_type_to_llvm(g, p.type_id))
+                param_tys.push(map_ir_type_to_llvm(g, p.type_id))
             }
-            c_param_count = c_param_count + 1
             ci = ci + 1
         }
-        let c_ret_ty = if returns_string { ptr_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+        let other_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+
+        -- Step 1: Declare the real C function with C types
+        dm_llvm_buf_clear()
+        ci = 0
+        while ci < param_tys.len() {
+            dm_llvm_buf_push(param_tys[ci])
+            ci = ci + 1
+        }
+        let c_ret_ty = if returns_string { ptr_ty } else { other_ret_ty }
         let c_fn_ty = dm_llvm_function_type_buf(c_ret_ty, 0)
         let real_fn = dm_llvm_module_add_function(g.llvm_module, func.name, c_fn_ty)
 
         -- Step 2: Declare the wrapper function with dm_string-based API
-        let mut w_param_count = 0
         dm_llvm_buf_clear()
         if returns_string {
             dm_llvm_buf_push(ptr_ty)
-            w_param_count = w_param_count + 1
         }
         ci = 0
-        while ci < func.params.len() {
-            dm_llvm_buf_push(ptr_ty)
-            w_param_count = w_param_count + 1
+        while ci < param_tys.len() {
+            dm_llvm_buf_push(param_tys[ci])
             ci = ci + 1
         }
-        let w_ret_ty = if returns_string { void_ty } else { map_ir_type_to_llvm(g, func.return_type) }
+        let w_ret_ty = other_ret_ty
         let w_fn_ty = dm_llvm_function_type_buf(w_ret_ty, 0)
         let wrapper_name = "llvm_" + func.name
         let wrapper_fn = dm_llvm_module_add_function(g.llvm_module, wrapper_name, w_fn_ty)
@@ -2071,6 +2082,8 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
             dm_llvm_build_br(g.builder, merge_bb)
 
             dm_llvm_position_at_end(g.builder, merge_bb)
+            dm_llvm_build_ret_void(g.builder)
+        } else if func.return_type == "void" {
             dm_llvm_build_ret_void(g.builder)
         } else {
             dm_llvm_build_ret(g.builder, c_result)

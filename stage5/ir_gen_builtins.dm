@@ -535,27 +535,12 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     g = val_result.gen
     b = val_result.block
 
-    -- Compute allocation size based on the value being boxed
-    let mut size = 8  -- default pointer-sized allocation
-    let arg0 = args[0]
-    if arg0.kind == EXPR_STRUCT_LITERAL() {
-        let sname = canon_type(g, arg0.type_name)
-        if g.struct_defs.contains(sname) {
-            let sinfo = g.struct_defs.get(sname)
-            -- Each field is 8 bytes (i64/f64/ptr)
-            size = sinfo.field_names.len() * 8
-            if size < 8 {
-                size = 8
-            }
-        }
-    }
-
-    -- Allocate memory via malloc
+    -- Allocate as many bytes as the boxed value's LLVM type needs
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
     malloc_inst.callee = "malloc"
     let mut margs: List[IRValue] = []
-    margs.push(ir_val_int(size))
+    margs.push(ir_val_sizeof_value(val_result.val_id))
     malloc_inst.call_args = margs
     malloc_inst.result_type = "ptr"
     malloc_inst.has_result = true

@@ -1226,10 +1226,18 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         return expr.enum_name
     }
     if expr.kind == EXPR_IF() {
-        -- Return type of then branch (then_branch is Box[Expr] to EXPR_BLOCK)
-        let tb = *expr.then_branch
-        if tb.kind == EXPR_BLOCK() and tb.stmts.len() > 0 {
-            let last = tb.stmts[tb.stmts.len() - 1]
+        -- Type of the then branch's trailing expression, else the else branch's
+        -- (a branch may end in `return` instead)
+        let then_t = infer_expr_type(gen, *expr.then_branch)
+        if then_t != "void" or expr.has_else == false {
+            return then_t
+        }
+        return infer_expr_type(gen, *expr.else_branch)
+    }
+    if expr.kind == EXPR_BLOCK() {
+        -- Type of the block's trailing expression statement
+        if expr.stmts.len() > 0 {
+            let last = expr.stmts[expr.stmts.len() - 1]
             if last.kind == STMT_EXPRESSION() {
                 return infer_expr_type(gen, *last.expr)
             }
@@ -5334,8 +5342,11 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
     let join_label = gen_next_label(g, "if_join")
     g = gen_advance_label(g)
 
-    -- Infer result type from then-branch expression
-    let if_result_type = infer_expr_type(g, *expr.then_branch)
+    -- Infer result type from the branches' trailing expressions
+    let mut if_result_type = infer_expr_type(g, expr)
+    if if_result_type == "void" {
+        if_result_type = "i64"
+    }
 
     -- Allocate a result slot before branching so both branches can store into it
     let result_alloca_id = g.builder.next_id
@@ -6396,6 +6407,28 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+
+    -- A block whose last statement is a non-void expression, such as an
+    -- `if` branch `{ a }`, has that expression's value
+    let n = expr.stmts.len()
+    if expr.has_result == false and n > 0 {
+        let last = expr.stmts[n - 1]
+        if last.kind == STMT_EXPRESSION() and infer_expr_type(g, *last.expr) != "void" {
+            let mut lead: List[Stmt] = []
+            let mut li = 0
+            while li < n - 1 {
+                lead.push(expr.stmts[li])
+                li = li + 1
+            }
+            let lead_result = generate_block_stmts(g, b, lead)
+            g = lead_result.gen
+            b = lead_result.block
+            if b.has_terminator {
+                return expr_result(g, b, g.builder.next_id - 1)
+            }
+            return generate_expr(g, b, *last.expr)
+        }
+    }
 
     -- Generate all statements in the block
     let stmts_result = generate_block_stmts(g, b, expr.stmts)
