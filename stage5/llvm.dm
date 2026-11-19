@@ -72,6 +72,8 @@ extern fn dm_llvm_build_sub(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_mul(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_sdiv(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_srem(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_udiv(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_urem(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_neg(b: int, val: int, name: string) -> int
 extern fn dm_llvm_build_fadd(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_fsub(b: int, lhs: int, rhs: int, name: string) -> int

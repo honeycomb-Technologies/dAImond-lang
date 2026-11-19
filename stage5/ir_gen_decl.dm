@@ -457,6 +457,10 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
 
     let mut func = ir_function_new(name, ret_type)
     func.is_extern = fd.is_extern
+    func.is_variadic = fd.is_variadic
+    if fd.is_variadic and ret_type == "string" {
+        g = ir_type_error(g, "variadic extern fn '" + name + "' cannot return string; declare it as returning int, the address of the C string", fd.line)
+    }
 
     -- Build parameter list
     let mut mut_flags = ""
@@ -521,6 +525,20 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     -- Track mut params
     if string_contains(mut_flags, "1") {
         g.mut_param_fns.insert(name, mut_flags)
+    }
+
+    -- A source extern fn replaces an earlier declaration of the same C
+    -- function, such as the compiler's own malloc; calls convert pointers
+    -- and ints between the two signatures
+    if fd.is_extern {
+        let mut fi = 0
+        while fi < g.ir_mod.functions.len() {
+            if g.ir_mod.functions[fi].name == name and g.ir_mod.functions[fi].is_extern {
+                g.ir_mod.functions[fi] = func
+                return g
+            }
+            fi = fi + 1
+        }
     }
 
     g.ir_mod.functions.push(func)

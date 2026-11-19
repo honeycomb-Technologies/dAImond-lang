@@ -1618,19 +1618,31 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
     pp = p_skip_newlines(pp)
     while p_peek(pp) != TK_RPAREN() and p_peek(pp) != TK_EOF() {
         pp = p_skip_newlines(pp)
-        let pname = p_cur(pp).value
-        pp = p_advance(pp)
-        pp = p_expect(pp, TK_COLON())
-        let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
-        let pty = parse_type(pp)
-        pp = pty.p
-        let mut eparam = func_param_new(pname, pty.type_name)
-        eparam.is_ref = pty_ref
-        fd.params.push(eparam)
-        if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
+        if p_peek(pp) == TK_DOTDOT() {
+            -- `...` (lexed as `..` then `.`): further arguments are C varargs
             pp = p_advance(pp)
+            pp = p_expect(pp, TK_DOT())
+            fd.is_variadic = true
+            pp = p_skip_newlines(pp)
+            if p_peek(pp) != TK_RPAREN() {
+                eprintln("Error: `...` must be the last parameter of extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+                exit(1)
+            }
+        } else {
+            let pname = p_cur(pp).value
+            pp = p_advance(pp)
+            pp = p_expect(pp, TK_COLON())
+            let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
+            let pty = parse_type(pp)
+            pp = pty.p
+            let mut eparam = func_param_new(pname, pty.type_name)
+            eparam.is_ref = pty_ref
+            fd.params.push(eparam)
+            if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
+                pp = p_advance(pp)
+            }
+            pp = p_skip_newlines(pp)
         }
-        pp = p_skip_newlines(pp)
     }
     pp = p_expect(pp, TK_RPAREN())
 

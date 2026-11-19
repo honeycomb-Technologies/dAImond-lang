@@ -345,6 +345,9 @@ struct IRInst {
     cast_val: IRValue,
     cast_from: string,
     cast_to: string,
+    -- Integer type of a binary operator's operands, for unsigned
+    -- comparison and division; "" when not an integer operation
+    operand_type: string,
     -- Phi
     phi_entries: List[PhiEntry],
     -- List new
@@ -375,6 +378,7 @@ fn ir_inst_new(id: int, op: int) -> IRInst {
         callee: "", call_args: [],
         callee_val: undef,
         cast_val: undef, cast_from: "", cast_to: "",
+        operand_type: "",
         phi_entries: [],
         elem_type: "",
         simd_scalar: undef, simd_vec_type: "", simd_elements: [],
@@ -499,6 +503,8 @@ struct IRFunction {
     blocks: List[IRBasicBlock],
     is_async: bool,
     is_extern: bool,
+    -- A C function that takes further arguments after its parameters
+    is_variadic: bool,
     is_comptime: bool
 }
 
@@ -506,7 +512,7 @@ fn ir_function_new(name: string, ret_type: string) -> IRFunction {
     return IRFunction {
         name: name, params: [], return_type: ret_type,
         blocks: [],
-        is_async: false, is_extern: false, is_comptime: false
+        is_async: false, is_extern: false, is_variadic: false, is_comptime: false
     }
 }
 

@@ -36,6 +36,52 @@ fn coerce_int_call_arg(gen: LLVMGenerator, callee: int, fn_name: string, user_id
     }
 }
 
+-- Convert between a pointer and an integer where a call's argument or
+-- result is one and the other side wants the other: a source extern fn
+-- may declare a C pointer as int, while the compiler passes ptr.
+fn coerce_ptr_int(gen: LLVMGenerator, val: int, want_ty: int) -> int {
+    unsafe {
+        let have_kind = dm_llvm_get_type_kind(dm_llvm_type_of(val))
+        let want_kind = dm_llvm_get_type_kind(want_ty)
+        if have_kind == 8 and want_kind == 12 { return dm_llvm_build_int_to_ptr(gen.builder, val, want_ty, "int.ptr") }
+        if have_kind == 12 and want_kind == 8 { return dm_llvm_build_ptr_to_int(gen.builder, val, want_ty, "ptr.int") }
+        return val
+    }
+}
+
+-- A string argument of a variadic C function as char*: the address of
+-- its bytes. A string literal already is one.
+fn string_arg_as_cstr(gen: LLVMGenerator, arg: IRValue, val: int) -> int {
+    unsafe {
+        if arg.kind == VAL_CONST_STRING() { return val }
+        let b = gen.builder
+        let ptr_ty = dm_llvm_pointer_type(gen.context)
+        if is_string_ptr(gen, arg) and dm_llvm_get_type_kind(dm_llvm_type_of(val)) == 12 {
+            let data_slot = dm_llvm_build_struct_gep2(b, gen.dm_string_type, val, 0, "cstr.addr")
+            return dm_llvm_build_load2(b, ptr_ty, data_slot, "cstr")
+        }
+        if dm_llvm_type_of(val) == gen.dm_string_type {
+            return dm_llvm_build_extract_value(b, val, 0, "cstr")
+        }
+        return val
+    }
+}
+
+-- An argument past a variadic C function's parameters, with C's default
+-- promotions: float to double, and bool, i8 and i16 to int
+fn promote_vararg(gen: LLVMGenerator, val: int) -> int {
+    unsafe {
+        let ty = dm_llvm_type_of(val)
+        let kind = dm_llvm_get_type_kind(ty)
+        if kind == 2 { return dm_llvm_build_fp_cast(gen.builder, val, dm_llvm_double_type(gen.context), "vararg.f64") }
+        if kind == 8 and dm_llvm_get_int_type_width(ty) < 32 {
+            let is_signed = if dm_llvm_get_int_type_width(ty) == 1 { 0 } else { 1 }
+            return dm_llvm_build_int_cast2(gen.builder, val, dm_llvm_int32_type(gen.context), is_signed, "vararg.i32")
+        }
+        return val
+    }
+}
+
 fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
@@ -61,18 +107,32 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Regular (non-wrapper) call
         -- Resolve arguments, handling string pointer loads
+        let nparams = dm_llvm_count_param_types(fn_ty)
+        let is_source_extern = g.ir_module.user_extern_fns.contains(callee_name)
+        let is_variadic = is_source_extern and dm_llvm_is_function_var_arg(fn_ty) != 0
         let mut args: List[int] = []
         let mut ai = 0
         while ai < inst.call_args.len() {
             let arg = inst.call_args[ai]
             let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
-            -- A string or list pointer passed by value: pass the value
-            let param = dm_llvm_get_param(callee, ai)
-            if param != 0 {
-                val = load_handle_as(g, arg, val, dm_llvm_type_of(param))
+            -- Strings go to a variadic C function as char*, and arguments
+            -- past its parameters get C's default promotions
+            let is_string_arg = arg.kind == VAL_CONST_STRING() or is_string_ptr(g, arg) or dm_llvm_type_of(val) == g.dm_string_type
+            if is_variadic and is_string_arg {
+                val = string_arg_as_cstr(g, arg, val)
+            } else if is_variadic and ai >= nparams {
+                val = promote_vararg(g, val)
             }
-            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
+            if ai < nparams and (is_variadic and is_string_arg) == false {
+                -- A string or list pointer passed by value: pass the value
+                let param = dm_llvm_get_param(callee, ai)
+                val = load_handle_as(g, arg, val, dm_llvm_type_of(param))
+                val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
+                if is_source_extern {
+                    val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
+                }
+            }
             args.push(val)
             ai = ai + 1
         }
@@ -90,6 +150,9 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         g = check_call_args(g, fn_ty, callee)
         let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
+        if is_source_extern and inst.has_result and (inst.result_type == "ptr" or is_int_type(inst.result_type)) {
+            result = coerce_ptr_int(g, result, map_ir_type_to_llvm(g, inst.result_type))
+        }
         -- Check if callee returns dm_string: store to alloca and track as string ptr
         if callee_returns_string(g, callee_name) and result != 0 {
             let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.ret")

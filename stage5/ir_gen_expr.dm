@@ -700,6 +700,224 @@ fn generate_byte_at(gen: IRGenerator, block: IRBasicBlock, s_expr: Expr, i_expr:
     return expr_result(g, b, cast)
 }
 
+-- Emit a cast of `val` from type `from` to type `to`
+fn emit_ir_cast(gen: IRGenerator, block: IRBasicBlock, val: IRValue, from: string, to: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let id = g.builder.next_id
+    let mut inst = ir_inst_new(id, OP_CAST())
+    inst.cast_val = val
+    inst.cast_from = from
+    inst.cast_to = to
+    inst.result_type = to
+    inst.has_result = true
+    b.instructions.push(inst)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
+-- Emit a store of `val` through `ptr`
+fn emit_ir_store(gen: IRGenerator, block: IRBasicBlock, ptr: IRValue, val: IRValue) -> GenResult {
+    let mut g = gen
+    let mut b = block
+    let mut st = ir_inst_new(g.builder.next_id, OP_STORE())
+    st.store_ptr = ptr
+    st.store_val = val
+    st.has_result = false
+    b.instructions.push(st)
+    g.builder.next_id = g.builder.next_id + 1
+    return gen_result(g, b)
+}
+
+-- Emit the address of field `index` (of IR type `field_t`) of the
+-- struct of IR type `struct_t` at `base`
+fn emit_ir_field_addr(gen: IRGenerator, block: IRBasicBlock, base: IRValue, struct_t: string, index: int, field_t: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let id = g.builder.next_id
+    let mut gep = ir_inst_new(id, OP_GEP())
+    gep.gep_base = base
+    gep.alloc_type = struct_t
+    gep.field_index = index
+    gep.field_type = field_t
+    gep.result_type = "ptr(" + field_t + ")"
+    gep.has_result = true
+    b.instructions.push(gep)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
+-- Generate an integer argument of a raw memory primitive
+fn generate_raw_int_arg(gen: IRGenerator, block: IRBasicBlock, fn_name: string, what: string, arg: Expr) -> ExprResult {
+    let mut g = gen
+    let arg_t = infer_expr_type(g, arg)
+    if is_integer_type(arg_t) == false {
+        g = ir_type_error(g, fn_name + "() takes an integer " + what + ", not '" + builtin_src_type(arg_t) + "'", arg.line)
+    }
+    let r = generate_expr(g, block, arg)
+    if arg_t == "i64" or is_integer_type(arg_t) == false {
+        return r
+    }
+    return emit_ir_cast(r.gen, r.block, ir_val_inst(r.val_id), arg_t, "i64")
+}
+
+-- An address argument as a pointer
+fn generate_raw_ptr_arg(gen: IRGenerator, block: IRBasicBlock, fn_name: string, arg: Expr) -> ExprResult {
+    let r = generate_raw_int_arg(gen, block, fn_name, "address", arg)
+    return emit_ir_cast(r.gen, r.block, ir_val_inst(r.val_id), "i64", "ptr")
+}
+
+-- Whether a source type names a type whose size is known
+fn sized_type_known(gen: IRGenerator, t: string) -> bool {
+    let ir_t = map_type_name(t)
+    if is_integer_type(ir_t) or is_float_type(ir_t) or t == "string" or t == "bool" { return true }
+    if starts_with(t, "List[") or starts_with(t, "Box[") { return true }
+    return gen.struct_defs.contains(t) or gen.enum_defs.contains(t)
+}
+
+fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, expr: Expr) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let args = expr.args
+    if g.unsafe_depth == 0 {
+        g = ir_type_error(g, fn_name + "() works on raw memory and requires an unsafe block", expr.line)
+        return expr_result(g, b, 0)
+    }
+    let want = if fn_name == "string_from_raw" { 3 } else if starts_with(fn_name, "store_") { 2 } else if fn_name == "size_of" { 0 } else { 1 }
+    if args.len() != want {
+        g = ir_type_error(g, fn_name + "() takes " + int_to_string(want) + " arguments, not " + int_to_string(args.len()), expr.line)
+        return expr_result(g, b, 0)
+    }
+    let mem_t = raw_mem_type(fn_name)
+
+    -- size_of[T]()
+    if fn_name == "size_of" {
+        if expr.generic_args.len() != 1 {
+            g = ir_type_error(g, "size_of takes one type: size_of[T]()", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let mut t = expr.generic_args[0]
+        g = ensure_type_instances(g, t, expr.line)
+        t = canon_type(g, t)
+        if sized_type_known(g, t) == false {
+            g = ir_type_error(g, "size_of: unknown type '" + t + "'", expr.line)
+            return expr_result(g, b, 0)
+        }
+        return emit_ir_cast(g, b, ir_val_sizeof(map_type_name(t)), "i64", "i64")
+    }
+
+    -- load_T(addr)
+    if starts_with(fn_name, "load_") {
+        let p = generate_raw_ptr_arg(g, b, fn_name, args[0])
+        g = p.gen
+        b = p.block
+        let ld = g.builder.next_id
+        let mut ld_inst = ir_inst_new(ld, OP_LOAD())
+        ld_inst.load_ptr = ir_val_inst(p.val_id)
+        ld_inst.load_type = mem_t
+        ld_inst.result_type = mem_t
+        ld_inst.has_result = true
+        b.instructions.push(ld_inst)
+        g.builder.next_id = ld + 1
+        let wide_t = if is_float_type(mem_t) { "f64" } else { "i64" }
+        return emit_ir_cast(g, b, ir_val_inst(ld), mem_t, wide_t)
+    }
+
+    -- store_T(addr, v)
+    if starts_with(fn_name, "store_") {
+        let p = generate_raw_ptr_arg(g, b, fn_name, args[0])
+        g = p.gen
+        b = p.block
+        let val_t = infer_expr_type(g, args[1])
+        let fits = if is_float_type(mem_t) { is_float_type(val_t) or is_integer_type(val_t) } else { is_integer_type(val_t) }
+        if fits == false {
+            g = ir_type_error(g, fn_name + "() cannot store a value of type '" + builtin_src_type(val_t) + "'", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let v = generate_expr(g, b, args[1])
+        let narrow = emit_ir_cast(v.gen, v.block, ir_val_inst(v.val_id), val_t, mem_t)
+        let st = emit_ir_store(narrow.gen, narrow.block, ir_val_inst(p.val_id), ir_val_inst(narrow.val_id))
+        return expr_result(st.gen, st.block, 0)
+    }
+
+    -- addr_of(place)
+    if fn_name == "addr_of" {
+        let a = generate_addr(g, b, args[0])
+        g = a.gen
+        b = a.block
+        if a.ok == false {
+            g = ir_type_error(g, "addr_of() takes a variable, a field or a list element", expr.line)
+            return expr_result(g, b, 0)
+        }
+        return emit_ir_cast(g, b, a.ptr, "ptr", "i64")
+    }
+
+    -- string_data(s)
+    if fn_name == "string_data" {
+        let s_t = infer_expr_type(g, args[0])
+        if s_t != "string" {
+            g = ir_type_error(g, "string_data() takes a string, not '" + builtin_src_type(s_t) + "'", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let s = generate_expr(g, b, args[0])
+        g = s.gen
+        b = s.block
+        let slot = g.builder.next_id
+        let mut slot_inst = ir_inst_new(slot, OP_ALLOCA())
+        slot_inst.alloc_type = "string"
+        slot_inst.result_type = "ptr(string)"
+        slot_inst.has_result = true
+        b.instructions.push(slot_inst)
+        g.builder.next_id = slot + 1
+        let st = emit_ir_store(g, b, ir_val_inst(slot), ir_val_inst(s.val_id))
+        let data_addr = emit_ir_field_addr(st.gen, st.block, ir_val_inst(slot), "string", 0, "ptr")
+        g = data_addr.gen
+        b = data_addr.block
+        let ld = g.builder.next_id
+        let mut ld_inst = ir_inst_new(ld, OP_LOAD())
+        ld_inst.load_ptr = ir_val_inst(data_addr.val_id)
+        ld_inst.load_type = "ptr"
+        ld_inst.result_type = "ptr"
+        ld_inst.has_result = true
+        b.instructions.push(ld_inst)
+        g.builder.next_id = ld + 1
+        return emit_ir_cast(g, b, ir_val_inst(ld), "ptr", "i64")
+    }
+
+    -- string_from_raw(ptr, len, cap)
+    let p = generate_raw_ptr_arg(g, b, fn_name, args[0])
+    let n = generate_raw_int_arg(p.gen, p.block, fn_name, "length", args[1])
+    let c = generate_raw_int_arg(n.gen, n.block, fn_name, "capacity", args[2])
+    g = c.gen
+    b = c.block
+    let slot = g.builder.next_id
+    let mut slot_inst = ir_inst_new(slot, OP_ALLOCA())
+    slot_inst.alloc_type = "string"
+    slot_inst.result_type = "ptr(string)"
+    slot_inst.has_result = true
+    b.instructions.push(slot_inst)
+    g.builder.next_id = slot + 1
+    let mut fi = 0
+    while fi < 3 {
+        let field_t = if fi == 0 { "ptr" } else { "i64" }
+        let field_val = if fi == 0 { p.val_id } else if fi == 1 { n.val_id } else { c.val_id }
+        let fa = emit_ir_field_addr(g, b, ir_val_inst(slot), "string", fi, field_t)
+        let st = emit_ir_store(fa.gen, fa.block, ir_val_inst(fa.val_id), ir_val_inst(field_val))
+        g = st.gen
+        b = st.block
+        fi = fi + 1
+    }
+    let ld = g.builder.next_id
+    let mut ld_inst = ir_inst_new(ld, OP_LOAD())
+    ld_inst.load_ptr = ir_val_inst(slot)
+    ld_inst.load_type = "string"
+    ld_inst.result_type = "string"
+    ld_inst.has_result = true
+    b.instructions.push(ld_inst)
+    g.builder.next_id = ld + 1
+    return expr_result(g, b, ld)
+}
+
 fn static_type(gen: IRGenerator, expr: Expr) -> string {
     let k = expr.kind
     if k == EXPR_LITERAL_INT() { return "int" }
@@ -1048,6 +1266,10 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         -- Logical operators always produce bool
         if op == BINOP_AND() or op == BINOP_OR() {
             return "bool"
+        }
+        let common_t = binary_int_type(gen, expr)
+        if common_t != "" {
+            return common_t
         }
         -- Arithmetic: infer from left operand
         let left_type = infer_expr_type(gen, *expr.left)
@@ -1695,17 +1917,39 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     let lhs_result = generate_expr(g, b, *expr.left)
     g = lhs_result.gen
     b = lhs_result.block
-    let lhs_id = lhs_result.val_id
+    let mut lhs_id = lhs_result.val_id
 
     -- Evaluate right operand
     let rhs_result = generate_expr(g, b, *expr.right)
     g = rhs_result.gen
     b = rhs_result.block
-    let rhs_id = rhs_result.val_id
+    let mut rhs_id = rhs_result.val_id
 
     -- Infer the type of the left operand to select the correct op family
-    let lhs_type = infer_expr_type(g, *expr.left)
-    let rhs_type = infer_expr_type(g, *expr.right)
+    let mut lhs_type = infer_expr_type(g, *expr.left)
+    let mut rhs_type = infer_expr_type(g, *expr.right)
+
+    -- Integers of different types meet at one type (see binary_int_type)
+    let common_t = binary_int_type(g, expr)
+    if common_t != "" {
+        if lhs_type != common_t {
+            g = check_int_literal_fits(g, *expr.left, common_t)
+            let lc = emit_ir_cast(g, b, ir_val_inst(lhs_id), lhs_type, common_t)
+            g = lc.gen
+            b = lc.block
+            lhs_id = lc.val_id
+            lhs_type = common_t
+        }
+        if rhs_type != common_t {
+            g = check_int_literal_fits(g, *expr.right, common_t)
+            let rc = emit_ir_cast(g, b, ir_val_inst(rhs_id), rhs_type, common_t)
+            g = rc.gen
+            b = rc.block
+            rhs_id = rc.val_id
+            rhs_type = common_t
+        }
+    }
+    let int_operand_t = if is_integer_type(lhs_type) and lhs_type == rhs_type { lhs_type } else { "" }
 
     -- Determine if either operand is float or string
     let is_string = lhs_type == "string" or rhs_type == "string"
@@ -1903,6 +2147,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         div_inst.lhs = ir_val_inst(lhs_id)
         div_inst.rhs = ir_val_inst(rhs_id)
         div_inst.result_type = arith_type
+        div_inst.operand_type = int_operand_t
         div_inst.has_result = true
         ok_block.instructions.push(div_inst)
         g.builder.next_id = div_id + 1
@@ -1957,6 +2202,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         mod_inst.lhs = ir_val_inst(lhs_id)
         mod_inst.rhs = ir_val_inst(rhs_id)
         mod_inst.result_type = arith_type
+        mod_inst.operand_type = int_operand_t
         mod_inst.has_result = true
         ok_block.instructions.push(mod_inst)
         g.builder.next_id = mod_id + 1
@@ -2054,6 +2300,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -2066,6 +2313,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -2078,6 +2326,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -2090,6 +2339,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -2363,6 +2613,11 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Unsafe fence: calling an `extern fn` requires an unsafe block
     check_extern_fence(g, fn_name, expr.line)
+
+    -- Raw memory primitives (load_T, store_T, addr_of, size_of, ...)
+    if is_raw_builtin(fn_name) {
+        return generate_raw_builtin(g, b, fn_name, expr)
+    }
 
     -- --------------------------------------------------------
     -- Special case dispatch (in priority order)
@@ -4292,6 +4547,81 @@ fn int_fit_min(name: string) -> int {
     if name == "i16" { return -32768 }
     if name == "i32" { return -2147483648 }
     return 0 - 9223372036854775807 - 1
+}
+
+-- An integer constant: a literal, or literals combined with unary minus,
+-- parentheses, +, - and *
+fn is_int_literal_expr(e: Expr) -> bool {
+    if e.kind == EXPR_LITERAL_INT() { return true }
+    if e.kind == EXPR_GROUPED() { return is_int_literal_expr(*e.operand) }
+    if e.kind == EXPR_UNARY() and e.op == UNOP_NEG() { return is_int_literal_expr(*e.operand) }
+    if e.kind == EXPR_BINARY() and (e.op == BINOP_ADD() or e.op == BINOP_SUB() or e.op == BINOP_MUL()) {
+        return is_int_literal_expr(*e.left) and is_int_literal_expr(*e.right)
+    }
+    return false
+}
+
+fn int_literal_value(e: Expr) -> int {
+    if e.kind == EXPR_GROUPED() { return int_literal_value(*e.operand) }
+    if e.kind == EXPR_UNARY() { return 0 - int_literal_value(*e.operand) }
+    if e.kind == EXPR_BINARY() {
+        let l = int_literal_value(*e.left)
+        let r = int_literal_value(*e.right)
+        if e.op == BINOP_ADD() { return l + r }
+        if e.op == BINOP_SUB() { return l - r }
+        return l * r
+    }
+    return e.int_val
+}
+
+-- Convert an integer value of type `from` to type `to` where it is
+-- stored, passed or returned as `to`: constants that fit and widening
+-- convert; narrowing anything else is an error that asks for `as`.
+fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, from: string, to: string, what: string) -> ExprResult {
+    let mut g = gen
+    if is_integer_type(from) == false or is_integer_type(to) == false or from == to {
+        return expr_result(g, block, val_id)
+    }
+    if is_int_literal_expr(e) {
+        g = check_int_literal_fits(g, e, to)
+    } else if type_bit_width(from) > type_bit_width(to) {
+        g = ir_type_error(g, what + " has type " + builtin_src_type(from) + ", which does not fit in " + to + "; convert it with `as " + to + "`", e.line)
+    }
+    return emit_ir_cast(g, block, ir_val_inst(val_id), from, to)
+}
+
+-- The integer type both operands of a binary operator take when they
+-- are integers of different types: an integer literal takes the other
+-- operand's type, as in `fd < 0` with fd: i32; otherwise the narrower
+-- operand widens. "" when the operands need no conversion.
+fn binary_int_type(gen: IRGenerator, expr: Expr) -> string {
+    let lt = infer_expr_type(gen, *expr.left)
+    let rt = infer_expr_type(gen, *expr.right)
+    if is_integer_type(lt) == false or is_integer_type(rt) == false or lt == rt { return "" }
+    let l_lit = is_int_literal_expr(*expr.left)
+    let r_lit = is_int_literal_expr(*expr.right)
+    if r_lit and l_lit == false { return lt }
+    if l_lit and r_lit == false { return rt }
+    if type_bit_width(rt) > type_bit_width(lt) { return rt }
+    return lt
+}
+
+-- Report an integer literal that does not fit the type it converts to
+fn check_int_literal_fits(gen: IRGenerator, e: Expr, t: string) -> IRGenerator {
+    if is_int_literal_expr(e) == false or type_bit_width(t) >= 64 { return gen }
+    let v = int_literal_value(e)
+    let mut lo = 0
+    let mut hi = 0
+    if is_unsigned_type(t) {
+        hi = if t == "u8" { 255 } else if t == "u16" { 65535 } else { 4294967295 }
+    } else {
+        lo = int_fit_min(t)
+        hi = int_fit_max(t)
+    }
+    if v < lo or v > hi {
+        return ir_type_error(gen, "integer literal " + int_to_string(v) + " does not fit in " + t, e.line)
+    }
+    return gen
 }
 
 fn int_fit_max(name: string) -> int {

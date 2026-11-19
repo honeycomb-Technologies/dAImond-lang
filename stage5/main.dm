@@ -1026,6 +1026,8 @@ struct FunctionDecl {
     body: List[Stmt],
     effects: List[string],
     is_extern: bool,
+    -- An extern fn declared with a trailing `...`, like C's printf
+    is_variadic: bool,
     is_async: bool,
     is_comptime: bool,
     line: int,
@@ -1041,6 +1043,7 @@ fn func_decl_new(name: string, line: int, col: int) -> FunctionDecl {
         body: [],
         effects: [],
         is_extern: false,
+        is_variadic: false,
         is_async: false,
         is_comptime: false,
         line: line,
@@ -1605,6 +1608,9 @@ struct IRInst {
     cast_val: IRValue,
     cast_from: string,
     cast_to: string,
+    -- Integer type of a binary operator's operands, for unsigned
+    -- comparison and division; "" when not an integer operation
+    operand_type: string,
     -- Phi
     phi_entries: List[PhiEntry],
     -- List new
@@ -1635,6 +1641,7 @@ fn ir_inst_new(id: int, op: int) -> IRInst {
         callee: "", call_args: [],
         callee_val: undef,
         cast_val: undef, cast_from: "", cast_to: "",
+        operand_type: "",
         phi_entries: [],
         elem_type: "",
         simd_scalar: undef, simd_vec_type: "", simd_elements: [],
@@ -1759,6 +1766,8 @@ struct IRFunction {
     blocks: List[IRBasicBlock],
     is_async: bool,
     is_extern: bool,
+    -- A C function that takes further arguments after its parameters
+    is_variadic: bool,
     is_comptime: bool
 }
 
@@ -1766,7 +1775,7 @@ fn ir_function_new(name: string, ret_type: string) -> IRFunction {
     return IRFunction {
         name: name, params: [], return_type: ret_type,
         blocks: [],
-        is_async: false, is_extern: false, is_comptime: false
+        is_async: false, is_extern: false, is_variadic: false, is_comptime: false
     }
 }
 
@@ -2393,6 +2402,8 @@ extern fn dm_llvm_build_sub(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_mul(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_sdiv(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_srem(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_udiv(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_urem(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_neg(b: int, val: int, name: string) -> int
 extern fn dm_llvm_build_fadd(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_fsub(b: int, lhs: int, rhs: int, name: string) -> int
@@ -4162,19 +4173,31 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
     pp = p_skip_newlines(pp)
     while p_peek(pp) != TK_RPAREN() and p_peek(pp) != TK_EOF() {
         pp = p_skip_newlines(pp)
-        let pname = p_cur(pp).value
-        pp = p_advance(pp)
-        pp = p_expect(pp, TK_COLON())
-        let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
-        let pty = parse_type(pp)
-        pp = pty.p
-        let mut eparam = func_param_new(pname, pty.type_name)
-        eparam.is_ref = pty_ref
-        fd.params.push(eparam)
-        if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
+        if p_peek(pp) == TK_DOTDOT() {
+            -- `...` (lexed as `..` then `.`): further arguments are C varargs
             pp = p_advance(pp)
+            pp = p_expect(pp, TK_DOT())
+            fd.is_variadic = true
+            pp = p_skip_newlines(pp)
+            if p_peek(pp) != TK_RPAREN() {
+                eprintln("Error: `...` must be the last parameter of extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+                exit(1)
+            }
+        } else {
+            let pname = p_cur(pp).value
+            pp = p_advance(pp)
+            pp = p_expect(pp, TK_COLON())
+            let pty_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
+            let pty = parse_type(pp)
+            pp = pty.p
+            let mut eparam = func_param_new(pname, pty.type_name)
+            eparam.is_ref = pty_ref
+            fd.params.push(eparam)
+            if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
+                pp = p_advance(pp)
+            }
+            pp = p_skip_newlines(pp)
         }
-        pp = p_skip_newlines(pp)
     }
     pp = p_expect(pp, TK_RPAREN())
 
@@ -5224,6 +5247,47 @@ fn map_builtin_name(name: string) -> string {
     return name
 }
 
+-- ============================================================
+-- RAW MEMORY PRIMITIVES
+-- Builtins for code that manages memory itself, such as the runtime.
+-- Each one needs an unsafe block. Addresses are ints.
+--   load_T(addr) and store_T(addr, v), where T is u8, i8, u16, i16,
+--     u32, i32, i64, f32 or f64. Integer loads widen to int (zero- or
+--     sign-extended by T); float loads widen to float. Stores narrow v.
+--   addr_of(place): the address of a variable, field or list element
+--   size_of[T](): the size of type T in bytes
+--   string_data(s): the address of a string's bytes (not NUL-terminated)
+--   string_from_raw(ptr, len, cap): the string at ptr; cap 0 marks
+--     memory the string does not own
+-- ============================================================
+
+-- The memory type a load_T or store_T builtin accesses, or ""
+fn raw_mem_type(name: string) -> string {
+    let mut t = ""
+    if starts_with(name, "load_") {
+        t = substr(name, 5, len(name) - 5)
+    } else if starts_with(name, "store_") {
+        t = substr(name, 6, len(name) - 6)
+    } else {
+        return ""
+    }
+    if t == "u8" or t == "i8" or t == "u16" or t == "i16" or t == "u32" or t == "i32" { return t }
+    if t == "i64" or t == "f32" or t == "f64" { return t }
+    return ""
+}
+
+fn is_raw_builtin(name: string) -> bool {
+    if raw_mem_type(name) != "" { return true }
+    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw"
+}
+
+fn raw_builtin_return_type(name: string) -> string {
+    if starts_with(name, "store_") { return "void" }
+    if name == "string_from_raw" { return "string" }
+    if name == "load_f32" or name == "load_f64" { return "f64" }
+    return "i64"
+}
+
 fn is_builtin_fn(name: string) -> bool {
     if name == "print" or name == "println" { return true }
     if name == "eprint" or name == "eprintln" { return true }
@@ -5245,6 +5309,7 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "Box_new" or name == "Box_null" { return true }
     if name == "Map_new" { return true }
     if name == "byte_at" or name == "hash_key" { return true }
+    if is_raw_builtin(name) { return true }
     if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return true }
     if name == "char_to_string" { return true }
     if name == "string_to_int" { return true }
@@ -5264,6 +5329,8 @@ fn builtin_return_type(name: string) -> string {
     if name == "exit" { return "void" }
     if name == "len" { return "i64" }
     if name == "byte_at" or name == "hash_key" { return "i64" }
+    if is_raw_builtin(name) { return raw_builtin_return_type(name) }
+    if name == "Box_new" or name == "Box_null" { return "ptr" }
     if name == "char_at" { return "string" }
     if name == "substr" { return "string" }
     if name == "int_to_string" { return "string" }
@@ -5925,6 +5992,10 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
 
     let mut func = ir_function_new(name, ret_type)
     func.is_extern = fd.is_extern
+    func.is_variadic = fd.is_variadic
+    if fd.is_variadic and ret_type == "string" {
+        g = ir_type_error(g, "variadic extern fn '" + name + "' cannot return string; declare it as returning int, the address of the C string", fd.line)
+    }
 
     -- Build parameter list
     let mut mut_flags = ""
@@ -5989,6 +6060,20 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     -- Track mut params
     if string_contains(mut_flags, "1") {
         g.mut_param_fns.insert(name, mut_flags)
+    }
+
+    -- A source extern fn replaces an earlier declaration of the same C
+    -- function, such as the compiler's own malloc; calls convert pointers
+    -- and ints between the two signatures
+    if fd.is_extern {
+        let mut fi = 0
+        while fi < g.ir_mod.functions.len() {
+            if g.ir_mod.functions[fi].name == name and g.ir_mod.functions[fi].is_extern {
+                g.ir_mod.functions[fi] = func
+                return g
+            }
+            fi = fi + 1
+        }
     }
 
     g.ir_mod.functions.push(func)
@@ -7009,7 +7094,9 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
     }
 
     if stmt.has_ret_value {
-        let result = generate_expr(g, b, map_ctor_as(g, *stmt.ret_value, g.current_return_type))
+        let ret_expr = map_ctor_as(g, *stmt.ret_value, g.current_return_type)
+        let mut result = generate_expr(g, b, ret_expr)
+        result = convert_int_value(result.gen, result.block, result.val_id, ret_expr, infer_expr_type(result.gen, ret_expr), map_type_name(g.current_return_type), "the return value")
         g = result.gen
         b = result.block
         b.terminator = Box_new(term_ret(ir_val_inst(result.val_id)))
@@ -8023,7 +8110,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     }
 
     -- Generate the value
-    let val_result = generate_expr(g, b, *stmt.assign_value)
+    let mut val_result = generate_expr(g, b, *stmt.assign_value)
     g = val_result.gen
     b = val_result.block
 
@@ -8039,6 +8126,12 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             -- Simple assignment
             if g.variable_map.contains(target_name) {
                 let ptr = g.variable_map.get(target_name)
+                if g.variable_types.contains(target_name) {
+                    let conv = convert_int_value(g, b, val_result.val_id, *stmt.assign_value, infer_expr_type(g, *stmt.assign_value), g.variable_types.get(target_name), "the assigned value")
+                    g = conv.gen
+                    b = conv.block
+                    val_result = conv
+                }
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
                 -- For mut params, store through the param pointer (no alloca exists)
                 if g.param_ptr_map.contains(target_name) {
@@ -8095,7 +8188,12 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             return gen_result(g, b)
         }
         let mut store_val_id = val_result.val_id
-        if assign_op != ASSIGN_EQ() {
+        if assign_op == ASSIGN_EQ() {
+            let conv = convert_int_value(g, b, val_result.val_id, *stmt.assign_value, infer_expr_type(g, *stmt.assign_value), map_type_name(fa.src_type), "the assigned value")
+            g = conv.gen
+            b = conv.block
+            store_val_id = conv.val_id
+        } else {
             let compound = generate_compound_value(g, b, fa.ptr, map_type_name(fa.src_type), assign_op, val_result.val_id, *stmt.assign_value)
             g = compound.gen
             b = compound.block
@@ -8845,6 +8943,224 @@ fn generate_byte_at(gen: IRGenerator, block: IRBasicBlock, s_expr: Expr, i_expr:
     return expr_result(g, b, cast)
 }
 
+-- Emit a cast of `val` from type `from` to type `to`
+fn emit_ir_cast(gen: IRGenerator, block: IRBasicBlock, val: IRValue, from: string, to: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let id = g.builder.next_id
+    let mut inst = ir_inst_new(id, OP_CAST())
+    inst.cast_val = val
+    inst.cast_from = from
+    inst.cast_to = to
+    inst.result_type = to
+    inst.has_result = true
+    b.instructions.push(inst)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
+-- Emit a store of `val` through `ptr`
+fn emit_ir_store(gen: IRGenerator, block: IRBasicBlock, ptr: IRValue, val: IRValue) -> GenResult {
+    let mut g = gen
+    let mut b = block
+    let mut st = ir_inst_new(g.builder.next_id, OP_STORE())
+    st.store_ptr = ptr
+    st.store_val = val
+    st.has_result = false
+    b.instructions.push(st)
+    g.builder.next_id = g.builder.next_id + 1
+    return gen_result(g, b)
+}
+
+-- Emit the address of field `index` (of IR type `field_t`) of the
+-- struct of IR type `struct_t` at `base`
+fn emit_ir_field_addr(gen: IRGenerator, block: IRBasicBlock, base: IRValue, struct_t: string, index: int, field_t: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let id = g.builder.next_id
+    let mut gep = ir_inst_new(id, OP_GEP())
+    gep.gep_base = base
+    gep.alloc_type = struct_t
+    gep.field_index = index
+    gep.field_type = field_t
+    gep.result_type = "ptr(" + field_t + ")"
+    gep.has_result = true
+    b.instructions.push(gep)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
+-- Generate an integer argument of a raw memory primitive
+fn generate_raw_int_arg(gen: IRGenerator, block: IRBasicBlock, fn_name: string, what: string, arg: Expr) -> ExprResult {
+    let mut g = gen
+    let arg_t = infer_expr_type(g, arg)
+    if is_integer_type(arg_t) == false {
+        g = ir_type_error(g, fn_name + "() takes an integer " + what + ", not '" + builtin_src_type(arg_t) + "'", arg.line)
+    }
+    let r = generate_expr(g, block, arg)
+    if arg_t == "i64" or is_integer_type(arg_t) == false {
+        return r
+    }
+    return emit_ir_cast(r.gen, r.block, ir_val_inst(r.val_id), arg_t, "i64")
+}
+
+-- An address argument as a pointer
+fn generate_raw_ptr_arg(gen: IRGenerator, block: IRBasicBlock, fn_name: string, arg: Expr) -> ExprResult {
+    let r = generate_raw_int_arg(gen, block, fn_name, "address", arg)
+    return emit_ir_cast(r.gen, r.block, ir_val_inst(r.val_id), "i64", "ptr")
+}
+
+-- Whether a source type names a type whose size is known
+fn sized_type_known(gen: IRGenerator, t: string) -> bool {
+    let ir_t = map_type_name(t)
+    if is_integer_type(ir_t) or is_float_type(ir_t) or t == "string" or t == "bool" { return true }
+    if starts_with(t, "List[") or starts_with(t, "Box[") { return true }
+    return gen.struct_defs.contains(t) or gen.enum_defs.contains(t)
+}
+
+fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, expr: Expr) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let args = expr.args
+    if g.unsafe_depth == 0 {
+        g = ir_type_error(g, fn_name + "() works on raw memory and requires an unsafe block", expr.line)
+        return expr_result(g, b, 0)
+    }
+    let want = if fn_name == "string_from_raw" { 3 } else if starts_with(fn_name, "store_") { 2 } else if fn_name == "size_of" { 0 } else { 1 }
+    if args.len() != want {
+        g = ir_type_error(g, fn_name + "() takes " + int_to_string(want) + " arguments, not " + int_to_string(args.len()), expr.line)
+        return expr_result(g, b, 0)
+    }
+    let mem_t = raw_mem_type(fn_name)
+
+    -- size_of[T]()
+    if fn_name == "size_of" {
+        if expr.generic_args.len() != 1 {
+            g = ir_type_error(g, "size_of takes one type: size_of[T]()", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let mut t = expr.generic_args[0]
+        g = ensure_type_instances(g, t, expr.line)
+        t = canon_type(g, t)
+        if sized_type_known(g, t) == false {
+            g = ir_type_error(g, "size_of: unknown type '" + t + "'", expr.line)
+            return expr_result(g, b, 0)
+        }
+        return emit_ir_cast(g, b, ir_val_sizeof(map_type_name(t)), "i64", "i64")
+    }
+
+    -- load_T(addr)
+    if starts_with(fn_name, "load_") {
+        let p = generate_raw_ptr_arg(g, b, fn_name, args[0])
+        g = p.gen
+        b = p.block
+        let ld = g.builder.next_id
+        let mut ld_inst = ir_inst_new(ld, OP_LOAD())
+        ld_inst.load_ptr = ir_val_inst(p.val_id)
+        ld_inst.load_type = mem_t
+        ld_inst.result_type = mem_t
+        ld_inst.has_result = true
+        b.instructions.push(ld_inst)
+        g.builder.next_id = ld + 1
+        let wide_t = if is_float_type(mem_t) { "f64" } else { "i64" }
+        return emit_ir_cast(g, b, ir_val_inst(ld), mem_t, wide_t)
+    }
+
+    -- store_T(addr, v)
+    if starts_with(fn_name, "store_") {
+        let p = generate_raw_ptr_arg(g, b, fn_name, args[0])
+        g = p.gen
+        b = p.block
+        let val_t = infer_expr_type(g, args[1])
+        let fits = if is_float_type(mem_t) { is_float_type(val_t) or is_integer_type(val_t) } else { is_integer_type(val_t) }
+        if fits == false {
+            g = ir_type_error(g, fn_name + "() cannot store a value of type '" + builtin_src_type(val_t) + "'", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let v = generate_expr(g, b, args[1])
+        let narrow = emit_ir_cast(v.gen, v.block, ir_val_inst(v.val_id), val_t, mem_t)
+        let st = emit_ir_store(narrow.gen, narrow.block, ir_val_inst(p.val_id), ir_val_inst(narrow.val_id))
+        return expr_result(st.gen, st.block, 0)
+    }
+
+    -- addr_of(place)
+    if fn_name == "addr_of" {
+        let a = generate_addr(g, b, args[0])
+        g = a.gen
+        b = a.block
+        if a.ok == false {
+            g = ir_type_error(g, "addr_of() takes a variable, a field or a list element", expr.line)
+            return expr_result(g, b, 0)
+        }
+        return emit_ir_cast(g, b, a.ptr, "ptr", "i64")
+    }
+
+    -- string_data(s)
+    if fn_name == "string_data" {
+        let s_t = infer_expr_type(g, args[0])
+        if s_t != "string" {
+            g = ir_type_error(g, "string_data() takes a string, not '" + builtin_src_type(s_t) + "'", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let s = generate_expr(g, b, args[0])
+        g = s.gen
+        b = s.block
+        let slot = g.builder.next_id
+        let mut slot_inst = ir_inst_new(slot, OP_ALLOCA())
+        slot_inst.alloc_type = "string"
+        slot_inst.result_type = "ptr(string)"
+        slot_inst.has_result = true
+        b.instructions.push(slot_inst)
+        g.builder.next_id = slot + 1
+        let st = emit_ir_store(g, b, ir_val_inst(slot), ir_val_inst(s.val_id))
+        let data_addr = emit_ir_field_addr(st.gen, st.block, ir_val_inst(slot), "string", 0, "ptr")
+        g = data_addr.gen
+        b = data_addr.block
+        let ld = g.builder.next_id
+        let mut ld_inst = ir_inst_new(ld, OP_LOAD())
+        ld_inst.load_ptr = ir_val_inst(data_addr.val_id)
+        ld_inst.load_type = "ptr"
+        ld_inst.result_type = "ptr"
+        ld_inst.has_result = true
+        b.instructions.push(ld_inst)
+        g.builder.next_id = ld + 1
+        return emit_ir_cast(g, b, ir_val_inst(ld), "ptr", "i64")
+    }
+
+    -- string_from_raw(ptr, len, cap)
+    let p = generate_raw_ptr_arg(g, b, fn_name, args[0])
+    let n = generate_raw_int_arg(p.gen, p.block, fn_name, "length", args[1])
+    let c = generate_raw_int_arg(n.gen, n.block, fn_name, "capacity", args[2])
+    g = c.gen
+    b = c.block
+    let slot = g.builder.next_id
+    let mut slot_inst = ir_inst_new(slot, OP_ALLOCA())
+    slot_inst.alloc_type = "string"
+    slot_inst.result_type = "ptr(string)"
+    slot_inst.has_result = true
+    b.instructions.push(slot_inst)
+    g.builder.next_id = slot + 1
+    let mut fi = 0
+    while fi < 3 {
+        let field_t = if fi == 0 { "ptr" } else { "i64" }
+        let field_val = if fi == 0 { p.val_id } else if fi == 1 { n.val_id } else { c.val_id }
+        let fa = emit_ir_field_addr(g, b, ir_val_inst(slot), "string", fi, field_t)
+        let st = emit_ir_store(fa.gen, fa.block, ir_val_inst(fa.val_id), ir_val_inst(field_val))
+        g = st.gen
+        b = st.block
+        fi = fi + 1
+    }
+    let ld = g.builder.next_id
+    let mut ld_inst = ir_inst_new(ld, OP_LOAD())
+    ld_inst.load_ptr = ir_val_inst(slot)
+    ld_inst.load_type = "string"
+    ld_inst.result_type = "string"
+    ld_inst.has_result = true
+    b.instructions.push(ld_inst)
+    g.builder.next_id = ld + 1
+    return expr_result(g, b, ld)
+}
+
 fn static_type(gen: IRGenerator, expr: Expr) -> string {
     let k = expr.kind
     if k == EXPR_LITERAL_INT() { return "int" }
@@ -9193,6 +9509,10 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         -- Logical operators always produce bool
         if op == BINOP_AND() or op == BINOP_OR() {
             return "bool"
+        }
+        let common_t = binary_int_type(gen, expr)
+        if common_t != "" {
+            return common_t
         }
         -- Arithmetic: infer from left operand
         let left_type = infer_expr_type(gen, *expr.left)
@@ -9840,17 +10160,39 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     let lhs_result = generate_expr(g, b, *expr.left)
     g = lhs_result.gen
     b = lhs_result.block
-    let lhs_id = lhs_result.val_id
+    let mut lhs_id = lhs_result.val_id
 
     -- Evaluate right operand
     let rhs_result = generate_expr(g, b, *expr.right)
     g = rhs_result.gen
     b = rhs_result.block
-    let rhs_id = rhs_result.val_id
+    let mut rhs_id = rhs_result.val_id
 
     -- Infer the type of the left operand to select the correct op family
-    let lhs_type = infer_expr_type(g, *expr.left)
-    let rhs_type = infer_expr_type(g, *expr.right)
+    let mut lhs_type = infer_expr_type(g, *expr.left)
+    let mut rhs_type = infer_expr_type(g, *expr.right)
+
+    -- Integers of different types meet at one type (see binary_int_type)
+    let common_t = binary_int_type(g, expr)
+    if common_t != "" {
+        if lhs_type != common_t {
+            g = check_int_literal_fits(g, *expr.left, common_t)
+            let lc = emit_ir_cast(g, b, ir_val_inst(lhs_id), lhs_type, common_t)
+            g = lc.gen
+            b = lc.block
+            lhs_id = lc.val_id
+            lhs_type = common_t
+        }
+        if rhs_type != common_t {
+            g = check_int_literal_fits(g, *expr.right, common_t)
+            let rc = emit_ir_cast(g, b, ir_val_inst(rhs_id), rhs_type, common_t)
+            g = rc.gen
+            b = rc.block
+            rhs_id = rc.val_id
+            rhs_type = common_t
+        }
+    }
+    let int_operand_t = if is_integer_type(lhs_type) and lhs_type == rhs_type { lhs_type } else { "" }
 
     -- Determine if either operand is float or string
     let is_string = lhs_type == "string" or rhs_type == "string"
@@ -10048,6 +10390,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         div_inst.lhs = ir_val_inst(lhs_id)
         div_inst.rhs = ir_val_inst(rhs_id)
         div_inst.result_type = arith_type
+        div_inst.operand_type = int_operand_t
         div_inst.has_result = true
         ok_block.instructions.push(div_inst)
         g.builder.next_id = div_id + 1
@@ -10102,6 +10445,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         mod_inst.lhs = ir_val_inst(lhs_id)
         mod_inst.rhs = ir_val_inst(rhs_id)
         mod_inst.result_type = arith_type
+        mod_inst.operand_type = int_operand_t
         mod_inst.has_result = true
         ok_block.instructions.push(mod_inst)
         g.builder.next_id = mod_id + 1
@@ -10199,6 +10543,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -10211,6 +10556,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -10223,6 +10569,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -10235,6 +10582,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = "bool"
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -10508,6 +10856,11 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Unsafe fence: calling an `extern fn` requires an unsafe block
     check_extern_fence(g, fn_name, expr.line)
+
+    -- Raw memory primitives (load_T, store_T, addr_of, size_of, ...)
+    if is_raw_builtin(fn_name) {
+        return generate_raw_builtin(g, b, fn_name, expr)
+    }
 
     -- --------------------------------------------------------
     -- Special case dispatch (in priority order)
@@ -12437,6 +12790,81 @@ fn int_fit_min(name: string) -> int {
     if name == "i16" { return -32768 }
     if name == "i32" { return -2147483648 }
     return 0 - 9223372036854775807 - 1
+}
+
+-- An integer constant: a literal, or literals combined with unary minus,
+-- parentheses, +, - and *
+fn is_int_literal_expr(e: Expr) -> bool {
+    if e.kind == EXPR_LITERAL_INT() { return true }
+    if e.kind == EXPR_GROUPED() { return is_int_literal_expr(*e.operand) }
+    if e.kind == EXPR_UNARY() and e.op == UNOP_NEG() { return is_int_literal_expr(*e.operand) }
+    if e.kind == EXPR_BINARY() and (e.op == BINOP_ADD() or e.op == BINOP_SUB() or e.op == BINOP_MUL()) {
+        return is_int_literal_expr(*e.left) and is_int_literal_expr(*e.right)
+    }
+    return false
+}
+
+fn int_literal_value(e: Expr) -> int {
+    if e.kind == EXPR_GROUPED() { return int_literal_value(*e.operand) }
+    if e.kind == EXPR_UNARY() { return 0 - int_literal_value(*e.operand) }
+    if e.kind == EXPR_BINARY() {
+        let l = int_literal_value(*e.left)
+        let r = int_literal_value(*e.right)
+        if e.op == BINOP_ADD() { return l + r }
+        if e.op == BINOP_SUB() { return l - r }
+        return l * r
+    }
+    return e.int_val
+}
+
+-- Convert an integer value of type `from` to type `to` where it is
+-- stored, passed or returned as `to`: constants that fit and widening
+-- convert; narrowing anything else is an error that asks for `as`.
+fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, from: string, to: string, what: string) -> ExprResult {
+    let mut g = gen
+    if is_integer_type(from) == false or is_integer_type(to) == false or from == to {
+        return expr_result(g, block, val_id)
+    }
+    if is_int_literal_expr(e) {
+        g = check_int_literal_fits(g, e, to)
+    } else if type_bit_width(from) > type_bit_width(to) {
+        g = ir_type_error(g, what + " has type " + builtin_src_type(from) + ", which does not fit in " + to + "; convert it with `as " + to + "`", e.line)
+    }
+    return emit_ir_cast(g, block, ir_val_inst(val_id), from, to)
+}
+
+-- The integer type both operands of a binary operator take when they
+-- are integers of different types: an integer literal takes the other
+-- operand's type, as in `fd < 0` with fd: i32; otherwise the narrower
+-- operand widens. "" when the operands need no conversion.
+fn binary_int_type(gen: IRGenerator, expr: Expr) -> string {
+    let lt = infer_expr_type(gen, *expr.left)
+    let rt = infer_expr_type(gen, *expr.right)
+    if is_integer_type(lt) == false or is_integer_type(rt) == false or lt == rt { return "" }
+    let l_lit = is_int_literal_expr(*expr.left)
+    let r_lit = is_int_literal_expr(*expr.right)
+    if r_lit and l_lit == false { return lt }
+    if l_lit and r_lit == false { return rt }
+    if type_bit_width(rt) > type_bit_width(lt) { return rt }
+    return lt
+}
+
+-- Report an integer literal that does not fit the type it converts to
+fn check_int_literal_fits(gen: IRGenerator, e: Expr, t: string) -> IRGenerator {
+    if is_int_literal_expr(e) == false or type_bit_width(t) >= 64 { return gen }
+    let v = int_literal_value(e)
+    let mut lo = 0
+    let mut hi = 0
+    if is_unsigned_type(t) {
+        hi = if t == "u8" { 255 } else if t == "u16" { 65535 } else { 4294967295 }
+    } else {
+        lo = int_fit_min(t)
+        hi = int_fit_max(t)
+    }
+    if v < lo or v > hi {
+        return ir_type_error(gen, "integer literal " + int_to_string(v) + " does not fit in " + t, e.line)
+    }
+    return gen
 }
 
 fn int_fit_max(name: string) -> int {
@@ -17823,6 +18251,29 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let ctx = g.context
+        -- A variadic C function is called directly: a wrapper could not pass
+        -- on its varargs. Call sites pass strings as char*.
+        if func.is_variadic {
+            let mut vparam_tys: List[int] = []
+            let mut vi = 0
+            while vi < func.params.len() {
+                let pt = func.params[vi].type_id
+                vparam_tys.push(if pt == "string" { dm_llvm_pointer_type(ctx) } else { map_ir_type_to_llvm(g, pt) })
+                vi = vi + 1
+            }
+            let vret_ty = map_ir_type_to_llvm(g, func.return_type)
+            dm_llvm_buf_clear()
+            vi = 0
+            while vi < vparam_tys.len() {
+                dm_llvm_buf_push(vparam_tys[vi])
+                vi = vi + 1
+            }
+            let vfn_ty = dm_llvm_function_type_buf(vret_ty, 1)
+            let vfn = dm_llvm_module_add_function(g.llvm_module, func.name, vfn_ty)
+            g.function_map.insert(func.name, vfn)
+            g.fn_type_map.insert(func.name, vfn_ty)
+            return g
+        }
         -- Check if wrapper is needed for extern functions with string params/return
         if func_needs_wrapper(func) {
             -- Check if this is a user extern function
@@ -18268,7 +18719,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if lg_is_float_type(inst.result_type) {
                 result = dm_llvm_build_fdiv(b, lhs, rhs, "fdiv")
             } else {
-                result = dm_llvm_build_sdiv(b, lhs, rhs, "div")
+                if lg_is_unsigned_type(inst.operand_type) {
+                    result = dm_llvm_build_udiv(b, lhs, rhs, "udiv")
+                } else {
+                    result = dm_llvm_build_sdiv(b, lhs, rhs, "div")
+                }
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -18282,7 +18737,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if lg_is_float_type(inst.result_type) {
                 result = dm_llvm_build_frem(b, lhs, rhs, "frem")
             } else {
-                result = dm_llvm_build_srem(b, lhs, rhs, "mod")
+                if lg_is_unsigned_type(inst.operand_type) {
+                    result = dm_llvm_build_urem(b, lhs, rhs, "umod")
+                } else {
+                    result = dm_llvm_build_srem(b, lhs, rhs, "mod")
+                }
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -18393,7 +18852,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_olt(), fl, fr, "flt")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_slt(), lhs, rhs, "lt")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 36 } else { dm_llvm_int_slt() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "lt")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -18414,7 +18874,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_ole(), fl, fr, "fle")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_sle(), lhs, rhs, "le")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 37 } else { dm_llvm_int_sle() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "le")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -18435,7 +18896,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_ogt(), fl, fr, "fgt")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_sgt(), lhs, rhs, "gt")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 34 } else { dm_llvm_int_sgt() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "gt")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -18456,7 +18918,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_oge(), fl, fr, "fge")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_sge(), lhs, rhs, "ge")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 35 } else { dm_llvm_int_sge() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "ge")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -18489,7 +18952,12 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Memory: alloca
         if op == OP_ALLOCA() {
-            let alloc_ty = map_ir_type_to_llvm(g, inst.alloc_type)
+            let mut alloc_ty = map_ir_type_to_llvm(g, inst.alloc_type)
+            if inst.alloc_type == "void" {
+                -- LLVM cannot allocate void; report it instead of crashing
+                g.type_errors.push("Error: a variable holds the result of a call that returns no value" + type_error_location(g))
+                alloc_ty = dm_llvm_int64_type(g.context)
+            }
             let result = dm_llvm_build_alloca(b, alloc_ty, "alloca")
             if inst.alloc_type == "string" {
                 g.string_ptrs.insert(id_key, true)
@@ -18781,6 +19249,10 @@ fn generate_cast(gen: LLVMGenerator, val: int, from: string, to: string) -> int 
         if from_is_float and to_is_float {
             let dest_ty = map_ir_type_to_llvm(gen, to)
             return dm_llvm_build_fp_cast(b, val, dest_ty, "cast")
+        }
+        -- Pointer to int (ptrtoint)
+        if from == "ptr" and to_is_int {
+            return dm_llvm_build_ptr_to_int(b, val, map_ir_type_to_llvm(gen, to), "cast")
         }
         -- Int to pointer (inttoptr)
         if from_is_int and to == "ptr" {
@@ -19412,6 +19884,52 @@ fn coerce_int_call_arg(gen: LLVMGenerator, callee: int, fn_name: string, user_id
     }
 }
 
+-- Convert between a pointer and an integer where a call's argument or
+-- result is one and the other side wants the other: a source extern fn
+-- may declare a C pointer as int, while the compiler passes ptr.
+fn coerce_ptr_int(gen: LLVMGenerator, val: int, want_ty: int) -> int {
+    unsafe {
+        let have_kind = dm_llvm_get_type_kind(dm_llvm_type_of(val))
+        let want_kind = dm_llvm_get_type_kind(want_ty)
+        if have_kind == 8 and want_kind == 12 { return dm_llvm_build_int_to_ptr(gen.builder, val, want_ty, "int.ptr") }
+        if have_kind == 12 and want_kind == 8 { return dm_llvm_build_ptr_to_int(gen.builder, val, want_ty, "ptr.int") }
+        return val
+    }
+}
+
+-- A string argument of a variadic C function as char*: the address of
+-- its bytes. A string literal already is one.
+fn string_arg_as_cstr(gen: LLVMGenerator, arg: IRValue, val: int) -> int {
+    unsafe {
+        if arg.kind == VAL_CONST_STRING() { return val }
+        let b = gen.builder
+        let ptr_ty = dm_llvm_pointer_type(gen.context)
+        if is_string_ptr(gen, arg) and dm_llvm_get_type_kind(dm_llvm_type_of(val)) == 12 {
+            let data_slot = dm_llvm_build_struct_gep2(b, gen.dm_string_type, val, 0, "cstr.addr")
+            return dm_llvm_build_load2(b, ptr_ty, data_slot, "cstr")
+        }
+        if dm_llvm_type_of(val) == gen.dm_string_type {
+            return dm_llvm_build_extract_value(b, val, 0, "cstr")
+        }
+        return val
+    }
+}
+
+-- An argument past a variadic C function's parameters, with C's default
+-- promotions: float to double, and bool, i8 and i16 to int
+fn promote_vararg(gen: LLVMGenerator, val: int) -> int {
+    unsafe {
+        let ty = dm_llvm_type_of(val)
+        let kind = dm_llvm_get_type_kind(ty)
+        if kind == 2 { return dm_llvm_build_fp_cast(gen.builder, val, dm_llvm_double_type(gen.context), "vararg.f64") }
+        if kind == 8 and dm_llvm_get_int_type_width(ty) < 32 {
+            let is_signed = if dm_llvm_get_int_type_width(ty) == 1 { 0 } else { 1 }
+            return dm_llvm_build_int_cast2(gen.builder, val, dm_llvm_int32_type(gen.context), is_signed, "vararg.i32")
+        }
+        return val
+    }
+}
+
 fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
@@ -19437,18 +19955,32 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Regular (non-wrapper) call
         -- Resolve arguments, handling string pointer loads
+        let nparams = dm_llvm_count_param_types(fn_ty)
+        let is_source_extern = g.ir_module.user_extern_fns.contains(callee_name)
+        let is_variadic = is_source_extern and dm_llvm_is_function_var_arg(fn_ty) != 0
         let mut args: List[int] = []
         let mut ai = 0
         while ai < inst.call_args.len() {
             let arg = inst.call_args[ai]
             let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
-            -- A string or list pointer passed by value: pass the value
-            let param = dm_llvm_get_param(callee, ai)
-            if param != 0 {
-                val = load_handle_as(g, arg, val, dm_llvm_type_of(param))
+            -- Strings go to a variadic C function as char*, and arguments
+            -- past its parameters get C's default promotions
+            let is_string_arg = arg.kind == VAL_CONST_STRING() or is_string_ptr(g, arg) or dm_llvm_type_of(val) == g.dm_string_type
+            if is_variadic and is_string_arg {
+                val = string_arg_as_cstr(g, arg, val)
+            } else if is_variadic and ai >= nparams {
+                val = promote_vararg(g, val)
             }
-            val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
+            if ai < nparams and (is_variadic and is_string_arg) == false {
+                -- A string or list pointer passed by value: pass the value
+                let param = dm_llvm_get_param(callee, ai)
+                val = load_handle_as(g, arg, val, dm_llvm_type_of(param))
+                val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
+                if is_source_extern {
+                    val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
+                }
+            }
             args.push(val)
             ai = ai + 1
         }
@@ -19466,6 +19998,9 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         g = check_call_args(g, fn_ty, callee)
         let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
+        if is_source_extern and inst.has_result and (inst.result_type == "ptr" or is_int_type(inst.result_type)) {
+            result = coerce_ptr_int(g, result, map_ir_type_to_llvm(g, inst.result_type))
+        }
         -- Check if callee returns dm_string: store to alloca and track as string ptr
         if callee_returns_string(g, callee_name) and result != 0 {
             let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.ret")

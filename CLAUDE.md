@@ -222,7 +222,7 @@ cd stage5 && bash gen_bootstrap.sh
 # Compile Stage 5 with itself (--link-llvm links the LLVM bridge)
 cd stage5 && /tmp/stage5_bin main.dm -o /tmp/stage5_self --link-llvm
 
-# Run the integration suite against the Stage 5 binary (277 tests)
+# Run the integration suite against the Stage 5 binary (283 tests)
 bash stage5/run_parity.sh
 ```
 
@@ -294,7 +294,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 277/277 integration tests and compiles itself, but Stage 0 is still required for its first build.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 283/283 integration tests and compiles itself, but Stage 0 is still required for its first build.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -371,7 +371,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Stage 0 (Zig → C): Bootstrap compiler, 300/300 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): first built by Stage 0, 277/277 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 277/277. Its link step still compiles the C runtime, wrappers and LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+- Stage 5 (dAImond + LLVM): first built by Stage 0, 283/283 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 283/283. Its link step still compiles the C runtime, wrappers and LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
@@ -492,6 +492,23 @@ Where TYPE is one of: `f32x4`, `f32x8`, `f64x2`, `f64x4`, `i32x4`, `i32x8`, `i64
 
 In Stage 5, `Map[K, V]` is the generic struct in `stage5/runtime/map.dm`. Keys must be strings or integers, `keys()`/`values()` and `for k in m` follow insertion order, and `Map_new()` needs a destination type (a typed `let`, a struct field, an assignment target or a return). Copying a map copies its list headers, so the copy shares storage with the original, as Stage 5 lists do. Stage 5 also has the builtin `byte_at(s, i) -> int` (the byte at index `i`, bounds-checked).
 
+### Stage 5 Runtime Primitives
+
+Stage 5 alone has the low-level features the runtime is being rewritten with (Stage 0 has none of them). The builtins below need an `unsafe` block. Addresses are `int`s.
+
+| Builtin | Description |
+|---------|-------------|
+| `load_T(addr)` | Read a `T` at `addr`, where `T` is `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `i64`, `f32` or `f64`. Integers widen to `int` (zero- or sign-extended), floats to `float` |
+| `store_T(addr, v)` | Write `v` at `addr` as a `T` (narrowing it) |
+| `addr_of(place)` | Address of a variable, field or list element |
+| `size_of[T]()` | Size of type `T` in bytes |
+| `string_data(s)` | Address of a string's bytes (not NUL-terminated unless `s` is a literal) |
+| `string_from_raw(ptr, len, cap)` | The string at `ptr`; `cap` 0 means the string does not own the memory |
+
+- **C-width integers**: integers of different types in one expression meet at one type. A literal takes the other operand's type (`fd < 0` with `fd: i32`), otherwise the narrower operand widens. `u8`/`u16`/`u32`/`u64` compare, divide and take remainders unsigned. Returning or assigning a wider integer to a narrower one is a compile error that asks for `as`, and a literal that doesn't fit its type is an error.
+- **Variadic externs**: `extern fn printf(fmt: string, ...) -> i32`. The C function is called directly: string arguments pass as `char*`, and extra arguments get C's default promotions (`f32` to double; `bool`, `i8` and `i16` to `i32`). A variadic extern can't return `string`.
+- A source `extern fn` may redeclare a C function the compiler also uses, such as `extern fn malloc(n: int) -> int`; calls convert between pointer and `int` where the two declarations differ.
+
 ## Stage 0 Codegen Quirks and Workarounds
 
 These are remaining known issues in Stage 0's C code generation:
@@ -591,7 +608,7 @@ cd stage5 && bash gen_bootstrap.sh
 Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
 stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
 Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
-stage5_bin compiles test programs                 → native binaries (277/277 tests pass)
+stage5_bin compiles test programs                 → native binaries (283/283 tests pass)
 stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓)
 ```
 

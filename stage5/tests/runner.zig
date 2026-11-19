@@ -189,6 +189,164 @@ const stage5_map_tests = [_]TestCase{
     },
 };
 
+/// Raw memory, C-width integers and variadic externs: the primitives
+/// the runtime is written with. Stage 0 has none of them.
+const stage5_primitive_tests = [_]TestCase{
+    .{
+        .name = "raw_memory_primitives",
+        .source =
+            \\module test
+            \\extern fn malloc(n: int) -> int
+            \\extern fn free(p: int)
+            \\struct Pt {
+            \\    x: int,
+            \\    y: i32,
+            \\    name: string
+            \\}
+            \\fn main() {
+            \\    unsafe {
+            \\        let p = malloc(64)
+            \\        store_u8(p, 300)
+            \\        store_i8(p + 1, 0 - 2)
+            \\        store_u16(p + 2, 65535)
+            \\        store_i32(p + 4, 0 - 5)
+            \\        store_i64(p + 8, 1234567890123)
+            \\        store_f64(p + 16, 2.5)
+            \\        store_f32(p + 24, 0.25)
+            \\        println(int_to_string(load_u8(p)) + " " + int_to_string(load_i8(p + 1)) + " " + int_to_string(load_u8(p + 1)))
+            \\        println(int_to_string(load_u16(p + 2)) + " " + int_to_string(load_i16(p + 2)))
+            \\        println(int_to_string(load_i32(p + 4)) + " " + int_to_string(load_u32(p + 4)) + " " + int_to_string(load_i64(p + 8)))
+            \\        println(float_to_string(load_f64(p + 16)) + " " + float_to_string(load_f32(p + 24)))
+            \\        let mut pt = Pt { x: 7, y: 9, name: "pt" }
+            \\        store_i64(addr_of(pt.x), 70)
+            \\        let ay = addr_of(pt.y)
+            \\        store_i32(ay, 90)
+            \\        println(int_to_string(pt.x) + " " + int_to_string(pt.y as int) + " " + int_to_string(ay - addr_of(pt)))
+            \\        let mut n = 5
+            \\        store_i64(addr_of(n), 6)
+            \\        println(int_to_string(n))
+            \\        println(int_to_string(size_of[int]()) + " " + int_to_string(size_of[u8]()) + " " + int_to_string(size_of[string]()) + " " + int_to_string(size_of[Pt]()))
+            \\        let s = "hello world"
+            \\        let d = string_data(s)
+            \\        println(int_to_string(load_u8(d + 4)) + " " + string_from_raw(d + 6, 5, 0))
+            \\        free(p)
+            \\    }
+            \\}
+        ,
+        .expected_output = "44 -2 254\n65535 -1\n-5 4294967291 1234567890123\n2.5 0.25\n70 90 8\n6\n8 1 24 40\n111 world\n",
+    },
+    .{
+        .name = "raw_memory_primitives_misuse",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let x = 5
+            \\    let a = addr_of(x)
+            \\    unsafe {
+            \\        let b = addr_of(x + 1)
+            \\        let c = load_i32("str")
+            \\        store_i64(b, "no")
+            \\        let d = size_of[Nope]()
+            \\        let e = load_u8(1, 2)
+            \\        let f = string_data(3)
+            \\    }
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"addr_of() works on raw memory and requires an unsafe block at line 4", "addr_of() takes a variable, a field or a list element at line 6", "load_i32() takes an integer address, not 'string' at line 7", "store_i64() cannot store a value of type 'string' at line 8", "size_of: unknown type 'Nope' at line 9", "load_u8() takes 1 arguments, not 2 at line 10", "string_data() takes a string, not 'int' at line 11"},
+    },
+    .{
+        .name = "c_width_integers",
+        .source =
+            \\module test
+            \\fn half(x: u32) -> u32 {
+            \\    return x / 2
+            \\}
+            \\fn code(ok: bool) -> i32 {
+            \\    if ok {
+            \\        return 0
+            \\    }
+            \\    return 0 - 1
+            \\}
+            \\fn main() {
+            \\    let big: u32 = 4000000000 as u32
+            \\    let small: u32 = 5 as u32
+            \\    println(bool_to_string(big > small) + " " + bool_to_string(big < 3000000000) + " " + bool_to_string(small >= 5))
+            \\    println(int_to_string(half(big) as int) + " " + int_to_string((big % 7) as int))
+            \\    let c = code(false)
+            \\    println(int_to_string(c as int) + " " + bool_to_string(c < 0) + " " + bool_to_string(code(true) == 0))
+            \\    let b: u8 = 250 as u8
+            \\    println(bool_to_string(b > 200) + " " + int_to_string((b + 5) as int))
+            \\    let w = c + 10
+            \\    println(int_to_string(w as int))
+            \\    let mix = c * 3 + big as int
+            \\    println(int_to_string(mix))
+            \\}
+        ,
+        .expected_output = "true false true\n2000000000 3\n-1 true true\ntrue 255\n9\n3999999997\n",
+    },
+    .{
+        .name = "c_width_integer_errors",
+        .source =
+            \\module test
+            \\fn f(x: int) -> i32 {
+            \\    return x
+            \\}
+            \\fn main() {
+            \\    let b: u8 = 7 as u8
+            \\    if b < 300 {
+            \\        println("x")
+            \\    }
+            \\    let c: i32 = 1 as i32
+            \\    println(bool_to_string(c == 3000000000))
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"the return value has type int, which does not fit in i32; convert it with `as i32` at line 3", "integer literal 300 does not fit in u8 at line 7", "integer literal 3000000000 does not fit in i32 at line 11"},
+    },
+    .{
+        .name = "variadic_extern_calls",
+        .source =
+            \\module test
+            \\extern fn malloc(n: int) -> int
+            \\extern fn free(p: int)
+            \\extern fn snprintf(buf: int, n: int, fmt: string, ...) -> i32
+            \\extern fn open(path: string, flags: i32, ...) -> i32
+            \\extern fn close(fd: i32) -> i32
+            \\fn main() {
+            \\    unsafe {
+            \\        let buf = malloc(128)
+            \\        let word = "wor" + "ld"
+            \\        let small: i16 = 0 - 3 as i16
+            \\        let f: f32 = 0.5 as f32
+            \\        let n = snprintf(buf, 128, "%d %s %.3f %ld %d %d %.2f", 42 as i32, word, 3.14159, 9000000000, small, true, f)
+            \\        println(string_from_raw(buf, n as int, 0) + " (" + int_to_string(n as int) + ")")
+            \\        let fd = open("/dev/null", 1, 420)
+            \\        println(bool_to_string(fd >= 0) + " " + int_to_string(close(fd) as int))
+            \\        free(buf)
+            \\    }
+            \\}
+        ,
+        .expected_output = "42 world 3.142 9000000000 -3 1 0.50 (35)\ntrue 0\n",
+    },
+    .{
+        .name = "let_of_void_call",
+        .source =
+            \\module test
+            \\fn nothing() {
+            \\}
+            \\fn main() {
+            \\    let x = nothing()
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"a variable holds the result of a call that returns no value"},
+    },
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -270,6 +428,7 @@ pub fn main() !void {
         .{ .name = "Comprehensive", .tests = &stage0_runner.comprehensive_test },
         .{ .name = "Generic Structs", .tests = &generic_struct_tests },
         .{ .name = "Maps (Stage 5)", .tests = &stage5_map_tests },
+        .{ .name = "Runtime Primitives", .tests = &stage5_primitive_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

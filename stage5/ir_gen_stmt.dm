@@ -627,7 +627,9 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
     }
 
     if stmt.has_ret_value {
-        let result = generate_expr(g, b, map_ctor_as(g, *stmt.ret_value, g.current_return_type))
+        let ret_expr = map_ctor_as(g, *stmt.ret_value, g.current_return_type)
+        let mut result = generate_expr(g, b, ret_expr)
+        result = convert_int_value(result.gen, result.block, result.val_id, ret_expr, infer_expr_type(result.gen, ret_expr), map_type_name(g.current_return_type), "the return value")
         g = result.gen
         b = result.block
         b.terminator = Box_new(term_ret(ir_val_inst(result.val_id)))
@@ -1641,7 +1643,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     }
 
     -- Generate the value
-    let val_result = generate_expr(g, b, *stmt.assign_value)
+    let mut val_result = generate_expr(g, b, *stmt.assign_value)
     g = val_result.gen
     b = val_result.block
 
@@ -1657,6 +1659,12 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             -- Simple assignment
             if g.variable_map.contains(target_name) {
                 let ptr = g.variable_map.get(target_name)
+                if g.variable_types.contains(target_name) {
+                    let conv = convert_int_value(g, b, val_result.val_id, *stmt.assign_value, infer_expr_type(g, *stmt.assign_value), g.variable_types.get(target_name), "the assigned value")
+                    g = conv.gen
+                    b = conv.block
+                    val_result = conv
+                }
                 let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
                 -- For mut params, store through the param pointer (no alloca exists)
                 if g.param_ptr_map.contains(target_name) {
@@ -1713,7 +1721,12 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             return gen_result(g, b)
         }
         let mut store_val_id = val_result.val_id
-        if assign_op != ASSIGN_EQ() {
+        if assign_op == ASSIGN_EQ() {
+            let conv = convert_int_value(g, b, val_result.val_id, *stmt.assign_value, infer_expr_type(g, *stmt.assign_value), map_type_name(fa.src_type), "the assigned value")
+            g = conv.gen
+            b = conv.block
+            store_val_id = conv.val_id
+        } else {
             let compound = generate_compound_value(g, b, fa.ptr, map_type_name(fa.src_type), assign_op, val_result.val_id, *stmt.assign_value)
             g = compound.gen
             b = compound.block

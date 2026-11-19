@@ -334,6 +334,18 @@ int64_t dm_llvm_build_sdiv(int64_t b, int64_t lhs, int64_t rhs, const char* name
                                  TO_PTR(LLVMValueRef, rhs), name));
 }
 
+int64_t dm_llvm_build_udiv(int64_t b, int64_t lhs, int64_t rhs, const char* name) {
+    return TO_INT(LLVMBuildUDiv(TO_PTR(LLVMBuilderRef, b),
+                                 TO_PTR(LLVMValueRef, lhs),
+                                 TO_PTR(LLVMValueRef, rhs), name));
+}
+
+int64_t dm_llvm_build_urem(int64_t b, int64_t lhs, int64_t rhs, const char* name) {
+    return TO_INT(LLVMBuildURem(TO_PTR(LLVMBuilderRef, b),
+                                 TO_PTR(LLVMValueRef, lhs),
+                                 TO_PTR(LLVMValueRef, rhs), name));
+}
+
 int64_t dm_llvm_build_srem(int64_t b, int64_t lhs, int64_t rhs, const char* name) {
     return TO_INT(LLVMBuildSRem(TO_PTR(LLVMBuilderRef, b),
                                  TO_PTR(LLVMValueRef, lhs),

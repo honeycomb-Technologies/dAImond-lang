@@ -562,6 +562,29 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let ctx = g.context
+        -- A variadic C function is called directly: a wrapper could not pass
+        -- on its varargs. Call sites pass strings as char*.
+        if func.is_variadic {
+            let mut vparam_tys: List[int] = []
+            let mut vi = 0
+            while vi < func.params.len() {
+                let pt = func.params[vi].type_id
+                vparam_tys.push(if pt == "string" { dm_llvm_pointer_type(ctx) } else { map_ir_type_to_llvm(g, pt) })
+                vi = vi + 1
+            }
+            let vret_ty = map_ir_type_to_llvm(g, func.return_type)
+            dm_llvm_buf_clear()
+            vi = 0
+            while vi < vparam_tys.len() {
+                dm_llvm_buf_push(vparam_tys[vi])
+                vi = vi + 1
+            }
+            let vfn_ty = dm_llvm_function_type_buf(vret_ty, 1)
+            let vfn = dm_llvm_module_add_function(g.llvm_module, func.name, vfn_ty)
+            g.function_map.insert(func.name, vfn)
+            g.fn_type_map.insert(func.name, vfn_ty)
+            return g
+        }
         -- Check if wrapper is needed for extern functions with string params/return
         if func_needs_wrapper(func) {
             -- Check if this is a user extern function
@@ -1007,7 +1030,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if lg_is_float_type(inst.result_type) {
                 result = dm_llvm_build_fdiv(b, lhs, rhs, "fdiv")
             } else {
-                result = dm_llvm_build_sdiv(b, lhs, rhs, "div")
+                if lg_is_unsigned_type(inst.operand_type) {
+                    result = dm_llvm_build_udiv(b, lhs, rhs, "udiv")
+                } else {
+                    result = dm_llvm_build_sdiv(b, lhs, rhs, "div")
+                }
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -1021,7 +1048,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if lg_is_float_type(inst.result_type) {
                 result = dm_llvm_build_frem(b, lhs, rhs, "frem")
             } else {
-                result = dm_llvm_build_srem(b, lhs, rhs, "mod")
+                if lg_is_unsigned_type(inst.operand_type) {
+                    result = dm_llvm_build_urem(b, lhs, rhs, "umod")
+                } else {
+                    result = dm_llvm_build_srem(b, lhs, rhs, "mod")
+                }
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -1132,7 +1163,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_olt(), fl, fr, "flt")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_slt(), lhs, rhs, "lt")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 36 } else { dm_llvm_int_slt() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "lt")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -1153,7 +1185,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_ole(), fl, fr, "fle")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_sle(), lhs, rhs, "le")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 37 } else { dm_llvm_int_sle() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "le")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -1174,7 +1207,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_ogt(), fl, fr, "fgt")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_sgt(), lhs, rhs, "gt")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 34 } else { dm_llvm_int_sgt() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "gt")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -1195,7 +1229,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_oge(), fl, fr, "fge")
             } else {
-                result = dm_llvm_build_icmp(b, dm_llvm_int_sge(), lhs, rhs, "ge")
+                let pred = if lg_is_unsigned_type(inst.operand_type) { 35 } else { dm_llvm_int_sge() }
+                result = dm_llvm_build_icmp(b, pred, lhs, rhs, "ge")
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
@@ -1228,7 +1263,12 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Memory: alloca
         if op == OP_ALLOCA() {
-            let alloc_ty = map_ir_type_to_llvm(g, inst.alloc_type)
+            let mut alloc_ty = map_ir_type_to_llvm(g, inst.alloc_type)
+            if inst.alloc_type == "void" {
+                -- LLVM cannot allocate void; report it instead of crashing
+                g.type_errors.push("Error: a variable holds the result of a call that returns no value" + type_error_location(g))
+                alloc_ty = dm_llvm_int64_type(g.context)
+            }
             let result = dm_llvm_build_alloca(b, alloc_ty, "alloca")
             if inst.alloc_type == "string" {
                 g.string_ptrs.insert(id_key, true)
@@ -1520,6 +1560,10 @@ fn generate_cast(gen: LLVMGenerator, val: int, from: string, to: string) -> int 
         if from_is_float and to_is_float {
             let dest_ty = map_ir_type_to_llvm(gen, to)
             return dm_llvm_build_fp_cast(b, val, dest_ty, "cast")
+        }
+        -- Pointer to int (ptrtoint)
+        if from == "ptr" and to_is_int {
+            return dm_llvm_build_ptr_to_int(b, val, map_ir_type_to_llvm(gen, to), "cast")
         }
         -- Int to pointer (inttoptr)
         if from_is_int and to == "ptr" {

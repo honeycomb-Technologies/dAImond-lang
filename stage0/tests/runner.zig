@@ -38,7 +38,9 @@ pub const TestResult = struct {
 pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) !TestResult {
     // Create temp directory for test files
     var tmp_dir_path: [std.fs.max_path_bytes]u8 = undefined;
-    const tmp_dir = try std.fmt.bufPrint(&tmp_dir_path, "/tmp/daimond_test_{d}", .{std.time.milliTimestamp()});
+    // The process ID keeps suites that run at the same time out of each
+    // other's directories
+    const tmp_dir = try std.fmt.bufPrint(&tmp_dir_path, "/tmp/daimond_test_{d}_{d}", .{ std.os.linux.getpid(), std.time.milliTimestamp() });
 
     std.fs.cwd().makeDir(tmp_dir) catch |err| {
         if (err != error.PathAlreadyExists) return err;

@@ -818,6 +818,47 @@ fn map_builtin_name(name: string) -> string {
     return name
 }
 
+-- ============================================================
+-- RAW MEMORY PRIMITIVES
+-- Builtins for code that manages memory itself, such as the runtime.
+-- Each one needs an unsafe block. Addresses are ints.
+--   load_T(addr) and store_T(addr, v), where T is u8, i8, u16, i16,
+--     u32, i32, i64, f32 or f64. Integer loads widen to int (zero- or
+--     sign-extended by T); float loads widen to float. Stores narrow v.
+--   addr_of(place): the address of a variable, field or list element
+--   size_of[T](): the size of type T in bytes
+--   string_data(s): the address of a string's bytes (not NUL-terminated)
+--   string_from_raw(ptr, len, cap): the string at ptr; cap 0 marks
+--     memory the string does not own
+-- ============================================================
+
+-- The memory type a load_T or store_T builtin accesses, or ""
+fn raw_mem_type(name: string) -> string {
+    let mut t = ""
+    if starts_with(name, "load_") {
+        t = substr(name, 5, len(name) - 5)
+    } else if starts_with(name, "store_") {
+        t = substr(name, 6, len(name) - 6)
+    } else {
+        return ""
+    }
+    if t == "u8" or t == "i8" or t == "u16" or t == "i16" or t == "u32" or t == "i32" { return t }
+    if t == "i64" or t == "f32" or t == "f64" { return t }
+    return ""
+}
+
+fn is_raw_builtin(name: string) -> bool {
+    if raw_mem_type(name) != "" { return true }
+    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw"
+}
+
+fn raw_builtin_return_type(name: string) -> string {
+    if starts_with(name, "store_") { return "void" }
+    if name == "string_from_raw" { return "string" }
+    if name == "load_f32" or name == "load_f64" { return "f64" }
+    return "i64"
+}
+
 fn is_builtin_fn(name: string) -> bool {
     if name == "print" or name == "println" { return true }
     if name == "eprint" or name == "eprintln" { return true }
@@ -839,6 +880,7 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "Box_new" or name == "Box_null" { return true }
     if name == "Map_new" { return true }
     if name == "byte_at" or name == "hash_key" { return true }
+    if is_raw_builtin(name) { return true }
     if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return true }
     if name == "char_to_string" { return true }
     if name == "string_to_int" { return true }
@@ -858,6 +900,8 @@ fn builtin_return_type(name: string) -> string {
     if name == "exit" { return "void" }
     if name == "len" { return "i64" }
     if name == "byte_at" or name == "hash_key" { return "i64" }
+    if is_raw_builtin(name) { return raw_builtin_return_type(name) }
+    if name == "Box_new" or name == "Box_null" { return "ptr" }
     if name == "char_at" { return "string" }
     if name == "substr" { return "string" }
     if name == "int_to_string" { return "string" }
