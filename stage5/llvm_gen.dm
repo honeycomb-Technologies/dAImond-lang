@@ -257,10 +257,6 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
             if gen.has_dm_string_type { return gen.dm_string_type }
             return dm_llvm_pointer_type(ctx)
         }
-        -- Map types: use [64 x i8] to ensure enough space for runtime map struct
-        if starts_with(type_name, "dm_map_") or starts_with(type_name, "map") or type_name == "map" or starts_with(type_name, "Map[") {
-            return dm_llvm_array_type(dm_llvm_int8_type(ctx), 64)
-        }
         -- Result type: { i32 tag, ok_type, err_type }
         -- Parse inner types from Result[T, E] for correct LLVM struct layout
         if type_name == "result" or starts_with(type_name, "Result[") or starts_with(type_name, "result_") {
@@ -383,17 +379,6 @@ fn register_builtin_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
         g.struct_type_map.insert("dm_list_dm_string", list_struct)
         g.struct_type_map.insert("dm_list_generic", list_struct)
         g.struct_type_map.insert("list", list_struct)
-
-        let map_struct = dm_llvm_struct_create_named(ctx, "dm_map")
-        dm_llvm_buf_clear()
-        dm_llvm_buf_push(dm_llvm_pointer_type(ctx))
-        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
-        dm_llvm_buf_push(dm_llvm_int64_type(ctx))
-        dm_llvm_struct_set_body_buf(map_struct, 0)
-        g.struct_type_map.insert("dm_map", map_struct)
-        g.struct_type_map.insert("dm_map_string_int", map_struct)
-        g.struct_type_map.insert("dm_map_int_string", map_struct)
-        g.struct_type_map.insert("map", map_struct)
 
         return g
     }
@@ -879,6 +864,18 @@ fn resolve_value_with_counter(gen: LLVMGenerator, val: IRValue) -> LLVMGenerator
     return g
 }
 
+-- A string or list value is a pointer to its storage. Where the
+-- value itself is wanted (a by-value parameter or a return value of
+-- that struct type), load it.
+fn load_handle_as(gen: LLVMGenerator, val: IRValue, v: int, want_ty: int) -> int {
+    unsafe {
+        if is_string_ptr(gen, val) == false { return v }
+        if dm_llvm_get_type_kind(want_ty) != 10 { return v }
+        if dm_llvm_get_type_kind(dm_llvm_type_of(v)) != 12 { return v }
+        return dm_llvm_build_load2(gen.builder, want_ty, v, "handle.val")
+    }
+}
+
 -- Check if an IR value is a string pointer (alloca to dm_string)
 fn is_string_ptr(gen: LLVMGenerator, val: IRValue) -> bool {
     if val.kind == VAL_INST_REF() {
@@ -1233,7 +1230,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 g.string_ptrs.insert(id_key, true)
             }
             -- List and map types are also aggregate pointers (pass by pointer, not value)
-            if starts_with(inst.alloc_type, "dm_list_") or starts_with(inst.alloc_type, "dm_map_") or starts_with(inst.alloc_type, "List[") or starts_with(inst.alloc_type, "Map[") {
+            if starts_with(inst.alloc_type, "dm_list_") or starts_with(inst.alloc_type, "List[") {
                 g.string_ptrs.insert(id_key, true)
             }
             if inst.has_result { g.value_map.insert(id_key, result) }
@@ -1249,8 +1246,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 if inst.has_result { g.value_map.insert(id_key, ptr_val) }
                 return g
             }
-            -- List/map loads return the pointer itself (aggregate types, always by pointer)
-            if starts_with(inst.load_type, "dm_list_") or starts_with(inst.load_type, "dm_map_") or inst.load_type == "list" or inst.load_type == "map" or starts_with(inst.load_type, "List[") or starts_with(inst.load_type, "Map[") {
+            -- List loads return the pointer itself (aggregate types, always by pointer)
+            if starts_with(inst.load_type, "dm_list_") or inst.load_type == "list" or starts_with(inst.load_type, "List[") {
                 let ptr_val = resolve_value(g, inst.load_ptr)
                 g = resolve_value_with_counter(g, inst.load_ptr)
                 g.string_ptrs.insert(id_key, true)
@@ -1467,23 +1464,6 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         if op == OP_LIST_POP() {
             g = generate_list_pop(g, inst)
-            return g
-        }
-        -- Map operations
-        if op == OP_MAP_NEW() {
-            g = generate_map_new(g, inst)
-            return g
-        }
-        if op == OP_MAP_INSERT() {
-            g = generate_map_insert(g, inst)
-            return g
-        }
-        if op == OP_MAP_GET() {
-            g = generate_map_get(g, inst)
-            return g
-        }
-        if op == OP_MAP_CONTAINS() {
-            g = generate_map_contains(g, inst)
             return g
         }
         -- Panic
@@ -1784,100 +1764,6 @@ fn generate_list_pop(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 }
 
 -- ============================================================
--- MAP OPERATIONS
--- ============================================================
-
-fn generate_map_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let id_key = int_to_string(inst.id)
-        let fn_name = "dm_map_new"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(g.builder, fn_ty, func, "map")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
-}
-
-fn generate_map_insert(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let map_val = resolve_value(g, inst.map_val)
-        let key_val = resolve_value(g, inst.map_key)
-        let value_val = resolve_value(g, inst.map_value)
-        g = resolve_value_with_counter(g, inst.map_val)
-        g = resolve_value_with_counter(g, inst.map_key)
-        g = resolve_value_with_counter(g, inst.map_value)
-        let fn_name = "dm_map_insert"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(map_val)
-            dm_llvm_buf_push(key_val)
-            dm_llvm_buf_push(value_val)
-            g = check_call_args(g, fn_ty, func)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
-        return g
-    }
-}
-
-fn generate_map_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let map_val = resolve_value(g, inst.map_val)
-        let key_val = resolve_value(g, inst.map_key)
-        g = resolve_value_with_counter(g, inst.map_val)
-        g = resolve_value_with_counter(g, inst.map_key)
-        let fn_name = "dm_map_get"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(map_val)
-            dm_llvm_buf_push(key_val)
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(b, fn_ty, func, "mapget")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
-}
-
-fn generate_map_contains(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let map_val = resolve_value(g, inst.map_val)
-        let key_val = resolve_value(g, inst.map_key)
-        g = resolve_value_with_counter(g, inst.map_val)
-        g = resolve_value_with_counter(g, inst.map_key)
-        let fn_name = "dm_map_contains"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(map_val)
-            dm_llvm_buf_push(key_val)
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(b, fn_ty, func, "maphas")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
-}
-
--- ============================================================
 -- PANIC
 -- ============================================================
 
@@ -1970,17 +1856,10 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
                 dm_llvm_build_store(b, ret_val, sret_ptr)
                 dm_llvm_build_ret_void(b)
             } else {
-                -- If returning string pointer, load the struct first
-                if func.return_type == "string" and is_string_ptr(g, term.ret_val) {
-                    let ptr_val = resolve_value(g, term.ret_val)
-                    g = resolve_value_with_counter(g, term.ret_val)
-                    let loaded = dm_llvm_build_load2(b, g.dm_string_type, ptr_val, "ret.str")
-                    dm_llvm_build_ret(b, loaded)
-                } else {
-                    let ret_val = resolve_value(g, term.ret_val)
-                    g = resolve_value_with_counter(g, term.ret_val)
-                    dm_llvm_build_ret(b, ret_val)
-                }
+                -- A returned string or list pointer: return the value
+                let ret_val = resolve_value(g, term.ret_val)
+                g = resolve_value_with_counter(g, term.ret_val)
+                dm_llvm_build_ret(b, load_handle_as(g, term.ret_val, ret_val, map_ir_type_to_llvm(g, func.return_type)))
             }
             return g
         }

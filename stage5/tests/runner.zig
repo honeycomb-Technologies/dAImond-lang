@@ -137,6 +137,58 @@ const generic_struct_tests = [_]TestCase{
     },
 };
 
+/// Map[K, V] in Stage 5 is runtime/map.dm. Stage 0 has no byte_at,
+/// and its keys() order is the hash table's, not insertion order.
+const stage5_map_tests = [_]TestCase{
+    .{
+        .name = "map_keys_in_insertion_order",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    m.insert("z", 1)
+            \\    m.insert("a", 2)
+            \\    m.insert("m", 3)
+            \\    m.remove("a")
+            \\    m.insert("a", 4)
+            \\    m["a"] += 10
+            \\    let mut out = ""
+            \\    for k in m {
+            \\        out = out + k + int_to_string(m[k])
+            \\    }
+            \\    println(out)
+            \\}
+        ,
+        .expected_output = "z1m3a14\n",
+    },
+    .{
+        .name = "byte_at_and_bounds",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let s = "Az~"
+            \\    println(int_to_string(byte_at(s, 0)) + " " + int_to_string(byte_at(s, 1)) + " " + int_to_string(byte_at(s, 2)))
+            \\    println(int_to_string(byte_at(s, 3)))
+            \\}
+        ,
+        .expected_output = "65 122 126\n",
+        .expected_exit_code = 1,
+    },
+    .{
+        .name = "map_new_needs_a_type",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let m = Map_new()
+            \\    println("x")
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"cannot tell which Map type Map_new() creates here"},
+    },
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -217,6 +269,7 @@ pub fn main() !void {
         .{ .name = "Op Overload Extended", .tests = &stage0_runner.op_overload_extended_tests },
         .{ .name = "Comprehensive", .tests = &stage0_runner.comprehensive_test },
         .{ .name = "Generic Structs", .tests = &generic_struct_tests },
+        .{ .name = "Maps (Stage 5)", .tests = &stage5_map_tests },
     };
 
     try stdout.print("\n============================================================\n", .{});

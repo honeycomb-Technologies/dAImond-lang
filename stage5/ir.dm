@@ -292,10 +292,6 @@ fn OP_LIST_PUSH() -> int { return 71 }
 fn OP_LIST_GET() -> int { return 72 }
 fn OP_LIST_LEN() -> int { return 73 }
 fn OP_LIST_POP() -> int { return 74 }
-fn OP_MAP_NEW() -> int { return 80 }
-fn OP_MAP_INSERT() -> int { return 81 }
-fn OP_MAP_GET() -> int { return 82 }
-fn OP_MAP_CONTAINS() -> int { return 83 }
 fn OP_ARENA_CREATE() -> int { return 90 }
 fn OP_ARENA_DESTROY() -> int { return 91 }
 fn OP_ARENA_ALLOC() -> int { return 92 }
@@ -346,14 +342,8 @@ struct IRInst {
     cast_to: string,
     -- Phi
     phi_entries: List[PhiEntry],
-    -- List/Map new
+    -- List new
     elem_type: string,
-    key_type: string,
-    val_type: string,
-    -- Map insert
-    map_val: IRValue,
-    map_key: IRValue,
-    map_value: IRValue,
     -- SIMD
     simd_scalar: IRValue,
     simd_vec_type: string,
@@ -381,8 +371,7 @@ fn ir_inst_new(id: int, op: int) -> IRInst {
         callee_val: undef,
         cast_val: undef, cast_from: "", cast_to: "",
         phi_entries: [],
-        elem_type: "", key_type: "", val_type: "",
-        map_val: undef, map_key: undef, map_value: undef,
+        elem_type: "",
         simd_scalar: undef, simd_vec_type: "", simd_elements: [],
         simd_vector: undef, simd_index: undef,
         source_line: 0, source_col: 0

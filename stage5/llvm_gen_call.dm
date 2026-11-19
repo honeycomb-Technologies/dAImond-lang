@@ -67,13 +67,10 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let arg = inst.call_args[ai]
             let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
-            -- If arg is a string pointer and target function expects dm_string by value,
-            -- load the struct from the pointer
-            if is_string_ptr(g, arg) {
-                let expects_string = callee_param_is_string(g, callee_name, ai)
-                if expects_string {
-                    val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
-                }
+            -- A string or list pointer passed by value: pass the value
+            let param = dm_llvm_get_param(callee, ai)
+            if param != 0 {
+                val = load_handle_as(g, arg, val, dm_llvm_type_of(param))
             }
             val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
             args.push(val)
@@ -137,6 +134,8 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                     }
                 }
                 val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
+                let wparam = dm_llvm_get_param(callee, ai + 1)
+                if wparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(wparam)) }
                 args.push(val)
                 ai = ai + 1
             }
@@ -169,6 +168,8 @@ fn generate_wrapper_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: i
                 }
             }
             val = coerce_int_call_arg(g, callee, callee_name, ai, ai, val)
+            let wparam = dm_llvm_get_param(callee, ai)
+            if wparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(wparam)) }
             args.push(val)
             ai = ai + 1
         }
@@ -396,13 +397,9 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
             let arg = inst.call_args[ai]
             let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
-            -- If arg is a string pointer and target function expects dm_string by value, load it
-            if is_string_ptr(g, arg) {
-                let expects_string = callee_param_is_string(g, callee_name, ai)
-                if expects_string {
-                    val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.arg")
-                }
-            }
+            -- A string or list pointer passed by value: pass the value
+            let sparam = dm_llvm_get_param(callee, ai + 1)
+            if sparam != 0 { val = load_handle_as(g, arg, val, dm_llvm_type_of(sparam)) }
             val = coerce_int_call_arg(g, callee, callee_name, ai, ai + 1, val)
             args.push(val)
             ai = ai + 1

@@ -61,38 +61,6 @@ fn parse_result_ok_type(type_ann: string) -> string {
     return "i64"
 }
 
--- Extract Map value type from "Map[K, V]" annotation
-fn extract_map_value_type(map_type: string) -> string {
-    let inner = extract_inner_type(map_type, "Map[")
-    let comma_pos = string_find(inner, ",")
-    if comma_pos >= 0 {
-        let val_type = string_trim(substr(inner, comma_pos + 1, len(inner) - comma_pos - 1))
-        return val_type
-    }
-    return "i64"
-}
-
--- Infer return type of a method call given the original collection type
-fn infer_collection_method_type(gen: IRGenerator, coll_type: string, method_name: string) -> string {
-    if starts_with(coll_type, "Map[") {
-        if method_name == "get" {
-            let val_type = extract_map_value_type(coll_type)
-            return map_type_name(val_type)
-        }
-        if method_name == "contains" { return "bool" }
-        if method_name == "len" { return "i64" }
-        if method_name == "keys" or method_name == "values" { return "list" }
-    }
-    if starts_with(coll_type, "List[") {
-        if method_name == "len" { return "i64" }
-        if method_name == "pop" {
-            let inner = extract_inner_type(coll_type, "List[")
-            return map_type_name(inner)
-        }
-    }
-    return ""
-}
-
 -- Parse the value type from an "Option[T]" type annotation string
 fn parse_option_value_type(type_ann: string) -> string {
     let open_bracket = string_find(type_ann, "[")
@@ -575,30 +543,11 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 -- ============================================================
 -- STATIC SOURCE TYPES
 -- The dAImond source type of an expression, as written in the
--- program (e.g. "Parser", "List[Stmt]", "Map[string, int]",
+-- program (e.g. "Parser", "List[Stmt]", "Map_string_i64",
 -- "Box[Expr]"), or "" when it cannot be determined. Used to
 -- dispatch field access and method calls on any receiver, not
 -- just on variables.
 -- ============================================================
-
--- "K" and "V" of a "Map[K, V]" type; "" when not a map type.
-fn map_type_arg(map_type: string, which: int) -> string {
-    if starts_with(map_type, "Map[") == false { return "" }
-    let inner = extract_inner_type(map_type, "Map[")
-    let mut depth = 0
-    let mut i = 0
-    while i < len(inner) {
-        let c = char_at(inner, i)
-        if c == "[" { depth = depth + 1 }
-        if c == "]" { depth = depth - 1 }
-        if c == "," and depth == 0 {
-            if which == 0 { return string_trim(substr(inner, 0, i)) }
-            return string_trim(substr(inner, i + 1, len(inner) - i - 1))
-        }
-        i = i + 1
-    }
-    return ""
-}
 
 fn strip_box_type(t: string) -> string {
     if starts_with(t, "Box[") { return extract_inner_type(t, "Box[") }
@@ -620,10 +569,135 @@ fn struct_field_src_type(gen: IRGenerator, struct_name: string, field: string) -
 
 -- Source type for a builtin's IR return type name
 fn builtin_src_type(ir_type: string) -> string {
+    -- string_split is the only builtin that returns a list
+    if ir_type == "list" { return "List[string]" }
     if ir_type == "i64" { return "int" }
     if ir_type == "f64" { return "float" }
     if ir_type == "void" { return "" }
     return ir_type
+}
+
+-- ============================================================
+-- MAPS
+-- Map[K, V] is the generic struct in runtime/map.dm; a map type
+-- is one of its instances, such as Map_string_i64.
+-- ============================================================
+
+fn is_map_type(gen: IRGenerator, t: string) -> bool {
+    if gen.generic_instances.contains(t) == false { return false }
+    return gen.generic_instances.get(t) == "Map"
+}
+
+-- Source type argument `which` (0 = K, 1 = V) of a map instance
+fn map_instance_arg(gen: IRGenerator, t: string, which: int) -> string {
+    let args = string_split(gen.generic_instance_args.get(t), "|")
+    if which < args.len() { return args[which] }
+    return ""
+}
+
+-- Map_new() or Map.new()
+fn is_map_ctor(e: Expr) -> bool {
+    if e.kind == EXPR_FUNCTION_CALL() and e.args.len() == 0 {
+        let c = *e.callee
+        return c.kind == EXPR_IDENTIFIER() and c.name == "Map_new"
+    }
+    if e.kind == EXPR_METHOD_CALL() and e.method == "new" and e.args.len() == 0 {
+        let o = *e.object
+        return o.kind == EXPR_IDENTIFIER() and o.name == "Map"
+    }
+    return false
+}
+
+-- Map_new() becomes an empty map of the type its destination
+-- needs, written as a struct literal; anything else is unchanged
+fn map_ctor_as(gen: IRGenerator, e: Expr, dest: string) -> Expr {
+    if is_map_ctor(e) == false or is_map_type(gen, dest) == false { return e }
+    let info = gen.struct_defs.get(dest)
+    let mut lit = expr_new(EXPR_STRUCT_LITERAL(), e.line, e.col)
+    lit.type_name = dest
+    let mut names: List[string] = []
+    let mut vals: List[Expr] = []
+    let mut i = 0
+    while i < info.field_names.len() {
+        names.push(info.field_names[i])
+        if starts_with(info.field_src_types[i], "List[") {
+            vals.push(expr_new(EXPR_ARRAY_LITERAL(), e.line, e.col))
+        } else {
+            vals.push(expr_int(0, e.line, e.col))
+        }
+        i = i + 1
+    }
+    lit.field_names = names
+    lit.field_values = vals
+    return lit
+}
+
+-- byte_at(s, i): the byte at index i of s as an int, 0 to 255
+fn generate_byte_at(gen: IRGenerator, block: IRBasicBlock, s_expr: Expr, i_expr: Expr) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let s_res = generate_expr(g, b, s_expr)
+    g = s_res.gen
+    b = s_res.block
+    let i_res = generate_expr(g, b, i_expr)
+    g = i_res.gen
+    b = i_res.block
+    -- A string is { data, len, capacity }, like a list of u8
+    let slot = g.builder.next_id
+    let mut slot_inst = ir_inst_new(slot, OP_ALLOCA())
+    slot_inst.alloc_type = "string"
+    slot_inst.result_type = "ptr(string)"
+    slot_inst.has_result = true
+    b.instructions.push(slot_inst)
+    g.builder.next_id = slot + 1
+    let mut st = ir_inst_new(g.builder.next_id, OP_STORE())
+    st.store_ptr = ir_val_inst(slot)
+    st.store_val = ir_val_inst(s_res.val_id)
+    b.instructions.push(st)
+    g.builder.next_id = g.builder.next_id + 1
+    let len_id = g.builder.next_id
+    let mut len_inst = ir_inst_new(len_id, OP_CALL())
+    len_inst.callee = "dm_string_len"
+    let mut len_args: List[IRValue] = []
+    len_args.push(ir_val_inst(s_res.val_id))
+    len_inst.call_args = len_args
+    len_inst.result_type = "i64"
+    len_inst.has_result = true
+    b.instructions.push(len_inst)
+    g.builder.next_id = len_id + 1
+    let chk = check_index_bounds(g, b, i_res.val_id, ir_val_inst(len_id), "(string)")
+    g = chk.gen
+    b = chk.block
+    let addr = g.builder.next_id
+    let mut gep = ir_inst_new(addr, OP_GEP())
+    gep.gep_base = ir_val_inst(slot)
+    let mut idx: List[IRValue] = []
+    idx.push(ir_val_inst(i_res.val_id))
+    gep.gep_indices = idx
+    gep.alloc_type = "u8"
+    gep.field_type = "u8"
+    gep.result_type = "ptr(u8)"
+    gep.has_result = true
+    b.instructions.push(gep)
+    g.builder.next_id = addr + 1
+    let ld = g.builder.next_id
+    let mut ld_inst = ir_inst_new(ld, OP_LOAD())
+    ld_inst.load_ptr = ir_val_inst(addr)
+    ld_inst.load_type = "u8"
+    ld_inst.result_type = "u8"
+    ld_inst.has_result = true
+    b.instructions.push(ld_inst)
+    g.builder.next_id = ld + 1
+    let cast = g.builder.next_id
+    let mut cast_inst = ir_inst_new(cast, OP_CAST())
+    cast_inst.cast_val = ir_val_inst(ld)
+    cast_inst.cast_from = "u8"
+    cast_inst.cast_to = "i64"
+    cast_inst.result_type = "i64"
+    cast_inst.has_result = true
+    b.instructions.push(cast_inst)
+    g.builder.next_id = cast + 1
+    return expr_result(g, b, cast)
 }
 
 fn static_type(gen: IRGenerator, expr: Expr) -> string {
@@ -645,8 +719,8 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
     }
     if k == EXPR_INDEX_ACCESS() {
         let obj_t = static_type(gen, *expr.object)
+        if is_map_type(gen, obj_t) { return map_instance_arg(gen, obj_t, 1) }
         if starts_with(obj_t, "List[") { return extract_inner_type(obj_t, "List[") }
-        if starts_with(obj_t, "Map[") { return map_type_arg(obj_t, 1) }
         if obj_t == "string" { return "string" }
         return ""
     }
@@ -692,14 +766,6 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
             if m == "len" { return "int" }
             if m == "pop" or m == "get" { return extract_inner_type(recv_t, "List[") }
             if m == "contains" { return "bool" }
-            return ""
-        }
-        if starts_with(recv_t, "Map[") {
-            if m == "get" { return map_type_arg(recv_t, 1) }
-            if m == "contains" { return "bool" }
-            if m == "len" { return "int" }
-            if m == "keys" { return "List[" + map_type_arg(recv_t, 0) + "]" }
-            if m == "values" { return "List[" + map_type_arg(recv_t, 1) + "]" }
             return ""
         }
         if recv_t == "string" and m == "len" { return "int" }
@@ -1267,12 +1333,6 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
                     return gen.list_elem_types.get(name)
                 }
             }
-            -- Map index access
-            if gen.map_var_kinds.contains(name) {
-                let idx_mk = gen.map_var_kinds.get(name)
-                if idx_mk == MAP_KIND_STRING_INT() { return "i64" }
-                if idx_mk == MAP_KIND_INT_STRING() { return "string" }
-            }
         }
         let idx_src = static_type(gen, expr)
         if idx_src != "" {
@@ -1291,17 +1351,6 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         if method == "len" { return "i64" }
         if method == "pop" { return "i64" }
         if method == "get" {
-            -- Check if object is a map variable to determine get return type
-            let get_obj = *expr.object
-            if get_obj.kind == EXPR_IDENTIFIER() {
-                let get_var = get_obj.name
-                if gen.map_var_kinds.contains(get_var) {
-                    let mk = gen.map_var_kinds.get(get_var)
-                    if mk == MAP_KIND_INT_STRING() {
-                        return "string"
-                    }
-                }
-            }
             return "i64"
         }
         if method == "contains" { return "bool" }
@@ -2361,16 +2410,36 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return generate_err_call(g, b, expr.args)
     }
 
-    -- Map_new() is handled at the let-binding level; return a placeholder
+    -- Map_new() takes its type from where the map goes (a typed let,
+    -- an assignment, a struct field, a return); see map_ctor_as
     if fn_name == "Map_new" {
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_ALLOCA())
-        inst.alloc_type = "i64"
-        inst.result_type = "ptr(i64)"
-        inst.has_result = true
-        b.instructions.push(inst)
-        g.builder.next_id = id + 1
-        return expr_result(g, b, id)
+        g = ir_type_error(g, "cannot tell which Map type Map_new() creates here; give it one, e.g. let m: Map[string, int] = Map_new()", expr.line)
+        return expr_result(g, b, 0)
+    }
+
+    -- byte_at(s, i): the byte at index i of s, 0 to 255
+    if fn_name == "byte_at" and expr.args.len() == 2 {
+        return generate_byte_at(g, b, expr.args[0], expr.args[1])
+    }
+
+    -- hash_key(k): the hash Map[K, V] uses for a string or integer key
+    if fn_name == "hash_key" and expr.args.len() == 1 {
+        let key_type = infer_expr_type(g, expr.args[0])
+        let hash_fn = if key_type == "string" { "rt_map_hash_string" } else { "rt_map_hash_int" }
+        if key_type != "string" and is_integer_type(key_type) == false {
+            g = ir_type_error(g, "hash_key() takes a string or integer key, not '" + key_type + "'", expr.line)
+        }
+        let mut hash_args: List[Expr] = []
+        hash_args.push(expr.args[0])
+        return generate_expr(g, b, expr_call(expr_ident(hash_fn, expr.line, expr.col), hash_args, expr.line, expr.col))
+    }
+
+    -- len(m) on a map is m.len()
+    if fn_name == "len" and expr.args.len() == 1 {
+        if is_map_type(g, static_type(g, expr.args[0])) {
+            let no_args: List[Expr] = []
+            return generate_expr(g, b, expr_method_call(expr.args[0], "len", no_args, expr.line, expr.col))
+        }
     }
 
     -- Explicit generic type arguments: fn_name[T](args)
@@ -3099,6 +3168,11 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let method_name = expr.method
     let args = expr.args
 
+    if is_map_ctor(expr) {
+        g = ir_type_error(g, "cannot tell which Map type Map.new() creates here; give it one, e.g. let m: Map[string, int] = Map.new()", expr.line)
+        return expr_result(g, b, 0)
+    }
+
     -- Region escape: push/insert/set store their argument into the
     -- container, so a region-born argument must not land in a
     -- container declared outside the region
@@ -3145,15 +3219,6 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         obj_expr.name
     } else {
         ""
-    }
-
-    -- --------------------------------------------------------
-    -- Map method calls
-    -- --------------------------------------------------------
-    if len(obj_var_name) > 0 and g.map_var_kinds.contains(obj_var_name) {
-        let mk = g.map_var_kinds.get(obj_var_name)
-        let map_ptr = g.variable_map.get(obj_var_name)
-        return generate_map_method_call(g, b, mk, map_ptr, method_name, args)
     }
 
     -- --------------------------------------------------------
@@ -3454,264 +3519,6 @@ fn generate_dyn_dispatch_call(gen: IRGenerator, block: IRBasicBlock, obj_name: s
 }
 
 -- ============================================================
--- MAP METHOD CALL
--- Dispatches .insert, .get, .contains, .remove, .len,
--- .keys, .values, .set on Map[K,V] variables.
--- ============================================================
-
-fn generate_map_method_call(gen: IRGenerator, block: IRBasicBlock, mk: int, map_ptr: int, method_name: string, args: List[Expr]) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- ---- insert / set ----
-    if method_name == "insert" or method_name == "set" {
-        if args.len() >= 2 {
-            let key_result = generate_expr(g, b, args[0])
-            g = key_result.gen
-            b = key_result.block
-
-            let val_result = generate_expr(g, b, args[1])
-            g = val_result.gen
-            b = val_result.block
-
-            let insert_fn = if mk == MAP_KIND_STRING_INT() {
-                "dm_map_string_int_insert"
-            } else {
-                "dm_map_int_string_insert"
-            }
-
-            let id = g.builder.next_id
-            let mut inst = ir_inst_new(id, OP_CALL())
-            inst.callee = insert_fn
-            let mut call_args: List[IRValue] = []
-            call_args.push(ir_val_inst(map_ptr))
-            call_args.push(ir_val_inst(key_result.val_id))
-            call_args.push(ir_val_inst(val_result.val_id))
-            inst.call_args = call_args
-            inst.result_type = "void"
-            inst.has_result = false
-            b.instructions.push(inst)
-            g.builder.next_id = g.builder.next_id + 1
-            return expr_result(g, b, id)
-        }
-        return expr_result(g, b, 0)
-    }
-
-    -- ---- get ----
-    if method_name == "get" {
-        if args.len() >= 1 {
-            let key_result = generate_expr(g, b, args[0])
-            g = key_result.gen
-            b = key_result.block
-
-            if mk == MAP_KIND_STRING_INT() {
-                let id = g.builder.next_id
-                let mut inst = ir_inst_new(id, OP_CALL())
-                inst.callee = "dm_map_string_int_get"
-                let mut call_args: List[IRValue] = []
-                call_args.push(ir_val_inst(map_ptr))
-                call_args.push(ir_val_inst(key_result.val_id))
-                inst.call_args = call_args
-                inst.result_type = "i64"
-                inst.has_result = true
-                b.instructions.push(inst)
-                g.builder.next_id = g.builder.next_id + 1
-                return expr_result(g, b, id)
-            } else {
-                -- MAP_KIND_INT_STRING: get returns string via out param
-                let out_alloca_id = g.builder.next_id
-                let mut out_inst = ir_inst_new(out_alloca_id, OP_ALLOCA())
-                out_inst.alloc_type = "string"
-                out_inst.result_type = "ptr(string)"
-                out_inst.has_result = true
-                b.instructions.push(out_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                let call_id = g.builder.next_id
-                let mut call_inst = ir_inst_new(call_id, OP_CALL())
-                call_inst.callee = "dm_map_int_string_get"
-                let mut call_args: List[IRValue] = []
-                call_args.push(ir_val_inst(out_alloca_id))
-                call_args.push(ir_val_inst(map_ptr))
-                call_args.push(ir_val_inst(key_result.val_id))
-                call_inst.call_args = call_args
-                call_inst.result_type = "void"
-                call_inst.has_result = false
-                b.instructions.push(call_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                -- Load the result from out_alloca
-                let load_id = g.builder.next_id
-                let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-                load_inst.load_ptr = ir_val_inst(out_alloca_id)
-                load_inst.load_type = "string"
-                load_inst.result_type = "string"
-                load_inst.has_result = true
-                b.instructions.push(load_inst)
-                g.builder.next_id = g.builder.next_id + 1
-                return expr_result(g, b, load_id)
-            }
-        }
-        return expr_result(g, b, 0)
-    }
-
-    -- ---- contains ----
-    if method_name == "contains" {
-        if args.len() >= 1 {
-            let key_result = generate_expr(g, b, args[0])
-            g = key_result.gen
-            b = key_result.block
-
-            let contains_fn = if mk == MAP_KIND_STRING_INT() {
-                "dm_map_string_int_contains"
-            } else {
-                "dm_map_int_string_contains"
-            }
-
-            let id = g.builder.next_id
-            let mut inst = ir_inst_new(id, OP_CALL())
-            inst.callee = contains_fn
-            let mut call_args: List[IRValue] = []
-            call_args.push(ir_val_inst(map_ptr))
-            call_args.push(ir_val_inst(key_result.val_id))
-            inst.call_args = call_args
-            inst.result_type = "bool"
-            inst.has_result = true
-            b.instructions.push(inst)
-            g.builder.next_id = g.builder.next_id + 1
-            return expr_result(g, b, id)
-        }
-        return expr_result(g, b, 0)
-    }
-
-    -- ---- remove ----
-    if method_name == "remove" {
-        if args.len() >= 1 {
-            let key_result = generate_expr(g, b, args[0])
-            g = key_result.gen
-            b = key_result.block
-
-            let remove_fn = if mk == MAP_KIND_STRING_INT() {
-                "dm_map_string_int_remove"
-            } else {
-                "dm_map_int_string_remove"
-            }
-
-            let id = g.builder.next_id
-            let mut inst = ir_inst_new(id, OP_CALL())
-            inst.callee = remove_fn
-            let mut call_args: List[IRValue] = []
-            call_args.push(ir_val_inst(map_ptr))
-            call_args.push(ir_val_inst(key_result.val_id))
-            inst.call_args = call_args
-            inst.result_type = "void"
-            inst.has_result = false
-            b.instructions.push(inst)
-            g.builder.next_id = g.builder.next_id + 1
-            return expr_result(g, b, id)
-        }
-        return expr_result(g, b, 0)
-    }
-
-    -- ---- len ----
-    if method_name == "len" {
-        let len_fn = if mk == MAP_KIND_STRING_INT() {
-            "dm_map_string_int_len"
-        } else {
-            "dm_map_int_string_len"
-        }
-
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_CALL())
-        inst.callee = len_fn
-        let mut call_args: List[IRValue] = []
-        call_args.push(ir_val_inst(map_ptr))
-        inst.call_args = call_args
-        inst.result_type = "i64"
-        inst.has_result = true
-        b.instructions.push(inst)
-        g.builder.next_id = g.builder.next_id + 1
-        return expr_result(g, b, id)
-    }
-
-    -- ---- keys ----
-    if method_name == "keys" {
-        let list_type = if mk == MAP_KIND_STRING_INT() {
-            "dm_list_dm_string"
-        } else {
-            "dm_list_int64"
-        }
-        let keys_fn = if mk == MAP_KIND_STRING_INT() {
-            "dm_map_string_int_keys"
-        } else {
-            "dm_map_int_string_keys"
-        }
-
-        -- Allocate a list to receive the keys
-        let list_alloca_id = g.builder.next_id
-        let mut list_inst = ir_inst_new(list_alloca_id, OP_ALLOCA())
-        list_inst.alloc_type = list_type
-        list_inst.result_type = "ptr(" + list_type + ")"
-        list_inst.has_result = true
-        b.instructions.push(list_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_CALL())
-        inst.callee = keys_fn
-        let mut call_args: List[IRValue] = []
-        call_args.push(ir_val_inst(list_alloca_id))
-        call_args.push(ir_val_inst(map_ptr))
-        inst.call_args = call_args
-        inst.result_type = "void"
-        inst.has_result = false
-        b.instructions.push(inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        return expr_result(g, b, list_alloca_id)
-    }
-
-    -- ---- values ----
-    if method_name == "values" {
-        let list_type = if mk == MAP_KIND_STRING_INT() {
-            "dm_list_int64"
-        } else {
-            "dm_list_dm_string"
-        }
-        let values_fn = if mk == MAP_KIND_STRING_INT() {
-            "dm_map_string_int_values"
-        } else {
-            "dm_map_int_string_values"
-        }
-
-        let list_alloca_id = g.builder.next_id
-        let mut list_inst = ir_inst_new(list_alloca_id, OP_ALLOCA())
-        list_inst.alloc_type = list_type
-        list_inst.result_type = "ptr(" + list_type + ")"
-        list_inst.has_result = true
-        b.instructions.push(list_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_CALL())
-        inst.callee = values_fn
-        let mut call_args: List[IRValue] = []
-        call_args.push(ir_val_inst(list_alloca_id))
-        call_args.push(ir_val_inst(map_ptr))
-        inst.call_args = call_args
-        inst.result_type = "void"
-        inst.has_result = false
-        b.instructions.push(inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        return expr_result(g, b, list_alloca_id)
-    }
-
-    -- Unknown map method; return undef
-    return expr_result(g, b, 0)
-}
-
--- ============================================================
 -- LIST METHOD CALL
 -- Dispatches .push, .pop, .len, .contains on List[T] variables.
 -- Runtime function names are selected based on elem_kind.
@@ -3923,7 +3730,6 @@ fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: strin
     g.list_elem_kinds = Map_new()
     g.list_elem_types = Map_new()
     g.var_enum_types = Map_new()
-    g.map_var_kinds = Map_new()
     g.box_inner_types = Map_new()
     g.fn_ptr_vars = Map_new()
     g.array_var_names = Map_new()
@@ -3942,7 +3748,6 @@ fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: strin
     out.fn_src_return_types = g.fn_src_return_types
     out.field_list_elem_kinds = g.field_list_elem_kinds
     out.field_list_elem_types = g.field_list_elem_types
-    out.field_map_kinds = g.field_map_kinds
     out.label_counter = g.label_counter
     out.lambda_counter = g.lambda_counter
     out.known_functions = g.known_functions
@@ -5092,6 +4897,13 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     let object = *expr.object
     let index = *expr.index
 
+    -- m[k] is m.get(k)
+    if is_map_type(g, static_type(g, object)) {
+        let mut get_args: List[Expr] = []
+        get_args.push(index)
+        return generate_expr(g, b, expr_method_call(object, "get", get_args, expr.line, expr.col))
+    }
+
     -- A list reached through a field, a box, a call, ...: index its storage
     let obj_static = if object.kind == EXPR_IDENTIFIER() { "" } else { static_type(g, object) }
     if starts_with(obj_static, "List[") {
@@ -5184,34 +4996,6 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
             let bounds_ctx = if g.array_var_names.contains(var_name) { "(array)" } else { "(list)" }
             return generate_list_index_get(g, b, elem_kind, elem_type, obj_id, idx_id, bounds_ctx)
         }
-
-        -- Map variable index access
-        if g.map_var_kinds.contains(var_name) {
-            let map_kind = g.map_var_kinds.get(var_name)
-            let mut callee_name = "dm_map_string_int_get"
-            let mut ret_type = "i64"
-
-            if map_kind == MAP_KIND_STRING_INT() {
-                callee_name = "dm_map_string_int_get"
-                ret_type = "i64"
-            } else if map_kind == MAP_KIND_INT_STRING() {
-                callee_name = "dm_map_int_string_get"
-                ret_type = "string"
-            }
-
-            let id = g.builder.next_id
-            let mut inst = ir_inst_new(id, OP_CALL())
-            inst.callee = callee_name
-            let mut call_args: List[IRValue] = []
-            call_args.push(ir_val_inst(obj_id))
-            call_args.push(ir_val_inst(idx_id))
-            inst.call_args = call_args
-            inst.result_type = ret_type
-            inst.has_result = true
-            b.instructions.push(inst)
-            g.builder.next_id = id + 1
-            return expr_result(g, b, id)
-        }
     }
 
     -- Unknown object type: report it, then emit an i64 list read to continue
@@ -5267,7 +5051,7 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
     let mut i = 0
     while i < num_fields {
         let fname = expr.field_names[i]
-        let fval_expr = expr.field_values[i]
+        let fval_expr = map_ctor_as(g, expr.field_values[i], struct_field_src_type(g, type_name, fname))
 
         -- Generate the field value expression
         let val_result = generate_expr(g, b, fval_expr)

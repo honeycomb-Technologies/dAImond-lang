@@ -1810,6 +1810,132 @@ pub const io_tests = [_]TestCase{
         .expected_output = "ba\n",
     },
     .{
+        .name = "map_struct_values_and_fields",
+        .source =
+            \\module test
+            \\struct Info { name: string, n: int }
+            \\struct Reg { by_name: Map[string, Info], flags: Map[string, bool], ids: Map[int, string] }
+            \\fn main() {
+            \\    let mut r = Reg { by_name: Map_new(), flags: Map_new(), ids: Map_new() }
+            \\    r.by_name.insert("a", Info { name: "alpha", n: 1 })
+            \\    r.by_name.insert("b", Info { name: "beta", n: 2 })
+            \\    r.flags.insert("a", true)
+            \\    r.ids[5] = "five"
+            \\    r.ids[5] = "FIVE"
+            \\    println(r.by_name.get("b").name + " " + int_to_string(r.by_name.get("a").n))
+            \\    println(bool_to_string(r.flags.get("a")) + " " + bool_to_string(r.flags.contains("b")))
+            \\    println(r.ids[5] + " " + int_to_string(r.ids.len()))
+            \\}
+        ,
+        .expected_output = "beta 1\ntrue false\nFIVE 1\n",
+    },
+    .{
+        .name = "map_counts_and_sums",
+        .source =
+            \\module test
+            \\fn count_words(text: string) -> Map[string, int] {
+            \\    let mut m: Map[string, int] = Map_new()
+            \\    for w in string_split(text, " ") {
+            \\        if m.contains(w) {
+            \\            m[w] = m[w] + 1
+            \\        } else {
+            \\            m[w] = 1
+            \\        }
+            \\    }
+            \\    return m
+            \\}
+            \\fn main() {
+            \\    let c = count_words("a b a c a b")
+            \\    let mut total = 0
+            \\    for k in c {
+            \\        total = total + c[k]
+            \\    }
+            \\    let mut vsum = 0
+            \\    for v in c.values() {
+            \\        vsum = vsum + v
+            \\    }
+            \\    println(int_to_string(c["a"]) + " " + int_to_string(c["b"]) + " " + int_to_string(c.len()))
+            \\    println(int_to_string(total) + " " + int_to_string(vsum) + " " + int_to_string(c.keys().len()))
+            \\}
+        ,
+        .expected_output = "3 2 3\n6 6 3\n",
+    },
+    .{
+        .name = "map_growth_and_removal",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let mut m: Map[int, string] = Map_new()
+            \\    let mut i = 0
+            \\    while i < 2000 {
+            \\        m.insert(i * 7919, int_to_string(i))
+            \\        i = i + 1
+            \\    }
+            \\    i = 0
+            \\    while i < 2000 {
+            \\        if i % 3 == 0 {
+            \\            m.remove(i * 7919)
+            \\        }
+            \\        i = i + 1
+            \\    }
+            \\    m.insert(3 * 7919, "back")
+            \\    m.remove(123456789)
+            \\    let mut s: Map[string, int] = Map_new()
+            \\    i = 0
+            \\    while i < 500 {
+            \\        s.insert("k" + int_to_string(i), i)
+            \\        i = i + 1
+            \\    }
+            \\    println(int_to_string(m.len()))
+            \\    println(m.get(1997 * 7919) + " " + m.get(3 * 7919) + " " + bool_to_string(m.contains(1998 * 7919)))
+            \\    println(int_to_string(s.get("k499") + s.get("k0") + s.get("k250")))
+            \\}
+        ,
+        .expected_output = "1334\n1997 back false\n749\n",
+    },
+    .{
+        .name = "map_copy_keeps_original",
+        .source =
+            \\module test
+            \\fn main() {
+            \\    let mut a: Map[string, int] = Map_new()
+            \\    a.insert("x", 1)
+            \\    let mut b = a
+            \\    b.insert("y", 2)
+            \\    b.insert("z", 3)
+            \\    println(int_to_string(a.len()) + " " + bool_to_string(a.contains("y")) + " " + int_to_string(a.get("x")))
+            \\    println(int_to_string(b.len()) + " " + int_to_string(b.get("y")) + " " + int_to_string(b.get("x")))
+            \\}
+        ,
+        .expected_output = "1 false 1\n3 2 1\n",
+    },
+    .{
+        .name = "list_values_passed_and_returned",
+        .source =
+            \\module test
+            \\fn first_two(xs: List[string]) -> string {
+            \\    return xs[0] + xs[1]
+            \\}
+            \\fn make(n: int) -> List[int] {
+            \\    let mut out: List[int] = []
+            \\    let mut i = 0
+            \\    while i < n {
+            \\        out.push(i * i)
+            \\        i = i + 1
+            \\    }
+            \\    return out
+            \\}
+            \\fn main() {
+            \\    let mut ws: List[string] = []
+            \\    ws.push("a")
+            \\    ws.push("b")
+            \\    let sq = make(4)
+            \\    println(first_two(ws) + " " + int_to_string(sq[3]) + " " + int_to_string(sq.len()))
+            \\}
+        ,
+        .expected_output = "ab 9 4\n",
+    },
+    .{
         .name = "statements_after_panic",
         .source =
             \\module test

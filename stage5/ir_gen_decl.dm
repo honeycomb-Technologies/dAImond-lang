@@ -203,7 +203,11 @@ fn register_impl_methods(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
     -- Register method->struct mappings
     let mut i = 0
     while i < ib.methods.len() {
-        g.method_struct_map.insert(ib.methods[i].name, struct_name)
+        -- A generic impl's methods are found through the receiver's
+        -- instance type, never by method name alone
+        if ib.generic_params.len() == 0 {
+            g.method_struct_map.insert(ib.methods[i].name, struct_name)
+        }
 
         -- For generic impl blocks, register each method as a generic fn decl
         -- so it can be monomorphized when called
@@ -351,24 +355,6 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- String split
     g = declare_extern3(g, "dm_string_split", "ptr", "string", "string", "void")
-
-    -- Map[string, int]
-    g = declare_extern(g, "dm_map_string_int_new", "ptr", "void")
-    g = declare_extern3(g, "dm_map_string_int_insert", "ptr", "string", "i64", "void")
-    g = declare_extern2(g, "dm_map_string_int_get", "ptr", "string", "i64")
-    g = declare_extern2(g, "dm_map_string_int_contains", "ptr", "string", "bool")
-    g = declare_extern2(g, "dm_map_string_int_remove", "ptr", "string", "void")
-    g = declare_extern(g, "dm_map_string_int_len", "ptr", "i64")
-    g = declare_extern2(g, "dm_map_string_int_keys", "ptr", "ptr", "void")
-    g = declare_extern2(g, "dm_map_string_int_values", "ptr", "ptr", "void")
-
-    -- Map[int, string]
-    g = declare_extern(g, "dm_map_int_string_new", "ptr", "void")
-    g = declare_extern3(g, "dm_map_int_string_insert", "ptr", "i64", "string", "void")
-    g = declare_extern3(g, "dm_map_int_string_get", "ptr", "ptr", "i64", "void")
-    g = declare_extern2(g, "dm_map_int_string_contains", "ptr", "i64", "bool")
-    g = declare_extern2(g, "dm_map_int_string_remove", "ptr", "i64", "void")
-    g = declare_extern(g, "dm_map_int_string_len", "ptr", "i64")
 
     return g
 }

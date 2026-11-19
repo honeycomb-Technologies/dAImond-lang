@@ -102,7 +102,7 @@ fn eval_binary_comptime(gen: IRGenerator, e: Expr) -> IRValue {
 
     -- Mixed int/float: promote int to float
     if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_FLOAT() {
-        let a = lhs.int_val
+        let a = lhs.int_val as float
         let b = rhs.float_val
         if op == BINOP_ADD() { return ir_val_float(a + b) }
         if op == BINOP_SUB() { return ir_val_float(a - b) }
@@ -111,7 +111,7 @@ fn eval_binary_comptime(gen: IRGenerator, e: Expr) -> IRValue {
 
     if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_INT() {
         let a = lhs.float_val
-        let b = rhs.int_val
+        let b = rhs.int_val as float
         if op == BINOP_ADD() { return ir_val_float(a + b) }
         if op == BINOP_SUB() { return ir_val_float(a - b) }
         if op == BINOP_MUL() { return ir_val_float(a * b) }

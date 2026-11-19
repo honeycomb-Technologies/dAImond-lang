@@ -46,9 +46,6 @@ fn LIST_ELEM_FLOAT() -> int { return 1 }
 fn LIST_ELEM_STRING() -> int { return 2 }
 fn LIST_ELEM_OTHER() -> int { return 3 }
 
--- Map key/value type combinations
-fn MAP_KIND_STRING_INT() -> int { return 0 }
-fn MAP_KIND_INT_STRING() -> int { return 1 }
 
 -- ============================================================
 -- IR GENERATOR STRUCT
@@ -89,8 +86,6 @@ struct IRGenerator {
     enum_defs: Map[string, EnumInfo],
     -- Variable name -> enum type name
     var_enum_types: Map[string, string],
-    -- Variable name -> map kind
-    map_var_kinds: Map[string, int],
     -- Variable name -> box inner type name
     box_inner_types: Map[string, string],
     -- Variable name -> concrete struct type for dyn Trait
@@ -107,8 +102,6 @@ struct IRGenerator {
     field_list_elem_kinds: Map[string, int],
     -- "StructName.field" -> list elem type name
     field_list_elem_types: Map[string, string],
-    -- "StructName.field" -> map kind
-    field_map_kinds: Map[string, int],
     -- Variable name -> true if it's a mut pointer (e.g. mut self)
     mut_ptr_vars: Map[string, bool],
     -- Variable name -> param index for mut pointer params (no alloca created)
@@ -193,7 +186,6 @@ fn ir_generator_new() -> IRGenerator {
         mut_param_fns: Map_new(),
         enum_defs: Map_new(),
         var_enum_types: Map_new(),
-        map_var_kinds: Map_new(),
         box_inner_types: Map_new(),
         dyn_var_concrete: Map_new(),
         dyn_var_traits: Map_new(),
@@ -202,7 +194,6 @@ fn ir_generator_new() -> IRGenerator {
         fn_return_types: Map_new(),
         field_list_elem_kinds: Map_new(),
         field_list_elem_types: Map_new(),
-        field_map_kinds: Map_new(),
         mut_ptr_vars: Map_new(),
         param_ptr_map: Map_new(),
         label_counter: 0,
@@ -481,9 +472,6 @@ fn parse_type_to_ir(type_str: string) -> string {
     if starts_with(type_str, "List[") {
         return "list"
     }
-    if starts_with(type_str, "Map[") {
-        return "map"
-    }
     if starts_with(type_str, "Box[") {
         return "ptr"
     }
@@ -545,7 +533,6 @@ fn safety_unwrap_grouped(e: Expr) -> Expr {
 -- composite containers collapse to their erased IR kinds
 fn safety_normalize_type(t: string) -> string {
     if starts_with(t, "dm_list_") { return "list" }
-    if starts_with(t, "dm_map_") { return "map" }
     return parse_type_to_ir(t)
 }
 
@@ -851,6 +838,7 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "assert" or name == "assert_eq" { return true }
     if name == "Box_new" or name == "Box_null" { return true }
     if name == "Map_new" { return true }
+    if name == "byte_at" or name == "hash_key" { return true }
     if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return true }
     if name == "char_to_string" { return true }
     if name == "string_to_int" { return true }
@@ -869,6 +857,7 @@ fn builtin_return_type(name: string) -> string {
     if name == "panic" { return "void" }
     if name == "exit" { return "void" }
     if name == "len" { return "i64" }
+    if name == "byte_at" or name == "hash_key" { return "i64" }
     if name == "char_at" { return "string" }
     if name == "substr" { return "string" }
     if name == "int_to_string" { return "string" }

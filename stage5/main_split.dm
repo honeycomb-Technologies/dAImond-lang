@@ -16,6 +16,7 @@ import llvm
 import llvm_gen
 import llvm_gen_call
 import llvm_gen_simd
+import prelude
 
 -- ============================================================
 -- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
@@ -313,6 +314,20 @@ fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFi
     return merged
 }
 
+-- Add the runtime written in dAImond (prelude.dm, generated from
+-- runtime/map.dm) to a program's declarations. Its generic
+-- declarations cost nothing until the program uses them.
+fn add_prelude(sf: SourceFile) -> SourceFile {
+    let mut out = sf
+    let prelude_sf = parse_source_file(parser_new(tokenize(prelude_source())))
+    let mut i = 0
+    while i < prelude_sf.declarations.len() {
+        out.declarations.push(prelude_sf.declarations[i])
+        i = i + 1
+    }
+    return out
+}
+
 -- Resolve an import path to a filesystem path.
 -- "foo" -> "<dir>/foo.dm"
 -- "std.io" -> "<dir>/std/io.dm"
@@ -443,6 +458,7 @@ fn compile(cli: CLIArgs) -> int {
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
     }
+    sf = add_prelude(sf)
 
     -- Effect system enforcement
     let effect_errors = validate_effects(sf)

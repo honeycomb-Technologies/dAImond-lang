@@ -440,36 +440,6 @@ fn builder_build_list_len(b: IRBuilder, list: IRValue) -> IRBuilder {
 }
 
 -- ============================================================
--- MAP BUILDERS
--- ============================================================
-
-fn builder_build_map_new(b: IRBuilder, key_type: string, val_type: string) -> IRBuilder {
-    let mut builder = b
-    let id = builder.next_id
-    let mut inst = ir_inst_new(id, OP_MAP_NEW())
-    inst.key_type = key_type
-    inst.val_type = val_type
-    inst.result_type = "map"
-    inst.has_result = true
-    builder = builder_add_inst(builder, inst)
-    builder.next_id = id + 1
-    return builder
-}
-
-fn builder_build_map_insert(b: IRBuilder, map: IRValue, key: IRValue, value: IRValue) -> IRBuilder {
-    let mut builder = b
-    let id = builder.next_id
-    let mut inst = ir_inst_new(id, OP_MAP_INSERT())
-    inst.map_val = map
-    inst.map_key = key
-    inst.map_value = value
-    inst.has_result = false
-    builder = builder_add_inst(builder, inst)
-    builder.next_id = id + 1
-    return builder
-}
-
--- ============================================================
 -- TERMINATOR BUILDERS
 -- ============================================================
 
