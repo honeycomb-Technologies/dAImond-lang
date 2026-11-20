@@ -4,7 +4,7 @@
 
 dAImond is a systems programming language designed to be the fastest compiled language, the most AI-generatable language, self-compiling, memory-safe without garbage collection (region-based with full inference), and fully Turing-complete at compile time.
 
-The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, and the compiler it builds contains no C: the LLVM bridge it uses is `llvm_bridge.dm`. Its first build still comes from Stage 0 (Zig), which emits C and links the C bridge `llvm_bridge.c`. Programs Stage 5 builds contain no C: their runtime is dAImond code, and the compiler links them with `ld.lld`.
+The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, and the compiler it builds contains no C: the LLVM bridge it uses is `llvm_bridge.dm`. It is built from a seed, `seed/daimond.bc` (the compiler as LLVM bitcode), by `bootstrap.sh`, with LLVM's tools and no Zig or C compiler. Stage 0 (Zig) can still build it too, emitting C and linking the C bridge `llvm_bridge.c`; the test harnesses still need Stage 0. Programs Stage 5 builds contain no C: their runtime is dAImond code, and the compiler links them with `ld.lld`.
 
 ## Repository Structure
 
@@ -13,6 +13,11 @@ dAImond-lang/
 ├── CLAUDE.md              # This file
 ├── README.md              # Project documentation and language overview
 ├── LICENSE                # MIT License
+├── bootstrap.sh           # Builds the compiler from the seed with llc and ld.lld (no Zig, no C compiler)
+├── seed/
+│   ├── daimond.bc         # The compiler as LLVM bitcode (x86-64 Linux), written by bootstrap.sh --update-seed
+│   ├── BUILD_ID           # The build ID of the source the seed was made from
+│   └── README.md          # What the seed is and when to write it again
 ├── stage0/                # Stage 0 bootstrap compiler (Zig)
 │   ├── build.zig          # Zig build configuration
 │   ├── .mise.toml         # Tool version pinning (Zig 0.13.0)
@@ -81,7 +86,7 @@ dAImond-lang/
 │   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
 │   └── tests/
 │       └── runner.zig         # Integration test harness (254 tests, mirrors Stage 0)
-├── stage5/                # Stage 5 LLVM backend (dAImond; built by Stage 0)
+├── stage5/                # Stage 5 LLVM backend (dAImond; built from the seed, or by Stage 0)
 │   ├── main.dm            # Monolithic bootstrap file (generated, ~22K lines)
 │   ├── main_split.dm      # Entry point with imports (for modular development)
 │   ├── token.dm           # Token kinds, Token struct, keyword lookup
@@ -199,10 +204,17 @@ Stage 3 is frozen. See `docs/stage-history.md` for build commands.
 
 ### Stage 5 (LLVM Backend in dAImond)
 
-Stage 5 is compiled by Stage 0. Building it requires **LLVM 17+** development libraries and Stage 0's C runtime. Running it requires LLVM's linker `ld.lld` and the C library's development files (`Scrt1.o`, `crti.o`, `crtn.o`, `libc.so`); it needs no C compiler, except to build itself.
+Stage 5 is built from the seed by `bootstrap.sh`, or by Stage 0. Either way it needs LLVM 19 with `lld` (a newer LLVM should work, but only 19 has been tested), and the C library's development files (`Scrt1.o`, `crti.o`, `crtn.o`, `libc.so`). It needs no C compiler, to build programs or to build itself.
 
 ```bash
-# Build Stage 5 compiler (Stage 0 compiles main.dm to C, then gcc produces binary)
+# Build the Stage 5 compiler from the seed: no Zig, no C compiler (about five minutes, 2 GB of memory)
+bash bootstrap.sh                 # -> build/daimond
+bash bootstrap.sh -o /tmp/stage5_bin
+
+# After changing the compiler so that an older compiler can no longer build it: write the seed again
+cd stage5 && bash gen_bootstrap.sh && cd .. && bash bootstrap.sh --update-seed
+
+# Or build the Stage 5 compiler with Stage 0 (Stage 0 compiles main.dm to C, then gcc produces the binary)
 cd stage0 && ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
 gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
 gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
@@ -302,7 +314,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 327/327 integration tests and compiles itself, but Stage 0 is still required for its first build.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 327/327 integration tests, compiles itself, and is built from a committed seed (`bootstrap.sh`) without Stage 0.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -354,6 +366,14 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 2. Emit the diagnostic from the relevant pipeline stage (parser, checker, etc.)
 3. Add a test case that triggers the new diagnostic
 
+### Changing the Stage 5 compiler
+
+1. Edit the split modules in `stage5/` (never `main.dm`), then run `cd stage5 && bash gen_bootstrap.sh`
+2. Build it: `bash bootstrap.sh` (from the seed), or with a compiler you already have: `cd stage5 && <compiler> main.dm --link-llvm -o /tmp/stage5_new`
+3. Run the suite: `cd stage5 && zig build && DAIMOND_STAGE5_BIN=/tmp/stage5_new ./zig-out/bin/test-integration`
+4. The compiler's own source may only use what the seed's compiler can compile. To use a new language feature in the compiler: add the feature, write the seed again (`bash bootstrap.sh --update-seed`), commit both, and only then use it
+5. `llvm_bridge.dm` and `llvm_bridge.c` define the same functions; change them together
+
 ### Working on the C runtime
 
 1. Add declarations to `daimond_runtime.h`
@@ -384,7 +404,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
 - Debug info (DWARF) in Stage 3/4
-- Bootstrapping Stage 5 without Stage 0 (Zig) and the C it emits: a committed seed (LLVM bitcode of the compiler) to build from
+- The test harness and the tools (`check`, `fmt`, `test`, the LSP) in dAImond; until then Stage 0, `llvm_bridge.c` and `daimond_runtime.c` stay
 
 ## Documentation Maintenance
 
@@ -670,10 +690,17 @@ Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
 stage5_bin compiles test programs                 → native binaries (327/327 tests pass)
 stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓, no C compiler)
 stage5_self compiles Stage 5                      → identical binary ✓
+
+Without Zig or C (bootstrap.sh):
+llc + ld.lld turn seed/daimond.bc into            → seed compiler
+seed compiler compiles Stage 5                    → gen1
+gen1 compiles Stage 5                             → gen2 (same file as gen1 when the seed is current ✓)
 ```
 
 ## Important Notes
 
+- `seed/daimond.bc` is a build product (2.5 MB of LLVM bitcode, written by LLVM 19). `bootstrap.sh --update-seed` writes it; each new version adds its size to the repository's history, so write it again only when the compiler needs a newer compiler to build it. A seed from the same source is byte-identical, so an unneeded update changes nothing.
+- `bootstrap.sh` gives each generation its own runtime-object cache (`DAIMOND_CACHE_DIR`), so that the comparison of generations covers the runtime object too.
 - The `.gitignore` in `stage0/` excludes `*.c` files (generated output) but includes `!src/*.c` to allow runtime C source files.
 - Zig version is pinned to 0.13.0 via `.mise.toml`. Do not upgrade without testing compatibility.
 - The largest source files are `codegen.zig` (~6830 lines), `parser.zig` (~3630 lines), and `checker.zig` (~3116 lines). Changes to these require careful testing.

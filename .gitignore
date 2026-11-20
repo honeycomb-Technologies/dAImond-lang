@@ -25,3 +25,6 @@
 *~
 .vscode/
 .idea/
+
+# The compiler that bootstrap.sh builds, and its working files
+/build/

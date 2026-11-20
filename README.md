@@ -11,18 +11,33 @@ dAImond is a systems programming language designed to be:
 
 ## Quick Start
 
-### Prerequisites
+### Building the compiler (Stage 5)
+
+On x86-64 Linux, with LLVM 19 (including `lld`) and the C library's development files. A newer LLVM should work, since LLVM reads older bitcode, but only LLVM 19 has been tested:
+
+```bash
+bash bootstrap.sh          # builds build/daimond
+build/daimond examples/hello.dm -o hello && ./hello
+```
+
+`bootstrap.sh` needs no Zig and no C compiler. It turns the seed, `seed/daimond.bc` (the compiler as LLVM bitcode), into a compiler with LLVM's `llc` and `ld.lld`, compiles `stage5/main.dm` with it, and repeats until the compiler reproduces itself. It takes about five minutes and 2 GB of memory.
+
+### Stage 0 (the Zig bootstrap compiler)
+
+Stage 0 is the older compiler, which emits C. The test harnesses and the tools (`fmt`, `test`, `pkg`, the LSP) still live there.
+
+#### Prerequisites
 
 - [Zig](https://ziglang.org/) 0.13.0 or later
 
-### Building
+#### Building
 
 ```bash
 cd stage0
 zig build
 ```
 
-### Running
+#### Running
 
 ```bash
 # Compile a dAImond file
@@ -55,7 +70,7 @@ zig build
 ./zig-out/bin/daimond clean
 ```
 
-### Running Tests
+#### Running Tests
 
 ```bash
 cd stage0
@@ -91,6 +106,10 @@ zig build test-integration
 
 ```
 dAImond-lang/
+├── bootstrap.sh               # Builds the compiler from the seed with LLVM's tools (no Zig, no C compiler)
+├── seed/
+│   ├── daimond.bc             # The compiler as LLVM bitcode, written by bootstrap.sh --update-seed
+│   └── BUILD_ID               # The build ID of the source the seed was made from
 ├── stage0/                    # Stage 0 bootstrap compiler (written in Zig)
 │   ├── build.zig              # Zig build configuration
 │   ├── .mise.toml             # Tool version pinning (Zig 0.13.0)
@@ -152,7 +171,7 @@ dAImond-lang/
 │   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
 │   └── tests/
 │       └── runner.zig         # Integration test harness (254 tests)
-├── stage5/                    # Stage 5 LLVM backend (written in dAImond; built by Stage 0 until it self-hosts)
+├── stage5/                    # Stage 5 LLVM backend (written in dAImond; built from the seed, or by Stage 0)
 │   ├── main.dm                # Monolithic bootstrap file (22K lines, generated)
 │   ├── main_split.dm          # Entry point with imports (for modular development)
 │   ├── token.dm               # Token kinds, Token struct, keyword lookup
@@ -430,7 +449,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 327/327 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code), but its first build still needs Stage 0 (Zig) and the C it emits. Programs it builds contain no C and are linked by `ld.lld`
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 327/327 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code). `bootstrap.sh` builds it from a committed seed with LLVM's tools alone; Stage 0 (Zig) is no longer needed to build the compiler, only for the test harnesses and tools that have not been ported. Programs it builds contain no C and are linked by `ld.lld`
 
 ## Current Status
 
@@ -509,7 +528,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Error detection: unterminated strings, syntax errors, undefined functions and variables, effect enforcement, untyped expressions reported at their source line
 - [x] Self-hosting: Stage 5 compiles itself; the self-built compiler emits byte-identical LLVM IR for its own source and passes 327/327
 - [x] A self-build contains no C and runs no C compiler; the first and second self-built compilers are identical
-- [ ] Bootstrap without Stage 0 (Zig) and the C it emits (a committed seed)
+- [x] Bootstrap without Stage 0 (Zig) or C: `bootstrap.sh` builds the compiler from `seed/daimond.bc` (LLVM bitcode) with `llc` and `ld.lld`, and checks that it reproduces itself
 - [x] `--emit-bitcode` writes a program as LLVM bitcode, as it goes to code generation
 - [x] Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1)
 - [x] Runtime primitives: raw memory loads and stores, `addr_of`, `size_of`, string internals, `symbol_addr`, `static_addr` (program-owned static storage), C-width integer types and variadic `extern fn`
@@ -526,7 +545,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 
 ### Upcoming
 - [ ] Debug info (DWARF) in Stage 5
-- [ ] A seed (LLVM bitcode of the compiler) so that Stage 0, `llvm_bridge.c` and `daimond_runtime.c` can go
+- [ ] The test harness and the tools (`check`, `fmt`, `test`, the LSP) in dAImond, so that Stage 0, `llvm_bridge.c` and `daimond_runtime.c` can be deleted
 
 ## Design Principles
 
