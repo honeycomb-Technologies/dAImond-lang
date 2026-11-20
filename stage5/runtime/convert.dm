@@ -2,7 +2,7 @@ module convert
 
 -- ============================================================
 -- Conversions between numbers, booleans and strings
--- int_to_string, float_to_string, bool_to_string, parse_int and
+-- int_to_string, float_to_string, bool_to_string, chr, parse_int and
 -- parse_float. See runtime/string.dm for how rt_X functions
 -- replace the C runtime and for the layout of a string.
 --
@@ -93,6 +93,16 @@ fn rt_bool_to_string(b: bool) -> string {
         return "true"
     }
     return "false"
+}
+
+-- chr(n): the one-byte string whose byte is n. Only the low 8 bits of
+-- n count.
+fn rt_chr(n: int) -> string {
+    unsafe {
+        let buf = rt_string_buffer(1)
+        store_u8(buf, n)
+        return string_from_raw(buf, 1, 2)
+    }
 }
 
 -- Whether byte c is whitespace to C's isspace: space, or tab

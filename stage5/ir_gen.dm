@@ -819,6 +819,15 @@ fn map_builtin_name(name: string) -> string {
     if name == "fs_remove" { return "dm_fs_remove" }
     -- OS builtins
     if name == "os_getenv" or name == "env_get" { return "dm_os_getenv" }
+    -- Terminal and time builtins
+    if name == "chr" { return "dm_chr" }
+    if name == "flush" { return "dm_flush" }
+    if name == "read_key" { return "dm_read_key" }
+    if name == "read_key_nb" { return "dm_read_key_nb" }
+    if name == "term_width" { return "dm_term_width" }
+    if name == "term_height" { return "dm_term_height" }
+    if name == "time_ms" { return "dm_time_ms" }
+    if name == "sleep_ms" { return "dm_sleep_ms" }
     return name
 }
 
@@ -896,6 +905,8 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "fs_getcwd" or name == "fs_readdir" or name == "fs_rename" { return true }
     if name == "fs_mkdir" or name == "fs_remove" { return true }
     if name == "os_getenv" or name == "env_get" { return true }
+    if name == "chr" or name == "flush" or name == "read_key" or name == "read_key_nb" { return true }
+    if name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return true }
     return false
 }
 
@@ -949,6 +960,11 @@ fn builtin_return_type(name: string) -> string {
     if name == "fs_remove" { return "i64" }
     -- OS builtins
     if name == "os_getenv" or name == "env_get" { return "string" }
+    -- Terminal and time builtins
+    if name == "chr" { return "string" }
+    if name == "flush" or name == "sleep_ms" { return "void" }
+    if name == "read_key" or name == "read_key_nb" { return "i64" }
+    if name == "term_width" or name == "term_height" or name == "time_ms" { return "i64" }
     return "void"
 }
 

@@ -351,6 +351,16 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     -- OS
     g = declare_extern(g, "dm_os_getenv", "string", "string")
 
+    -- Terminal and time
+    g = declare_extern(g, "dm_chr", "i64", "string")
+    g = declare_extern0(g, "dm_flush", "void")
+    g = declare_extern0(g, "dm_read_key", "i64")
+    g = declare_extern0(g, "dm_read_key_nb", "i64")
+    g = declare_extern0(g, "dm_term_width", "i64")
+    g = declare_extern0(g, "dm_term_height", "i64")
+    g = declare_extern0(g, "dm_time_ms", "i64")
+    g = declare_extern(g, "dm_sleep_ms", "i64", "void")
+
     -- String split
     g = declare_extern3(g, "dm_string_split", "ptr", "string", "string", "void")
 

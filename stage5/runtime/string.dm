@@ -369,3 +369,18 @@ fn rt_is_alnum(s: string) -> bool {
 fn rt_char_to_string(s: string) -> string {
     return s
 }
+
+-- ---- Memory ----
+-- Strings are never freed: a string lives until the program ends.
+-- mem_mark and mem_sweep exist for programs written when a sweep
+-- freed the strings made since the mark, which also freed strings
+-- still in use.
+
+-- mem_mark(): always 0
+fn rt_mem_mark() -> int {
+    return 0
+}
+
+-- mem_sweep(mark): does nothing
+fn rt_mem_sweep(mark: int) {
+}

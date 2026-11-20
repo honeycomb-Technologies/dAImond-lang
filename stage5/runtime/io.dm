@@ -2,7 +2,8 @@ module io
 
 -- ============================================================
 -- The console
--- print, println, eprint, eprintln, read_line and panic. See
+-- print, println, eprint, eprintln, flush, read_line, read_key,
+-- read_key_nb, term_width, term_height and panic. See
 -- runtime/string.dm for how rt_X functions replace the C runtime.
 --
 -- They use libc's stdio streams, so what a program prints keeps its
@@ -13,6 +14,10 @@ module io
 
 extern fn libc_fputc(c: i32, stream: int) -> i32 = "fputc"
 extern fn libc_getline(line: int, room: int, stream: int) -> int = "getline"
+extern fn libc_fflush(stream: int) -> i32 = "fflush"
+extern fn libc_fgetc(stream: int) -> i32 = "fgetc"
+extern fn libc_poll(fds: int, count: int, timeout: i32) -> i32 = "poll"
+extern fn libc_ioctl(fd: i32, request: int, ...) -> i32 = "ioctl"
 
 -- libc's stdin, stdout and stderr are variables that hold a FILE*
 
@@ -96,5 +101,75 @@ fn rt_read_line() -> string {
         }
         store_u8(line + n, 0)
         return string_from_raw(line, n, room)
+    }
+}
+
+-- flush(): write out what standard output still holds
+fn rt_flush() {
+    unsafe {
+        libc_fflush(rt_stdout())
+    }
+}
+
+-- read_key(): the next byte of standard input, or -1 at its end. It
+-- waits for a byte.
+fn rt_read_key() -> int {
+    unsafe {
+        return libc_fgetc(rt_stdin()) as int
+    }
+}
+
+-- read_key_nb(): the next byte of standard input, or -1 when none is
+-- waiting or the input has ended. It does not wait.
+fn rt_read_key_nb() -> int {
+    unsafe {
+        -- A struct pollfd is fd (4 bytes), events (2) and revents (2).
+        -- This one is fd 0, standard input, and event 1, POLLIN.
+        let mut pollfd = 0
+        store_u16(addr_of(pollfd) + 4, 1)
+        if libc_poll(addr_of(pollfd), 1, 0) > 0 {
+            return libc_fgetc(rt_stdin()) as int
+        }
+        return -1
+    }
+}
+
+-- The size of the terminal on standard output as the kernel's struct
+-- winsize: rows, columns and two sizes in pixels, 2 bytes each. All
+-- are 0 when standard output is not a terminal.
+fn rt_term_size() -> int {
+    unsafe {
+        let mut size = 0
+        -- 21523 is TIOCGWINSZ on Linux
+        if libc_ioctl(1, 21523, addr_of(size)) != 0 {
+            return 0
+        }
+        return size
+    }
+}
+
+-- term_width(): the terminal's width in columns, or 80 when standard
+-- output is not a terminal
+fn rt_term_width() -> int {
+    unsafe {
+        let mut size = rt_term_size()
+        let columns = load_u16(addr_of(size) + 2)
+        if columns > 0 {
+            return columns
+        }
+        return 80
+    }
+}
+
+-- term_height(): the terminal's height in rows, or 24 when standard
+-- output is not a terminal
+fn rt_term_height() -> int {
+    unsafe {
+        let mut size = rt_term_size()
+        let rows = load_u16(addr_of(size))
+        if rows > 0 {
+            return rows
+        }
+        return 24
     }
 }

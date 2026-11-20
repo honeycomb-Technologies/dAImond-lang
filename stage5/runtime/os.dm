@@ -1,11 +1,12 @@
 module os
 
 -- ============================================================
--- Files, directories, the environment, the command line and processes
+-- Files, directories, the environment, the command line, processes
+-- and time
 -- file_read, file_write, file_append, file_exists, fs_mkdir,
 -- fs_readdir, fs_remove, fs_rename, fs_getcwd, env_get, args_len,
--- args_get and system. See runtime/string.dm for how rt_X functions
--- replace the C runtime.
+-- args_get, system, time_ms and sleep_ms. See runtime/string.dm for
+-- how rt_X functions replace the C runtime.
 --
 -- Files go through libc's stdio. A path, a name or a command goes to
 -- C as the address of the string's bytes: every literal and every
@@ -30,6 +31,8 @@ extern fn libc_rename(from: int, to: int) -> i32 = "rename"
 extern fn libc_getcwd(buf: int, size: int) -> int = "getcwd"
 extern fn libc_getenv(name: int) -> int = "getenv"
 extern fn libc_errno_location() -> int = "__errno_location"
+extern fn libc_clock_gettime(clock: i32, time: int) -> i32 = "clock_gettime"
+extern fn libc_nanosleep(time: int, remaining: int) -> i32 = "nanosleep"
 
 -- ---- Files ----
 
@@ -311,5 +314,36 @@ fn rt_system(command: string) -> int {
     }
     unsafe {
         return libc_system(string_data(command)) as int
+    }
+}
+
+-- ---- Time ----
+
+-- libc's struct timespec on x86-64 Linux
+struct RtTimespec {
+    seconds: int,
+    nanoseconds: int
+}
+
+-- time_ms(): milliseconds on a clock that only moves forward. Its
+-- zero is not a date; only the difference of two readings means
+-- something.
+fn rt_time_ms() -> int {
+    unsafe {
+        let mut now = RtTimespec { seconds: 0, nanoseconds: 0 }
+        -- 1 is CLOCK_MONOTONIC
+        libc_clock_gettime(1, addr_of(now))
+        return now.seconds * 1000 + now.nanoseconds / 1000000
+    }
+}
+
+-- sleep_ms(ms): wait for ms milliseconds. A negative ms does not wait.
+fn rt_sleep_ms(ms: int) {
+    if ms <= 0 {
+        return
+    }
+    unsafe {
+        let mut time = RtTimespec { seconds: ms / 1000, nanoseconds: (ms % 1000) * 1000000 }
+        libc_nanosleep(addr_of(time), 0)
     }
 }

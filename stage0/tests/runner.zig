@@ -2214,6 +2214,200 @@ pub const io_tests = [_]TestCase{
         .expected_exit_code = 1,
         .expected_stderr = "PANIC: boom: 42\n",
     },
+    .{
+        .name = "chr_makes_one_byte_strings",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(chr(72) + chr(105) + chr(33))
+            \\    println(int_to_string(len(chr(65))) + " " + int_to_string(len(chr(0))) + " " + int_to_string(len(chr(10))))
+            \\    -- Three bytes that are one character in UTF-8
+            \\    let block = chr(226) + chr(150) + chr(160)
+            \\    println(block + " " + int_to_string(len(block)))
+            \\    -- Every byte from 32 to 126 is itself
+            \\    let mut text = ""
+            \\    let mut c = 32
+            \\    while c < 127 {
+            \\        text = text + chr(c)
+            \\        c = c + 1
+            \\    }
+            \\    println(text)
+            \\    println(bool_to_string(chr(97) == "a") + " " + bool_to_string(chr(97) < chr(98)))
+            \\    -- Only the low 8 bits count
+            \\    println(chr(256 + 66) + chr(300) + chr(1024 + 48))
+            \\}
+        ,
+        .expected_output = "Hi!\n1 1 1\n■ 3\n !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\ntrue true\nB,0\n",
+    },
+    .{
+        .name = "time_ms_and_sleep_ms",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    let start = time_ms()
+            \\    sleep_ms(150)
+            \\    let waited = time_ms() - start
+            \\    println(bool_to_string(waited >= 150) + " " + bool_to_string(waited < 20000))
+            \\    -- The clock never goes back
+            \\    let mut last = time_ms()
+            \\    let mut ordered = true
+            \\    let mut i = 0
+            \\    while i < 1000 {
+            \\        let now = time_ms()
+            \\        if now < last { ordered = false }
+            \\        last = now
+            \\        i = i + 1
+            \\    }
+            \\    println(bool_to_string(ordered))
+            \\    -- Zero and negative times do not wait
+            \\    let before = time_ms()
+            \\    sleep_ms(0)
+            \\    sleep_ms(0 - 1)
+            \\    sleep_ms(0 - 60000)
+            \\    println(bool_to_string(time_ms() - before < 20000))
+            \\}
+        ,
+        .expected_output = "true true\ntrue\ntrue\n",
+    },
+    // The harness reads the program's output through a pipe, so there is
+    // no terminal to measure and the size is the default.
+    .{
+        .name = "term_size_without_a_terminal",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println(int_to_string(term_width()) + "x" + int_to_string(term_height()))
+            \\}
+        ,
+        .expected_output = "80x24\n",
+    },
+    // Without the flushes the child's stderr text would come first.
+    .{
+        .name = "flush_writes_out_stdout",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    if args_len() > 1 {
+            \\        -- The child: standard output is a pipe, so it holds what is
+            \\        -- printed until a flush or the end of the program
+            \\        print("one ")
+            \\        flush()
+            \\        eprint("two ")
+            \\        print("three ")
+            \\        flush()
+            \\        eprint("four ")
+            \\        print("five")
+            \\        flush()
+            \\        flush()
+            \\        eprintln("")
+            \\        return
+            \\    }
+            \\    -- The parent runs this program again with both streams on its own
+            \\    -- standard output
+            \\    let status = system(args_get(0) + " child 2>&1")
+            \\    println(int_to_string(status))
+            \\}
+        ,
+        .expected_output = "one two three four five\n0\n",
+    },
+    .{
+        .name = "read_key_from_a_file",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    if args_len() > 1 {
+            \\        -- The child: standard input is a file
+            \\        let a = read_key()
+            \\        let b = read_key_nb()
+            \\        println(int_to_string(a) + " " + int_to_string(b))
+            \\        let line = read_line()
+            \\        println("[" + line + "]")
+            \\        let c = read_key()
+            \\        let d = read_key()
+            \\        println(int_to_string(c) + " " + int_to_string(d))
+            \\        let mut count = 0
+            \\        let mut total = 0
+            \\        let mut k = read_key()
+            \\        while k != 0 - 1 {
+            \\            count = count + 1
+            \\            total = total + k
+            \\            k = read_key()
+            \\        }
+            \\        println(int_to_string(count) + " " + int_to_string(total))
+            \\        -- At the end of input both give -1, again and again
+            \\        let e1 = read_key()
+            \\        let e2 = read_key_nb()
+            \\        let e3 = read_key()
+            \\        println(int_to_string(e1) + " " + int_to_string(e2) + " " + int_to_string(e3))
+            \\        return
+            \\    }
+            \\    let input = args_get(0) + ".in"
+            \\    file_write(input, "AB rest of line\n\n" + chr(200) + "xyz")
+            \\    let status = system(args_get(0) + " child < " + input)
+            \\    let removed = fs_remove(input)
+            \\    println(int_to_string(status) + " " + int_to_string(removed))
+            \\}
+        ,
+        .expected_output = "65 66\n[ rest of line]\n10 200\n3 363\n-1 -1 -1\n0 0\n",
+    },
+    .{
+        .name = "read_key_nb_does_not_wait",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    if args_len() > 1 {
+            \\        -- The child: standard input is a pipe that stays open and
+            \\        -- never has a byte in it
+            \\        let start = time_ms()
+            \\        let a = read_key_nb()
+            \\        let b = read_key_nb()
+            \\        println(int_to_string(a) + " " + int_to_string(b) + " " + bool_to_string(time_ms() - start < 900))
+            \\        return
+            \\    }
+            \\    let status = system("sleep 1 | " + args_get(0) + " child")
+            \\    println(int_to_string(status))
+            \\}
+        ,
+        .expected_output = "-1 -1 true\n0\n",
+    },
+    .{
+        .name = "mem_mark_and_sweep_keep_strings",
+        .source =
+            \\module test
+            \\
+            \\fn label(i: int) -> string {
+            \\    return "item " + int_to_string(i)
+            \\}
+            \\
+            \\fn main() {
+            \\    let before = "made before the mark " + int_to_string(1)
+            \\    let mark = mem_mark()
+            \\    let mut items: List[string] = []
+            \\    let mut i = 0
+            \\    while i < 5 {
+            \\        items.push(label(i))
+            \\        i = i + 1
+            \\    }
+            \\    let after = "made after the mark " + int_to_string(2)
+            \\    mem_sweep(mark)
+            \\    -- A sweep frees nothing: strings made after the mark are still whole
+            \\    println(before)
+            \\    println(after)
+            \\    println(items[0] + ", " + items[4] + ", " + int_to_string(items.len()))
+            \\    let inner = mem_mark()
+            \\    mem_sweep(inner)
+            \\    mem_sweep(mark)
+            \\    println(label(9) + " " + bool_to_string(inner >= mark))
+            \\}
+        ,
+        .expected_output = "made before the mark 1\nmade after the mark 2\nitem 0, item 4, 5\nitem 9 true\n",
+    },
 };
 
 // Phase D: Process Execution

@@ -819,7 +819,9 @@ fn main() -> int {
 fn builtin_required_effect(name: string) -> string {
     if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
     if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
+    if name == "read_key" or name == "read_key_nb" { return "Console" }
     if name == "args_get" or name == "args_len" { return "IO" }
+    if name == "flush" or name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return "IO" }
     if name == "system" or name == "exit" { return "Process" }
     return ""
 }
