@@ -95,6 +95,57 @@ fn token_new(kind: int, value: string, line: int, col: int) -> Token {
     return Token { kind: kind, value: value, line: line, col: col }
 }
 
+-- ============================================================
+-- LINES IN FILES
+-- A program is made of several files: the one being compiled, the
+-- files it imports and the runtime. A line number says which file it
+-- is in: line L of file number F is the number F * FILE_LINE_SPAN()
+-- + L. The file being compiled is number 0, so its line numbers are
+-- plain. The lexer numbers a file's lines this way (tokenize_file),
+-- and the files' names are in a list, at their numbers
+-- (SourceFile.files, then IRModule.files). A file may have up to
+-- FILE_LINE_SPAN() - 1 lines.
+-- ============================================================
+
+fn FILE_LINE_SPAN() -> int { return 1000000 }
+
+-- The line within its file
+fn line_in_file(line: int) -> int {
+    return line % FILE_LINE_SPAN()
+}
+
+-- The number of the file a line is in
+fn file_of_line(line: int) -> int {
+    return line / FILE_LINE_SPAN()
+}
+
+-- "NAME: " for a line of another file than the one being compiled,
+-- which is how an error says where it is
+fn file_prefix(files: List[string], line: int) -> string {
+    let file = file_of_line(line)
+    if file > 0 and file < files.len() {
+        return files[file] + ": "
+    }
+    return ""
+}
+
+-- "line L" for a line an error at line `from` mentions, or "line L of
+-- NAME" when the two are in different files
+fn line_ref(files: List[string], line: int, from: int) -> string {
+    let file = file_of_line(line)
+    let text = "line " + int_to_string(line_in_file(line))
+    if file != file_of_line(from) and file < files.len() {
+        return text + " of " + files[file]
+    }
+    return text
+}
+
+-- The text of an error at a line: "Error: MESSAGE at line L", after
+-- "NAME: " in another file than the one being compiled
+fn error_at(files: List[string], msg: string, line: int) -> string {
+    return file_prefix(files, line) + "Error: " + msg + " at line " + int_to_string(line_in_file(line))
+}
+
 fn keyword_lookup(name: string) -> int {
     if name == "fn" { return TK_FN() }
     if name == "let" { return TK_LET() }

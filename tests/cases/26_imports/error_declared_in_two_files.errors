@@ -1,0 +1,4 @@
+/second.dm: Error: function 'shared' is declared more than once (first at line 3 of 
+/first.dm) at line 3
+Error: function 'helper' is declared more than once (first at line 7 of 
+/first.dm) at line 6

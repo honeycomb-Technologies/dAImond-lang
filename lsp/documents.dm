@@ -192,15 +192,42 @@ fn add_error_line(server: Server, src: int, text: string, line: string) {
         return
     }
 
-    -- A syntax error in an imported file: "FILE: Error at LINE:COLUMN:
-    -- message". It is shown where the file is imported.
-    let in_file = string_find(line, ": Error at ")
-    if in_file > 0 {
-        let file = view(line, 0, in_file)
-        let position_at = in_file + 11
+    -- An error in an imported file: "FILE: Error at LINE:COLUMN:
+    -- message" or "FILE: Error: message at line LINE". It is shown
+    -- where the file is imported, as "FILE:LINE: message".
+    if starts_with(line, "Error") == false {
+        let syntax_at = string_find(line, ": Error at ")
+        let other_at = string_find(line, ": Error: ")
+        let mut name_end = syntax_at
+        if syntax_at <= 0 {
+            name_end = other_at
+        }
+        if name_end <= 0 {
+            return
+        }
+        let file = view(line, 0, name_end)
         buf_add(note, file)
         buf_add(note, ":")
-        buf_add_part(note, line, position_at, len(line) - position_at)
+        if syntax_at > 0 {
+            let position_at = syntax_at + 11
+            buf_add_part(note, line, position_at, len(line) - position_at)
+        } else {
+            let body_at = other_at + 9
+            let at_line = find_last(line, " at line ")
+            if at_line >= body_at and all_digits(view(line, at_line + 9, len(line) - at_line - 9)) {
+                let mut message_end = at_line
+                let in_function = find_last(view(line, 0, at_line), " (in function '")
+                if in_function >= body_at and byte_at(line, at_line - 1) == 41 {
+                    message_end = in_function
+                }
+                buf_add_part(note, line, at_line + 9, len(line) - at_line - 9)
+                buf_add(note, ": ")
+                buf_add_part(note, line, body_at, message_end - body_at)
+            } else {
+                buf_add(note, " ")
+                buf_add_part(note, line, body_at, len(line) - body_at)
+            }
+        }
         let symbols = buf_view(source_symbols(server, src))
         let mut import_line = 1
         let mut import_column = 0

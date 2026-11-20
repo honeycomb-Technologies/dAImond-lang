@@ -234,7 +234,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if callee_name == "dm_symbol_addr" and inst.call_args.len() == 1 {
             let symbol = inst.call_args[0].str_val
             if g.function_map.contains(symbol) or g.c_symbols.contains(symbol) {
-                g.type_errors.push("Error: symbol_addr(\"" + symbol + "\") names a function, not a data symbol" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "symbol_addr(\"" + symbol + "\") names a function, not a data symbol"))
             }
             g = declare_data_symbol(g, symbol, dm_llvm_int8_type(g.context))
             let symbol_addr = dm_llvm_build_ptr_to_int(b, g.data_symbols.get(symbol), dm_llvm_int64_type(g.context), "symbol.addr")
@@ -291,7 +291,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             -- A call the IR generator emitted of a function it never
             -- declared. Dropping it would make the program do less than
             -- its source says.
-            g.type_errors.push("Error: internal: call of '" + callee_name + "', which is not declared" + type_error_location(g))
+            g.type_errors.push(lg_error(g, "internal: call of '" + callee_name + "', which is not declared"))
             return g
         }
         let callee = g.function_map.get(callee_name)

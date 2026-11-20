@@ -9,6 +9,9 @@ save helper.dm
 open effects.dm
 # An error with no line and no function is shown on the first line
 change effects.dm duplicate.dm
+# An error inside an imported file's function is shown where the file is imported,
+# next to the document's own
+open uses_broken.dm
 # A document that is no file
 {"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"untitled:Untitled-1","languageId":"daimond","version":1,"text":"module scratch\nfn main() -> int {\n    return nothing\n}\n"}}}
 {"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{"textDocument":{"uri":"untitled:Untitled-1"},"position":{"line":1,"character":4}}}

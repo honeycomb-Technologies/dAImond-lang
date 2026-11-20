@@ -682,9 +682,13 @@ struct SourceFile {
     imports: List[ImportDecl],
     declarations: List[Declaration],
     -- The syntax errors the parser found, in source order
-    errors: List[string]
+    errors: List[string],
+    -- The names of the files the declarations come from, at their
+    -- numbers (see LINES IN FILES in token.dm). Empty until the
+    -- imports are resolved.
+    files: List[string]
 }
 
 fn source_file_new(name: string) -> SourceFile {
-    return SourceFile { module_name: name, imports: [], declarations: [], errors: [] }
+    return SourceFile { module_name: name, imports: [], declarations: [], errors: [], files: [] }
 }

@@ -545,7 +545,10 @@ struct IRModule {
     globals: List[IRGlobal],
     struct_defs: Map[string, IRType],
     extern_decls: List[IRExternDecl],
-    user_extern_fns: Map[string, bool]
+    user_extern_fns: Map[string, bool],
+    -- The names of the program's source files, at their numbers (see
+    -- LINES IN FILES in token.dm)
+    files: List[string]
 }
 
 fn ir_module_new() -> IRModule {
@@ -554,7 +557,8 @@ fn ir_module_new() -> IRModule {
         globals: [],
         struct_defs: Map_new(),
         extern_decls: [],
-        user_extern_fns: Map_new()
+        user_extern_fns: Map_new(),
+        files: []
     }
 }
 

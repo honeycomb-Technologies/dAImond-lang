@@ -56,7 +56,18 @@ fn lexer_skip_ws(lex: Lexer) -> Lexer {
 }
 
 fn tokenize(source: string) -> List[Token] {
+    return tokenize_file(source, "", 0)
+}
+
+-- tokenize, for file number `file` of a program (see LINES IN FILES in
+-- token.dm), which is named `name` in errors
+fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
+    let mut prefix = ""
+    if file > 0 {
+        prefix = name + ": "
+    }
     let mut lex = lexer_new(source)
+    lex.line = file * FILE_LINE_SPAN() + 1
     let mut tokens: List[Token] = []
     let mut done = false
 
@@ -144,7 +155,7 @@ fn tokenize(source: string) -> List[Token] {
                     }
                 }
                 if lex.pos >= lex.src_len {
-                    eprintln("Error: unterminated string at line " + int_to_string(sl))
+                    eprintln(prefix + "Error: unterminated string at line " + int_to_string(line_in_file(sl)))
                     exit(1)
                 }
                 lex.pos = lex.pos + 1

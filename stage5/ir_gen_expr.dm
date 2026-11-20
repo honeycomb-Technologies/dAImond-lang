@@ -2622,7 +2622,7 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
         -- &T parameters) need an unsafe block to dereference. Box derefs
         -- stay safe (runtime null check below).
         if g.unsafe_depth == 0 and expr_is_tainted_ref(g, *expr.operand) {
-            eprintln("Error: dereference of a reference from an extern call or cast requires unsafe block at line " + int_to_string(expr.line))
+            eprintln(error_at(gen.ir_mod.files, "dereference of a reference from an extern call or cast requires unsafe block", expr.line))
             exit(1)
         }
         -- Dereference Box[T]: load the struct value from the pointer
@@ -2912,7 +2912,7 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Check if function is defined
     if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false and g.static_fns.contains(fn_name) == false {
-        eprintln("Error: undefined function '" + fn_name + "' at line " + int_to_string(expr.line))
+        eprintln(error_at(gen.ir_mod.files, "undefined function '" + fn_name + "'", expr.line))
         exit(1)
     }
 
@@ -3606,7 +3606,7 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         if any_born {
             let born_root = root_identifier_name(obj_expr)
             if born_root != "" and var_declared_outside_innermost_region(g, born_root) {
-                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(expr.line))
+                eprintln(error_at(gen.ir_mod.files, "store of region-born value into container declared outside the region (region escape)", expr.line))
                 exit(1)
             }
         }

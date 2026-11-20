@@ -174,8 +174,14 @@ fn llvm_type_name(ty: int) -> string {
 -- " (in function 'f') at line N" for errors found while lowering an instruction.
 fn type_error_location(g: LLVMGenerator) -> string {
     let mut loc = " (in function '" + g.current_func_name + "')"
-    if g.current_line > 0 { loc = loc + " at line " + int_to_string(g.current_line) }
+    if g.current_line > 0 { loc = loc + " at line " + int_to_string(line_in_file(g.current_line)) }
     return loc
+}
+
+-- The text of an error found while lowering an instruction, which
+-- names the file when it is not the one being compiled
+fn lg_error(g: LLVMGenerator, msg: string) -> string {
+    return file_prefix(g.ir_module.files, g.current_line) + "Error: " + msg + type_error_location(g)
 }
 
 -- Check the arguments in the call buffer against fn_ty's parameter types.
@@ -189,10 +195,9 @@ fn check_call_args(gen: LLVMGenerator, fn_ty: int, callee: int) -> LLVMGenerator
         let nargs = dm_llvm_buf_len()
         let mut callee_name = dm_llvm_get_value_name(callee)
         if callee_name == "" { callee_name = "<function pointer>" }
-        let loc = type_error_location(g)
         let var_arg = dm_llvm_is_function_var_arg(fn_ty) != 0
         if nargs < nparams or (nargs > nparams and var_arg == false) {
-            g.type_errors.push("Error: call to '" + callee_name + "' passes " + int_to_string(nargs) + " arguments, expected " + int_to_string(nparams) + loc)
+            g.type_errors.push(lg_error(g, "call to '" + callee_name + "' passes " + int_to_string(nargs) + " arguments, expected " + int_to_string(nparams)))
             return g
         }
         let mut i = 0
@@ -200,7 +205,7 @@ fn check_call_args(gen: LLVMGenerator, fn_ty: int, callee: int) -> LLVMGenerator
             let want = dm_llvm_param_type_at(fn_ty, i)
             let got = dm_llvm_type_of(dm_llvm_buf_get(i))
             if got != want {
-                g.type_errors.push("Error: call to '" + callee_name + "' argument " + int_to_string(i + 1) + " has type " + llvm_type_name(got) + ", expected " + llvm_type_name(want) + loc)
+                g.type_errors.push(lg_error(g, "call to '" + callee_name + "' argument " + int_to_string(i + 1) + " has type " + llvm_type_name(got) + ", expected " + llvm_type_name(want)))
             }
             i = i + 1
         }
@@ -572,7 +577,7 @@ fn define_static_storage(gen: LLVMGenerator, name: string, size: int) -> LLVMGen
         let mut g = gen
         if g.static_sizes.contains(name) {
             if g.static_sizes.get(name) != size {
-                g.type_errors.push("Error: static_addr(\"" + name + "\") has the size " + int_to_string(size) + " here and " + int_to_string(g.static_sizes.get(name)) + " elsewhere" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "static_addr(\"" + name + "\") has the size " + int_to_string(size) + " here and " + int_to_string(g.static_sizes.get(name)) + " elsewhere"))
             }
             return g
         }
@@ -1513,7 +1518,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let mut alloc_ty = map_ir_type_to_llvm(g, inst.alloc_type)
             if inst.alloc_type == "void" {
                 -- LLVM cannot allocate void; report it instead of crashing
-                g.type_errors.push("Error: a variable holds the result of a call that returns no value" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "a variable holds the result of a call that returns no value"))
                 alloc_ty = dm_llvm_int64_type(g.context)
             }
             let result = dm_llvm_build_alloca(b, alloc_ty, "alloca")
@@ -1582,7 +1587,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             g = resolve_value_with_counter(g, inst.field_base)
             let base_ty = dm_llvm_type_of(base)
             if dm_llvm_get_type_kind(base_ty) != 10 {
-                g.type_errors.push("Error: field " + int_to_string(inst.field_index) + " read from a value of type " + llvm_type_name(base_ty) + ", which is not a struct" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "field " + int_to_string(inst.field_index) + " read from a value of type " + llvm_type_name(base_ty) + ", which is not a struct"))
             }
             let result = dm_llvm_build_extract_value(b, base, inst.field_index, "field")
             -- If extracted field is dm_string, store to alloca and track
@@ -1610,7 +1615,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 let ptr_ty = dm_llvm_pointer_type(g.context)
                 let mut header = base
                 if dm_llvm_get_type_kind(dm_llvm_type_of(base)) != 12 {
-                    g.type_errors.push("Error: element taken from a value of type " + llvm_type_name(dm_llvm_type_of(base)) + ", which is not the address of a list" + type_error_location(g))
+                    g.type_errors.push(lg_error(g, "element taken from a value of type " + llvm_type_name(dm_llvm_type_of(base)) + ", which is not the address of a list"))
                     header = dm_llvm_const_null(ptr_ty)
                 }
                 let data_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, header, 0, "list.data.addr")

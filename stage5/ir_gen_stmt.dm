@@ -628,7 +628,7 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
 
     -- Region escape: a region-born value must not be returned
     if stmt.has_ret_value and expr_is_region_born(g, *stmt.ret_value) {
-        eprintln("Error: return of region-born value from inside a region (region escape) at line " + int_to_string(stmt.line))
+        eprintln(error_at(gen.ir_mod.files, "return of region-born value from inside a region (region escape)", stmt.line))
         exit(1)
     }
 
@@ -1564,13 +1564,13 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     if g.region_depth > 0 and stmt.assign_op == ASSIGN_EQ() and expr_is_region_born(g, *stmt.assign_value) {
         if track_target.kind == EXPR_IDENTIFIER() {
             if var_declared_outside_innermost_region(g, track_target.name) {
-                eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                eprintln(error_at(gen.ir_mod.files, "assignment of region-born value to variable declared outside the region (region escape)", stmt.line))
                 exit(1)
             }
         } else {
             let store_root = root_identifier_name(track_target)
             if store_root != "" and var_declared_outside_innermost_region(g, store_root) {
-                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                eprintln(error_at(gen.ir_mod.files, "store of region-born value into container declared outside the region (region escape)", stmt.line))
                 exit(1)
             }
         }
@@ -1590,7 +1590,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
         if target_is_string {
             if track_target.kind == EXPR_IDENTIFIER() {
                 if var_declared_outside_innermost_region(g, track_target.name) {
-                    eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    eprintln(error_at(gen.ir_mod.files, "assignment of region-born value to variable declared outside the region (region escape)", stmt.line))
                     exit(1)
                 } else {
                     g.region_born_vars.insert(track_target.name, true)
@@ -1598,7 +1598,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             } else {
                 let add_root = root_identifier_name(track_target)
                 if add_root != "" and var_declared_outside_innermost_region(g, add_root) {
-                    eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    eprintln(error_at(gen.ir_mod.files, "store of region-born value into container declared outside the region (region escape)", stmt.line))
                     exit(1)
                 }
             }

@@ -1,0 +1,5 @@
+/geometry.dm: Error: type mismatch in the value of 'label': expected string, found int at line 6
+/shapes/square.dm: Error: undefined variable 'missing_factor' at line 6
+/shapes/square.dm: Error: undefined variable 'squared' at line 10
+Error: undefined variable 'undefined_in_main' at line 7
+Error: 4 type errors

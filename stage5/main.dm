@@ -95,6 +95,57 @@ fn token_new(kind: int, value: string, line: int, col: int) -> Token {
     return Token { kind: kind, value: value, line: line, col: col }
 }
 
+-- ============================================================
+-- LINES IN FILES
+-- A program is made of several files: the one being compiled, the
+-- files it imports and the runtime. A line number says which file it
+-- is in: line L of file number F is the number F * FILE_LINE_SPAN()
+-- + L. The file being compiled is number 0, so its line numbers are
+-- plain. The lexer numbers a file's lines this way (tokenize_file),
+-- and the files' names are in a list, at their numbers
+-- (SourceFile.files, then IRModule.files). A file may have up to
+-- FILE_LINE_SPAN() - 1 lines.
+-- ============================================================
+
+fn FILE_LINE_SPAN() -> int { return 1000000 }
+
+-- The line within its file
+fn line_in_file(line: int) -> int {
+    return line % FILE_LINE_SPAN()
+}
+
+-- The number of the file a line is in
+fn file_of_line(line: int) -> int {
+    return line / FILE_LINE_SPAN()
+}
+
+-- "NAME: " for a line of another file than the one being compiled,
+-- which is how an error says where it is
+fn file_prefix(files: List[string], line: int) -> string {
+    let file = file_of_line(line)
+    if file > 0 and file < files.len() {
+        return files[file] + ": "
+    }
+    return ""
+}
+
+-- "line L" for a line an error at line `from` mentions, or "line L of
+-- NAME" when the two are in different files
+fn line_ref(files: List[string], line: int, from: int) -> string {
+    let file = file_of_line(line)
+    let text = "line " + int_to_string(line_in_file(line))
+    if file != file_of_line(from) and file < files.len() {
+        return text + " of " + files[file]
+    }
+    return text
+}
+
+-- The text of an error at a line: "Error: MESSAGE at line L", after
+-- "NAME: " in another file than the one being compiled
+fn error_at(files: List[string], msg: string, line: int) -> string {
+    return file_prefix(files, line) + "Error: " + msg + " at line " + int_to_string(line_in_file(line))
+}
+
 fn keyword_lookup(name: string) -> int {
     if name == "fn" { return TK_FN() }
     if name == "let" { return TK_LET() }
@@ -272,7 +323,18 @@ fn lexer_skip_ws(lex: Lexer) -> Lexer {
 }
 
 fn tokenize(source: string) -> List[Token] {
+    return tokenize_file(source, "", 0)
+}
+
+-- tokenize, for file number `file` of a program (see LINES IN FILES in
+-- token.dm), which is named `name` in errors
+fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
+    let mut prefix = ""
+    if file > 0 {
+        prefix = name + ": "
+    }
     let mut lex = lexer_new(source)
+    lex.line = file * FILE_LINE_SPAN() + 1
     let mut tokens: List[Token] = []
     let mut done = false
 
@@ -360,7 +422,7 @@ fn tokenize(source: string) -> List[Token] {
                     }
                 }
                 if lex.pos >= lex.src_len {
-                    eprintln("Error: unterminated string at line " + int_to_string(sl))
+                    eprintln(prefix + "Error: unterminated string at line " + int_to_string(line_in_file(sl)))
                     exit(1)
                 }
                 lex.pos = lex.pos + 1
@@ -1289,11 +1351,15 @@ struct SourceFile {
     imports: List[ImportDecl],
     declarations: List[Declaration],
     -- The syntax errors the parser found, in source order
-    errors: List[string]
+    errors: List[string],
+    -- The names of the files the declarations come from, at their
+    -- numbers (see LINES IN FILES in token.dm). Empty until the
+    -- imports are resolved.
+    files: List[string]
 }
 
 fn source_file_new(name: string) -> SourceFile {
-    return SourceFile { module_name: name, imports: [], declarations: [], errors: [] }
+    return SourceFile { module_name: name, imports: [], declarations: [], errors: [], files: [] }
 }
 
 -- ============================================================
@@ -1841,7 +1907,10 @@ struct IRModule {
     globals: List[IRGlobal],
     struct_defs: Map[string, IRType],
     extern_decls: List[IRExternDecl],
-    user_extern_fns: Map[string, bool]
+    user_extern_fns: Map[string, bool],
+    -- The names of the program's source files, at their numbers (see
+    -- LINES IN FILES in token.dm)
+    files: List[string]
 }
 
 fn ir_module_new() -> IRModule {
@@ -1850,7 +1919,8 @@ fn ir_module_new() -> IRModule {
         globals: [],
         struct_defs: Map_new(),
         extern_decls: [],
-        user_extern_fns: Map_new()
+        user_extern_fns: Map_new(),
+        files: []
     }
 }
 
@@ -2659,7 +2729,7 @@ fn p_expect(p: Parser, kind: int) -> Parser {
         return p_advance(pp)
     }
     let tok = p_cur(pp)
-    let msg = "Error at " + int_to_string(tok.line) + ":" + int_to_string(tok.col) + ": expected " + token_kind_name(kind) + " but got " + token_kind_name(tok.kind)
+    let msg = "Error at " + int_to_string(line_in_file(tok.line)) + ":" + int_to_string(tok.col) + ": expected " + token_kind_name(kind) + " but got " + token_kind_name(tok.kind)
     pp.errors.push(msg)
     return pp
 }
@@ -2667,7 +2737,7 @@ fn p_expect(p: Parser, kind: int) -> Parser {
 fn p_error(p: Parser, msg: string) -> Parser {
     let mut pp = p
     let tok = p_cur(pp)
-    let full = "Error at " + int_to_string(tok.line) + ":" + int_to_string(tok.col) + ": " + msg
+    let full = "Error at " + int_to_string(line_in_file(tok.line)) + ":" + int_to_string(tok.col) + ": " + msg
     pp.errors.push(full)
     return pp
 }
@@ -3570,10 +3640,20 @@ fn parse_fstring(p: Parser) -> ParseExprResult {
                 if depth > 0 { i = i + 1 }
             }
             let expr_text = substr(template, start, i - start)
-            -- Tokenize and parse the expression
-            let expr_tokens = tokenize(expr_text)
+            -- Tokenize and parse the expression. Its tokens are at the
+            -- f-string's place, which is where its errors are reported.
+            let lexed = tokenize(expr_text)
+            let mut expr_tokens: List[Token] = []
+            let mut ti = 0
+            while ti < lexed.len() {
+                expr_tokens.push(token_new(lexed[ti].kind, lexed[ti].value, tok.line, tok.col))
+                ti = ti + 1
+            }
             let expr_parser = parser_new(expr_tokens)
             let expr_result = parse_expr(expr_parser)
+            if expr_result.p.errors.len() > 0 {
+                pp.errors.push(expr_result.p.errors[0])
+            }
             parts.push(expr_result.expr)
             is_literal.push(false)
             if i < tlen {
@@ -4384,7 +4464,7 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
             fd.is_variadic = true
             pp = p_skip_newlines(pp)
             if p_peek(pp) != TK_RPAREN() {
-                eprintln("Error: `...` must be the last parameter of extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+                eprintln("Error: `...` must be the last parameter of extern fn '" + fd.name + "' at line " + int_to_string(line_in_file(tok.line)))
                 exit(1)
             }
         } else {
@@ -4417,7 +4497,7 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
     if p_peek(pp) == TK_EQ() {
         pp = p_advance(pp)
         if p_peek(pp) != TK_STRING() or p_cur(pp).value == "" {
-            eprintln("Error: expected a C symbol name in quotes after `=` in extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+            eprintln("Error: expected a C symbol name in quotes after `=` in extern fn '" + fd.name + "' at line " + int_to_string(line_in_file(tok.line)))
             exit(1)
         }
         fd.link_name = p_cur(pp).value
@@ -4986,7 +5066,7 @@ fn param_src_types(fd: FunctionDecl) -> string {
 
 fn ir_type_error(gen: IRGenerator, msg: string, line: int) -> IRGenerator {
     let mut g = gen
-    g.type_errors.push("Error: " + msg + " at line " + int_to_string(line))
+    g.type_errors.push(error_at(g.ir_mod.files, msg, line))
     return g
 }
 
@@ -5362,7 +5442,7 @@ fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_typ
         if src_is_ref { src_disp = "&" + safety_display_name(from_type) }
         let mut dst_disp = safety_display_name(cast_type)
         if cast_is_ref { dst_disp = "&" + safety_display_name(cast_type) }
-        eprintln("Error: invalid cast from " + src_disp + " to " + dst_disp + ": only numeric to numeric casts are allowed at line " + int_to_string(line))
+        eprintln(error_at(gen.ir_mod.files, "invalid cast from " + src_disp + " to " + dst_disp + ": only numeric to numeric casts are allowed", line))
         exit(1)
     }
 }
@@ -5409,7 +5489,7 @@ fn expr_is_ref_value(gen: IRGenerator, e: Expr) -> bool {
 -- Unsafe fence: calling an `extern fn` requires an unsafe block
 fn check_extern_fence(gen: IRGenerator, fn_name: string, line: int) {
     if gen.unsafe_depth == 0 and gen.all_extern_fns.contains(fn_name) and gen.all_extern_fns.get(fn_name) {
-        eprintln("Error: extern function call '" + fn_name + "' requires unsafe block at line " + int_to_string(line))
+        eprintln(error_at(gen.ir_mod.files, "extern function call '" + fn_name + "' requires unsafe block", line))
         exit(1)
     }
 }
@@ -5728,6 +5808,7 @@ fn builtin_return_type(name: string) -> string {
 fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
     let mut g = gen
     g.declarations = source.declarations
+    g.ir_mod.files = source.files
 
     -- Phase 1: Register all struct and enum definitions. Generic structs
     -- are recorded first; each use with type arguments registers an
@@ -7524,7 +7605,7 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
 
     -- Region escape: a region-born value must not be returned
     if stmt.has_ret_value and expr_is_region_born(g, *stmt.ret_value) {
-        eprintln("Error: return of region-born value from inside a region (region escape) at line " + int_to_string(stmt.line))
+        eprintln(error_at(gen.ir_mod.files, "return of region-born value from inside a region (region escape)", stmt.line))
         exit(1)
     }
 
@@ -8460,13 +8541,13 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     if g.region_depth > 0 and stmt.assign_op == ASSIGN_EQ() and expr_is_region_born(g, *stmt.assign_value) {
         if track_target.kind == EXPR_IDENTIFIER() {
             if var_declared_outside_innermost_region(g, track_target.name) {
-                eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                eprintln(error_at(gen.ir_mod.files, "assignment of region-born value to variable declared outside the region (region escape)", stmt.line))
                 exit(1)
             }
         } else {
             let store_root = root_identifier_name(track_target)
             if store_root != "" and var_declared_outside_innermost_region(g, store_root) {
-                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                eprintln(error_at(gen.ir_mod.files, "store of region-born value into container declared outside the region (region escape)", stmt.line))
                 exit(1)
             }
         }
@@ -8486,7 +8567,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
         if target_is_string {
             if track_target.kind == EXPR_IDENTIFIER() {
                 if var_declared_outside_innermost_region(g, track_target.name) {
-                    eprintln("Error: assignment of region-born value to variable declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    eprintln(error_at(gen.ir_mod.files, "assignment of region-born value to variable declared outside the region (region escape)", stmt.line))
                     exit(1)
                 } else {
                     g.region_born_vars.insert(track_target.name, true)
@@ -8494,7 +8575,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             } else {
                 let add_root = root_identifier_name(track_target)
                 if add_root != "" and var_declared_outside_innermost_region(g, add_root) {
-                    eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(stmt.line))
+                    eprintln(error_at(gen.ir_mod.files, "store of region-born value into container declared outside the region (region escape)", stmt.line))
                     exit(1)
                 }
             }
@@ -11262,7 +11343,7 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
         -- &T parameters) need an unsafe block to dereference. Box derefs
         -- stay safe (runtime null check below).
         if g.unsafe_depth == 0 and expr_is_tainted_ref(g, *expr.operand) {
-            eprintln("Error: dereference of a reference from an extern call or cast requires unsafe block at line " + int_to_string(expr.line))
+            eprintln(error_at(gen.ir_mod.files, "dereference of a reference from an extern call or cast requires unsafe block", expr.line))
             exit(1)
         }
         -- Dereference Box[T]: load the struct value from the pointer
@@ -11552,7 +11633,7 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Check if function is defined
     if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false and g.static_fns.contains(fn_name) == false {
-        eprintln("Error: undefined function '" + fn_name + "' at line " + int_to_string(expr.line))
+        eprintln(error_at(gen.ir_mod.files, "undefined function '" + fn_name + "'", expr.line))
         exit(1)
     }
 
@@ -12246,7 +12327,7 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         if any_born {
             let born_root = root_identifier_name(obj_expr)
             if born_root != "" and var_declared_outside_innermost_region(g, born_root) {
-                eprintln("Error: store of region-born value into container declared outside the region (region escape) at line " + int_to_string(expr.line))
+                eprintln(error_at(gen.ir_mod.files, "store of region-born value into container declared outside the region (region escape)", expr.line))
                 exit(1)
             }
         }
@@ -18467,8 +18548,14 @@ fn llvm_type_name(ty: int) -> string {
 -- " (in function 'f') at line N" for errors found while lowering an instruction.
 fn type_error_location(g: LLVMGenerator) -> string {
     let mut loc = " (in function '" + g.current_func_name + "')"
-    if g.current_line > 0 { loc = loc + " at line " + int_to_string(g.current_line) }
+    if g.current_line > 0 { loc = loc + " at line " + int_to_string(line_in_file(g.current_line)) }
     return loc
+}
+
+-- The text of an error found while lowering an instruction, which
+-- names the file when it is not the one being compiled
+fn lg_error(g: LLVMGenerator, msg: string) -> string {
+    return file_prefix(g.ir_module.files, g.current_line) + "Error: " + msg + type_error_location(g)
 }
 
 -- Check the arguments in the call buffer against fn_ty's parameter types.
@@ -18482,10 +18569,9 @@ fn check_call_args(gen: LLVMGenerator, fn_ty: int, callee: int) -> LLVMGenerator
         let nargs = dm_llvm_buf_len()
         let mut callee_name = dm_llvm_get_value_name(callee)
         if callee_name == "" { callee_name = "<function pointer>" }
-        let loc = type_error_location(g)
         let var_arg = dm_llvm_is_function_var_arg(fn_ty) != 0
         if nargs < nparams or (nargs > nparams and var_arg == false) {
-            g.type_errors.push("Error: call to '" + callee_name + "' passes " + int_to_string(nargs) + " arguments, expected " + int_to_string(nparams) + loc)
+            g.type_errors.push(lg_error(g, "call to '" + callee_name + "' passes " + int_to_string(nargs) + " arguments, expected " + int_to_string(nparams)))
             return g
         }
         let mut i = 0
@@ -18493,7 +18579,7 @@ fn check_call_args(gen: LLVMGenerator, fn_ty: int, callee: int) -> LLVMGenerator
             let want = dm_llvm_param_type_at(fn_ty, i)
             let got = dm_llvm_type_of(dm_llvm_buf_get(i))
             if got != want {
-                g.type_errors.push("Error: call to '" + callee_name + "' argument " + int_to_string(i + 1) + " has type " + llvm_type_name(got) + ", expected " + llvm_type_name(want) + loc)
+                g.type_errors.push(lg_error(g, "call to '" + callee_name + "' argument " + int_to_string(i + 1) + " has type " + llvm_type_name(got) + ", expected " + llvm_type_name(want)))
             }
             i = i + 1
         }
@@ -18865,7 +18951,7 @@ fn define_static_storage(gen: LLVMGenerator, name: string, size: int) -> LLVMGen
         let mut g = gen
         if g.static_sizes.contains(name) {
             if g.static_sizes.get(name) != size {
-                g.type_errors.push("Error: static_addr(\"" + name + "\") has the size " + int_to_string(size) + " here and " + int_to_string(g.static_sizes.get(name)) + " elsewhere" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "static_addr(\"" + name + "\") has the size " + int_to_string(size) + " here and " + int_to_string(g.static_sizes.get(name)) + " elsewhere"))
             }
             return g
         }
@@ -19806,7 +19892,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let mut alloc_ty = map_ir_type_to_llvm(g, inst.alloc_type)
             if inst.alloc_type == "void" {
                 -- LLVM cannot allocate void; report it instead of crashing
-                g.type_errors.push("Error: a variable holds the result of a call that returns no value" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "a variable holds the result of a call that returns no value"))
                 alloc_ty = dm_llvm_int64_type(g.context)
             }
             let result = dm_llvm_build_alloca(b, alloc_ty, "alloca")
@@ -19875,7 +19961,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             g = resolve_value_with_counter(g, inst.field_base)
             let base_ty = dm_llvm_type_of(base)
             if dm_llvm_get_type_kind(base_ty) != 10 {
-                g.type_errors.push("Error: field " + int_to_string(inst.field_index) + " read from a value of type " + llvm_type_name(base_ty) + ", which is not a struct" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "field " + int_to_string(inst.field_index) + " read from a value of type " + llvm_type_name(base_ty) + ", which is not a struct"))
             }
             let result = dm_llvm_build_extract_value(b, base, inst.field_index, "field")
             -- If extracted field is dm_string, store to alloca and track
@@ -19903,7 +19989,7 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 let ptr_ty = dm_llvm_pointer_type(g.context)
                 let mut header = base
                 if dm_llvm_get_type_kind(dm_llvm_type_of(base)) != 12 {
-                    g.type_errors.push("Error: element taken from a value of type " + llvm_type_name(dm_llvm_type_of(base)) + ", which is not the address of a list" + type_error_location(g))
+                    g.type_errors.push(lg_error(g, "element taken from a value of type " + llvm_type_name(dm_llvm_type_of(base)) + ", which is not the address of a list"))
                     header = dm_llvm_const_null(ptr_ty)
                 }
                 let data_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, header, 0, "list.data.addr")
@@ -20843,7 +20929,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if callee_name == "dm_symbol_addr" and inst.call_args.len() == 1 {
             let symbol = inst.call_args[0].str_val
             if g.function_map.contains(symbol) or g.c_symbols.contains(symbol) {
-                g.type_errors.push("Error: symbol_addr(\"" + symbol + "\") names a function, not a data symbol" + type_error_location(g))
+                g.type_errors.push(lg_error(g, "symbol_addr(\"" + symbol + "\") names a function, not a data symbol"))
             }
             g = declare_data_symbol(g, symbol, dm_llvm_int8_type(g.context))
             let symbol_addr = dm_llvm_build_ptr_to_int(b, g.data_symbols.get(symbol), dm_llvm_int64_type(g.context), "symbol.addr")
@@ -20900,7 +20986,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             -- A call the IR generator emitted of a function it never
             -- declared. Dropping it would make the program do less than
             -- its source says.
-            g.type_errors.push("Error: internal: call of '" + callee_name + "', which is not declared" + type_error_location(g))
+            g.type_errors.push(lg_error(g, "internal: call of '" + callee_name + "', which is not declared"))
             return g
         }
         let callee = g.function_map.get(callee_name)
@@ -21630,7 +21716,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "d02c405d2bf8d781"
+    return "d6dcd6825041e9f9"
 }
 
 
@@ -21931,9 +22017,10 @@ fn find_bridge_file(input_dir: string) -> string {
     return ""
 }
 
--- The LLVM bridge at path, parsed. Exits when it does not parse.
-fn parse_llvm_bridge(path: string) -> SourceFile {
-    let p = parser_new(tokenize(file_read(path)))
+-- The LLVM bridge at path, parsed as file number `file` of the
+-- program. Exits when it does not parse.
+fn parse_llvm_bridge(path: string, file: int) -> SourceFile {
+    let p = parser_new(tokenize_file(file_read(path), path, file))
     let bridge_sf = parse_source_file(p)
     let mut errors = bridge_sf.errors
     if errors.len() == 0 {
@@ -22002,7 +22089,9 @@ fn add_llvm_bridge(sf: SourceFile, bridge_sf: SourceFile) -> SourceFile {
 -- Handles transitive and diamond imports via deduplication.
 fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFile {
     let mut merged = source_file_new(sf.module_name)
-    let mut state = Imports { loaded: [], decls: [] }
+    -- The file being compiled is file number 0, and each imported file
+    -- takes the next number as it is loaded
+    let mut state = Imports { loaded: sf.files, decls: [] }
 
     -- Process each import
     let mut i = 0
@@ -22019,13 +22108,18 @@ fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFi
     }
 
     merged.declarations = state.decls
+    merged.files = state.loaded
     return merged
 }
 
+-- The name of the runtime in errors. Its line numbers are those of the
+-- runtime/*.dm files joined, as gen_bootstrap.sh joins them.
+fn PRELUDE_NAME() -> string { return "<runtime>" }
+
 -- The runtime written in dAImond (prelude.dm, generated from
--- runtime/*.dm), parsed
-fn parse_prelude() -> SourceFile {
-    return parse_source_file(parser_new(tokenize(prelude_source())))
+-- runtime/*.dm), parsed as file number `file` of the program
+fn parse_prelude(file: int) -> SourceFile {
+    return parse_source_file(parser_new(tokenize_file(prelude_source(), PRELUDE_NAME(), file)))
 }
 
 -- Add the runtime to a program's declarations. Its generic
@@ -22152,7 +22246,8 @@ fn resolve_import_path(import_path: string, base_dir: string) -> string {
 
 -- The files imported so far and their declarations. It is passed to
 -- process_import and returned by it, so that a file imported by two
--- files is known to both.
+-- files is known to both. `loaded` begins with the file being
+-- compiled, so a file's place in it is its file number.
 struct Imports {
     loaded: List[string],
     decls: List[Declaration]
@@ -22165,13 +22260,14 @@ fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: 
     let file_path = resolve_import_path(imp.path, base_dir)
 
     -- A file is loaded once, however many files import it
-    let mut li = 0
+    let mut li = 1
     while li < state.loaded.len() {
         if state.loaded[li] == file_path {
             return state
         }
         li = li + 1
     }
+    let file = state.loaded.len()
     state.loaded.push(file_path)
 
     if verbose {
@@ -22186,7 +22282,7 @@ fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: 
 
     -- Read, tokenize, and parse the imported file
     let source = file_read(file_path)
-    let tokens = tokenize(source)
+    let tokens = tokenize_file(source, file_path, file)
     let p = parser_new(tokens)
     let imp_sf = parse_source_file(p)
     if imp_sf.errors.len() > 0 {
@@ -22781,6 +22877,7 @@ fn compile(cli: CLIArgs) -> int {
     }
 
     -- Phase 3.5: Resolve imports
+    sf.files.push(input_file)
     if sf.imports.len() > 0 {
         if verbose { println("  [3.5/6] Resolving imports...") }
         let input_dir = dirname(input_file)
@@ -22805,13 +22902,15 @@ fn compile(cli: CLIArgs) -> int {
             return 1
         }
         if verbose { println("  LLVM bridge: " + bridge_file) }
-        sf = add_llvm_bridge(sf, parse_llvm_bridge(bridge_file))
+        sf = add_llvm_bridge(sf, parse_llvm_bridge(bridge_file, sf.files.len()))
+        sf.files.push(bridge_file)
     }
     -- test: a main that runs the file's tests takes the place of its own
     if cli.command == "test" {
         sf = with_test_main(sf)
     }
-    let prelude_sf = parse_prelude()
+    let prelude_sf = parse_prelude(sf.files.len())
+    sf.files.push(PRELUDE_NAME())
     sf = add_prelude(sf, prelude_sf)
 
     -- Effect system enforcement
@@ -23262,7 +23361,7 @@ fn duplicate_declarations(sf: SourceFile) -> List[string] {
             }
         }
         if first_line >= 0 {
-            errors.push("Error: " + what + " '" + name + "' is declared more than once (first at line " + int_to_string(first_line) + ") at line " + int_to_string(line))
+            errors.push(error_at(sf.files, what + " '" + name + "' is declared more than once (first at " + line_ref(sf.files, first_line, line) + ")", line))
         }
         i = i + 1
     }

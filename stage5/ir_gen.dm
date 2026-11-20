@@ -257,7 +257,7 @@ fn param_src_types(fd: FunctionDecl) -> string {
 
 fn ir_type_error(gen: IRGenerator, msg: string, line: int) -> IRGenerator {
     let mut g = gen
-    g.type_errors.push("Error: " + msg + " at line " + int_to_string(line))
+    g.type_errors.push(error_at(g.ir_mod.files, msg, line))
     return g
 }
 
@@ -633,7 +633,7 @@ fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_typ
         if src_is_ref { src_disp = "&" + safety_display_name(from_type) }
         let mut dst_disp = safety_display_name(cast_type)
         if cast_is_ref { dst_disp = "&" + safety_display_name(cast_type) }
-        eprintln("Error: invalid cast from " + src_disp + " to " + dst_disp + ": only numeric to numeric casts are allowed at line " + int_to_string(line))
+        eprintln(error_at(gen.ir_mod.files, "invalid cast from " + src_disp + " to " + dst_disp + ": only numeric to numeric casts are allowed", line))
         exit(1)
     }
 }
@@ -680,7 +680,7 @@ fn expr_is_ref_value(gen: IRGenerator, e: Expr) -> bool {
 -- Unsafe fence: calling an `extern fn` requires an unsafe block
 fn check_extern_fence(gen: IRGenerator, fn_name: string, line: int) {
     if gen.unsafe_depth == 0 and gen.all_extern_fns.contains(fn_name) and gen.all_extern_fns.get(fn_name) {
-        eprintln("Error: extern function call '" + fn_name + "' requires unsafe block at line " + int_to_string(line))
+        eprintln(error_at(gen.ir_mod.files, "extern function call '" + fn_name + "' requires unsafe block", line))
         exit(1)
     }
 }
@@ -999,6 +999,7 @@ fn builtin_return_type(name: string) -> string {
 fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
     let mut g = gen
     g.declarations = source.declarations
+    g.ir_mod.files = source.files
 
     -- Phase 1: Register all struct and enum definitions. Generic structs
     -- are recorded first; each use with type arguments registers an

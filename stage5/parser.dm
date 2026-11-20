@@ -91,7 +91,7 @@ fn p_expect(p: Parser, kind: int) -> Parser {
         return p_advance(pp)
     }
     let tok = p_cur(pp)
-    let msg = "Error at " + int_to_string(tok.line) + ":" + int_to_string(tok.col) + ": expected " + token_kind_name(kind) + " but got " + token_kind_name(tok.kind)
+    let msg = "Error at " + int_to_string(line_in_file(tok.line)) + ":" + int_to_string(tok.col) + ": expected " + token_kind_name(kind) + " but got " + token_kind_name(tok.kind)
     pp.errors.push(msg)
     return pp
 }
@@ -99,7 +99,7 @@ fn p_expect(p: Parser, kind: int) -> Parser {
 fn p_error(p: Parser, msg: string) -> Parser {
     let mut pp = p
     let tok = p_cur(pp)
-    let full = "Error at " + int_to_string(tok.line) + ":" + int_to_string(tok.col) + ": " + msg
+    let full = "Error at " + int_to_string(line_in_file(tok.line)) + ":" + int_to_string(tok.col) + ": " + msg
     pp.errors.push(full)
     return pp
 }
@@ -1002,10 +1002,20 @@ fn parse_fstring(p: Parser) -> ParseExprResult {
                 if depth > 0 { i = i + 1 }
             }
             let expr_text = substr(template, start, i - start)
-            -- Tokenize and parse the expression
-            let expr_tokens = tokenize(expr_text)
+            -- Tokenize and parse the expression. Its tokens are at the
+            -- f-string's place, which is where its errors are reported.
+            let lexed = tokenize(expr_text)
+            let mut expr_tokens: List[Token] = []
+            let mut ti = 0
+            while ti < lexed.len() {
+                expr_tokens.push(token_new(lexed[ti].kind, lexed[ti].value, tok.line, tok.col))
+                ti = ti + 1
+            }
             let expr_parser = parser_new(expr_tokens)
             let expr_result = parse_expr(expr_parser)
+            if expr_result.p.errors.len() > 0 {
+                pp.errors.push(expr_result.p.errors[0])
+            }
             parts.push(expr_result.expr)
             is_literal.push(false)
             if i < tlen {
@@ -1816,7 +1826,7 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
             fd.is_variadic = true
             pp = p_skip_newlines(pp)
             if p_peek(pp) != TK_RPAREN() {
-                eprintln("Error: `...` must be the last parameter of extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+                eprintln("Error: `...` must be the last parameter of extern fn '" + fd.name + "' at line " + int_to_string(line_in_file(tok.line)))
                 exit(1)
             }
         } else {
@@ -1849,7 +1859,7 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
     if p_peek(pp) == TK_EQ() {
         pp = p_advance(pp)
         if p_peek(pp) != TK_STRING() or p_cur(pp).value == "" {
-            eprintln("Error: expected a C symbol name in quotes after `=` in extern fn '" + fd.name + "' at line " + int_to_string(tok.line))
+            eprintln("Error: expected a C symbol name in quotes after `=` in extern fn '" + fd.name + "' at line " + int_to_string(line_in_file(tok.line)))
             exit(1)
         }
         fd.link_name = p_cur(pp).value

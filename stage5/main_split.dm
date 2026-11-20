@@ -315,9 +315,10 @@ fn find_bridge_file(input_dir: string) -> string {
     return ""
 }
 
--- The LLVM bridge at path, parsed. Exits when it does not parse.
-fn parse_llvm_bridge(path: string) -> SourceFile {
-    let p = parser_new(tokenize(file_read(path)))
+-- The LLVM bridge at path, parsed as file number `file` of the
+-- program. Exits when it does not parse.
+fn parse_llvm_bridge(path: string, file: int) -> SourceFile {
+    let p = parser_new(tokenize_file(file_read(path), path, file))
     let bridge_sf = parse_source_file(p)
     let mut errors = bridge_sf.errors
     if errors.len() == 0 {
@@ -386,7 +387,9 @@ fn add_llvm_bridge(sf: SourceFile, bridge_sf: SourceFile) -> SourceFile {
 -- Handles transitive and diamond imports via deduplication.
 fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFile {
     let mut merged = source_file_new(sf.module_name)
-    let mut state = Imports { loaded: [], decls: [] }
+    -- The file being compiled is file number 0, and each imported file
+    -- takes the next number as it is loaded
+    let mut state = Imports { loaded: sf.files, decls: [] }
 
     -- Process each import
     let mut i = 0
@@ -403,13 +406,18 @@ fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFi
     }
 
     merged.declarations = state.decls
+    merged.files = state.loaded
     return merged
 }
 
+-- The name of the runtime in errors. Its line numbers are those of the
+-- runtime/*.dm files joined, as gen_bootstrap.sh joins them.
+fn PRELUDE_NAME() -> string { return "<runtime>" }
+
 -- The runtime written in dAImond (prelude.dm, generated from
--- runtime/*.dm), parsed
-fn parse_prelude() -> SourceFile {
-    return parse_source_file(parser_new(tokenize(prelude_source())))
+-- runtime/*.dm), parsed as file number `file` of the program
+fn parse_prelude(file: int) -> SourceFile {
+    return parse_source_file(parser_new(tokenize_file(prelude_source(), PRELUDE_NAME(), file)))
 }
 
 -- Add the runtime to a program's declarations. Its generic
@@ -536,7 +544,8 @@ fn resolve_import_path(import_path: string, base_dir: string) -> string {
 
 -- The files imported so far and their declarations. It is passed to
 -- process_import and returned by it, so that a file imported by two
--- files is known to both.
+-- files is known to both. `loaded` begins with the file being
+-- compiled, so a file's place in it is its file number.
 struct Imports {
     loaded: List[string],
     decls: List[Declaration]
@@ -549,13 +558,14 @@ fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: 
     let file_path = resolve_import_path(imp.path, base_dir)
 
     -- A file is loaded once, however many files import it
-    let mut li = 0
+    let mut li = 1
     while li < state.loaded.len() {
         if state.loaded[li] == file_path {
             return state
         }
         li = li + 1
     }
+    let file = state.loaded.len()
     state.loaded.push(file_path)
 
     if verbose {
@@ -570,7 +580,7 @@ fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: 
 
     -- Read, tokenize, and parse the imported file
     let source = file_read(file_path)
-    let tokens = tokenize(source)
+    let tokens = tokenize_file(source, file_path, file)
     let p = parser_new(tokens)
     let imp_sf = parse_source_file(p)
     if imp_sf.errors.len() > 0 {
@@ -1165,6 +1175,7 @@ fn compile(cli: CLIArgs) -> int {
     }
 
     -- Phase 3.5: Resolve imports
+    sf.files.push(input_file)
     if sf.imports.len() > 0 {
         if verbose { println("  [3.5/6] Resolving imports...") }
         let input_dir = dirname(input_file)
@@ -1189,13 +1200,15 @@ fn compile(cli: CLIArgs) -> int {
             return 1
         }
         if verbose { println("  LLVM bridge: " + bridge_file) }
-        sf = add_llvm_bridge(sf, parse_llvm_bridge(bridge_file))
+        sf = add_llvm_bridge(sf, parse_llvm_bridge(bridge_file, sf.files.len()))
+        sf.files.push(bridge_file)
     }
     -- test: a main that runs the file's tests takes the place of its own
     if cli.command == "test" {
         sf = with_test_main(sf)
     }
-    let prelude_sf = parse_prelude()
+    let prelude_sf = parse_prelude(sf.files.len())
+    sf.files.push(PRELUDE_NAME())
     sf = add_prelude(sf, prelude_sf)
 
     -- Effect system enforcement
@@ -1646,7 +1659,7 @@ fn duplicate_declarations(sf: SourceFile) -> List[string] {
             }
         }
         if first_line >= 0 {
-            errors.push("Error: " + what + " '" + name + "' is declared more than once (first at line " + int_to_string(first_line) + ") at line " + int_to_string(line))
+            errors.push(error_at(sf.files, what + " '" + name + "' is declared more than once (first at " + line_ref(sf.files, first_line, line) + ")", line))
         }
         i = i + 1
     }
