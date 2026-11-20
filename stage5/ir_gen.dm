@@ -898,6 +898,19 @@ fn map_builtin_name(name: string) -> string {
     if name == "term_height" { return "dm_term_height" }
     if name == "time_ms" { return "dm_time_ms" }
     if name == "sleep_ms" { return "dm_sleep_ms" }
+    -- Network and thread builtins
+    if name == "tcp_listen" { return "dm_tcp_listen" }
+    if name == "tcp_accept" { return "dm_tcp_accept" }
+    if name == "tcp_connect" { return "dm_tcp_connect" }
+    if name == "tcp_read" { return "dm_tcp_read" }
+    if name == "tcp_write" { return "dm_tcp_write" }
+    if name == "tcp_close" { return "dm_tcp_close" }
+    if name == "thread_spawn" { return "dm_thread_spawn" }
+    if name == "thread_join" { return "dm_thread_join" }
+    if name == "mutex_new" { return "dm_mutex_new" }
+    if name == "mutex_lock" { return "dm_mutex_lock" }
+    if name == "mutex_unlock" { return "dm_mutex_unlock" }
+    if name == "mutex_destroy" { return "dm_mutex_destroy" }
     return name
 }
 
@@ -980,6 +993,10 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "os_getenv" or name == "env_get" { return true }
     if name == "chr" or name == "flush" or name == "read_key" or name == "read_key_nb" { return true }
     if name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return true }
+    if name == "tcp_listen" or name == "tcp_accept" or name == "tcp_connect" { return true }
+    if name == "tcp_read" or name == "tcp_write" or name == "tcp_close" { return true }
+    if name == "thread_spawn" or name == "thread_join" { return true }
+    if name == "mutex_new" or name == "mutex_lock" or name == "mutex_unlock" or name == "mutex_destroy" { return true }
     return false
 }
 
@@ -1038,6 +1055,10 @@ fn builtin_return_type(name: string) -> string {
     if name == "flush" or name == "sleep_ms" { return "void" }
     if name == "read_key" or name == "read_key_nb" { return "i64" }
     if name == "term_width" or name == "term_height" or name == "time_ms" { return "i64" }
+    -- Network and thread builtins
+    if name == "tcp_listen" or name == "tcp_accept" or name == "tcp_connect" or name == "tcp_write" { return "i64" }
+    if name == "tcp_read" { return "string" }
+    if name == "thread_spawn" or name == "mutex_new" { return "i64" }
     return "void"
 }
 

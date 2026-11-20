@@ -497,39 +497,44 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         gi = gi + 1
     }
 
-    -- Check if the identifier is a known function name (function pointer reference)
+    -- Check if the identifier is a known function name (function pointer reference).
+    -- A function declared further down is not in the module yet, but
+    -- its signature is registered.
+    let mut is_function = g.fn_src_param_types.contains(name) and g.generic_fn_decls.contains(name) == false
     let mut fi = 0
-    while fi < g.ir_mod.functions.len() {
-        let func = g.ir_mod.functions[fi]
-        if func.name == name {
-            -- Return a global reference to the function
-            let ref_id = g.builder.next_id
-            let mut ref_inst = ir_inst_new(ref_id, OP_ALLOCA())
-            ref_inst.alloc_type = "ptr"
-            ref_inst.result_type = "ptr(ptr)"
-            ref_inst.has_result = true
-            b.instructions.push(ref_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut store_ref = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_ref.store_ptr = ir_val_inst(ref_id)
-            store_ref.store_val = ir_val_global(name)
-            store_ref.has_result = false
-            b.instructions.push(store_ref)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let load_id = g.builder.next_id
-            let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-            load_inst.load_ptr = ir_val_inst(ref_id)
-            load_inst.load_type = "ptr"
-            load_inst.result_type = "ptr"
-            load_inst.has_result = true
-            b.instructions.push(load_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            return expr_result(g, b, load_id)
+    while fi < g.ir_mod.functions.len() and is_function == false {
+        if g.ir_mod.functions[fi].name == name {
+            is_function = true
         }
         fi = fi + 1
+    }
+    if is_function {
+        -- Return a global reference to the function
+        let ref_id = g.builder.next_id
+        let mut ref_inst = ir_inst_new(ref_id, OP_ALLOCA())
+        ref_inst.alloc_type = "ptr"
+        ref_inst.result_type = "ptr(ptr)"
+        ref_inst.has_result = true
+        b.instructions.push(ref_inst)
+        g.builder.next_id = g.builder.next_id + 1
+
+        let mut store_ref = ir_inst_new(g.builder.next_id, OP_STORE())
+        store_ref.store_ptr = ir_val_inst(ref_id)
+        store_ref.store_val = ir_val_global(name)
+        store_ref.has_result = false
+        b.instructions.push(store_ref)
+        g.builder.next_id = g.builder.next_id + 1
+
+        let load_id = g.builder.next_id
+        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+        load_inst.load_ptr = ir_val_inst(ref_id)
+        load_inst.load_type = "ptr"
+        load_inst.result_type = "ptr"
+        load_inst.has_result = true
+        b.instructions.push(load_inst)
+        g.builder.next_id = g.builder.next_id + 1
+
+        return expr_result(g, b, load_id)
     }
 
     -- Unknown identifier: report it, then emit a placeholder to continue
@@ -2958,6 +2963,18 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Builtin function (println, len, int_to_string, etc.)
     if is_builtin_fn(fn_name) {
+        -- A thread runs a function that is named and takes nothing: the
+        -- runtime gets the function's address and nothing to call it with
+        if fn_name == "thread_spawn" {
+            if expr.args.len() != 1 {
+                g = ir_type_error(g, "thread_spawn() takes 1 argument, not " + int_to_string(expr.args.len()), expr.line)
+                return expr_result(g, b, 0)
+            }
+            if is_thread_function(g, expr.args[0]) == false {
+                g = ir_type_error(g, "thread_spawn() takes a function that takes no arguments, by its name", expr.line)
+                return expr_result(g, b, 0)
+            }
+        }
         return generate_builtin_call(g, b, fn_name, expr.args)
     }
 

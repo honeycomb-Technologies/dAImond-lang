@@ -1,0 +1,14 @@
+a second listener on the port: -1
+server got: ping from the client
+server sent 4 bytes
+client sent 20 bytes
+client got: pong
+client after the server closed: []
+connect when nothing listens: -1
+no port: -1
+a name that is not an address: -1
+a port that is too large: -1
+accept on no socket: -1
+read from no socket: []
+write to no socket: 0
+done

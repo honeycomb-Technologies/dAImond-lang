@@ -326,6 +326,22 @@ fn simd_lane_count(vec_type: string) -> int {
 -- BUILTIN CALL GENERATION HELPERS
 -- ============================================================
 
+-- Whether the expression is what a thread can run: the name of a
+-- dAImond function that takes no arguments, or a variable that holds
+-- such a function
+fn is_thread_function(gen: IRGenerator, arg: Expr) -> bool {
+    if arg.kind != EXPR_IDENTIFIER() {
+        return false
+    }
+    if gen.variable_types.contains(arg.name) {
+        return starts_with(gen.variable_types.get(arg.name), "fn()")
+    }
+    if gen.all_extern_fns.contains(arg.name) or gen.generic_fn_decls.contains(arg.name) {
+        return false
+    }
+    return gen.fn_src_param_types.contains(arg.name) and gen.fn_src_param_types.get(arg.name) == ""
+}
+
 -- Generate a simple builtin function call (non-SIMD).
 -- Maps the dAImond builtin name to the C runtime name and emits
 -- an OP_CALL instruction with generated argument values.

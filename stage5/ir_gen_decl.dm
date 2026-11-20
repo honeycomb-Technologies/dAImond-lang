@@ -384,6 +384,22 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern0(g, "dm_time_ms", "i64")
     g = declare_extern(g, "dm_sleep_ms", "i64", "void")
 
+    -- Network
+    g = declare_extern(g, "dm_tcp_listen", "string", "i64")
+    g = declare_extern(g, "dm_tcp_accept", "i64", "i64")
+    g = declare_extern(g, "dm_tcp_connect", "string", "i64")
+    g = declare_extern2(g, "dm_tcp_read", "i64", "i64", "string")
+    g = declare_extern2(g, "dm_tcp_write", "i64", "string", "i64")
+    g = declare_extern(g, "dm_tcp_close", "i64", "void")
+
+    -- Threads. A thread's function reaches the runtime as its address.
+    g = declare_extern(g, "dm_thread_spawn", "ptr", "i64")
+    g = declare_extern(g, "dm_thread_join", "i64", "void")
+    g = declare_extern0(g, "dm_mutex_new", "i64")
+    g = declare_extern(g, "dm_mutex_lock", "i64", "void")
+    g = declare_extern(g, "dm_mutex_unlock", "i64", "void")
+    g = declare_extern(g, "dm_mutex_destroy", "i64", "void")
+
     -- String split
     g = declare_extern3(g, "dm_string_split", "ptr", "string", "string", "void")
 
