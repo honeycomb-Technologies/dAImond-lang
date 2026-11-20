@@ -293,10 +293,7 @@ fn OP_STRING_CONCAT() -> int { return 60 }
 fn OP_STRING_EQ() -> int { return 61 }
 fn OP_STRING_LEN() -> int { return 62 }
 fn OP_LIST_NEW() -> int { return 70 }
-fn OP_LIST_PUSH() -> int { return 71 }
 fn OP_LIST_GET() -> int { return 72 }
-fn OP_LIST_LEN() -> int { return 73 }
-fn OP_LIST_POP() -> int { return 74 }
 fn OP_ARENA_CREATE() -> int { return 90 }
 fn OP_ARENA_DESTROY() -> int { return 91 }
 fn OP_ARENA_ALLOC() -> int { return 92 }

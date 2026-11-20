@@ -402,18 +402,6 @@ fn builder_build_list_new(b: IRBuilder, elem_type: string) -> IRBuilder {
     return builder
 }
 
-fn builder_build_list_push(b: IRBuilder, list: IRValue, elem: IRValue) -> IRBuilder {
-    let mut builder = b
-    let id = builder.next_id
-    let mut inst = ir_inst_new(id, OP_LIST_PUSH())
-    inst.lhs = list
-    inst.rhs = elem
-    inst.has_result = false
-    builder = builder_add_inst(builder, inst)
-    builder.next_id = id + 1
-    return builder
-}
-
 fn builder_build_list_get(b: IRBuilder, list: IRValue, index: IRValue, elem_type: string) -> IRBuilder {
     let mut builder = b
     let id = builder.next_id
@@ -421,18 +409,6 @@ fn builder_build_list_get(b: IRBuilder, list: IRValue, index: IRValue, elem_type
     inst.lhs = list
     inst.rhs = index
     inst.result_type = elem_type
-    inst.has_result = true
-    builder = builder_add_inst(builder, inst)
-    builder.next_id = id + 1
-    return builder
-}
-
-fn builder_build_list_len(b: IRBuilder, list: IRValue) -> IRBuilder {
-    let mut builder = b
-    let id = builder.next_id
-    let mut inst = ir_inst_new(id, OP_LIST_LEN())
-    inst.operand = list
-    inst.result_type = "i64"
     inst.has_result = true
     builder = builder_add_inst(builder, inst)
     builder.next_id = id + 1

@@ -289,7 +289,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         if init_expr.kind == EXPR_ARRAY_LITERAL() and init_expr.elements.len() > 0 {
             let push_fn_name = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_push" }
             else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_push" }
-            else if elem_kind == LIST_ELEM_STRING() { "llvm_dm_list_string_push" }
+            else if elem_kind == LIST_ELEM_STRING() { "dm_list_string_push" }
             else { "dm_list_generic_push" }
             let mut ei = 0
             while ei < init_expr.elements.len() {

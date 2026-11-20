@@ -1579,7 +1579,11 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
             return map_type_name(mc_src)
         }
         if method == "len" { return "i64" }
-        if method == "pop" { return "i64" }
+        if method == "pop" {
+            let pop_src = static_type(gen, expr)
+            if pop_src != "" { return list_elem_ir_type(pop_src) }
+            return "i64"
+        }
         if method == "get" {
             return "i64"
         }
@@ -3861,10 +3865,52 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 
     -- ---- pop ----
     if method_name == "pop" {
+        if ek == LIST_ELEM_OTHER() {
+            -- Generic pop: dm_list_generic_pop(out_ptr, list_ptr, elem_size)
+            -- copies the element to a temporary, which is then loaded
+            let elem_type_name = if len(obj_var_name) > 0 and g.list_elem_types.contains(obj_var_name) {
+                g.list_elem_types.get(obj_var_name)
+            } else {
+                "i64"
+            }
+            let temp_alloca_id = g.builder.next_id
+            let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
+            temp_inst.alloc_type = elem_type_name
+            temp_inst.result_type = "ptr(" + elem_type_name + ")"
+            temp_inst.has_result = true
+            b.instructions.push(temp_inst)
+            g.builder.next_id = g.builder.next_id + 1
+
+            let pop_id = g.builder.next_id
+            let mut pop_inst = ir_inst_new(pop_id, OP_CALL())
+            pop_inst.callee = "dm_list_generic_pop"
+            let mut pop_args: List[IRValue] = []
+            pop_args.push(ir_val_inst(temp_alloca_id))
+            pop_args.push(ir_val_inst(list_ptr))
+            pop_args.push(ir_val_sizeof(elem_type_name))
+            pop_inst.call_args = pop_args
+            pop_inst.result_type = "void"
+            pop_inst.has_result = false
+            b.instructions.push(pop_inst)
+            g.builder.next_id = pop_id + 1
+
+            let load_id = g.builder.next_id
+            let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+            load_inst.load_ptr = ir_val_inst(temp_alloca_id)
+            load_inst.load_type = elem_type_name
+            load_inst.result_type = elem_type_name
+            load_inst.has_result = true
+            b.instructions.push(load_inst)
+            g.builder.next_id = load_id + 1
+            if g.struct_defs.contains(elem_type_name) {
+                g.var_struct_types.insert("_listget_" + int_to_string(load_id), elem_type_name)
+            }
+            return expr_result(g, b, load_id)
+        }
+
         let pop_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_pop" }
-        else if ek == LIST_ELEM_FLOAT() { "dm_list_double_get" }
-        else if ek == LIST_ELEM_STRING() { "dm_list_string_get" }
-        else { "dm_list_int64_pop" }
+        else if ek == LIST_ELEM_FLOAT() { "dm_list_double_pop" }
+        else { "dm_list_string_pop" }
 
         let ret_type = if ek == LIST_ELEM_FLOAT() { "f64" }
         else if ek == LIST_ELEM_STRING() { "string" }
@@ -3912,6 +3958,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 
             let contains_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_contains" }
             else if ek == LIST_ELEM_STRING() { "dm_list_string_contains" }
+            else if ek == LIST_ELEM_FLOAT() { "dm_list_double_contains" }
             else { "dm_list_int64_contains" }
 
             let id = g.builder.next_id
@@ -5601,7 +5648,7 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         push_fn = "dm_list_double_push"
     } else if elem_ir_type == "string" {
         new_fn = "dm_list_string_new"
-        push_fn = "llvm_dm_list_string_push"
+        push_fn = "dm_list_string_push"
     }
 
     -- Create list alloca and call new function (sret pattern)

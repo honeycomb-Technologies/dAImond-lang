@@ -1560,10 +1560,7 @@ fn OP_STRING_CONCAT() -> int { return 60 }
 fn OP_STRING_EQ() -> int { return 61 }
 fn OP_STRING_LEN() -> int { return 62 }
 fn OP_LIST_NEW() -> int { return 70 }
-fn OP_LIST_PUSH() -> int { return 71 }
 fn OP_LIST_GET() -> int { return 72 }
-fn OP_LIST_LEN() -> int { return 73 }
-fn OP_LIST_POP() -> int { return 74 }
 fn OP_ARENA_CREATE() -> int { return 90 }
 fn OP_ARENA_DESTROY() -> int { return 91 }
 fn OP_ARENA_ALLOC() -> int { return 92 }
@@ -2239,18 +2236,6 @@ fn builder_build_list_new(b: IRBuilder, elem_type: string) -> IRBuilder {
     return builder
 }
 
-fn builder_build_list_push(b: IRBuilder, list: IRValue, elem: IRValue) -> IRBuilder {
-    let mut builder = b
-    let id = builder.next_id
-    let mut inst = ir_inst_new(id, OP_LIST_PUSH())
-    inst.lhs = list
-    inst.rhs = elem
-    inst.has_result = false
-    builder = builder_add_inst(builder, inst)
-    builder.next_id = id + 1
-    return builder
-}
-
 fn builder_build_list_get(b: IRBuilder, list: IRValue, index: IRValue, elem_type: string) -> IRBuilder {
     let mut builder = b
     let id = builder.next_id
@@ -2258,18 +2243,6 @@ fn builder_build_list_get(b: IRBuilder, list: IRValue, index: IRValue, elem_type
     inst.lhs = list
     inst.rhs = index
     inst.result_type = elem_type
-    inst.has_result = true
-    builder = builder_add_inst(builder, inst)
-    builder.next_id = id + 1
-    return builder
-}
-
-fn builder_build_list_len(b: IRBuilder, list: IRValue) -> IRBuilder {
-    let mut builder = b
-    let id = builder.next_id
-    let mut inst = ir_inst_new(id, OP_LIST_LEN())
-    inst.operand = list
-    inst.result_type = "i64"
     inst.has_result = true
     builder = builder_add_inst(builder, inst)
     builder.next_id = id + 1
@@ -5843,6 +5816,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     -- List contains
     g = declare_extern2(g, "dm_list_int64_contains", "ptr", "i64", "bool")
     g = declare_extern2(g, "dm_list_string_contains", "ptr", "string", "bool")
+    g = declare_extern2(g, "dm_list_double_contains", "ptr", "f64", "bool")
 
     -- Process
     g = declare_extern(g, "dm_panic", "string", "void")
@@ -5895,6 +5869,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_list_string_get", "ptr", "i64", "string")
     g = declare_extern3(g, "dm_list_string_set", "ptr", "i64", "string", "void")
     g = declare_extern(g, "dm_list_string_len", "ptr", "i64")
+    g = declare_extern(g, "dm_list_string_pop", "ptr", "string")
 
     -- List operations (double)
     g = declare_extern(g, "dm_list_double_new", "ptr", "void")
@@ -5902,6 +5877,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_list_double_get", "ptr", "i64", "f64")
     g = declare_extern3(g, "dm_list_double_set", "ptr", "i64", "f64", "void")
     g = declare_extern(g, "dm_list_double_len", "ptr", "i64")
+    g = declare_extern(g, "dm_list_double_pop", "ptr", "f64")
 
     -- List operations (generic)
     g = declare_extern(g, "dm_list_generic_new", "ptr", "void")
@@ -5909,6 +5885,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern4(g, "dm_list_generic_get", "ptr", "ptr", "i64", "i64", "void")
     g = declare_extern4(g, "dm_list_generic_set", "ptr", "ptr", "i64", "i64", "void")
     g = declare_extern(g, "dm_list_generic_len", "ptr", "i64")
+    g = declare_extern3(g, "dm_list_generic_pop", "ptr", "ptr", "i64", "void")
 
     -- Filesystem
     g = declare_extern(g, "dm_fs_mkdir", "string", "i64")
@@ -6823,7 +6800,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         if init_expr.kind == EXPR_ARRAY_LITERAL() and init_expr.elements.len() > 0 {
             let push_fn_name = if elem_kind == LIST_ELEM_INT() { "dm_list_int64_push" }
             else if elem_kind == LIST_ELEM_FLOAT() { "dm_list_double_push" }
-            else if elem_kind == LIST_ELEM_STRING() { "llvm_dm_list_string_push" }
+            else if elem_kind == LIST_ELEM_STRING() { "dm_list_string_push" }
             else { "dm_list_generic_push" }
             let mut ei = 0
             while ei < init_expr.elements.len() {
@@ -9889,7 +9866,11 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
             return map_type_name(mc_src)
         }
         if method == "len" { return "i64" }
-        if method == "pop" { return "i64" }
+        if method == "pop" {
+            let pop_src = static_type(gen, expr)
+            if pop_src != "" { return list_elem_ir_type(pop_src) }
+            return "i64"
+        }
         if method == "get" {
             return "i64"
         }
@@ -12171,10 +12152,52 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 
     -- ---- pop ----
     if method_name == "pop" {
+        if ek == LIST_ELEM_OTHER() {
+            -- Generic pop: dm_list_generic_pop(out_ptr, list_ptr, elem_size)
+            -- copies the element to a temporary, which is then loaded
+            let elem_type_name = if len(obj_var_name) > 0 and g.list_elem_types.contains(obj_var_name) {
+                g.list_elem_types.get(obj_var_name)
+            } else {
+                "i64"
+            }
+            let temp_alloca_id = g.builder.next_id
+            let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
+            temp_inst.alloc_type = elem_type_name
+            temp_inst.result_type = "ptr(" + elem_type_name + ")"
+            temp_inst.has_result = true
+            b.instructions.push(temp_inst)
+            g.builder.next_id = g.builder.next_id + 1
+
+            let pop_id = g.builder.next_id
+            let mut pop_inst = ir_inst_new(pop_id, OP_CALL())
+            pop_inst.callee = "dm_list_generic_pop"
+            let mut pop_args: List[IRValue] = []
+            pop_args.push(ir_val_inst(temp_alloca_id))
+            pop_args.push(ir_val_inst(list_ptr))
+            pop_args.push(ir_val_sizeof(elem_type_name))
+            pop_inst.call_args = pop_args
+            pop_inst.result_type = "void"
+            pop_inst.has_result = false
+            b.instructions.push(pop_inst)
+            g.builder.next_id = pop_id + 1
+
+            let load_id = g.builder.next_id
+            let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+            load_inst.load_ptr = ir_val_inst(temp_alloca_id)
+            load_inst.load_type = elem_type_name
+            load_inst.result_type = elem_type_name
+            load_inst.has_result = true
+            b.instructions.push(load_inst)
+            g.builder.next_id = load_id + 1
+            if g.struct_defs.contains(elem_type_name) {
+                g.var_struct_types.insert("_listget_" + int_to_string(load_id), elem_type_name)
+            }
+            return expr_result(g, b, load_id)
+        }
+
         let pop_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_pop" }
-        else if ek == LIST_ELEM_FLOAT() { "dm_list_double_get" }
-        else if ek == LIST_ELEM_STRING() { "dm_list_string_get" }
-        else { "dm_list_int64_pop" }
+        else if ek == LIST_ELEM_FLOAT() { "dm_list_double_pop" }
+        else { "dm_list_string_pop" }
 
         let ret_type = if ek == LIST_ELEM_FLOAT() { "f64" }
         else if ek == LIST_ELEM_STRING() { "string" }
@@ -12222,6 +12245,7 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 
             let contains_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_contains" }
             else if ek == LIST_ELEM_STRING() { "dm_list_string_contains" }
+            else if ek == LIST_ELEM_FLOAT() { "dm_list_double_contains" }
             else { "dm_list_int64_contains" }
 
             let id = g.builder.next_id
@@ -13911,7 +13935,7 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         push_fn = "dm_list_double_push"
     } else if elem_ir_type == "string" {
         new_fn = "dm_list_string_new"
-        push_fn = "llvm_dm_list_string_push"
+        push_fn = "dm_list_string_push"
     }
 
     -- Create list alloca and call new function (sret pattern)
@@ -18266,18 +18290,34 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- RUNTIME FUNCTIONS
 -- The IR names a runtime function dm_X. It is one of three things:
 --   inline: lowered to instructions here, with no function behind it
---     (is_inline_runtime_fn): len(s) and the integer overflow and
---     range checks;
+--     (is_inline_runtime_fn): len(s), the integer overflow and
+--     range checks, xs.len() and the creation of an empty list;
 --   ported: the dAImond function rt_X, which stage5/runtime/*.dm
 --     defines with the same signature and which is called like any
---     other dAImond function (strings by value, result through sret);
+--     other dAImond function (strings by value, result through sret).
+--     Where dm_X takes a pointer, rt_X takes an int, the address;
 --   otherwise the C function llvm_dm_X in runtime/llvm_wrappers.c,
 --     which takes strings by pointer.
 -- Porting a function is writing rt_X and deleting llvm_dm_X.
 -- ============================================================
 
 fn is_inline_runtime_fn(name: string) -> bool {
-    return name == "dm_string_len" or overflow_intrinsic_of(name) != "" or is_range_check_fn(name)
+    return name == "dm_string_len" or overflow_intrinsic_of(name) != "" or is_range_check_fn(name) or is_list_len_fn(name) or is_list_new_fn(name)
+}
+
+-- Every list is { data, len, capacity }, whatever its elements are
+fn is_list_len_fn(name: string) -> bool {
+    return name == "dm_list_int64_len" or name == "dm_list_double_len" or name == "dm_list_string_len" or name == "dm_list_generic_len"
+}
+
+fn is_list_new_fn(name: string) -> bool {
+    return name == "dm_list_int64_new" or name == "dm_list_double_new" or name == "dm_list_string_new" or name == "dm_list_generic_new"
+}
+
+-- Whether rt_X may stand in for a parameter or return of type
+-- `declared`: with the same type, or with an int where dm_X has a pointer
+fn port_type_matches(declared: string, ported: string) -> bool {
+    return declared == ported or (declared == "ptr" and ported == "i64")
 }
 
 -- Record which dm_X functions the module defines as rt_X
@@ -18315,7 +18355,7 @@ fn bind_runtime_port(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     let mut same = decl.return_type == func.return_type and decl.params.len() == func.params.len()
     i = 0
     while same and i < decl.params.len() {
-        if decl.params[i].type_id != func.params[i].type_id { same = false }
+        if port_type_matches(decl.params[i].type_id, func.params[i].type_id) == false { same = false }
         i = i + 1
     }
     if same == false {
@@ -19380,20 +19420,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             g = generate_list_new(g, inst)
             return g
         }
-        if op == OP_LIST_PUSH() {
-            g = generate_list_push(g, inst)
-            return g
-        }
         if op == OP_LIST_GET() {
             g = generate_list_get(g, inst)
-            return g
-        }
-        if op == OP_LIST_LEN() {
-            g = generate_list_len(g, inst)
-            return g
-        }
-        if op == OP_LIST_POP() {
-            g = generate_list_pop(g, inst)
             return g
         }
         -- Panic
@@ -19571,128 +19599,23 @@ fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     }
 }
 
-fn generate_list_push(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let list_val = resolve_value(g, inst.lhs)
-        let elem_val = resolve_value(g, inst.rhs)
-        g = resolve_value_with_counter(g, inst.lhs)
-        g = resolve_value_with_counter(g, inst.rhs)
-        -- Pick the correct runtime function based on element type
-        let mut fn_name = "dm_list_int64_push"
-        if inst.callee == "dm_list_double_push" or inst.result_type == "f64" {
-            fn_name = "dm_list_double_push"
-        } else if inst.callee == "dm_list_string_push" or inst.callee == "llvm_dm_list_string_push" or inst.result_type == "string" {
-            fn_name = "dm_list_string_push"
-        }
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(list_val)
-            dm_llvm_buf_push(elem_val)
-            g = check_call_args(g, fn_ty, func)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
-        return g
-    }
-}
-
+-- xs[i], after its bounds check: a call to the runtime function for
+-- the list's element type
 fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let list_val = resolve_value(g, inst.lhs)
-        let idx_val = resolve_value(g, inst.rhs)
-        g = resolve_value_with_counter(g, inst.lhs)
-        g = resolve_value_with_counter(g, inst.rhs)
-        -- Pick the correct runtime function based on element type
-        let mut fn_name = "dm_list_int64_get"
-        if inst.result_type == "f64" {
-            fn_name = "dm_list_double_get"
-        } else if inst.result_type == "string" {
-            fn_name = "dm_list_string_get"
-        }
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            if fn_name == "dm_list_string_get" {
-                -- String list get uses sret pattern
-                g = get_dm_string_type(g)
-                let sret = dm_llvm_build_alloca(b, g.dm_string_type, "listget_sret")
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(sret)
-                dm_llvm_buf_push(list_val)
-                dm_llvm_buf_push(idx_val)
-                g = check_call_args(g, fn_ty, func)
-                dm_llvm_build_call2_buf(b, fn_ty, func, "")
-                if inst.has_result {
-                    g.value_map.insert(id_key, sret)
-                    g.string_ptrs.insert(id_key, true)
-                }
-            } else {
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(list_val)
-                dm_llvm_buf_push(idx_val)
-                g = check_call_args(g, fn_ty, func)
-                let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
-                if inst.has_result { g.value_map.insert(id_key, result) }
-            }
-        }
-        return g
+    let mut get_call = ir_inst_new(inst.id, OP_CALL())
+    get_call.callee = "dm_list_int64_get"
+    if inst.result_type == "f64" {
+        get_call.callee = "dm_list_double_get"
+    } else if inst.result_type == "string" {
+        get_call.callee = "dm_list_string_get"
     }
-}
-
-fn generate_list_len(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let list_val = resolve_value(g, inst.operand)
-        g = resolve_value_with_counter(g, inst.operand)
-        -- Use type-specific len function (all return i64)
-        let mut fn_name = "dm_list_int64_len"
-        if inst.result_type == "f64" or inst.callee == "dm_list_double_len" {
-            fn_name = "dm_list_double_len"
-        } else if inst.result_type == "string" or inst.callee == "dm_list_string_len" {
-            fn_name = "dm_list_string_len"
-        } else if inst.callee == "dm_list_generic_len" {
-            fn_name = "dm_list_generic_len"
-        }
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(list_val)
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listlen")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
-}
-
-fn generate_list_pop(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let list_val = resolve_value(g, inst.operand)
-        g = resolve_value_with_counter(g, inst.operand)
-        let fn_name = "dm_list_int64_pop"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(list_val)
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listpop")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
+    let mut get_args: List[IRValue] = []
+    get_args.push(inst.lhs)
+    get_args.push(inst.rhs)
+    get_call.call_args = get_args
+    get_call.result_type = inst.result_type
+    get_call.has_result = inst.has_result
+    return generate_call(gen, get_call)
 }
 
 -- ============================================================
@@ -20309,6 +20232,24 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, s_len) }
             return g
         }
+        -- xs.len() reads the list's length field
+        if is_list_len_fn(callee_name) and inst.call_args.len() == 1 {
+            let list_res = resolve_value(g, inst.call_args[0])
+            let mut list_len = 0
+            if dm_llvm_get_type_kind(dm_llvm_type_of(list_res)) == 12 {
+                let len_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, list_res, 1, "list.len.addr")
+                list_len = dm_llvm_build_load2(b, dm_llvm_int64_type(g.context), len_slot, "list.len")
+            } else {
+                list_len = dm_llvm_build_extract_value(b, list_res, 1, "list.len")
+            }
+            if inst.has_result { g.value_map.insert(id_key, list_len) }
+            return g
+        }
+        -- An empty list is all zeros
+        if is_list_new_fn(callee_name) and inst.call_args.len() == 1 {
+            dm_llvm_build_store(b, dm_llvm_const_null(g.dm_string_type), resolve_value(g, inst.call_args[0]))
+            return g
+        }
         -- Look up function in function_map
         if g.function_map.contains(callee_name) == false {
             -- Unknown function: skip
@@ -20352,7 +20293,9 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 -- A string or list pointer passed by value: pass the value
                 val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
                 val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
-                if is_source_extern {
+                -- A source extern and a ported runtime function may take an
+                -- int where the compiler has a pointer, and the other way round
+                if is_source_extern or g.rt_ports.contains(callee_name) {
                     val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
                 }
             }
@@ -20672,6 +20615,9 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
             }
             if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
             val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
+            if sparam_ty != 0 and g.rt_ports.contains(callee_name) {
+                val = coerce_ptr_int(g, val, sparam_ty)
+            }
             args.push(val)
             ai = ai + 1
         }
@@ -21027,16 +20973,16 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 --   -> Object File -> Linker -> Native Binary
 -- ============================================================
 
--- Generated by gen_bootstrap.sh from runtime/string.dm runtime/convert.dm runtime/map.dm; edit those files instead.
+-- Generated by gen_bootstrap.sh from runtime/string.dm runtime/convert.dm runtime/list.dm runtime/map.dm; edit those files instead.
 -- The compiler parses this source into every program it compiles.
 
 fn prelude_source() -> string {
-    return "\n-- ============================================================\n-- Strings\n-- The string functions behind every program Stage 5 compiles.\n-- gen_bootstrap.sh embeds this file in the compiler (prelude.dm),\n-- which adds it to each program's declarations.\n--\n-- A string is { data, len, cap }: the address of its bytes, their\n-- count, and the size of the allocation that holds them. cap is 0\n-- when the string does not own its bytes, as a literal doesn't.\n-- Every string built here is followed by a NUL byte, so its data\n-- can go to C as a char*.\n--\n-- The compiler calls rt_X wherever its IR names the runtime\n-- function dm_X (see RUNTIME FUNCTIONS in llvm_gen.dm), so each\n-- rt_X keeps the signature that dm_X is declared with in\n-- ir_gen_decl.dm. len(s) and string literals are inline and call\n-- nothing. Code here must not use the string operators it\n-- implements: no +, == or < on strings, and no char_at or substr.\n-- ============================================================\n\n-- libc, under names that a program's own extern declarations of\n-- the same C functions cannot collide with\nextern fn libc_malloc(n: int) -> int = \"malloc\"\nextern fn libc_memcpy(dst: int, src: int, n: int) -> int = \"memcpy\"\nextern fn libc_memcmp(a: int, b: int, n: int) -> i32 = \"memcmp\"\n\n-- A new string holding the n bytes at address src\nfn rt_string_copy(src: int, n: int) -> string {\n    if n <= 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, src, n)\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a + b\nfn rt_string_concat(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    let n = na + nb\n    if n == 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        if na > 0 {\n            libc_memcpy(buf, string_data(a), na)\n        }\n        if nb > 0 {\n            libc_memcpy(buf + na, string_data(b), nb)\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a == b\nfn rt_string_eq(a: string, b: string) -> bool {\n    let n = len(a)\n    if n != len(b) {\n        return false\n    }\n    if n == 0 {\n        return true\n    }\n    unsafe {\n        return libc_memcmp(string_data(a), string_data(b), n) == 0\n    }\n}\n\n-- Byte order of a and b: negative when a sorts first, 0 when they\n-- are equal, positive when b sorts first. A prefix sorts before\n-- the longer string.\nfn rt_string_cmp(a: string, b: string) -> int {\n    let na = len(a)\n    let nb = len(b)\n    let mut n = na\n    if nb < na {\n        n = nb\n    }\n    if n > 0 {\n        unsafe {\n            let c = libc_memcmp(string_data(a), string_data(b), n)\n            if c != 0 {\n                return c as int\n            }\n        }\n    }\n    if na < nb {\n        return -1\n    }\n    if na > nb {\n        return 1\n    }\n    return 0\n}\n\n-- char_at(s, i): the byte at index i as a one-byte string, or \"\"\n-- when i is outside s\nfn rt_char_at(s: string, i: int) -> string {\n    if i < 0 or i >= len(s) {\n        return \"\"\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + i, 1)\n    }\n}\n\n-- substr(s, start, length): up to length bytes of s from index\n-- start. The range is clamped to s: a start outside s or a length\n-- below 1 gives \"\", and a length past the end stops at the end.\nfn rt_substr(s: string, start: int, length: int) -> string {\n    let n = len(s)\n    if start < 0 or start >= n {\n        return \"\"\n    }\n    let mut count = length\n    if count > n - start {\n        count = n - start\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + start, count)\n    }\n}\n\n-- ============================================================\n-- Conversions between numbers, booleans and strings\n-- int_to_string, float_to_string, bool_to_string, parse_int and\n-- parse_float. See runtime/string.dm for how rt_X functions\n-- replace the C runtime and for the layout of a string.\n--\n-- Integers are formatted and parsed here. Floats go through\n-- libc (snprintf \"%g\" and strtod), which round correctly.\n-- ============================================================\n\nextern fn libc_free(p: int) = \"free\"\nextern fn libc_memmove(dst: int, src: int, n: int) -> int = \"memmove\"\nextern fn libc_snprintf(buf: int, n: int, fmt: string, ...) -> i32 = \"snprintf\"\nextern fn libc_strtod(s: int, end: int) -> float = \"strtod\"\n\n-- int_to_string(n): n in decimal, with a leading \"-\" when negative\nfn rt_int_to_string(n: int) -> string {\n    -- The two digits of every number below 100, side by side\n    let pairs = \"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899\"\n    -- Work on -|n|: every int has a negative counterpart, but the\n    -- lowest int has no positive one\n    let mut v = n\n    if n > 0 {\n        v = 0 - n\n    }\n    unsafe {\n        let table = string_data(pairs)\n        -- The longest result, \"-9223372036854775808\", is 20 bytes\n        let size = 21\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        -- Digits come out lowest first, two per division, so they are\n        -- written from the end of the buffer backwards\n        let end = buf + size - 1\n        store_u8(end, 0)\n        let mut at = end\n        while v <= 0 - 100 {\n            let rest = v / 100\n            let pair = table + (rest * 100 - v) * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n            v = rest\n        }\n        if v <= 0 - 10 {\n            let pair = table - v * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n        } else {\n            at = at - 1\n            store_u8(at, 48 - v)\n        }\n        if n < 0 {\n            at = at - 1\n            store_u8(at, 45)\n        }\n        -- Move the text, with its NUL, to the start of the buffer\n        let length = end - at\n        if at != buf {\n            libc_memmove(buf, at, length + 1)\n        }\n        return string_from_raw(buf, length, size)\n    }\n}\n\n-- float_to_string(f): f as C's \"%g\" prints it, with up to six\n-- significant digits (\"3.14159\", \"1e+20\", \"inf\", \"nan\")\nfn rt_float_to_string(f: float) -> string {\n    unsafe {\n        -- The longest \"%g\" output is 13 bytes, such as \"-1.79769e+308\"\n        let size = 32\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        let n = libc_snprintf(buf, size, \"%g\", f) as int\n        if n < 0 or n >= size {\n            libc_free(buf)\n            return \"\"\n        }\n        return string_from_raw(buf, n, size)\n    }\n}\n\n-- bool_to_string(b): \"true\" or \"false\"\nfn rt_bool_to_string(b: bool) -> string {\n    if b {\n        return \"true\"\n    }\n    return \"false\"\n}\n\n-- Whether byte c is whitespace to C's isspace: space, or tab\n-- through carriage return\nfn rt_is_space(c: int) -> bool {\n    return c == 32 or (c >= 9 and c <= 13)\n}\n\n-- parse_int(s): the decimal integer at the start of s, as C's\n-- atoll reads it. Leading whitespace is skipped, a \"+\" or \"-\" may\n-- come first, and the number ends at the first byte that is not a\n-- digit. Without a digit the result is 0. A number outside the\n-- range of int gives the nearest int.\nfn rt_parse_int(s: string) -> int {\n    let n = len(s)\n    let int_max = 9223372036854775807\n    -- The lowest int is lowest_tenth * 10 - 8\n    let lowest_tenth = 0 - 922337203685477580\n    unsafe {\n        let p = string_data(s)\n        let mut i = 0\n        while i < n and rt_is_space(load_u8(p + i)) {\n            i = i + 1\n        }\n        let mut negative = false\n        if i < n {\n            let c = load_u8(p + i)\n            if c == 45 {\n                negative = true\n                i = i + 1\n            } else if c == 43 {\n                i = i + 1\n            }\n        }\n        -- Accumulate -|value|, which can hold the lowest int\n        let mut v = 0\n        let mut in_range = true\n        while i < n {\n            let d = load_u8(p + i) - 48\n            if d < 0 or d > 9 {\n                i = n\n            } else {\n                if v < lowest_tenth or (v == lowest_tenth and d > 8) {\n                    in_range = false\n                    i = n\n                } else {\n                    v = v * 10 - d\n                    i = i + 1\n                }\n            }\n        }\n        if negative {\n            if in_range {\n                return v\n            }\n            return 0 - int_max - 1\n        }\n        if in_range and v >= 0 - int_max {\n            return 0 - v\n        }\n        return int_max\n    }\n}\n\n-- parse_float(s): the number at the start of s, as C's strtod\n-- reads it (\"3.5\", \"-1e3\", \"inf\"); 0.0 when s does not start with\n-- a number. Leading whitespace is skipped.\nfn rt_parse_float(s: string) -> float {\n    let n = len(s)\n    if n == 0 {\n        return 0.0\n    }\n    unsafe {\n        -- strtod reads up to a NUL byte, which s need not end with\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, string_data(s), n)\n        store_u8(buf + n, 0)\n        let value = libc_strtod(buf, 0)\n        libc_free(buf)\n        return value\n    }\n}\n\n-- ============================================================\n-- Map[K, V]\n-- The hash map behind Map[K, V] in every program Stage 5\n-- compiles. gen_bootstrap.sh embeds this file in the compiler\n-- (prelude.dm), which adds it to each program's declarations.\n-- Keys are strings or integers; hash_key picks the hash.\n--\n-- Entries are kept in insertion order in entry_keys,\n-- entry_vals and entry_hashes, so keys() and values() return\n-- them in that order. slots is an open-addressing table of\n-- indexes into those lists: -1 marks an empty slot and -2 a\n-- removed entry. A removed entry's hash is -1 until rebuild()\n-- drops it.\n--\n-- Copying a map copies its list headers, so a copy shares the\n-- slot table with the original until either one rebuilds. A slot\n-- that names an entry past this map's own entries was written by\n-- another copy; lookups skip it and inserts may take it.\n-- ============================================================\n\nstruct Map[K, V] {\n    entry_keys: List[K],\n    entry_vals: List[V],\n    entry_hashes: List[int],\n    slots: List[int],\n    count: int\n}\n\nimpl Map[K, V] {\n    fn insert(mut self, k: K, v: V) {\n        let h = hash_key(k)\n        let s = self.find_slot(k, h)\n        if s >= 0 {\n            self.entry_vals[self.slots[s]] = v\n            return\n        }\n        -- Keep at least a quarter of the slots empty so probes end\n        if (self.entry_keys.len() + 1) * 4 > self.slots.len() * 3 {\n            self.rebuild()\n        }\n        let cap = self.slots.len()\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 and self.slots[i] < n {\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        self.slots[i] = n\n        self.entry_keys.push(k)\n        self.entry_vals.push(v)\n        self.entry_hashes.push(h)\n        self.count = self.count + 1\n    }\n\n    fn set(mut self, k: K, v: V) {\n        self.insert(k, v)\n    }\n\n    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries and size the table for twice the live ones\n    fn rebuild(mut self) {\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n"
+    return "\n-- ============================================================\n-- Strings\n-- The string functions behind every program Stage 5 compiles.\n-- gen_bootstrap.sh embeds this file in the compiler (prelude.dm),\n-- which adds it to each program's declarations.\n--\n-- A string is { data, len, cap }: the address of its bytes, their\n-- count, and the size of the allocation that holds them. cap is 0\n-- when the string does not own its bytes, as a literal doesn't.\n-- Every string built here is followed by a NUL byte, so its data\n-- can go to C as a char*.\n--\n-- The compiler calls rt_X wherever its IR names the runtime\n-- function dm_X (see RUNTIME FUNCTIONS in llvm_gen.dm), so each\n-- rt_X keeps the signature that dm_X is declared with in\n-- ir_gen_decl.dm. len(s) and string literals are inline and call\n-- nothing. Code here must not use the string operators it\n-- implements: no +, == or < on strings, and no char_at or substr.\n-- ============================================================\n\n-- libc, under names that a program's own extern declarations of\n-- the same C functions cannot collide with\nextern fn libc_malloc(n: int) -> int = \"malloc\"\nextern fn libc_memcpy(dst: int, src: int, n: int) -> int = \"memcpy\"\nextern fn libc_memcmp(a: int, b: int, n: int) -> i32 = \"memcmp\"\n\n-- A new string holding the n bytes at address src\nfn rt_string_copy(src: int, n: int) -> string {\n    if n <= 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, src, n)\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a + b\nfn rt_string_concat(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    let n = na + nb\n    if n == 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        if na > 0 {\n            libc_memcpy(buf, string_data(a), na)\n        }\n        if nb > 0 {\n            libc_memcpy(buf + na, string_data(b), nb)\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a == b\nfn rt_string_eq(a: string, b: string) -> bool {\n    let n = len(a)\n    if n != len(b) {\n        return false\n    }\n    if n == 0 {\n        return true\n    }\n    unsafe {\n        return libc_memcmp(string_data(a), string_data(b), n) == 0\n    }\n}\n\n-- Byte order of a and b: negative when a sorts first, 0 when they\n-- are equal, positive when b sorts first. A prefix sorts before\n-- the longer string.\nfn rt_string_cmp(a: string, b: string) -> int {\n    let na = len(a)\n    let nb = len(b)\n    let mut n = na\n    if nb < na {\n        n = nb\n    }\n    if n > 0 {\n        unsafe {\n            let c = libc_memcmp(string_data(a), string_data(b), n)\n            if c != 0 {\n                return c as int\n            }\n        }\n    }\n    if na < nb {\n        return -1\n    }\n    if na > nb {\n        return 1\n    }\n    return 0\n}\n\n-- char_at(s, i): the byte at index i as a one-byte string, or \"\"\n-- when i is outside s\nfn rt_char_at(s: string, i: int) -> string {\n    if i < 0 or i >= len(s) {\n        return \"\"\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + i, 1)\n    }\n}\n\n-- substr(s, start, length): up to length bytes of s from index\n-- start. The range is clamped to s: a start outside s or a length\n-- below 1 gives \"\", and a length past the end stops at the end.\nfn rt_substr(s: string, start: int, length: int) -> string {\n    let n = len(s)\n    if start < 0 or start >= n {\n        return \"\"\n    }\n    let mut count = length\n    if count > n - start {\n        count = n - start\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + start, count)\n    }\n}\n\n-- ============================================================\n-- Conversions between numbers, booleans and strings\n-- int_to_string, float_to_string, bool_to_string, parse_int and\n-- parse_float. See runtime/string.dm for how rt_X functions\n-- replace the C runtime and for the layout of a string.\n--\n-- Integers are formatted and parsed here. Floats go through\n-- libc (snprintf \"%g\" and strtod), which round correctly.\n-- ============================================================\n\nextern fn libc_free(p: int) = \"free\"\nextern fn libc_memmove(dst: int, src: int, n: int) -> int = \"memmove\"\nextern fn libc_snprintf(buf: int, n: int, fmt: string, ...) -> i32 = \"snprintf\"\nextern fn libc_strtod(s: int, end: int) -> float = \"strtod\"\n\n-- int_to_string(n): n in decimal, with a leading \"-\" when negative\nfn rt_int_to_string(n: int) -> string {\n    -- The two digits of every number below 100, side by side\n    let pairs = \"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899\"\n    -- Work on -|n|: every int has a negative counterpart, but the\n    -- lowest int has no positive one\n    let mut v = n\n    if n > 0 {\n        v = 0 - n\n    }\n    unsafe {\n        let table = string_data(pairs)\n        -- The longest result, \"-9223372036854775808\", is 20 bytes\n        let size = 21\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        -- Digits come out lowest first, two per division, so they are\n        -- written from the end of the buffer backwards\n        let end = buf + size - 1\n        store_u8(end, 0)\n        let mut at = end\n        while v <= 0 - 100 {\n            let rest = v / 100\n            let pair = table + (rest * 100 - v) * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n            v = rest\n        }\n        if v <= 0 - 10 {\n            let pair = table - v * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n        } else {\n            at = at - 1\n            store_u8(at, 48 - v)\n        }\n        if n < 0 {\n            at = at - 1\n            store_u8(at, 45)\n        }\n        -- Move the text, with its NUL, to the start of the buffer\n        let length = end - at\n        if at != buf {\n            libc_memmove(buf, at, length + 1)\n        }\n        return string_from_raw(buf, length, size)\n    }\n}\n\n-- float_to_string(f): f as C's \"%g\" prints it, with up to six\n-- significant digits (\"3.14159\", \"1e+20\", \"inf\", \"nan\")\nfn rt_float_to_string(f: float) -> string {\n    unsafe {\n        -- The longest \"%g\" output is 13 bytes, such as \"-1.79769e+308\"\n        let size = 32\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        let n = libc_snprintf(buf, size, \"%g\", f) as int\n        if n < 0 or n >= size {\n            libc_free(buf)\n            return \"\"\n        }\n        return string_from_raw(buf, n, size)\n    }\n}\n\n-- bool_to_string(b): \"true\" or \"false\"\nfn rt_bool_to_string(b: bool) -> string {\n    if b {\n        return \"true\"\n    }\n    return \"false\"\n}\n\n-- Whether byte c is whitespace to C's isspace: space, or tab\n-- through carriage return\nfn rt_is_space(c: int) -> bool {\n    return c == 32 or (c >= 9 and c <= 13)\n}\n\n-- parse_int(s): the decimal integer at the start of s, as C's\n-- atoll reads it. Leading whitespace is skipped, a \"+\" or \"-\" may\n-- come first, and the number ends at the first byte that is not a\n-- digit. Without a digit the result is 0. A number outside the\n-- range of int gives the nearest int.\nfn rt_parse_int(s: string) -> int {\n    let n = len(s)\n    let int_max = 9223372036854775807\n    -- The lowest int is lowest_tenth * 10 - 8\n    let lowest_tenth = 0 - 922337203685477580\n    unsafe {\n        let p = string_data(s)\n        let mut i = 0\n        while i < n and rt_is_space(load_u8(p + i)) {\n            i = i + 1\n        }\n        let mut negative = false\n        if i < n {\n            let c = load_u8(p + i)\n            if c == 45 {\n                negative = true\n                i = i + 1\n            } else if c == 43 {\n                i = i + 1\n            }\n        }\n        -- Accumulate -|value|, which can hold the lowest int\n        let mut v = 0\n        let mut in_range = true\n        while i < n {\n            let d = load_u8(p + i) - 48\n            if d < 0 or d > 9 {\n                i = n\n            } else {\n                if v < lowest_tenth or (v == lowest_tenth and d > 8) {\n                    in_range = false\n                    i = n\n                } else {\n                    v = v * 10 - d\n                    i = i + 1\n                }\n            }\n        }\n        if negative {\n            if in_range {\n                return v\n            }\n            return 0 - int_max - 1\n        }\n        if in_range and v >= 0 - int_max {\n            return 0 - v\n        }\n        return int_max\n    }\n}\n\n-- parse_float(s): the number at the start of s, as C's strtod\n-- reads it (\"3.5\", \"-1e3\", \"inf\"); 0.0 when s does not start with\n-- a number. Leading whitespace is skipped.\nfn rt_parse_float(s: string) -> float {\n    let n = len(s)\n    if n == 0 {\n        return 0.0\n    }\n    unsafe {\n        -- strtod reads up to a NUL byte, which s need not end with\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, string_data(s), n)\n        store_u8(buf + n, 0)\n        let value = libc_strtod(buf, 0)\n        libc_free(buf)\n        return value\n    }\n}\n\n-- ============================================================\n-- Lists\n-- The functions behind List[T]. See runtime/string.dm for how\n-- rt_X functions replace the C runtime.\n--\n-- A list is { data, len, capacity }: the address of its elements,\n-- their count, and the number of elements its allocation has room\n-- for. The empty list is all zeros. The compiler passes a list as\n-- the address of this header.\n--\n-- Elements lie side by side in the allocation. An int or a float\n-- takes 8 bytes and a string 24. Lists of any other type go through\n-- the rt_list_generic functions, which are told the element size\n-- and copy elements to and from addresses the caller provides.\n--\n-- len(xs) and the creation of an empty list are inline and call\n-- nothing.\n--\n-- A list that outgrows its allocation moves to a new one and leaves\n-- the old one as it is. A copy of a list is a copy of its header, so\n-- the copy goes on reading the allocation it was made with.\n-- ============================================================\n\n-- Make room for one more element of elem_size bytes\nfn rt_list_grow(list: int, elem_size: int) {\n    unsafe {\n        let count = load_i64(list + 8)\n        let capacity = load_i64(list + 16)\n        if count < capacity {\n            return\n        }\n        let mut new_capacity = 8\n        if capacity > 0 {\n            new_capacity = capacity * 2\n        }\n        let new_data = libc_malloc(new_capacity * elem_size)\n        if new_data == 0 {\n            panic(\"list push: out of memory\")\n        }\n        let data = load_i64(list)\n        if count > 0 {\n            libc_memcpy(new_data, data, count * elem_size)\n        }\n        store_i64(list, new_data)\n        store_i64(list + 16, new_capacity)\n    }\n}\n\n-- The address of a new last element of elem_size bytes, which the\n-- caller fills\nfn rt_list_append(list: int, elem_size: int) -> int {\n    rt_list_grow(list, elem_size)\n    unsafe {\n        let count = load_i64(list + 8)\n        store_i64(list + 8, count + 1)\n        return load_i64(list) + count * elem_size\n    }\n}\n\n-- The address of element index, whose elements are elem_size bytes.\n-- Panics when index is outside the list.\nfn rt_list_slot(list: int, index: int, elem_size: int) -> int {\n    unsafe {\n        let count = load_i64(list + 8)\n        if index < 0 or index >= count {\n            panic(\"list index out of bounds: \" + int_to_string(index) + \" (len=\" + int_to_string(count) + \")\")\n        }\n        return load_i64(list) + index * elem_size\n    }\n}\n\n-- Remove the last element, of elem_size bytes, and give its address.\n-- The bytes stay where they are until the next push. Panics on an\n-- empty list.\nfn rt_list_remove_last(list: int, elem_size: int) -> int {\n    unsafe {\n        let count = load_i64(list + 8)\n        if count <= 0 {\n            panic(\"list pop: empty list\")\n        }\n        store_i64(list + 8, count - 1)\n        return load_i64(list) + (count - 1) * elem_size\n    }\n}\n\n-- The string stored at address p\nfn rt_string_at(p: int) -> string {\n    unsafe {\n        return string_from_raw(load_i64(p), load_i64(p + 8), load_i64(p + 16))\n    }\n}\n\n-- ---- List[int] and the other integer lists ----\n\nfn rt_list_int64_push(list: int, value: int) {\n    unsafe {\n        store_i64(rt_list_append(list, 8), value)\n    }\n}\n\nfn rt_list_int64_get(list: int, index: int) -> int {\n    unsafe {\n        return load_i64(rt_list_slot(list, index, 8))\n    }\n}\n\nfn rt_list_int64_set(list: int, index: int, value: int) {\n    unsafe {\n        store_i64(rt_list_slot(list, index, 8), value)\n    }\n}\n\nfn rt_list_int64_pop(list: int) -> int {\n    unsafe {\n        return load_i64(rt_list_remove_last(list, 8))\n    }\n}\n\nfn rt_list_int64_contains(list: int, value: int) -> bool {\n    unsafe {\n        let data = load_i64(list)\n        let count = load_i64(list + 8)\n        let mut i = 0\n        while i < count {\n            if load_i64(data + i * 8) == value {\n                return true\n            }\n            i = i + 1\n        }\n        return false\n    }\n}\n\n-- ---- List[float] ----\n\nfn rt_list_double_push(list: int, value: float) {\n    unsafe {\n        store_f64(rt_list_append(list, 8), value)\n    }\n}\n\nfn rt_list_double_get(list: int, index: int) -> float {\n    unsafe {\n        return load_f64(rt_list_slot(list, index, 8))\n    }\n}\n\nfn rt_list_double_set(list: int, index: int, value: float) {\n    unsafe {\n        store_f64(rt_list_slot(list, index, 8), value)\n    }\n}\n\nfn rt_list_double_pop(list: int) -> float {\n    unsafe {\n        return load_f64(rt_list_remove_last(list, 8))\n    }\n}\n\nfn rt_list_double_contains(list: int, value: float) -> bool {\n    unsafe {\n        let data = load_i64(list)\n        let count = load_i64(list + 8)\n        let mut i = 0\n        while i < count {\n            if load_f64(data + i * 8) == value {\n                return true\n            }\n            i = i + 1\n        }\n        return false\n    }\n}\n\n-- ---- List[string] ----\n\nfn rt_list_string_push(list: int, value: string) {\n    unsafe {\n        libc_memcpy(rt_list_append(list, 24), addr_of(value), 24)\n    }\n}\n\nfn rt_list_string_get(list: int, index: int) -> string {\n    return rt_string_at(rt_list_slot(list, index, 24))\n}\n\nfn rt_list_string_set(list: int, index: int, value: string) {\n    unsafe {\n        libc_memcpy(rt_list_slot(list, index, 24), addr_of(value), 24)\n    }\n}\n\nfn rt_list_string_pop(list: int) -> string {\n    return rt_string_at(rt_list_remove_last(list, 24))\n}\n\nfn rt_list_string_contains(list: int, value: string) -> bool {\n    unsafe {\n        let data = load_i64(list)\n        let count = load_i64(list + 8)\n        let mut i = 0\n        while i < count {\n            if rt_string_at(data + i * 24) == value {\n                return true\n            }\n            i = i + 1\n        }\n        return false\n    }\n}\n\n-- ---- Lists of any other type ----\n\n-- Append the elem_size bytes at address value\nfn rt_list_generic_push(list: int, value: int, elem_size: int) {\n    unsafe {\n        libc_memcpy(rt_list_append(list, elem_size), value, elem_size)\n    }\n}\n\n-- Copy element index to address out\nfn rt_list_generic_get(out: int, list: int, index: int, elem_size: int) {\n    unsafe {\n        libc_memcpy(out, rt_list_slot(list, index, elem_size), elem_size)\n    }\n}\n\n-- Replace element index with the elem_size bytes at address value\nfn rt_list_generic_set(list: int, value: int, index: int, elem_size: int) {\n    unsafe {\n        libc_memcpy(rt_list_slot(list, index, elem_size), value, elem_size)\n    }\n}\n\n-- Remove the last element and copy it to address out\nfn rt_list_generic_pop(out: int, list: int, elem_size: int) {\n    unsafe {\n        libc_memcpy(out, rt_list_remove_last(list, elem_size), elem_size)\n    }\n}\n\n-- ============================================================\n-- Map[K, V]\n-- The hash map behind Map[K, V] in every program Stage 5\n-- compiles. gen_bootstrap.sh embeds this file in the compiler\n-- (prelude.dm), which adds it to each program's declarations.\n-- Keys are strings or integers; hash_key picks the hash.\n--\n-- Entries are kept in insertion order in entry_keys,\n-- entry_vals and entry_hashes, so keys() and values() return\n-- them in that order. slots is an open-addressing table of\n-- indexes into those lists: -1 marks an empty slot and -2 a\n-- removed entry. A removed entry's hash is -1 until rebuild()\n-- drops it.\n--\n-- Copying a map copies its list headers, so a copy shares the\n-- slot table with the original until either one rebuilds. A slot\n-- that names an entry past this map's own entries was written by\n-- another copy; lookups skip it and inserts may take it.\n-- ============================================================\n\nstruct Map[K, V] {\n    entry_keys: List[K],\n    entry_vals: List[V],\n    entry_hashes: List[int],\n    slots: List[int],\n    count: int\n}\n\nimpl Map[K, V] {\n    fn insert(mut self, k: K, v: V) {\n        let h = hash_key(k)\n        let s = self.find_slot(k, h)\n        if s >= 0 {\n            self.entry_vals[self.slots[s]] = v\n            return\n        }\n        -- Keep at least a quarter of the slots empty so probes end\n        if (self.entry_keys.len() + 1) * 4 > self.slots.len() * 3 {\n            self.rebuild()\n        }\n        let cap = self.slots.len()\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 and self.slots[i] < n {\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        self.slots[i] = n\n        self.entry_keys.push(k)\n        self.entry_vals.push(v)\n        self.entry_hashes.push(h)\n        self.count = self.count + 1\n    }\n\n    fn set(mut self, k: K, v: V) {\n        self.insert(k, v)\n    }\n\n    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries and size the table for twice the live ones\n    fn rebuild(mut self) {\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n"
 }
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "9764b12bb1c22e06"
+    return "841f0e36e80dffa8"
 }
 
 

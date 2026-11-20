@@ -247,6 +247,24 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, s_len) }
             return g
         }
+        -- xs.len() reads the list's length field
+        if is_list_len_fn(callee_name) and inst.call_args.len() == 1 {
+            let list_res = resolve_value(g, inst.call_args[0])
+            let mut list_len = 0
+            if dm_llvm_get_type_kind(dm_llvm_type_of(list_res)) == 12 {
+                let len_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, list_res, 1, "list.len.addr")
+                list_len = dm_llvm_build_load2(b, dm_llvm_int64_type(g.context), len_slot, "list.len")
+            } else {
+                list_len = dm_llvm_build_extract_value(b, list_res, 1, "list.len")
+            }
+            if inst.has_result { g.value_map.insert(id_key, list_len) }
+            return g
+        }
+        -- An empty list is all zeros
+        if is_list_new_fn(callee_name) and inst.call_args.len() == 1 {
+            dm_llvm_build_store(b, dm_llvm_const_null(g.dm_string_type), resolve_value(g, inst.call_args[0]))
+            return g
+        }
         -- Look up function in function_map
         if g.function_map.contains(callee_name) == false {
             -- Unknown function: skip
@@ -290,7 +308,9 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 -- A string or list pointer passed by value: pass the value
                 val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
                 val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
-                if is_source_extern {
+                -- A source extern and a ported runtime function may take an
+                -- int where the compiler has a pointer, and the other way round
+                if is_source_extern or g.rt_ports.contains(callee_name) {
                     val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
                 }
             }
@@ -610,6 +630,9 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
             }
             if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
             val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
+            if sparam_ty != 0 and g.rt_ports.contains(callee_name) {
+                val = coerce_ptr_int(g, val, sparam_ty)
+            }
             args.push(val)
             ai = ai + 1
         }

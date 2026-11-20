@@ -510,18 +510,34 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- RUNTIME FUNCTIONS
 -- The IR names a runtime function dm_X. It is one of three things:
 --   inline: lowered to instructions here, with no function behind it
---     (is_inline_runtime_fn): len(s) and the integer overflow and
---     range checks;
+--     (is_inline_runtime_fn): len(s), the integer overflow and
+--     range checks, xs.len() and the creation of an empty list;
 --   ported: the dAImond function rt_X, which stage5/runtime/*.dm
 --     defines with the same signature and which is called like any
---     other dAImond function (strings by value, result through sret);
+--     other dAImond function (strings by value, result through sret).
+--     Where dm_X takes a pointer, rt_X takes an int, the address;
 --   otherwise the C function llvm_dm_X in runtime/llvm_wrappers.c,
 --     which takes strings by pointer.
 -- Porting a function is writing rt_X and deleting llvm_dm_X.
 -- ============================================================
 
 fn is_inline_runtime_fn(name: string) -> bool {
-    return name == "dm_string_len" or overflow_intrinsic_of(name) != "" or is_range_check_fn(name)
+    return name == "dm_string_len" or overflow_intrinsic_of(name) != "" or is_range_check_fn(name) or is_list_len_fn(name) or is_list_new_fn(name)
+}
+
+-- Every list is { data, len, capacity }, whatever its elements are
+fn is_list_len_fn(name: string) -> bool {
+    return name == "dm_list_int64_len" or name == "dm_list_double_len" or name == "dm_list_string_len" or name == "dm_list_generic_len"
+}
+
+fn is_list_new_fn(name: string) -> bool {
+    return name == "dm_list_int64_new" or name == "dm_list_double_new" or name == "dm_list_string_new" or name == "dm_list_generic_new"
+}
+
+-- Whether rt_X may stand in for a parameter or return of type
+-- `declared`: with the same type, or with an int where dm_X has a pointer
+fn port_type_matches(declared: string, ported: string) -> bool {
+    return declared == ported or (declared == "ptr" and ported == "i64")
 }
 
 -- Record which dm_X functions the module defines as rt_X
@@ -559,7 +575,7 @@ fn bind_runtime_port(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     let mut same = decl.return_type == func.return_type and decl.params.len() == func.params.len()
     i = 0
     while same and i < decl.params.len() {
-        if decl.params[i].type_id != func.params[i].type_id { same = false }
+        if port_type_matches(decl.params[i].type_id, func.params[i].type_id) == false { same = false }
         i = i + 1
     }
     if same == false {
@@ -1624,20 +1640,8 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             g = generate_list_new(g, inst)
             return g
         }
-        if op == OP_LIST_PUSH() {
-            g = generate_list_push(g, inst)
-            return g
-        }
         if op == OP_LIST_GET() {
             g = generate_list_get(g, inst)
-            return g
-        }
-        if op == OP_LIST_LEN() {
-            g = generate_list_len(g, inst)
-            return g
-        }
-        if op == OP_LIST_POP() {
-            g = generate_list_pop(g, inst)
             return g
         }
         -- Panic
@@ -1815,128 +1819,23 @@ fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     }
 }
 
-fn generate_list_push(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let list_val = resolve_value(g, inst.lhs)
-        let elem_val = resolve_value(g, inst.rhs)
-        g = resolve_value_with_counter(g, inst.lhs)
-        g = resolve_value_with_counter(g, inst.rhs)
-        -- Pick the correct runtime function based on element type
-        let mut fn_name = "dm_list_int64_push"
-        if inst.callee == "dm_list_double_push" or inst.result_type == "f64" {
-            fn_name = "dm_list_double_push"
-        } else if inst.callee == "dm_list_string_push" or inst.callee == "llvm_dm_list_string_push" or inst.result_type == "string" {
-            fn_name = "dm_list_string_push"
-        }
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(list_val)
-            dm_llvm_buf_push(elem_val)
-            g = check_call_args(g, fn_ty, func)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
-        return g
-    }
-}
-
+-- xs[i], after its bounds check: a call to the runtime function for
+-- the list's element type
 fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let list_val = resolve_value(g, inst.lhs)
-        let idx_val = resolve_value(g, inst.rhs)
-        g = resolve_value_with_counter(g, inst.lhs)
-        g = resolve_value_with_counter(g, inst.rhs)
-        -- Pick the correct runtime function based on element type
-        let mut fn_name = "dm_list_int64_get"
-        if inst.result_type == "f64" {
-            fn_name = "dm_list_double_get"
-        } else if inst.result_type == "string" {
-            fn_name = "dm_list_string_get"
-        }
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            if fn_name == "dm_list_string_get" {
-                -- String list get uses sret pattern
-                g = get_dm_string_type(g)
-                let sret = dm_llvm_build_alloca(b, g.dm_string_type, "listget_sret")
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(sret)
-                dm_llvm_buf_push(list_val)
-                dm_llvm_buf_push(idx_val)
-                g = check_call_args(g, fn_ty, func)
-                dm_llvm_build_call2_buf(b, fn_ty, func, "")
-                if inst.has_result {
-                    g.value_map.insert(id_key, sret)
-                    g.string_ptrs.insert(id_key, true)
-                }
-            } else {
-                dm_llvm_buf_clear()
-                dm_llvm_buf_push(list_val)
-                dm_llvm_buf_push(idx_val)
-                g = check_call_args(g, fn_ty, func)
-                let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listget")
-                if inst.has_result { g.value_map.insert(id_key, result) }
-            }
-        }
-        return g
+    let mut get_call = ir_inst_new(inst.id, OP_CALL())
+    get_call.callee = "dm_list_int64_get"
+    if inst.result_type == "f64" {
+        get_call.callee = "dm_list_double_get"
+    } else if inst.result_type == "string" {
+        get_call.callee = "dm_list_string_get"
     }
-}
-
-fn generate_list_len(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let list_val = resolve_value(g, inst.operand)
-        g = resolve_value_with_counter(g, inst.operand)
-        -- Use type-specific len function (all return i64)
-        let mut fn_name = "dm_list_int64_len"
-        if inst.result_type == "f64" or inst.callee == "dm_list_double_len" {
-            fn_name = "dm_list_double_len"
-        } else if inst.result_type == "string" or inst.callee == "dm_list_string_len" {
-            fn_name = "dm_list_string_len"
-        } else if inst.callee == "dm_list_generic_len" {
-            fn_name = "dm_list_generic_len"
-        }
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(list_val)
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listlen")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
-}
-
-fn generate_list_pop(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let id_key = int_to_string(inst.id)
-        let list_val = resolve_value(g, inst.operand)
-        g = resolve_value_with_counter(g, inst.operand)
-        let fn_name = "dm_list_int64_pop"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(list_val)
-            g = check_call_args(g, fn_ty, func)
-            let result = dm_llvm_build_call2_buf(b, fn_ty, func, "listpop")
-            if inst.has_result { g.value_map.insert(id_key, result) }
-        }
-        return g
-    }
+    let mut get_args: List[IRValue] = []
+    get_args.push(inst.lhs)
+    get_args.push(inst.rhs)
+    get_call.call_args = get_args
+    get_call.result_type = inst.result_type
+    get_call.has_result = inst.has_result
+    return generate_call(gen, get_call)
 }
 
 -- ============================================================

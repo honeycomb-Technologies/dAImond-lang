@@ -310,72 +310,9 @@ void llvm_dm_args_get(dm_string* out, int64_t idx) {
 }
 
 // =====================================================================
-// Typed List Operations (int64_t)
-// =====================================================================
-
-typedef struct {
-    int64_t* data;
-    int64_t len;
-    int64_t capacity;
-} dm_list_int64;
-
-void dm_list_int64_new(dm_list_int64* out) {
-    out->data = NULL;
-    out->len = 0;
-    out->capacity = 0;
-}
-
-void dm_list_int64_push(dm_list_int64* list, int64_t value) {
-    if (list->len >= list->capacity) {
-        int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
-        int64_t* new_data = (int64_t*)malloc((size_t)new_cap * sizeof(int64_t));
-        if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
-        if (list->data) memcpy(new_data, list->data, (size_t)list->len * sizeof(int64_t));
-        /* Old buffer intentionally leaked (never-free growth): variable
-           copies share the header by value, so aliases keep reading their
-           snapshot buffer after the original grows. */
-        list->data = new_data;
-        list->capacity = new_cap;
-    }
-    list->data[list->len] = value;
-    list->len++;
-}
-
-int64_t dm_list_int64_get(dm_list_int64* list, int64_t index) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    return list->data[index];
-}
-
-void dm_list_int64_set(dm_list_int64* list, int64_t index, int64_t value) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    list->data[index] = value;
-}
-
-int64_t dm_list_int64_len(dm_list_int64* list) {
-    return list->len;
-}
-
-int64_t dm_list_int64_pop(dm_list_int64* list) {
-    if (list->len == 0) { fprintf(stderr, "list pop: empty list\n"); exit(1); }
-    list->len--;
-    return list->data[list->len];
-}
-
-int64_t dm_list_int64_contains(dm_list_int64* list, int64_t value) {
-    for (size_t i = 0; i < list->len; i++) {
-        if (list->data[i] == value) return 1;
-    }
-    return 0;
-}
-
-// =====================================================================
-// Typed List Operations (dm_string)
+// List[string], for dm_string_split below. Lists themselves are
+// written in dAImond (stage5/runtime/list.dm); this must keep their
+// layout: { data, len, capacity }.
 // =====================================================================
 
 typedef struct {
@@ -384,170 +321,23 @@ typedef struct {
     int64_t capacity;
 } dm_list_dm_string;
 
-void dm_list_string_new(dm_list_dm_string* out) {
+static void dm_list_string_new(dm_list_dm_string* out) {
     out->data = NULL;
     out->len = 0;
     out->capacity = 0;
 }
 
-void dm_list_string_push(dm_list_dm_string* list, const dm_string* value) {
+static void dm_list_string_push(dm_list_dm_string* list, const dm_string* value) {
     if (list->len >= list->capacity) {
         int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
         dm_string* new_data = (dm_string*)malloc((size_t)new_cap * sizeof(dm_string));
         if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
         if (list->data) memcpy(new_data, list->data, (size_t)list->len * sizeof(dm_string));
-        /* Old buffer intentionally leaked (never-free growth, see int64 push). */
         list->data = new_data;
         list->capacity = new_cap;
     }
     list->data[list->len] = *value;
     list->len++;
-}
-
-void dm_list_string_get(dm_string* out, dm_list_dm_string* list, int64_t index) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    *out = list->data[index];
-}
-
-void dm_list_string_set(dm_list_dm_string* list, int64_t index, const dm_string* value) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    list->data[index] = *value;
-}
-
-int64_t dm_list_string_len(dm_list_dm_string* list) {
-    return list->len;
-}
-
-// LLVM ABI wrappers for string list (llvm_ prefix for string-param externs)
-void llvm_dm_list_string_push(dm_list_dm_string* list, const dm_string* value) {
-    dm_list_string_push(list, value);
-}
-
-void llvm_dm_list_string_set(dm_list_dm_string* list, int64_t index, const dm_string* value) {
-    dm_list_string_set(list, index, value);
-}
-
-void llvm_dm_list_string_get(dm_string* out, dm_list_dm_string* list, int64_t index) {
-    dm_list_string_get(out, list, index);
-}
-
-int64_t dm_list_string_contains(dm_list_dm_string* list, const dm_string* value) {
-    for (size_t i = 0; i < list->len; i++) {
-        if (list->data[i].len == value->len &&
-            memcmp(list->data[i].data, value->data, value->len) == 0) return 1;
-    }
-    return 0;
-}
-
-// LLVM ABI wrapper for string list contains
-int64_t llvm_dm_list_string_contains(dm_list_dm_string* list, const dm_string* value) {
-    return dm_list_string_contains(list, value);
-}
-
-// =====================================================================
-// Typed List Operations (double / float)
-// =====================================================================
-
-typedef struct {
-    double* data;
-    int64_t len;
-    int64_t capacity;
-} dm_list_double;
-
-void dm_list_double_new(dm_list_double* out) {
-    out->data = NULL;
-    out->len = 0;
-    out->capacity = 0;
-}
-
-void dm_list_double_push(dm_list_double* list, double value) {
-    if (list->len >= list->capacity) {
-        int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
-        double* new_data = (double*)malloc((size_t)new_cap * sizeof(double));
-        if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
-        if (list->data) memcpy(new_data, list->data, (size_t)list->len * sizeof(double));
-        /* Old buffer intentionally leaked (never-free growth, see int64 push). */
-        list->data = new_data;
-        list->capacity = new_cap;
-    }
-    list->data[list->len] = value;
-    list->len++;
-}
-
-double dm_list_double_get(dm_list_double* list, int64_t index) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    return list->data[index];
-}
-
-void dm_list_double_set(dm_list_double* list, int64_t index, double value) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    list->data[index] = value;
-}
-
-int64_t dm_list_double_len(dm_list_double* list) {
-    return list->len;
-}
-
-// =====================================================================
-// Generic List Operations (for struct types — uses void* + elem_size)
-// =====================================================================
-
-typedef struct {
-    void* data;
-    int64_t len;
-    int64_t capacity;
-} dm_list_generic;
-
-void dm_list_generic_new(dm_list_generic* out) {
-    out->data = NULL;
-    out->len = 0;
-    out->capacity = 0;
-}
-
-void dm_list_generic_push(dm_list_generic* list, const void* value, int64_t elem_size) {
-    if (list->len >= list->capacity) {
-        int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
-        void* new_data = malloc((size_t)(new_cap * elem_size));
-        if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
-        if (list->data) memcpy(new_data, list->data, (size_t)(list->len * elem_size));
-        /* Old buffer intentionally leaked (never-free growth, see int64 push). */
-        list->data = new_data;
-        list->capacity = new_cap;
-    }
-    memcpy((char*)list->data + list->len * elem_size, value, (size_t)elem_size);
-    list->len++;
-}
-
-void dm_list_generic_get(void* out, dm_list_generic* list, int64_t index, int64_t elem_size) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    memcpy(out, (char*)list->data + index * elem_size, (size_t)elem_size);
-}
-
-void dm_list_generic_set(dm_list_generic* list, const void* value, int64_t index, int64_t elem_size) {
-    if (index < 0 || index >= list->len) {
-        fprintf(stderr, "list index out of bounds: %lld (len=%lld)\n", (long long)index, (long long)list->len);
-        exit(1);
-    }
-    memcpy((char*)list->data + index * elem_size, value, (size_t)elem_size);
-}
-
-int64_t dm_list_generic_len(dm_list_generic* list) {
-    return list->len;
 }
 
 // =====================================================================

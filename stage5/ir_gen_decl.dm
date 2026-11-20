@@ -275,6 +275,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     -- List contains
     g = declare_extern2(g, "dm_list_int64_contains", "ptr", "i64", "bool")
     g = declare_extern2(g, "dm_list_string_contains", "ptr", "string", "bool")
+    g = declare_extern2(g, "dm_list_double_contains", "ptr", "f64", "bool")
 
     -- Process
     g = declare_extern(g, "dm_panic", "string", "void")
@@ -327,6 +328,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_list_string_get", "ptr", "i64", "string")
     g = declare_extern3(g, "dm_list_string_set", "ptr", "i64", "string", "void")
     g = declare_extern(g, "dm_list_string_len", "ptr", "i64")
+    g = declare_extern(g, "dm_list_string_pop", "ptr", "string")
 
     -- List operations (double)
     g = declare_extern(g, "dm_list_double_new", "ptr", "void")
@@ -334,6 +336,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_list_double_get", "ptr", "i64", "f64")
     g = declare_extern3(g, "dm_list_double_set", "ptr", "i64", "f64", "void")
     g = declare_extern(g, "dm_list_double_len", "ptr", "i64")
+    g = declare_extern(g, "dm_list_double_pop", "ptr", "f64")
 
     -- List operations (generic)
     g = declare_extern(g, "dm_list_generic_new", "ptr", "void")
@@ -341,6 +344,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern4(g, "dm_list_generic_get", "ptr", "ptr", "i64", "i64", "void")
     g = declare_extern4(g, "dm_list_generic_set", "ptr", "ptr", "i64", "i64", "void")
     g = declare_extern(g, "dm_list_generic_len", "ptr", "i64")
+    g = declare_extern3(g, "dm_list_generic_pop", "ptr", "ptr", "i64", "void")
 
     -- Filesystem
     g = declare_extern(g, "dm_fs_mkdir", "string", "i64")
