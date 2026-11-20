@@ -1,0 +1,5 @@
+static_addr() works on raw memory and requires an unsafe block at line 4
+static_addr() takes the name of the storage as a string literal at line 6
+static_addr() takes the size in bytes as an integer literal above 0 at line 7
+static_addr() takes the size in bytes as an integer literal above 0 at line 8
+static_addr() takes 2 arguments, not 1 at line 9

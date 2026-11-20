@@ -1,0 +1,3 @@
+module test
+fn main( {
+}

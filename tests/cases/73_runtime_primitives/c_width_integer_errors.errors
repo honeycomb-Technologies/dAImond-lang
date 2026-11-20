@@ -1,0 +1,3 @@
+the return value has type int, which does not fit in i32; convert it with `as i32` at line 3
+integer literal 300 does not fit in u8 at line 7
+integer literal 3000000000 does not fit in i32 at line 11

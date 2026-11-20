@@ -1,0 +1,2 @@
+symbol_addr("puts") names a function, not a data symbol
+symbol_addr("helper") names a function, not a data symbol

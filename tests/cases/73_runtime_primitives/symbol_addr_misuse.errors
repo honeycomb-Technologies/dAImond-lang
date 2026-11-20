@@ -1,0 +1,4 @@
+symbol_addr() works on raw memory and requires an unsafe block at line 4
+symbol_addr() takes the name of a symbol as a string literal at line 6
+symbol_addr() takes the name of a symbol as a string literal at line 7
+symbol_addr() takes 1 arguments, not 2 at line 8

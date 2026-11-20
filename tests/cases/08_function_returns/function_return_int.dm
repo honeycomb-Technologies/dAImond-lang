@@ -1,0 +1,10 @@
+module test
+
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn main() {
+    let result = add(3, 4)
+    println(result)
+}

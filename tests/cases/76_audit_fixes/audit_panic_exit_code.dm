@@ -1,0 +1,6 @@
+module test
+
+fn main() {
+    println("before")
+    panic("boom")
+}

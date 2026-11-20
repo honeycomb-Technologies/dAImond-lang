@@ -1,0 +1,7 @@
+module test
+
+fn main() {
+    print("A")
+    print("B")
+    print("C")
+}

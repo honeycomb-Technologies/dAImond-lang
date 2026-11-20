@@ -1,0 +1,9 @@
+module utils
+
+fn add(a: int, b: int) -> int {
+    return a + b
+}
+
+fn sub(a: int, b: int) -> int {
+    return a - b
+}

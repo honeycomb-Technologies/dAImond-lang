@@ -1,0 +1,8 @@
+mkdir 0 0 0
+mkdir under a file -1, of no name -1
+readdir 2:a,one, 2:b,file.txt, (none) (none) (none) (none)
+many 300:entry_with_a_long_name_0.txt,entry_with_a_long_name_1.txt,entry_with_a_long_name_10.txt,entry_with_a_long_name_100.txt,entry_with_a_long_name_101.txt,entry_with_a_long_name_98.txt,entry_with_a_long_name_99.txt, 9189
+rename 0 -1 true false
+remove 0 -1 -1 0 -1
+env [][] true
+true true

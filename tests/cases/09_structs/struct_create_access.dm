@@ -1,0 +1,12 @@
+module test
+
+struct Point {
+    x: int,
+    y: int
+}
+
+fn main() {
+    let p = Point { x: 10, y: 20 }
+    println(p.x)
+    println(p.y)
+}
