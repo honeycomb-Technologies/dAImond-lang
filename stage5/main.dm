@@ -293,6 +293,28 @@ fn is_alpha_char(ch: string) -> bool {
     return false
 }
 
+-- Where the digits of a number's exponent begin, when an exponent
+-- begins at pos: after "e" or "E" and a sign, if there is one. Gives
+-- pos when no exponent begins there.
+fn exponent_digits_at(source: string, pos: int) -> int {
+    let n = len(source)
+    if pos >= n {
+        return pos
+    }
+    let e = char_at(source, pos)
+    if e != "e" and e != "E" {
+        return pos
+    }
+    let mut digits = pos + 1
+    if digits < n and (char_at(source, digits) == "+" or char_at(source, digits) == "-") {
+        digits = digits + 1
+    }
+    if digits < n and is_digit_char(char_at(source, digits)) {
+        return digits
+    }
+    return pos
+}
+
 fn is_digit_char(ch: string) -> bool {
     if ch >= "0" and ch <= "9" { return true }
     return false
@@ -411,6 +433,18 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                 if is_float {
                     lex.pos = lex.pos + 1
                     lex.col = lex.col + 1
+                    while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
+                        lex.pos = lex.pos + 1
+                        lex.col = lex.col + 1
+                    }
+                }
+                -- An exponent makes a float: 1.5e10, 2e-3, 6E+2. The
+                -- "e" belongs to the number only when digits follow it.
+                let exp_digits = exponent_digits_at(lex.source, lex.pos)
+                if exp_digits > lex.pos {
+                    is_float = true
+                    lex.col = lex.col + exp_digits - lex.pos
+                    lex.pos = exp_digits
                     while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
                         lex.pos = lex.pos + 1
                         lex.col = lex.col + 1
@@ -4196,6 +4230,13 @@ fn parse_source_file(p: Parser) -> SourceFile {
         let name_tok = p_cur(pp)
         sf.module_name = name_tok.value
         pp = p_advance(pp)
+        -- A dotted name: module tests.arithmetic
+        while p_peek(pp) == TK_DOT() {
+            pp = p_advance(pp)
+            pp = p_need_name(pp, "a module name")
+            sf.module_name = sf.module_name + "." + p_cur(pp).value
+            pp = p_advance(pp)
+        }
     }
     pp = p_skip_newlines(pp)
 
@@ -10399,29 +10440,39 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         }
         return "i64"
     }
+    -- A lambda is the address of its function
+    if expr.kind == EXPR_LAMBDA() {
+        return "ptr"
+    }
     if expr.kind == EXPR_BINARY() {
-        let op = expr.op
-        -- Comparison operators always produce bool
-        if op == BINOP_EQ() or op == BINOP_NE() {
+        -- Comparison and logical operators always produce bool
+        if is_bool_binop(expr.op) {
             return "bool"
         }
-        if op == BINOP_LT() or op == BINOP_LE() or op == BINOP_GT() or op == BINOP_GE() {
-            return "bool"
+        -- Arithmetic. A chain a + b + c + ... nests to the left, one
+        -- level for each operator, so its type is worked out in a loop
+        -- from the innermost operator outwards; by recursion, a chain
+        -- of a few hundred overflowed the stack. Each operand's type is
+        -- inferred once: inferring the left one twice doubles the work
+        -- at every level.
+        let mut levels: List[Expr] = []
+        let mut node = expr
+        while node.kind == EXPR_BINARY() and is_bool_binop(node.op) == false {
+            levels.push(node)
+            node = *node.left
         }
-        -- Logical operators always produce bool
-        if op == BINOP_AND() or op == BINOP_OR() {
-            return "bool"
+        let mut chain_type = infer_expr_type(gen, node)
+        let mut level = levels.len() - 1
+        while level >= 0 {
+            -- Integers of different types meet at one type; otherwise
+            -- the operator has its left operand's type
+            let common_t = common_int_type(levels[level], chain_type, infer_expr_type(gen, *levels[level].right))
+            if common_t != "" {
+                chain_type = common_t
+            }
+            level = level - 1
         }
-        let common_t = binary_int_type(gen, expr)
-        if common_t != "" {
-            return common_t
-        }
-        -- Arithmetic: infer from left operand
-        let left_type = infer_expr_type(gen, *expr.left)
-        if left_type == "string" and op == BINOP_ADD() {
-            return "string"
-        }
-        return left_type
+        return chain_type
     }
     if expr.kind == EXPR_UNARY() {
         if expr.op == UNOP_NOT() {
@@ -10832,6 +10883,35 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
 -- ============================================================
 
 fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
+    -- A chain such as a + b + c + ... nests to the left, one level
+    -- for each operator. Its levels are generated in a loop, from the
+    -- innermost outwards: generated by recursion, each level takes
+    -- more than a megabyte of stack, and a chain of 40 overflowed it.
+    let mut spine: List[Expr] = []
+    let mut node = expr
+    while node.op != BINOP_AND() and node.op != BINOP_OR() and binary_left_is_binary(node) {
+        spine.push(node)
+        node = *node.left
+    }
+    let mut result = generate_binary_level(gen, block, node, -1)
+    let mut i = spine.len() - 1
+    while i >= 0 {
+        result = generate_binary_level(result.gen, result.block, spine[i], result.val_id)
+        i = i - 1
+    }
+    return result
+}
+
+fn binary_left_is_binary(expr: Expr) -> bool {
+    let left = *expr.left
+    return left.kind == EXPR_BINARY()
+}
+
+-- One binary operator. lhs_done is the value of its left operand when
+-- that is generated already, and -1 when it is not. It is only given
+-- for an operator that is not `and` or `or` and whose left operand is
+-- itself a binary operator, which is never an overloaded one's.
+fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_done: int) -> ExprResult {
     let mut g = gen
     let mut b = block
     let op = expr.op
@@ -11067,10 +11147,13 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     -- --------------------------------------------------------
 
     -- Evaluate left operand
-    let lhs_result = generate_expr(g, b, *expr.left)
-    g = lhs_result.gen
-    b = lhs_result.block
-    let mut lhs_id = lhs_result.val_id
+    let mut lhs_id = lhs_done
+    if lhs_done < 0 {
+        let lhs_result = generate_expr(g, b, *expr.left)
+        g = lhs_result.gen
+        b = lhs_result.block
+        lhs_id = lhs_result.val_id
+    }
 
     -- Evaluate right operand
     let rhs_result = generate_expr(g, b, *expr.right)
@@ -13816,8 +13899,18 @@ fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr
 -- operand's type, as in `fd < 0` with fd: i32; otherwise the narrower
 -- operand widens. "" when the operands need no conversion.
 fn binary_int_type(gen: IRGenerator, expr: Expr) -> string {
-    let lt = infer_expr_type(gen, *expr.left)
-    let rt = infer_expr_type(gen, *expr.right)
+    return common_int_type(expr, infer_expr_type(gen, *expr.left), infer_expr_type(gen, *expr.right))
+}
+
+-- Whether a binary operator gives a bool whatever its operands are
+fn is_bool_binop(op: int) -> bool {
+    if op == BINOP_EQ() or op == BINOP_NE() { return true }
+    if op == BINOP_LT() or op == BINOP_LE() or op == BINOP_GT() or op == BINOP_GE() { return true }
+    return op == BINOP_AND() or op == BINOP_OR()
+}
+
+-- binary_int_type for operands whose types, lt and rt, are known
+fn common_int_type(expr: Expr, lt: string, rt: string) -> string {
     if is_integer_type(lt) == false or is_integer_type(rt) == false or lt == rt { return "" }
     let l_lit = is_int_literal_expr(*expr.left)
     let r_lit = is_int_literal_expr(*expr.right)
@@ -22420,7 +22513,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "45be75bf8532cdfd"
+    return "9fe2493a2c57ebaf"
 }
 
 

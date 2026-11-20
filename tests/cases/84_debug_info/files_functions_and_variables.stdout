@@ -23,7 +23,7 @@ fn main at main.dm:40
   variable tags: List[string], line 43
   variable leaf: Node, line 46
   variable root: Node, line 47
-  variable add: int, line 48
+  variable add: void *, line 48
 fn __lambda_0 at main.dm:48
   parameter a: int
   parameter b: int

@@ -13,6 +13,28 @@ fn is_alpha_char(ch: string) -> bool {
     return false
 }
 
+-- Where the digits of a number's exponent begin, when an exponent
+-- begins at pos: after "e" or "E" and a sign, if there is one. Gives
+-- pos when no exponent begins there.
+fn exponent_digits_at(source: string, pos: int) -> int {
+    let n = len(source)
+    if pos >= n {
+        return pos
+    }
+    let e = char_at(source, pos)
+    if e != "e" and e != "E" {
+        return pos
+    }
+    let mut digits = pos + 1
+    if digits < n and (char_at(source, digits) == "+" or char_at(source, digits) == "-") {
+        digits = digits + 1
+    }
+    if digits < n and is_digit_char(char_at(source, digits)) {
+        return digits
+    }
+    return pos
+}
+
 fn is_digit_char(ch: string) -> bool {
     if ch >= "0" and ch <= "9" { return true }
     return false
@@ -131,6 +153,18 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                 if is_float {
                     lex.pos = lex.pos + 1
                     lex.col = lex.col + 1
+                    while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
+                        lex.pos = lex.pos + 1
+                        lex.col = lex.col + 1
+                    }
+                }
+                -- An exponent makes a float: 1.5e10, 2e-3, 6E+2. The
+                -- "e" belongs to the number only when digits follow it.
+                let exp_digits = exponent_digits_at(lex.source, lex.pos)
+                if exp_digits > lex.pos {
+                    is_float = true
+                    lex.col = lex.col + exp_digits - lex.pos
+                    lex.pos = exp_digits
                     while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
                         lex.pos = lex.pos + 1
                         lex.col = lex.col + 1

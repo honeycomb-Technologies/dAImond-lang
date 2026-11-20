@@ -1514,6 +1514,13 @@ fn parse_source_file(p: Parser) -> SourceFile {
         let name_tok = p_cur(pp)
         sf.module_name = name_tok.value
         pp = p_advance(pp)
+        -- A dotted name: module tests.arithmetic
+        while p_peek(pp) == TK_DOT() {
+            pp = p_advance(pp)
+            pp = p_need_name(pp, "a module name")
+            sf.module_name = sf.module_name + "." + p_cur(pp).value
+            pp = p_advance(pp)
+        }
     }
     pp = p_skip_newlines(pp)
 
