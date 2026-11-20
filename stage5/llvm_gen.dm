@@ -17,10 +17,6 @@ import llvm
 -- declared with `extern fn` takes and returns char*.
 -- ============================================================
 
--- Bridge functions declared in llvm_bridge.c but not yet in llvm.dm
-extern fn dm_llvm_struct_set_body(struct_ty: int, fields: int, field_count: int, is_packed: int)extern fn dm_llvm_add_incoming(phi: int, values: int, blocks: int, count: int)extern fn dm_llvm_const_struct(ctx: int, values: int, count: int, is_packed: int) -> int
-extern fn dm_llvm_const_array(elem_ty: int, values: int, count: int) -> int
-
 -- ============================================================
 -- LLVM GENERATOR STRUCT
 -- ============================================================

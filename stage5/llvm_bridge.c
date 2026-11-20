@@ -62,11 +62,6 @@ int64_t dm_llvm_module_add_function(int64_t mod, const char* name, int64_t fn_ty
                                    TO_PTR(LLVMTypeRef, fn_type)));
 }
 
-int64_t dm_llvm_module_get_named_function(int64_t mod, const char* name) {
-    LLVMValueRef f = LLVMGetNamedFunction(TO_PTR(LLVMModuleRef, mod), name);
-    return TO_INT(f); /* 0 if not found */
-}
-
 int64_t dm_llvm_module_add_global(int64_t mod, int64_t ty, const char* name) {
     return TO_INT(LLVMAddGlobal(TO_PTR(LLVMModuleRef, mod),
                                  TO_PTR(LLVMTypeRef, ty), name));
@@ -84,10 +79,6 @@ int64_t dm_llvm_module_verify(int64_t mod) {
 }
 
 /* Returns a C string (caller must call dm_llvm_dispose_message) */
-int64_t dm_llvm_module_print_to_string(int64_t mod) {
-    return TO_INT(LLVMPrintModuleToString(TO_PTR(LLVMModuleRef, mod)));
-}
-
 int64_t dm_llvm_module_print_to_file(int64_t mod, const char* filename) {
     char* err_msg = NULL;
     int result = LLVMPrintModuleToFile(TO_PTR(LLVMModuleRef, mod), filename, &err_msg);
@@ -95,16 +86,6 @@ int64_t dm_llvm_module_print_to_file(int64_t mod, const char* filename) {
         LLVMDisposeMessage(err_msg);
     }
     return (int64_t)result;
-}
-
-int64_t dm_llvm_module_write_bitcode(int64_t mod, const char* filename) {
-    return (int64_t)LLVMWriteBitcodeToFile(TO_PTR(LLVMModuleRef, mod), filename);
-}
-
-void dm_llvm_dispose_message(int64_t msg) {
-    if (msg != 0) {
-        LLVMDisposeMessage(TO_PTR(char*, msg));
-    }
 }
 
 /* Pass manager */
@@ -171,27 +152,8 @@ int64_t dm_llvm_vector_type(int64_t elem, int64_t count) {
 }
 
 /* Struct types - fields passed as array of int64_t */
-int64_t dm_llvm_struct_type(int64_t ctx, int64_t* fields, int64_t field_count, int64_t is_packed) {
-    return TO_INT(LLVMStructTypeInContext(
-        TO_PTR(LLVMContextRef, ctx),
-        (LLVMTypeRef*)(uintptr_t)fields,
-        (unsigned)field_count,
-        is_packed ? 1 : 0));
-}
-
 int64_t dm_llvm_struct_create_named(int64_t ctx, const char* name) {
     return TO_INT(LLVMStructCreateNamed(TO_PTR(LLVMContextRef, ctx), name));
-}
-
-void dm_llvm_struct_set_body(int64_t struct_ty, int64_t* fields, int64_t field_count, int64_t is_packed) {
-    LLVMStructSetBody(TO_PTR(LLVMTypeRef, struct_ty),
-                       (LLVMTypeRef*)(uintptr_t)fields,
-                       (unsigned)field_count,
-                       is_packed ? 1 : 0);
-}
-
-int64_t dm_llvm_struct_get_type_at_index(int64_t struct_ty, int64_t index) {
-    return TO_INT(LLVMStructGetTypeAtIndex(TO_PTR(LLVMTypeRef, struct_ty), (unsigned)index));
 }
 
 int64_t dm_llvm_get_type_kind(int64_t ty) {
@@ -200,14 +162,6 @@ int64_t dm_llvm_get_type_kind(int64_t ty) {
 
 int64_t dm_llvm_get_int_type_width(int64_t ty) {
     return (int64_t)LLVMGetIntTypeWidth(TO_PTR(LLVMTypeRef, ty));
-}
-
-int64_t dm_llvm_function_type(int64_t ret, int64_t* params, int64_t param_count, int64_t is_var_arg) {
-    return TO_INT(LLVMFunctionType(
-        TO_PTR(LLVMTypeRef, ret),
-        (LLVMTypeRef*)(uintptr_t)params,
-        (unsigned)param_count,
-        is_var_arg ? 1 : 0));
 }
 
 /* ================================================================
@@ -224,27 +178,6 @@ int64_t dm_llvm_const_real(int64_t ty, double val) {
 
 int64_t dm_llvm_const_null(int64_t ty) {
     return TO_INT(LLVMConstNull(TO_PTR(LLVMTypeRef, ty)));
-}
-
-int64_t dm_llvm_const_string(int64_t ctx, const char* str, int64_t len, int64_t null_terminate) {
-    return TO_INT(LLVMConstStringInContext(
-        TO_PTR(LLVMContextRef, ctx), str, (unsigned)len,
-        null_terminate ? 0 : 1));
-}
-
-int64_t dm_llvm_const_struct(int64_t ctx, int64_t* values, int64_t count, int64_t is_packed) {
-    return TO_INT(LLVMConstStructInContext(
-        TO_PTR(LLVMContextRef, ctx),
-        (LLVMValueRef*)(uintptr_t)values,
-        (unsigned)count,
-        is_packed ? 1 : 0));
-}
-
-int64_t dm_llvm_const_array(int64_t elem_ty, int64_t* values, int64_t count) {
-    return TO_INT(LLVMConstArray2(
-        TO_PTR(LLVMTypeRef, elem_ty),
-        (LLVMValueRef*)(uintptr_t)values,
-        (uint64_t)count));
 }
 
 void dm_llvm_set_initializer(int64_t global, int64_t init) {
@@ -435,15 +368,6 @@ int64_t dm_llvm_build_store(int64_t b, int64_t val, int64_t ptr) {
                                   TO_PTR(LLVMValueRef, ptr)));
 }
 
-int64_t dm_llvm_build_gep2(int64_t b, int64_t ty, int64_t ptr,
-                            int64_t* indices, int64_t num_indices, const char* name) {
-    return TO_INT(LLVMBuildGEP2(TO_PTR(LLVMBuilderRef, b),
-                                 TO_PTR(LLVMTypeRef, ty),
-                                 TO_PTR(LLVMValueRef, ptr),
-                                 (LLVMValueRef*)(uintptr_t)indices,
-                                 (unsigned)num_indices, name));
-}
-
 int64_t dm_llvm_build_gep2_one(int64_t b, int64_t ty, int64_t ptr, int64_t idx, const char* name) {
     LLVMValueRef index = TO_PTR(LLVMValueRef, idx);
     return TO_INT(LLVMBuildInBoundsGEP2(TO_PTR(LLVMBuilderRef, b), TO_PTR(LLVMTypeRef, ty),
@@ -524,26 +448,10 @@ static LLVMValueRef dm_call_zeroext_bools(LLVMValueRef call) {
     return call;
 }
 
-int64_t dm_llvm_build_call2(int64_t b, int64_t fn_ty, int64_t func,
-                             int64_t* args, int64_t arg_count, const char* name) {
-    return TO_INT(dm_call_zeroext_bools(LLVMBuildCall2(TO_PTR(LLVMBuilderRef, b),
-                                  TO_PTR(LLVMTypeRef, fn_ty),
-                                  TO_PTR(LLVMValueRef, func),
-                                  (LLVMValueRef*)(uintptr_t)args,
-                                  (unsigned)arg_count, name)));
-}
-
 /* Phi */
 int64_t dm_llvm_build_phi(int64_t b, int64_t ty, const char* name) {
     return TO_INT(LLVMBuildPhi(TO_PTR(LLVMBuilderRef, b),
                                 TO_PTR(LLVMTypeRef, ty), name));
-}
-
-void dm_llvm_add_incoming(int64_t phi, int64_t* values, int64_t* blocks, int64_t count) {
-    LLVMAddIncoming(TO_PTR(LLVMValueRef, phi),
-                     (LLVMValueRef*)(uintptr_t)values,
-                     (LLVMBasicBlockRef*)(uintptr_t)blocks,
-                     (unsigned)count);
 }
 
 /* Casts */
@@ -589,12 +497,6 @@ int64_t dm_llvm_build_sext(int64_t b, int64_t val, int64_t dest_ty, const char* 
     return TO_INT(LLVMBuildSExt(TO_PTR(LLVMBuilderRef, b),
                                  TO_PTR(LLVMValueRef, val),
                                  TO_PTR(LLVMTypeRef, dest_ty), name));
-}
-
-int64_t dm_llvm_build_bit_cast(int64_t b, int64_t val, int64_t dest_ty, const char* name) {
-    return TO_INT(LLVMBuildBitCast(TO_PTR(LLVMBuilderRef, b),
-                                    TO_PTR(LLVMValueRef, val),
-                                    TO_PTR(LLVMTypeRef, dest_ty), name));
 }
 
 int64_t dm_llvm_build_int_to_ptr(int64_t b, int64_t val, int64_t dest_ty, const char* name) {
@@ -643,13 +545,6 @@ int64_t dm_llvm_build_extract_element(int64_t b, int64_t vec, int64_t idx, const
     return TO_INT(LLVMBuildExtractElement(TO_PTR(LLVMBuilderRef, b),
                                            TO_PTR(LLVMValueRef, vec),
                                            TO_PTR(LLVMValueRef, idx), name));
-}
-
-int64_t dm_llvm_build_shuffle_vector(int64_t b, int64_t v1, int64_t v2, int64_t mask, const char* name) {
-    return TO_INT(LLVMBuildShuffleVector(TO_PTR(LLVMBuilderRef, b),
-                                          TO_PTR(LLVMValueRef, v1),
-                                          TO_PTR(LLVMValueRef, v2),
-                                          TO_PTR(LLVMValueRef, mask), name));
 }
 
 /* Global strings */
@@ -767,8 +662,6 @@ int64_t dm_llvm_real_oge(void) { return (int64_t)LLVMRealOGE; }
 
 /* Linkage */
 int64_t dm_llvm_external_linkage(void) { return (int64_t)LLVMExternalLinkage; }
-int64_t dm_llvm_internal_linkage(void) { return (int64_t)LLVMInternalLinkage; }
-int64_t dm_llvm_private_linkage(void) { return (int64_t)LLVMPrivateLinkage; }
 
 /* File types */
 int64_t dm_llvm_object_file(void) { return 0; }
@@ -896,28 +789,6 @@ int64_t dm_llvm_build_call2_buf(int64_t b, int64_t fn_ty, int64_t func, const ch
     int64_t result = TO_INT(dm_call_zeroext_bools(LLVMBuildCall2(
         TO_PTR(LLVMBuilderRef, b), TO_PTR(LLVMTypeRef, fn_ty),
         TO_PTR(LLVMValueRef, func), args, dm_llvm_buf_count, name)));
-    dm_llvm_buf_count = 0;
-    return result;
-}
-
-int64_t dm_llvm_const_struct_buf(int64_t ctx, int64_t is_packed) {
-    LLVMValueRef vals[DM_LLVM_BUF_MAX];
-    for (int i = 0; i < dm_llvm_buf_count; i++) {
-        vals[i] = TO_PTR(LLVMValueRef, dm_llvm_buf[i]);
-    }
-    int64_t result = TO_INT(LLVMConstStructInContext(
-        TO_PTR(LLVMContextRef, ctx), vals, dm_llvm_buf_count, (LLVMBool)is_packed));
-    dm_llvm_buf_count = 0;
-    return result;
-}
-
-int64_t dm_llvm_const_array_buf(int64_t elem_ty) {
-    LLVMValueRef vals[DM_LLVM_BUF_MAX];
-    for (int i = 0; i < dm_llvm_buf_count; i++) {
-        vals[i] = TO_PTR(LLVMValueRef, dm_llvm_buf[i]);
-    }
-    int64_t result = TO_INT(LLVMConstArray2(
-        TO_PTR(LLVMTypeRef, elem_ty), vals, dm_llvm_buf_count));
     dm_llvm_buf_count = 0;
     return result;
 }
