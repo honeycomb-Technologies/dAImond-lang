@@ -20,7 +20,7 @@ bash bootstrap.sh          # builds build/daimond
 build/daimond examples/hello.dm -o hello && ./hello
 ```
 
-To run the test suite (376 cases, about a minute):
+To run the test suite (390 cases, about a minute):
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
@@ -31,7 +31,7 @@ build/harness build/daimond
 
 ### Stage 0 (the Zig bootstrap compiler)
 
-Stage 0 is the older compiler, which emits C. The tools (`check`, `fmt`, `test`, `pkg`, the LSP) still live there.
+Stage 0 is the older compiler, which emits C. `pkg` and the LSP still live there; `run`, `check`, `fmt` and `test` are also in the Stage 5 compiler (`build/daimond run file.dm -- args`, `build/daimond check file.dm`, `build/daimond fmt file.dm`, `build/daimond test file.dm`).
 
 #### Prerequisites
 
@@ -458,7 +458,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 376/376 cases pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code). `bootstrap.sh` builds it from a committed seed with LLVM's tools alone; Stage 0 (Zig) is no longer needed to build or test the compiler, only for the tools that have not been ported. Programs it builds contain no C and are linked by `ld.lld`
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 390/390 cases pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code). `bootstrap.sh` builds it from a committed seed with LLVM's tools alone; Stage 0 (Zig) is no longer needed to build or test the compiler, only for the tools that have not been ported. Programs it builds contain no C and are linked by `ld.lld`
 
 ## Current Status
 
@@ -531,7 +531,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 
 ### Stage 5 LLVM Backend in dAImond -- In Progress
 - [x] Entire LLVM backend written in dAImond (~22K lines monolithic, ~15 split modules)
-- [x] Passes the integration suite (376/376, the 19 memory-safety probes among them)
+- [x] Passes the integration suite (390/390, the 19 memory-safety probes among them)
 - [x] Test harness written in dAImond (`tests/harness.dm`), with the cases as plain files in `tests/cases/`
 - [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
 - [x] LLVM bridge written in dAImond over LLVM's C API (`llvm_bridge.dm`); `llvm_bridge.c` remains only for the compiler Stage 0 builds
@@ -557,7 +557,8 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [ ] Debug info (DWARF) in Stage 5
 - [x] `Type.name(args)` calls of an `impl`'s functions, `Box.new`/`Box.null`, `s.len()`, and errors for a string, bool or number given where another is expected
 - [ ] A full type checker in Stage 5
-- [ ] The tools (`check`, `fmt`, `test`, the LSP) in dAImond, so that Stage 0, `llvm_bridge.c` and `daimond_runtime.c` can be deleted
+- [x] `run`, `check`, `fmt` and `test` in the Stage 5 compiler, and `assert`/`assert_eq` that panic there (they did nothing before)
+- [ ] The LSP in dAImond, so that Stage 0, `llvm_bridge.c` and `daimond_runtime.c` can be deleted
 
 ## Design Principles
 

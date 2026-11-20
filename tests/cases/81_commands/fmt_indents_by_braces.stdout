@@ -1,0 +1,20 @@
+Formatted: f.dm
+module fmt_indents_by_braces
+struct Point {
+    x: int,
+    y: int
+}
+
+fn main() -> int {
+    let text = "a { b"   -- a comment with a } brace
+    if len(text) > 3 {
+        println("}}}")
+    } else {
+        match 1 {
+            1 => { println("one") }
+            _ => {}
+        }
+    }
+    return 0
+}
+Formatted: g.dm

@@ -83,6 +83,26 @@ fn rt_panic(message: string) {
     exit(1)
 }
 
+-- assert(cond): panic unless the condition holds
+fn rt_assert(condition: bool) {
+    if condition == false {
+        panic("assertion failed")
+    }
+}
+
+-- assert_eq(a, b): the compiler passes whether a == b
+fn rt_assert_eq_values(equal: bool) {
+    if equal == false {
+        panic("assert_eq failed: values not equal")
+    }
+}
+
+fn rt_assert_eq_strings(equal: bool) {
+    if equal == false {
+        panic("assert_eq failed: strings not equal")
+    }
+}
+
 -- read_line(): the next line of standard input without its newline,
 -- or "" at the end of input
 fn rt_read_line() -> string {

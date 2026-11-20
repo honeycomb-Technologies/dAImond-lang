@@ -409,22 +409,21 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
     return expr_result(g, b, id)
 }
 
--- Generate an assert call. Emits a conditional panic.
--- assert(cond) -> if !cond { panic("assertion failed") }
+-- assert(cond): panic with "assertion failed" unless cond is true
 fn generate_assert_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    if args.len() < 1 {
+    if args.len() != 1 {
+        g = ir_type_error(g, "assert() takes 1 argument, not " + int_to_string(args.len()), 0)
         return expr_result(g, b, 0)
     }
 
-    -- Generate the condition
     let cond_result = generate_expr(g, b, args[0])
     g = cond_result.gen
     b = cond_result.block
 
-    -- Emit a call to dm_assert (runtime handles the panic)
+    -- The runtime's rt_assert panics when the condition is false
     let id = g.builder.next_id
     let mut inst = ir_inst_new(id, OP_CALL())
     inst.callee = "dm_assert"
@@ -439,32 +438,33 @@ fn generate_assert_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr])
     return expr_result(g, b, id)
 }
 
--- Generate an assert_eq call.
--- assert_eq(a, b) -> if a != b { panic("values not equal") }
+-- assert_eq(a, b): panic unless a == b. The comparison is the ==
+-- operator's, so it works for every type == does; the runtime's
+-- function panics with "assert_eq failed: strings not equal" or
+-- "assert_eq failed: values not equal".
 fn generate_assert_eq_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    if args.len() < 2 {
+    if args.len() != 2 {
+        g = ir_type_error(g, "assert_eq() takes 2 arguments, not " + int_to_string(args.len()), 0)
         return expr_result(g, b, 0)
     }
 
-    -- Generate both argument expressions
-    let lhs_result = generate_expr(g, b, args[0])
-    g = lhs_result.gen
-    b = lhs_result.block
+    let compares_strings = static_type(g, args[0]) == "string" or static_type(g, args[1]) == "string"
+    let equal = expr_binary(BINOP_EQ(), args[0], args[1], args[0].line, args[0].col)
+    let eq_result = generate_expr(g, b, equal)
+    g = eq_result.gen
+    b = eq_result.block
 
-    let rhs_result = generate_expr(g, b, args[1])
-    g = rhs_result.gen
-    b = rhs_result.block
-
-    -- Emit a call to dm_assert_eq (runtime handles the comparison + panic)
     let id = g.builder.next_id
     let mut inst = ir_inst_new(id, OP_CALL())
-    inst.callee = "dm_assert_eq"
+    inst.callee = "dm_assert_eq_values"
+    if compares_strings {
+        inst.callee = "dm_assert_eq_strings"
+    }
     let mut call_args: List[IRValue] = []
-    call_args.push(ir_val_inst(lhs_result.val_id))
-    call_args.push(ir_val_inst(rhs_result.val_id))
+    call_args.push(ir_val_inst(eq_result.val_id))
     inst.call_args = call_args
     inst.result_type = "void"
     inst.has_result = false

@@ -1,0 +1,2 @@
+Error: type mismatch in the value of 'x': expected int, found string at line 5
+Error: 1 type errors

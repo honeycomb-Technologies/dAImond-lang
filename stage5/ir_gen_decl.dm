@@ -287,6 +287,9 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- Process
     g = declare_extern(g, "dm_panic", "string", "void")
+    g = declare_extern(g, "dm_assert", "bool", "void")
+    g = declare_extern(g, "dm_assert_eq_values", "bool", "void")
+    g = declare_extern(g, "dm_assert_eq_strings", "bool", "void")
     g = declare_extern2(g, "dm_checked_add_i64", "i64", "i64", "i64")
     g = declare_extern2(g, "dm_checked_sub_i64", "i64", "i64", "i64")
     g = declare_extern2(g, "dm_checked_mul_i64", "i64", "i64", "i64")

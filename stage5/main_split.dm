@@ -38,9 +38,16 @@ fn VERSION() -> string { return "0.1.0" }
 -- ============================================================
 
 fn print_usage() {
-    println("dAImond Stage 4 Compiler (LLVM Backend)")
+    println("dAImond Compiler (LLVM backend)")
     println("")
-    println("Usage: daimond-llvm <file.dm> [options]")
+    println("Usage: daimond [command] <file.dm> [options]")
+    println("")
+    println("Commands:")
+    println("  (none)        Compile the file to a program")
+    println("  run           Compile the file and run the program; arguments after -- go to it")
+    println("  check         Report the file's errors without building a program")
+    println("  fmt           Indent the file by its braces, in place or into -o <file>")
+    println("  test          Run each fn test_*() of the file and report which pass")
     println("")
     println("Options:")
     println("  -o <file>     Output binary name (default: input without .dm)")
@@ -66,8 +73,14 @@ fn print_usage() {
 -- ============================================================
 
 struct CLIArgs {
+    -- "" to compile, or "run", "check", "fmt" or "test"
+    command: string,
     input_file: string,
     output_file: string,
+    -- Whether -o named the output file
+    has_output: bool,
+    -- run: the program's arguments, as one piece of a shell command
+    program_args: string,
     opt_level: int,
     emit_ir: bool,
     emit_llvm: bool,
@@ -82,8 +95,11 @@ struct CLIArgs {
 
 fn parse_cli_args() -> CLIArgs {
     let mut args = CLIArgs {
+        command: "",
         input_file: "",
         output_file: "",
+        has_output: false,
+        program_args: "",
         opt_level: 0,
         emit_ir: false,
         emit_llvm: false,
@@ -107,7 +123,16 @@ fn parse_cli_args() -> CLIArgs {
     while i < argc {
         let arg = args_get(i)
 
-        if arg == "-h" or arg == "--help" {
+        if i == 1 and (arg == "run" or arg == "check" or arg == "fmt" or arg == "test") {
+            args.command = arg
+        } else if arg == "--" and args.command == "run" {
+            -- The rest goes to the program
+            i = i + 1
+            while i < argc {
+                args.program_args = args.program_args + " " + shell_quote(args_get(i))
+                i = i + 1
+            }
+        } else if arg == "-h" or arg == "--help" {
             args.show_help = true
             return args
         } else if arg == "--version" {
@@ -117,6 +142,7 @@ fn parse_cli_args() -> CLIArgs {
             if i + 1 < argc {
                 i = i + 1
                 args.output_file = args_get(i)
+                args.has_output = true
             } else {
                 args.has_error = true
                 args.error_msg = "Error: -o requires an argument"
@@ -543,6 +569,250 @@ fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], 
 }
 
 -- ============================================================
+-- COMMANDS: run, fmt and test
+-- (check is the compilation pipeline, stopped before it builds)
+-- ============================================================
+
+-- A word of a shell command that stands for exactly this text
+fn shell_quote(text: string) -> string {
+    return "'" + string_replace(text, "'", "'\\''") + "'"
+}
+
+-- The exit code that a result of system() stands for: the command's
+-- own, 128 plus the signal's number when a signal ended it, or 127
+-- when the shell could not be started
+fn exit_code_of(status: int) -> int {
+    if status < 0 {
+        return 127
+    }
+    if status % 128 != 0 {
+        return 128 + status % 128
+    }
+    return (status / 256) % 256
+}
+
+-- A path in /tmp for a file of this process's own. It needs no quoting
+-- in a shell command.
+fn temp_path(kind: string) -> string {
+    let mut pid = 0
+    unsafe { pid = getpid() as int }
+    return "/tmp/daimond_" + kind + "_" + int_to_string(pid) + "_" + int_to_string(time_ms())
+}
+
+-- run: compile the file, run the program with the arguments after --,
+-- and give its exit code. The program is deleted afterwards unless -o
+-- named it.
+fn run_file(cli: CLIArgs) -> int {
+    let mut build = cli
+    build.command = ""
+    if cli.has_output == false {
+        build.output_file = temp_path("run")
+    }
+    let built = compile(build)
+    if built != 0 {
+        return built
+    }
+    let mut program = build.output_file
+    if string_contains(program, "/") == false {
+        program = "./" + program
+    }
+    let code = exit_code_of(system(shell_quote(program) + cli.program_args))
+    if cli.has_output == false {
+        fs_remove(build.output_file)
+    }
+    return code
+}
+
+-- Source with every line indented by the braces around it, four spaces
+-- a level. Lines are otherwise unchanged, apart from the white space
+-- at their ends; braces in strings and comments do not count.
+fn format_source(source: string) -> string {
+    let lines = string_split(source, "\n")
+    let mut out = ""
+    let mut level = 0
+    let mut li = 0
+    while li < lines.len() {
+        if li > 0 {
+            out = out + "\n"
+        }
+        let line = string_trim(lines[li])
+        if len(line) > 0 {
+            let closes_first = char_at(line, 0) == "}"
+            if closes_first and level > 0 {
+                level = level - 1
+            }
+            let mut indent = 0
+            while indent < level {
+                out = out + "    "
+                indent = indent + 1
+            }
+            out = out + line
+
+            -- The braces of this line change the level of the next ones
+            let mut in_string = false
+            let mut in_comment = false
+            let mut prev = ""
+            let mut ci = 0
+            while ci < len(line) and in_comment == false {
+                let ch = char_at(line, ci)
+                if ch == "\"" and prev != "\\" {
+                    in_string = in_string == false
+                }
+                let mut starts_comment = false
+                if in_string == false {
+                    if ch == "-" and prev == "-" {
+                        starts_comment = true
+                        in_comment = true
+                    } else if ch == "{" {
+                        level = level + 1
+                    } else if ch == "}" and closes_first == false {
+                        if level > 0 {
+                            level = level - 1
+                        }
+                    }
+                }
+                if starts_comment == false {
+                    prev = ch
+                }
+                ci = ci + 1
+            }
+        }
+        li = li + 1
+    }
+    if len(out) > 0 and ends_with(out, "\n") == false {
+        out = out + "\n"
+    }
+    return out
+}
+
+-- fmt: format the file in place, or into the file -o names
+fn format_file(cli: CLIArgs) -> int {
+    if file_exists(cli.input_file) == false {
+        eprintln("Error: file not found: " + cli.input_file)
+        return 1
+    }
+    let mut target = cli.input_file
+    if cli.has_output {
+        target = cli.output_file
+    }
+    file_write(target, format_source(file_read(cli.input_file)))
+    println("Formatted: " + target)
+    return 0
+}
+
+-- The names of a file's tests: its functions named test_..., which
+-- take no parameters
+fn test_function_names(sf: SourceFile) -> List[string] {
+    let mut names: List[string] = []
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if starts_with(fd.name, "test_") and fd.params.len() == 0 and fd.is_extern == false {
+                names.push(fd.name)
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+-- The source of the main function of a test program. Given a test's
+-- name as its argument, the program runs that test. Given none, it
+-- runs itself once per test, so that a test that panics ends only its
+-- own process, and reports each as PASS or FAIL with the panic's text.
+fn test_main_source(names: List[string]) -> string {
+    let mut src = "fn dm_test_run(name: string, log: string) -> bool {\n"
+    src = src + "    print(\"  test \" + name + \" ... \")\n"
+    src = src + "    flush()\n"
+    src = src + "    let status = system(args_get(0) + \" \" + name + \" 2> \" + log)\n"
+    src = src + "    if status == 0 {\n        println(\"PASS\")\n        return true\n    }\n"
+    src = src + "    let mut message = \"\"\n"
+    src = src + "    if file_exists(log) {\n        message = string_trim(file_read(log))\n    }\n"
+    src = src + "    if starts_with(message, \"PANIC: \") {\n        message = substr(message, 7, len(message) - 7)\n    }\n"
+    src = src + "    if message == \"\" {\n        println(\"FAIL\")\n    } else {\n        println(\"FAIL: \" + message)\n    }\n"
+    src = src + "    return false\n}\n"
+    src = src + "fn main() -> int {\n"
+    src = src + "    if args_len() > 1 {\n        let name = args_get(1)\n"
+    let mut i = 0
+    while i < names.len() {
+        src = src + "        if name == \"" + names[i] + "\" {\n            " + names[i] + "()\n        }\n"
+        i = i + 1
+    }
+    src = src + "        return 0\n    }\n"
+    src = src + "    let log = args_get(0) + \".stderr\"\n    let mut passed = 0\n    let mut failed = 0\n"
+    i = 0
+    while i < names.len() {
+        src = src + "    if dm_test_run(\"" + names[i] + "\", log) {\n        passed = passed + 1\n    } else {\n        failed = failed + 1\n    }\n"
+        i = i + 1
+    }
+    src = src + "    fs_remove(log)\n"
+    src = src + "    println(\"\")\n"
+    src = src + "    println(int_to_string(passed) + \" passed, \" + int_to_string(failed) + \" failed\")\n"
+    src = src + "    if failed > 0 {\n        return 1\n    }\n    return 0\n}\n"
+    return src
+}
+
+-- The file's declarations with a main that runs its tests in place of
+-- its own main
+fn with_test_main(sf: SourceFile) -> SourceFile {
+    let test_sf = parse_source_file(parser_new(tokenize(test_main_source(test_function_names(sf)))))
+    let mut out = sf
+    let mut decls: List[Declaration] = []
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        let mut is_main = false
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            is_main = fd.name == "main"
+        }
+        if is_main == false {
+            decls.push(decl)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < test_sf.declarations.len() {
+        decls.push(test_sf.declarations[i])
+        i = i + 1
+    }
+    out.declarations = decls
+    return out
+}
+
+-- test: build the file's test program, run it and give its exit code:
+-- 0 when every test passes
+fn test_file(cli: CLIArgs) -> int {
+    if file_exists(cli.input_file) == false {
+        eprintln("Error: file not found: " + cli.input_file)
+        return 1
+    }
+    let p = parser_new(tokenize(file_read(cli.input_file)))
+    let names = test_function_names(parse_source_file(p))
+    if p.errors.len() == 0 and names.len() == 0 {
+        println("No test functions found (functions starting with 'test_').")
+        return 0
+    }
+    if p.errors.len() == 0 {
+        println("Found " + int_to_string(names.len()) + " test(s) in " + cli.input_file)
+        println("")
+        flush()
+    }
+    -- Parse errors are reported by the compilation that follows
+    let mut build = cli
+    build.output_file = temp_path("test")
+    let built = compile(build)
+    if built != 0 {
+        return built
+    }
+    let code = exit_code_of(system(build.output_file))
+    fs_remove(build.output_file)
+    return code
+}
+
+-- ============================================================
 -- COMPILATION PIPELINE
 -- ============================================================
 
@@ -553,7 +823,7 @@ fn compile(cli: CLIArgs) -> int {
     let verbose = cli.verbose
 
     if verbose {
-        println("dAImond Stage 4 Compiler (LLVM Backend)")
+        println("dAImond Compiler (LLVM backend)")
         println("Input:  " + input_file)
         println("Output: " + output_file)
     }
@@ -616,6 +886,10 @@ fn compile(cli: CLIArgs) -> int {
         if verbose { println("  LLVM bridge: " + bridge_file) }
         sf = add_llvm_bridge(sf, parse_llvm_bridge(bridge_file))
     }
+    -- test: a main that runs the file's tests takes the place of its own
+    if cli.command == "test" {
+        sf = with_test_main(sf)
+    }
     let prelude_sf = parse_prelude()
     sf = add_prelude(sf, prelude_sf)
 
@@ -637,7 +911,7 @@ fn compile(cli: CLIArgs) -> int {
     -- runtime object (see PRECOMPILED RUNTIME). --emit-ir, --emit-llvm
     -- and --emit-bitcode give the whole program, runtime included.
     let mut runtime_obj = ""
-    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false and cli.emit_bitcode == false {
+    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false and cli.emit_bitcode == false and cli.command != "check" {
         runtime_obj = find_or_build_runtime_object(prelude_sf, verbose)
     }
 
@@ -731,6 +1005,13 @@ fn compile(cli: CLIArgs) -> int {
         eprintln("Error: LLVM module verification failed")
         llvm_gen_dispose(lg)
         return 1
+    }
+
+    -- check: the file has no errors, and nothing is built
+    if cli.command == "check" {
+        llvm_gen_dispose(lg)
+        println("No errors found in " + input_file)
+        return 0
     }
 
     -- If --emit-llvm, emit LLVM IR file and exit
@@ -857,6 +1138,15 @@ fn main() -> int {
         return 1
     }
 
+    if cli.command == "fmt" {
+        return format_file(cli)
+    }
+    if cli.command == "run" {
+        return run_file(cli)
+    }
+    if cli.command == "test" {
+        return test_file(cli)
+    }
     return compile(cli)
 }
 

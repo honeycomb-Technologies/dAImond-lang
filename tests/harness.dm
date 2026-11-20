@@ -21,6 +21,12 @@ module harness
 --   X.args     the arguments the program is run with, as shell words
 --   X.errors   the case must fail to compile, and each line of this
 --              file must appear in what the compiler prints
+--   X.cmd      a shell command to run in place of compiling and running
+--              the program, for the compiler's own commands. In it,
+--              {compiler} stands for the compiler, {source} for the
+--              case's program and {work} for an empty directory, the
+--              first two as absolute paths. X.stdout, X.exit and
+--              X.stderr are what the command must print and end with.
 -- A case has X.stdout or X.errors, not both.
 --
 -- The harness runs the compiler and the programs through the shell,
@@ -119,6 +125,42 @@ fn remove_tree(path: string) {
     fs_remove(path)
 }
 
+-- A path that names the same file from any directory
+fn absolute_path(path: string) -> string {
+    if starts_with(path, "/") {
+        return path
+    }
+    return fs_getcwd() + "/" + path
+}
+
+-- Compare what a command did with the case's .exit, .stdout and
+-- .stderr files. `code` is its exit code; its output is in the files
+-- `out_file` and `err_file`.
+fn compare_run(base: string, code: int, out_file: string, err_file: string) -> Outcome {
+    let mut expected_code = 0
+    if file_exists(base + ".exit") {
+        expected_code = parse_int(string_trim(file_read(base + ".exit")))
+    }
+    if code != expected_code {
+        return fail("Expected exit code " + int_to_string(expected_code) + ", got " + int_to_string(code) + "\nStderr: '" + read_or_empty(err_file) + "'")
+    }
+
+    let expected_out = file_read(base + ".stdout")
+    let actual_out = read_or_empty(out_file)
+    if actual_out != expected_out {
+        return fail("Output mismatch.\nExpected: '" + expected_out + "'\nGot: '" + actual_out + "'")
+    }
+
+    if file_exists(base + ".stderr") {
+        let expected_err = file_read(base + ".stderr")
+        let actual_err = read_or_empty(err_file)
+        if actual_err != expected_err {
+            return fail("Stderr mismatch.\nExpected: '" + expected_err + "'\nGot: '" + actual_err + "'")
+        }
+    }
+    return pass()
+}
+
 -- Run one case: its program is the file `source`, and its expectation
 -- files are `base`.stdout and so on. `work` is an empty directory for
 -- the program and for what it writes next to itself.
@@ -129,6 +171,24 @@ fn run_case(compiler: string, source: string, base: string, work: string) -> Out
     }
     if expects_error and file_exists(base + ".stdout") {
         return fail("the case has both a .stdout and a .errors file")
+    }
+
+    let run_out = work + "/run.stdout"
+    let run_err = work + "/run.stderr"
+
+    -- A case with its own command
+    if file_exists(base + ".cmd") {
+        if expects_error {
+            return fail("the case has both a .cmd and a .errors file")
+        }
+        let command_dir = work + "/cmd"
+        fs_mkdir(command_dir)
+        let mut command = string_trim(file_read(base + ".cmd"))
+        command = string_replace(command, "{compiler}", shell_quote(absolute_path(compiler)))
+        command = string_replace(command, "{source}", shell_quote(absolute_path(source)))
+        command = string_replace(command, "{work}", shell_quote(command_dir))
+        let command_code = run("( " + command + " ) > " + shell_quote(run_out) + " 2> " + shell_quote(run_err) + " < /dev/null")
+        return compare_run(base, command_code, run_out, run_err)
     }
 
     let binary = work + "/test_bin"
@@ -159,36 +219,12 @@ fn run_case(compiler: string, source: string, base: string, work: string) -> Out
         return fail("Compilation failed (exit code " + int_to_string(compile_code) + ")\n" + compile_output)
     }
 
-    let run_out = work + "/run.stdout"
-    let run_err = work + "/run.stderr"
     let mut arguments = ""
     if file_exists(base + ".args") {
         arguments = " " + string_trim(file_read(base + ".args"))
     }
     let code = run(binary + arguments + " > " + shell_quote(run_out) + " 2> " + shell_quote(run_err) + " < /dev/null")
-
-    let mut expected_code = 0
-    if file_exists(base + ".exit") {
-        expected_code = parse_int(string_trim(file_read(base + ".exit")))
-    }
-    if code != expected_code {
-        return fail("Expected exit code " + int_to_string(expected_code) + ", got " + int_to_string(code))
-    }
-
-    let expected_out = file_read(base + ".stdout")
-    let actual_out = read_or_empty(run_out)
-    if actual_out != expected_out {
-        return fail("Output mismatch.\nExpected: '" + expected_out + "'\nGot: '" + actual_out + "'")
-    }
-
-    if file_exists(base + ".stderr") {
-        let expected_err = file_read(base + ".stderr")
-        let actual_err = read_or_empty(run_err)
-        if actual_err != expected_err {
-            return fail("Stderr mismatch.\nExpected: '" + expected_err + "'\nGot: '" + actual_err + "'")
-        }
-    }
-    return pass()
+    return compare_run(base, code, run_out, run_err)
 }
 
 fn main() -> int {

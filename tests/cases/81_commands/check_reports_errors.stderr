@@ -1,0 +1,2 @@
+Error: type mismatch in argument 1 of 'double': expected int, found string at line 8
+Error: 1 type errors

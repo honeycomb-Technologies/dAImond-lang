@@ -288,7 +288,10 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Look up function in function_map
         if g.function_map.contains(callee_name) == false {
-            -- Unknown function: skip
+            -- A call the IR generator emitted of a function it never
+            -- declared. Dropping it would make the program do less than
+            -- its source says.
+            g.type_errors.push("Error: internal: call of '" + callee_name + "', which is not declared" + type_error_location(g))
             return g
         }
         let callee = g.function_map.get(callee_name)
