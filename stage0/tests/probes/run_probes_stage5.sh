@@ -133,7 +133,6 @@ fi
 
 # ---- build the stage5 compiler binary (md5-cached in /tmp) ----
 new_hash="$(cat "$ROOT/stage5/main.dm" "$ROOT/stage5/llvm_bridge.c" \
-    "$ROOT/stage5/runtime/llvm_wrappers.c" \
     "$ROOT/stage0/runtime/daimond_runtime.c" | md5sum | cut -d' ' -f1)"
 old_hash=""
 [ -f "$STAGE5_HASH_FILE" ] && old_hash="$(cat "$STAGE5_HASH_FILE")"
@@ -151,15 +150,11 @@ if [ "${STAGE5_PROBE_FORCE_BUILD:-0}" = "1" ] || [ ! -x "$STAGE5_BIN" ] || [ "$n
         echo "error: gcc failed on stage5/llvm_bridge.c" >&2
         exit 2
     fi
-    if ! (cd "$ROOT/stage0" && timeout 300 gcc -c ../stage5/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers_probe.o -I runtime); then
-        echo "error: gcc failed on stage5/runtime/llvm_wrappers.c" >&2
-        exit 2
-    fi
     if ! (cd "$ROOT/stage0" && timeout 300 gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime_probe.o); then
         echo "error: gcc failed on stage0 runtime" >&2
         exit 2
     fi
-    if ! timeout 300 gcc /tmp/stage5_probe.o /tmp/llvm_bridge_probe.o /tmp/llvm_wrappers_probe.o /tmp/daimond_runtime_probe.o -o "$STAGE5_BIN" -lm -lpthread $(llvm-config --libs --ldflags); then
+    if ! timeout 300 gcc /tmp/stage5_probe.o /tmp/llvm_bridge_probe.o /tmp/daimond_runtime_probe.o -o "$STAGE5_BIN" -lm -lpthread $(llvm-config --libs --ldflags); then
         echo "error: linking the stage5 compiler failed" >&2
         exit 2
     fi

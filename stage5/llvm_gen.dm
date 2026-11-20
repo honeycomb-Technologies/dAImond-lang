@@ -11,13 +11,10 @@ import llvm
 -- Key design: All LLVM refs (context, module, builder, types,
 -- values, basic blocks) are represented as int (int64_t on C side).
 --
--- String ABI: dm_string is { ptr, i64, i64 } (24 bytes) which
--- exceeds the x86-64 SysV ABI 16-byte register threshold.
--- Runtime functions using dm_string are called through thin
--- C wrapper functions (llvm_dm_*) with pointer-based ABI:
--- - Returns dm_string -> wrapper takes dm_string* as first param (sret)
--- - Takes dm_string -> wrapper takes const dm_string* (pointer)
--- String values in LLVM IR are pointers to stack-allocated dm_string structs.
+-- String ABI: dm_string is { ptr, i64, i64 } (24 bytes). dAImond
+-- functions, the runtime's included, take strings by value and return
+-- them through a pointer the caller passes first (sret). A C function
+-- declared with `extern fn` takes and returns char*.
 -- ============================================================
 
 -- Bridge functions declared in llvm_bridge.c but not yet in llvm.dm
@@ -516,17 +513,18 @@ fn generate_globals(gen: LLVMGenerator) -> LLVMGenerator {
 -- are too large for register return on x86_64 and cause LLVM errors.
 -- ============================================================
 -- RUNTIME FUNCTIONS
--- The IR names a runtime function dm_X. It is one of three things:
+-- The IR names a runtime function dm_X. It is one of two things:
 --   inline: lowered to instructions here, with no function behind it
 --     (is_inline_runtime_fn): len(s), the integer overflow and
 --     range checks, xs.len() and the creation of an empty list;
---   ported: the dAImond function rt_X, which stage5/runtime/*.dm
---     defines with the same signature and which is called like any
---     other dAImond function (strings by value, result through sret).
---     Where dm_X takes a pointer, rt_X takes an int, the address;
---   otherwise the C function llvm_dm_X in runtime/llvm_wrappers.c,
---     which takes strings by pointer.
--- Porting a function is writing rt_X and deleting llvm_dm_X.
+--   the dAImond function rt_X, which stage5/runtime/*.dm defines
+--     with the same signature and which is called like any other
+--     dAImond function (strings by value, result through sret).
+--     Where dm_X is declared with a pointer, rt_X takes an int, the
+--     address.
+-- A dm_X with neither is called as the C function llvm_dm_X, taking
+-- strings by pointer, as every runtime function once was. None is
+-- left, so such a call fails to link: write rt_X.
 -- ============================================================
 
 fn is_inline_runtime_fn(name: string) -> bool {

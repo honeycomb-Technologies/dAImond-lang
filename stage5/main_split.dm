@@ -195,32 +195,6 @@ fn dirname(path: string) -> string {
     return substr(path, 0, last_slash)
 }
 
--- Find the directory of llvm_wrappers.c, the C that is left of the
--- runtime and is compiled into every program
-fn find_wrappers_dir(input_dir: string) -> string {
-    -- Strategy 1: Go up from input file dir
-    let try5 = input_dir + "/../stage5/runtime"
-    if file_exists(try5 + "/llvm_wrappers.c") {
-        return try5
-    }
-
-    -- Strategy 2: Relative (assume running from stage5/ or a sibling dir)
-    if file_exists("../stage5/runtime/llvm_wrappers.c") {
-        return "../stage5/runtime"
-    }
-    if file_exists("runtime/llvm_wrappers.c") {
-        return "runtime"
-    }
-
-    -- Strategy 3: From project root
-    if file_exists("stage5/runtime/llvm_wrappers.c") {
-        return "stage5/runtime"
-    }
-
-    -- Fallback
-    return "runtime"
-}
-
 -- Find llvm_bridge.c for self-compilation (--link-llvm)
 fn find_bridge_file(input_dir: string) -> string {
     -- Strategy 1: Same directory as input file
@@ -665,24 +639,14 @@ fn compile(cli: CLIArgs) -> int {
     -- Dispose LLVM resources before linking
     llvm_gen_dispose(lg)
 
-    -- Find the wrapper source
-    let input_dir = dirname(input_file)
-    let wrappers_c = find_wrappers_dir(input_dir) + "/llvm_wrappers.c"
-
     -- Build the link command
-    -- cc -o <output> <obj> [<runtime.o>] <wrappers.c> -lm -lpthread
+    -- cc -o <output> <obj> [<runtime.o>] -lm -lpthread
+    let input_dir = dirname(input_file)
     let mut link_cmd = "cc"
     link_cmd = link_cmd + " -o " + output_file
     link_cmd = link_cmd + " " + obj_file
     if runtime_obj != "" {
         link_cmd = link_cmd + " " + runtime_obj
-    }
-
-    -- Add the wrapper source (compiled by this command)
-    if file_exists(wrappers_c) {
-        link_cmd = link_cmd + " " + wrappers_c
-    } else {
-        eprintln("Warning: LLVM wrappers not found at " + wrappers_c)
     }
 
     -- Link system libraries

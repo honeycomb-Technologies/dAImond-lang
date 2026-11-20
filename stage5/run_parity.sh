@@ -30,15 +30,13 @@ cd "$ROOT/stage0"
 ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
 gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
 gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
-gcc -c ../stage5/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
 gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
-gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o -o "$STAGE5_BIN" -lm -lpthread $(llvm-config --libs --ldflags)
+gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/daimond_runtime.o -o "$STAGE5_BIN" -lm -lpthread $(llvm-config --libs --ldflags)
 
 echo "==> Building Stage 5 parity harness"
 (cd "$ROOT/stage5" && "$ZIG" build)
 
 echo "==> Running Stage 5 integration tests (compiler: $STAGE5_BIN)"
-# Must run from stage5/ so the compiler finds the C runtime/wrappers.
 cd "$ROOT/stage5"
 set +e
 ./zig-out/bin/test-integration 2>&1 | tee /tmp/stage5_parity.log

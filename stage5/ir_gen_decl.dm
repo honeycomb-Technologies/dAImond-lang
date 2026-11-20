@@ -294,6 +294,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_system", "string", "i64")
     g = declare_extern0(g, "dm_args_len", "i64")
     g = declare_extern(g, "dm_args_get", "i64", "string")
+    g = declare_extern0(g, "dm_start", "void")
     g = declare_extern0(g, "dm_mem_mark", "i64")
     g = declare_extern(g, "dm_mem_sweep", "i64", "void")
 
@@ -641,6 +642,18 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     -- Create entry block
     let entry_label = "entry"
     let mut blk = ir_block_new(entry_label)
+
+    -- A program begins by letting the runtime prepare the process
+    if name == "main" {
+        let mut start_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+        start_inst.callee = "dm_start"
+        let no_args: List[IRValue] = []
+        start_inst.call_args = no_args
+        start_inst.result_type = "void"
+        start_inst.has_result = false
+        blk.instructions.push(start_inst)
+        g.builder.next_id = g.builder.next_id + 1
+    }
 
     -- Set up parameters
     i = 0

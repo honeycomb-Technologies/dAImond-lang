@@ -179,8 +179,7 @@ dAImond-lang/
 │   │   ├── map.dm             # Map[K, V] written in dAImond (embedded via prelude.dm)
 │   │   ├── os.dm              # Files, directories, environment, arguments and system() written in dAImond (embedded via prelude.dm)
 │   │   ├── path.dm            # Path functions written in dAImond (embedded via prelude.dm)
-│   │   ├── io.dm              # Console output, keys, the terminal's size and panic written in dAImond (embedded via prelude.dm)
-│   │   └── llvm_wrappers.c    # The C left of the runtime: the start-up stack-size increase
+│   │   └── io.dm              # Console output, keys, the terminal's size and panic written in dAImond (embedded via prelude.dm)
 │   └── gen_bootstrap.sh       # Concatenates modules into main.dm
 ├── docs/                      # Design documents
 │   ├── ir-spec.md             # dAImond IR specification (SSA-based, typed)
@@ -430,7 +429,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 323/323 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig) and its link step still runs `cc` (18 lines of runtime C and the LLVM bridge)
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 324/324 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig), and building itself still compiles the LLVM bridge with `cc`. Programs it builds contain no C; `cc` only links them
 
 ## Current Status
 
@@ -503,11 +502,11 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 
 ### Stage 5 LLVM Backend in dAImond -- In Progress
 - [x] Entire LLVM backend written in dAImond (~22K lines monolithic, ~15 split modules)
-- [x] Passes the integration suite (323/323) and 19/19 memory-safety probes
+- [x] Passes the integration suite (324/324) and 19/19 memory-safety probes
 - [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
 - [x] LLVM-C bridge via extern FFI (llvm_bridge.c)
 - [x] Error detection: unterminated strings, syntax errors, undefined functions and variables, effect enforcement, untyped expressions reported at their source line
-- [x] Self-hosting: Stage 5 compiles itself; the self-built compiler emits byte-identical LLVM IR for its own source and passes 323/323
+- [x] Self-hosting: Stage 5 compiles itself; the self-built compiler emits byte-identical LLVM IR for its own source and passes 324/324
 - [ ] Bootstrap without Stage 0 (Zig) or C
 - [x] Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1)
 - [x] Runtime primitives: raw memory loads and stores, `addr_of`, `size_of`, string internals, `symbol_addr`, C-width integer types and variadic `extern fn`
@@ -519,11 +518,12 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] The dAImond runtime is optimized at every `-O` level: `-O0` builds link a precompiled, optimized runtime object that the compiler builds once and caches (`~/.cache/daimond`, or `$DAIMOND_CACHE_DIR`)
 - [x] Terminal and time builtins in dAImond: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms`, `sleep_ms`; `examples/snake.dm` and `examples/breakout` build with Stage 5
 - [x] Programs no longer link `stage0/runtime/daimond_runtime.c`
-- [ ] The last runtime C (the start-up stack-size increase in `llvm_wrappers.c`), then linking with `ld.lld` instead of `cc`
+- [x] No C in the runtime: the start-up stack-size increase is dAImond code that `main` calls, and `llvm_wrappers.c` is deleted
+- [ ] Linking with `ld.lld` instead of `cc`
 
 ### Upcoming
 - [ ] Debug info (DWARF) in Stage 5
-- [ ] Stage 5 runtime, wrappers and LLVM bridge rewritten in dAImond (no C)
+- [ ] Stage 5's LLVM bridge rewritten in dAImond (the last C)
 
 ## Design Principles
 

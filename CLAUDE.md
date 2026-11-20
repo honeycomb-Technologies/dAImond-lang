@@ -4,7 +4,7 @@
 
 dAImond is a systems programming language designed to be the fastest compiled language, the most AI-generatable language, self-compiling, memory-safe without garbage collection (region-based with full inference), and fully Turing-complete at compile time.
 
-The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, but its first build still comes from Stage 0 (Zig), and its link step still runs `cc`, which compiles the 18 lines of C left of the runtime (`llvm_wrappers.c`) and, for the compiler itself, the LLVM bridge.
+The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, but its first build still comes from Stage 0 (Zig), and when it builds itself it still compiles the LLVM bridge (`llvm_bridge.c`) with `cc`. Programs it builds contain no C: their runtime is dAImond code, and `cc` only links them.
 
 ## Repository Structure
 
@@ -107,10 +107,9 @@ dAImond-lang/
 │   │   ├── convert.dm         # int/float/bool to string, chr, parse_int, parse_float, written in dAImond
 │   │   ├── list.dm            # List[T]: push, pop, contains and the for-in read, written in dAImond
 │   │   ├── map.dm             # Map[K, V], written in dAImond, compiled into every program
-│   │   ├── os.dm              # Files, directories, environment, arguments, system() and time, written in dAImond
+│   │   ├── os.dm              # Files, directories, environment, arguments, system(), time and program start, written in dAImond
 │   │   ├── path.dm            # path_dirname, path_basename, path_extension, path_stem, path_join, written in dAImond
-│   │   ├── io.dm              # Console output, flush, read_line, read_key, the terminal's size and panic, written in dAImond
-│   │   └── llvm_wrappers.c    # The C left of the runtime: the start-up stack-size increase
+│   │   └── io.dm              # Console output, flush, read_line, read_key, the terminal's size and panic, written in dAImond
 │   ├── build.zig          # Builds the integration test harness
 │   ├── tests/
 │   │   └── runner.zig     # Runs Stage 0's test cases, plus Stage 5-only ones, against the Stage 5 binary
@@ -199,16 +198,15 @@ Stage 3 is frozen. See `docs/stage-history.md` for build commands.
 
 ### Stage 5 (LLVM Backend in dAImond)
 
-Stage 5 is compiled by Stage 0. It requires **LLVM 17+** development libraries and the C runtime.
+Stage 5 is compiled by Stage 0. Building it requires **LLVM 17+** development libraries and Stage 0's C runtime. Running it requires `cc`, which links the programs it builds.
 
 ```bash
 # Build Stage 5 compiler (Stage 0 compiles main.dm to C, then gcc produces binary)
 cd stage0 && ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
 gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
 gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
-gcc -c ../stage5/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
 gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
-gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o -o /tmp/stage5_bin -lm -lpthread $(llvm-config --libs --ldflags)
+gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/daimond_runtime.o -o /tmp/stage5_bin -lm -lpthread $(llvm-config --libs --ldflags)
 
 # Compile a dAImond program to native binary via Stage 5
 /tmp/stage5_bin <file.dm> -o output
@@ -228,7 +226,7 @@ cd stage5 && bash gen_bootstrap.sh
 # Compile Stage 5 with itself (--link-llvm links the LLVM bridge)
 cd stage5 && /tmp/stage5_bin main.dm -o /tmp/stage5_self --link-llvm
 
-# Run the integration suite against the Stage 5 binary (323 tests)
+# Run the integration suite against the Stage 5 binary (324 tests)
 bash stage5/run_parity.sh
 ```
 
@@ -300,7 +298,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 323/323 integration tests and compiles itself, but Stage 0 is still required for its first build.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 324/324 integration tests and compiles itself, but Stage 0 is still required for its first build.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -377,12 +375,12 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Stage 0 (Zig → C): Bootstrap compiler, 328/328 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): first built by Stage 0, 323/323 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 323/323. Programs it builds no longer link `stage0/runtime/daimond_runtime.c`; the link step still runs `cc`, which compiles `llvm_wrappers.c` (the start-up stack-size increase) and, for the compiler itself, the LLVM bridge. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+- Stage 5 (dAImond + LLVM): first built by Stage 0, 324/324 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 324/324. Programs it builds contain no C; `cc` only links them. When it builds itself (`--link-llvm`) it still compiles the LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
 - Debug info (DWARF) in Stage 3/4
-- Bootstrapping Stage 5 without Stage 0 (Zig) or C (the stack-size increase and the LLVM bridge in dAImond, and linking with `ld.lld` instead of `cc`)
+- Bootstrapping Stage 5 without Stage 0 (Zig) or C (the LLVM bridge in dAImond, and linking with `ld.lld` instead of `cc`)
 
 ## Documentation Maintenance
 
@@ -536,11 +534,12 @@ Stage 5 alone has the low-level features the runtime is being rewritten with (St
 The C runtime has been replaced, one function at a time, by dAImond code in `stage5/runtime/*.dm`, which `gen_bootstrap.sh` embeds in the compiler (`prelude.dm`) and the compiler adds to every program. Only Stage 5 parses these files, so they may use Stage 5-only features.
 
 - A dAImond function `rt_X` replaces the C runtime function `dm_X`: the compiler binds every call to `dm_X` to `rt_X` (see RUNTIME FUNCTIONS in `llvm_gen.dm`). `rt_X` must keep the signature `dm_X` is declared with in `ir_gen_decl.dm`, except that it takes an `int`, the address, where `dm_X` takes a pointer; a mismatch is a compile error.
-- To port a function: write `rt_X` in a runtime file, delete `llvm_dm_X` from `runtime/llvm_wrappers.c`, and run `gen_bootstrap.sh`. A new runtime file also needs a line in `gen_bootstrap.sh`.
-- Ported so far: `string_concat`, `string_eq`, `string_cmp`, `char_at`, `substr`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_trim`, `string_replace`, `string_to_upper`, `string_to_lower`, `string_split`, `is_alpha`, `is_digit`, `is_whitespace`, `is_alnum`, `char_to_string` (`runtime/string.dm`); `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float` (`runtime/convert.dm`); the list operations push, pop and contains for int, float, string and other elements, and the element read `for x in xs` makes (`runtime/list.dm`); `file_read`, `file_write`, `file_append`, `file_exists`, `fs_mkdir`, `fs_readdir`, `fs_remove`, `fs_rename`, `fs_getcwd`, `env_get`, `args_len`, `args_get`, `system` (`runtime/os.dm`); `path_dirname`, `path_basename`, `path_extension`, `path_stem`, `path_join` (`runtime/path.dm`); `print`, `println`, `eprint`, `eprintln`, `flush`, `read_line`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `panic` (`runtime/io.dm`); `time_ms`, `sleep_ms` (`runtime/os.dm`); `chr` (`runtime/convert.dm`); `mem_mark`, `mem_sweep` (`runtime/string.dm`). Still C in `llvm_wrappers.c`: the start-up stack-size increase, and nothing else. A program no longer links `stage0/runtime/daimond_runtime.c`. Floats go through libc's `snprintf("%g")` and `strtod`; integers are formatted and parsed in dAImond.
+- To add a runtime function: declare `dm_X` in `ir_gen_decl.dm`, write `rt_X` in a runtime file, and run `gen_bootstrap.sh`. A new runtime file also needs a line in `gen_bootstrap.sh`. A `dm_X` with no `rt_X` fails to link.
+- The runtime's functions: `string_concat`, `string_eq`, `string_cmp`, `char_at`, `substr`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_trim`, `string_replace`, `string_to_upper`, `string_to_lower`, `string_split`, `is_alpha`, `is_digit`, `is_whitespace`, `is_alnum`, `char_to_string` (`runtime/string.dm`); `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float` (`runtime/convert.dm`); the list operations push, pop and contains for int, float, string and other elements, and the element read `for x in xs` makes (`runtime/list.dm`); `file_read`, `file_write`, `file_append`, `file_exists`, `fs_mkdir`, `fs_readdir`, `fs_remove`, `fs_rename`, `fs_getcwd`, `env_get`, `args_len`, `args_get`, `system` (`runtime/os.dm`); `path_dirname`, `path_basename`, `path_extension`, `path_stem`, `path_join` (`runtime/path.dm`); `print`, `println`, `eprint`, `eprintln`, `flush`, `read_line`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `panic` (`runtime/io.dm`); `time_ms`, `sleep_ms` (`runtime/os.dm`); `chr` (`runtime/convert.dm`); `mem_mark`, `mem_sweep` (`runtime/string.dm`). No C is left: `llvm_wrappers.c` is deleted, and a program does not link `stage0/runtime/daimond_runtime.c`. Floats go through libc's `snprintf("%g")` and `strtod`; integers are formatted and parsed in dAImond.
 - A list is `{ data, len, capacity }` and is passed to the runtime as the address of that header.
 - Inline, with no function behind them: `len(s)`, string literals, `xs.len()`, the creation of an empty list, `xs[i]` and `xs[i] = v` (one bounds check, then a load or store at the element's address), and the overflow and range checks on signed arithmetic and narrowing casts (`dm_checked_*`, `dm_cast_check_*`), which lower to LLVM's overflow intrinsics and a branch to a panic block.
 - **Console**: output and `read_line` go through libc's `stdout`, `stderr` and `stdin` streams, reached with `symbol_addr`, so they keep their order with C code that uses the same streams. `read_line` gives a whole line however long it is (Stage 0 cuts a line at 4095 bytes).
+- **Program start**: `main` begins with a call of `dm_start` (`rt_start` in `runtime/os.dm`), which raises the limit on the stack's size to 64 MB where it is lower, or to the highest value allowed when that is below 64 MB. A C constructor did this before `main`. The stack of a running program grows up to the limit in force, so the raise takes effect at once.
 - **Terminal and time**: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms` and `sleep_ms` are builtins in Stage 5 as in Stage 0, so `examples/snake.dm` and `examples/breakout` build. `read_key` and `read_key_nb` read libc's `stdin` stream, so they see what `read_line` left in its buffer. `read_key_nb` asks `poll` about file descriptor 0, as the C did: bytes already in the stream's buffer are not seen until the descriptor has more. `sleep_ms` with a negative time does not wait. `mem_mark()` is 0 and `mem_sweep` does nothing, as in Stage 0.
 - **OS constants**: `TIOCGWINSZ` (21523), `CLOCK_MONOTONIC` (1), `POLLIN` (1) and the layouts of `struct winsize`, `struct pollfd` and `struct timespec` are those of x86-64 Linux.
 - **Panics**: `dm_panic` (`rt_panic` in `runtime/io.dm`) writes `PANIC: <message>` to stderr and exits with code 1, as Stage 0 does. Messages passed to it, by the compiler's checks or by runtime code, do not include the prefix.
@@ -622,7 +621,7 @@ runtime/string.dm  — Strings: rt_string_concat, rt_string_eq, rt_string_cmp, r
 runtime/convert.dm — Conversions: rt_int_to_string, rt_float_to_string, rt_bool_to_string, rt_chr, rt_parse_int, rt_parse_float
 runtime/list.dm    — Lists: rt_list_int64_*, rt_list_double_*, rt_list_string_*, rt_list_generic_*
 runtime/map.dm     — Map[K, V] as a generic struct (hash table over List fields)
-runtime/os.dm      — Files, directories, environment, arguments, processes: rt_file_*, rt_fs_*, rt_os_getenv, rt_args_len, rt_args_get, rt_system, rt_time_ms, rt_sleep_ms
+runtime/os.dm      — Files, directories, environment, arguments, processes: rt_file_*, rt_fs_*, rt_os_getenv, rt_args_len, rt_args_get, rt_system, rt_time_ms, rt_sleep_ms, rt_start
 runtime/path.dm    — Paths: rt_path_dirname, rt_path_basename, rt_path_extension, rt_path_stem, rt_path_join
 runtime/io.dm      — Console: rt_print, rt_println, rt_eprint, rt_eprintln, rt_flush, rt_read_line, rt_read_key, rt_read_key_nb, rt_term_width, rt_term_height, rt_panic
 main_split.dm      — Entry point with imports (for modular development)
@@ -644,9 +643,8 @@ cd stage0 && ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
 # Compile C output + LLVM bridge + runtime to binary
 gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
 gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
-gcc -c ../stage5/runtime/llvm_wrappers.c -o /tmp/llvm_wrappers.o -I runtime
 gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
-gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/llvm_wrappers.o /tmp/daimond_runtime.o \
+gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/daimond_runtime.o \
     -o /tmp/stage5_bin -lm -lpthread $(llvm-config --libs --ldflags)
 
 # Stage 5 compiles a test program
@@ -661,7 +659,7 @@ cd stage5 && bash gen_bootstrap.sh
 Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
 stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
 Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
-stage5_bin compiles test programs                 → native binaries (323/323 tests pass)
+stage5_bin compiles test programs                 → native binaries (324/324 tests pass)
 stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓)
 ```
 

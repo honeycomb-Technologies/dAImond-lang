@@ -4,9 +4,6 @@
 //! the Stage 5 LLVM compiler binary instead of the Stage 0 compiler.
 //! The compiler path is read from the DAIMOND_STAGE5_BIN environment
 //! variable, defaulting to "/tmp/stage5_bin" (see run_parity.sh).
-//!
-//! Run from the stage5/ directory so the Stage 5 compiler can locate
-//! the C runtime and LLVM wrappers via its relative-path strategies.
 
 const std = @import("std");
 const stage0_runner = @import("stage0_runner");
@@ -393,6 +390,48 @@ const stage5_symbol_tests = [_]TestCase{
     },
 };
 
+/// A program starts by raising the limit on its stack's size to 64 MB.
+/// Stage 0 leaves the limit as it is.
+const stage5_start_tests = [_]TestCase{
+    .{
+        .name = "stack_limit_is_raised",
+        .source =
+            \\module test
+            \\
+            \\extern fn getrlimit(resource: i32, limit: int) -> i32
+            \\
+            \\struct Limit {
+            \\    current: int,
+            \\    highest: int
+            \\}
+            \\
+            \\-- Neither a loop nor a tail call: each level keeps its n for after
+            \\-- the call
+            \\fn depth(n: int) -> int {
+            \\    if n == 0 {
+            \\        return 1
+            \\    }
+            \\    return (depth(n - 1) * 31 + n) % 1000003
+            \\}
+            \\
+            \\fn main() {
+            \\    -- The limit on the stack's size is at least 64 MB, or there is
+            \\    -- none, or it is as high as it may be raised
+            \\    unsafe {
+            \\        let mut limit = Limit { current: 0, highest: 0 }
+            \\        let result = getrlimit(3, addr_of(limit))
+            \\        let mb = 1024 * 1024
+            \\        println(int_to_string(result as int) + " " + bool_to_string(limit.current < 0 or limit.current >= 64 * mb or limit.current == limit.highest))
+            \\    }
+            \\    -- 100,000 levels need more than the 8 MB a program usually starts
+            \\    -- with
+            \\    println(int_to_string(depth(100000)))
+            \\}
+        ,
+        .expected_output = "0 true\n119784\n",
+    },
+};
+
 /// Raw memory, C-width integers and variadic externs: the primitives
 /// the runtime is written with. Stage 0 has none of them.
 const stage5_primitive_tests = [_]TestCase{
@@ -759,6 +798,7 @@ pub fn main() !void {
         .{ .name = "Files (Stage 5)", .tests = &stage5_file_tests },
         .{ .name = "Console (Stage 5)", .tests = &stage5_console_tests },
         .{ .name = "C Symbol Names (Stage 5)", .tests = &stage5_symbol_tests },
+        .{ .name = "Program Start (Stage 5)", .tests = &stage5_start_tests },
         .{ .name = "Runtime Primitives", .tests = &stage5_primitive_tests },
     };
 
