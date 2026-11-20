@@ -1,9 +1,0 @@
-# Generated C files
-*.c
-
-# Compiled binaries and objects
-*.o
-*.out
-main
-stage1_compiler
-test_*

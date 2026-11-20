@@ -264,6 +264,13 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
     let mut g = gen
+    -- A lambda bound to a name may capture variables; the calls of that
+    -- name pass them. A name bound to anything else is not a lambda's.
+    let bound_value = *stmt.let_value
+    g.lambda_bound_by_let = bound_value.kind == EXPR_LAMBDA()
+    if g.lambda_bound_by_let == false and g.fn_ptr_vars.contains(stmt.let_name) {
+        g.fn_ptr_vars.remove(stmt.let_name)
+    }
     let mut b = block
     let var_name = stmt.let_name
     let mut type_str = stmt.let_type
@@ -1839,5 +1846,4 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
 -- ============================================================
 -- EXPRESSION IR GENERATION
 -- Main dispatcher and all expression kind handlers
--- Port of stage3/src/ir_gen.zig generateExpr
 -- ============================================================

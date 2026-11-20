@@ -4,9 +4,9 @@
         {
             "label": "Build dAImond Program (debug)",
             "type": "shell",
-            "command": "${workspaceFolder}/stage0/zig-out/bin/daimond",
+            "command": "${workspaceFolder}/build/daimond",
             "args": [
-                "--debug",
+                "-g",
                 "${input:sourceFile}",
                 "-o",
                 "${workspaceFolder}/${input:programName}"

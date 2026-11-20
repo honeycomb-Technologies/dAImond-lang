@@ -1,5 +1,6 @@
 #!/bin/bash
-# Concatenate Stage 5 modules into a single main.dm for bootstrap compilation
+# Concatenate the compiler's modules into a single main.dm, which is what
+# bootstrap.sh compiles
 # Usage: cd stage5 && bash gen_bootstrap.sh
 
 set -e
@@ -17,7 +18,7 @@ RUNTIME_SOURCES="runtime/string.dm runtime/convert.dm runtime/list.dm runtime/ma
 
 # Identifies this compiler's source. It names the precompiled runtime
 # object in the cache, so a changed compiler builds its own.
-BUILD_ID=$(cat $MODULES main_split.dm $RUNTIME_SOURCES llvm_bridge.c llvm_bridge.dm | sha256sum | cut -c1-16)
+BUILD_ID=$(cat $MODULES main_split.dm $RUNTIME_SOURCES llvm_bridge.dm | sha256sum | cut -c1-16)
 
 {
     echo "module prelude"

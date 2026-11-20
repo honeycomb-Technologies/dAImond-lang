@@ -9,7 +9,6 @@ import ir_gen
 -- Compile-Time Expression Evaluation
 -- Evaluates expressions at compile time, producing IRValues
 -- directly without emitting IR instructions.
--- Port of stage3/src/ir_gen.zig comptime evaluation logic.
 -- ============================================================
 
 -- Maximum recursion depth for comptime function calls

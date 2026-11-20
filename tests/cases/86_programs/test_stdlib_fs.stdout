@@ -1,0 +1,9 @@
+mkdir: PASS
+write+read: PASS
+exists: PASS
+readdir: PASS
+rename: PASS
+getcwd: PASS
+env_get: PASS
+cleanup: PASS
+All stdlib fs tests passed!

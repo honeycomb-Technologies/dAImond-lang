@@ -20,10 +20,10 @@ if ! command -v hyperfine &>/dev/null; then
 fi
 
 # Check for dAImond compiler
-DAIMOND="$ROOT/stage0/zig-out/bin/daimond"
+DAIMOND="${DAIMOND:-$ROOT/build/daimond}"
 if [ ! -f "$DAIMOND" ]; then
     echo "Building dAImond compiler..."
-    (cd "$ROOT/stage0" && zig build)
+    bash "$ROOT/bootstrap.sh"
 fi
 
 # Build command list dynamically based on available tools

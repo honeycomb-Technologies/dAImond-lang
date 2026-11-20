@@ -386,11 +386,6 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
 }
 
 -- ============================================================
--- AST Node Definitions for dAImond Stage 4
--- Uses integer kind tags (not tagged unions) following Stage 1 pattern
--- ============================================================
-
--- ============================================================
 -- EXPRESSION KINDS
 -- ============================================================
 

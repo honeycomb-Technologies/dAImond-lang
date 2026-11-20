@@ -7,7 +7,6 @@ import ir_builder
 -- ============================================================
 -- IR Generator Core
 -- Central struct and initialization, type mapping
--- Port of stage3/src/ir_gen.zig IRGenerator struct
 -- ============================================================
 
 -- Struct info for tracking registered structs
@@ -122,6 +121,9 @@ struct IRGenerator {
     fn_ptr_vars: Map[string, string],
     -- Lambda name -> pipe-delimited capture list
     lambda_captures: Map[string, string],
+    -- True while the value of a `let` that is a lambda is generated:
+    -- the one place a lambda that captures variables may be written
+    lambda_bound_by_let: bool,
     -- Method name -> struct type name
     method_struct_map: Map[string, string],
     -- The functions of impl blocks that take no self, by mangled name
@@ -237,6 +239,7 @@ fn ir_generator_new() -> IRGenerator {
         type_substitutions: Map_new(),
         fn_ptr_vars: Map_new(),
         lambda_captures: Map_new(),
+        lambda_bound_by_let: false,
         method_struct_map: Map_new(),
         static_fns: Map_new(),
         var_struct_types: Map_new(),
@@ -590,7 +593,7 @@ fn classify_list_elem(elem_type: string) -> int {
 -- walk, where variable types, struct definitions, and the
 -- extern registry already live. A violation prints a
 -- source-located diagnostic and exits before LLVM emission.
--- Mirrors stage0/src/checker.zig (inferCast, unsafe fence
+-- The rules of the Zig compiler's checker (inferCast, unsafe fence
 -- provenance, REGION ESCAPE RULE).
 -- ============================================================
 

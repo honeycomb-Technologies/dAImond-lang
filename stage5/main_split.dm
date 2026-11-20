@@ -19,11 +19,9 @@ import llvm_gen_simd
 import prelude
 
 -- ============================================================
--- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
+-- The dAImond compiler
 --
 -- Compiles dAImond source to native binaries via LLVM.
--- Uses its own frontend (lexer.dm, parser.dm) instead of
--- reusing Stage 0's Zig frontend.
 --
 -- Pipeline:
 --   Source (.dm) -> Lexer -> Tokens -> Parser -> AST
@@ -342,8 +340,7 @@ fn parse_llvm_bridge(path: string, file: int) -> SourceFile {
 }
 
 -- Add the LLVM bridge to the compiler's declarations. The compiler
--- declares each bridge function as an extern fn (llvm.dm), which is
--- what the compiler built by Stage 0 calls in llvm_bridge.c. Here the
+-- declares each bridge function as an extern fn (llvm.dm). The
 -- bridge's own function of that name takes the declaration's place.
 fn add_llvm_bridge(sf: SourceFile, bridge_sf: SourceFile) -> SourceFile {
     let mut defined: Map[string, bool] = Map_new()
@@ -544,6 +541,46 @@ fn resolve_import_path(import_path: string, base_dir: string) -> string {
     return result + ".dm"
 }
 
+extern fn compiler_realpath(path: string, resolved: int) -> int = "realpath"
+extern fn compiler_strlen(s: int) -> int = "strlen"
+
+-- The directory the running compiler is in, or "" when it can't be found
+fn compiler_dir() -> string {
+    unsafe {
+        -- Given no buffer, realpath allocates one of the size it needs
+        let exe = compiler_realpath("/proc/self/exe", 0)
+        if exe == 0 {
+            return ""
+        }
+        let n = compiler_strlen(exe)
+        return dirname(string_from_raw(exe, n, n + 1))
+    }
+}
+
+-- The file of the standard library module `import std.<module>` names,
+-- or "" when there is none. The library is the directory
+-- $DAIMOND_STDLIB, else stdlib/ beside the compiler's directory (the
+-- compiler is build/daimond in a checkout), else stdlib/ in the
+-- compiler's directory, else stdlib/ in the current directory.
+fn stdlib_file(module_path: string) -> string {
+    let chosen = env_get("DAIMOND_STDLIB")
+    if chosen != "" {
+        let in_chosen = resolve_import_path(module_path, chosen)
+        if file_exists(in_chosen) { return in_chosen }
+        return ""
+    }
+    let beside = compiler_dir()
+    if beside != "" {
+        let in_checkout = resolve_import_path(module_path, beside + "/../stdlib")
+        if file_exists(in_checkout) { return in_checkout }
+        let in_compiler_dir = resolve_import_path(module_path, beside + "/stdlib")
+        if file_exists(in_compiler_dir) { return in_compiler_dir }
+    }
+    let in_current = resolve_import_path(module_path, "stdlib")
+    if file_exists(in_current) { return in_current }
+    return ""
+}
+
 -- The files imported so far and their declarations. It is passed to
 -- process_import and returned by it, so that a file imported by two
 -- files is known to both. `loaded` begins with the file being
@@ -557,7 +594,15 @@ struct Imports {
 fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: bool) -> Imports {
     let mut state = imports
 
-    let file_path = resolve_import_path(imp.path, base_dir)
+    -- An import names a file next to the importing file. `std.<module>`
+    -- with no such file is a module of the standard library.
+    let mut file_path = resolve_import_path(imp.path, base_dir)
+    if starts_with(imp.path, "std.") and file_exists(file_path) == false {
+        let in_stdlib = stdlib_file(substr(imp.path, 4, len(imp.path) - 4))
+        if in_stdlib != "" {
+            file_path = in_stdlib
+        }
+    }
 
     -- A file is loaded once, however many files import it
     let mut li = 1
@@ -576,7 +621,11 @@ fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: 
 
     -- Check if file exists
     if file_exists(file_path) == false {
-        eprintln("Error: import file not found: " + file_path)
+        if starts_with(imp.path, "std.") {
+            eprintln("Error: import file not found: " + file_path + ", and the standard library has no module '" + imp.path + "' (set DAIMOND_STDLIB to the library's directory)")
+        } else {
+            eprintln("Error: import file not found: " + file_path)
+        }
         exit(1)
     }
 
@@ -1488,54 +1537,6 @@ fn builtin_required_effect(name: string) -> string {
     return ""
 }
 
-fn collect_call_names_from_expr(e: Expr) -> List[string] {
-    let mut names: List[string] = []
-    if e.kind == EXPR_FUNCTION_CALL() {
-        let callee_expr = *e.callee
-        if len(callee_expr.name) > 0 {
-            names.push(callee_expr.name)
-        }
-    }
-    return names
-}
-
-fn collect_call_names_from_stmts(stmts: List[Stmt]) -> List[string] {
-    let mut names: List[string] = []
-    let mut i = 0
-    while i < stmts.len() {
-        let s = stmts[i]
-        if s.kind == STMT_EXPRESSION() {
-            let e = *s.expr
-            let sub = collect_call_names_from_expr(e)
-            let mut j = 0
-            while j < sub.len() {
-                names.push(sub[j])
-                j = j + 1
-            }
-        } else if s.kind == STMT_RETURN() {
-            if s.has_ret_value {
-                let e = *s.ret_value
-                let sub = collect_call_names_from_expr(e)
-                let mut j = 0
-                while j < sub.len() {
-                    names.push(sub[j])
-                    j = j + 1
-                }
-            }
-        } else if s.kind == STMT_LET() {
-            let e = *s.let_value
-            let sub = collect_call_names_from_expr(e)
-            let mut j = 0
-            while j < sub.len() {
-                names.push(sub[j])
-                j = j + 1
-            }
-        }
-        i = i + 1
-    }
-    return names
-}
-
 fn list_contains_str(lst: List[string], val: string) -> bool {
     let mut i = 0
     while i < lst.len() {
@@ -1545,6 +1546,44 @@ fn list_contains_str(lst: List[string], val: string) -> bool {
     return false
 }
 
+-- An error for each call in the function's body that needs an effect
+-- the function does not declare, added to `found`. A function that
+-- declares no effects is not checked. The calls are the ones made by
+-- name, at any depth of the body: a builtin needs its effect, and a
+-- function needs the effects it declares (fn_effects). Calls of methods
+-- and calls through a function value are not checked.
+fn function_effect_errors(fd: FunctionDecl, fn_effects: Map[string, List[string]], found: List[string]) -> List[string] {
+    let mut errors = found
+    if fd.effects.len() == 0 {
+        return errors
+    }
+    let call_names = stmts_calls(fd.body)
+    let mut ci = 0
+    while ci < call_names.len() {
+        let callee = call_names[ci]
+        let req = builtin_required_effect(callee)
+        if len(req) > 0 {
+            if list_contains_str(fd.effects, req) == false {
+                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
+            }
+        }
+        if fn_effects.contains(callee) {
+            let callee_effects = fn_effects.get(callee)
+            let mut ei = 0
+            while ei < callee_effects.len() {
+                let eff = callee_effects[ei]
+                if list_contains_str(fd.effects, eff) == false {
+                    errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
+                }
+                ei = ei + 1
+            }
+        }
+        ci = ci + 1
+    }
+    return errors
+}
+
+-- The effect errors of every function and method in the file
 fn validate_effects(sf: SourceFile) -> List[string] {
     let mut errors: List[string] = []
     -- Build map: function name -> declared effects
@@ -1561,39 +1600,17 @@ fn validate_effects(sf: SourceFile) -> List[string] {
         i = i + 1
     }
 
-    -- For each function with effects, check its calls
     i = 0
     while i < sf.declarations.len() {
         let decl = sf.declarations[i]
         if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            if fd.effects.len() > 0 {
-                let caller_effects = fd.effects
-                let call_names = collect_call_names_from_stmts(fd.body)
-                let mut ci = 0
-                while ci < call_names.len() {
-                    let callee = call_names[ci]
-                    -- Check builtin required effects
-                    let req = builtin_required_effect(callee)
-                    if len(req) > 0 {
-                        if list_contains_str(caller_effects, req) == false {
-                            errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
-                        }
-                    }
-                    -- Check callee's declared effects are subset of caller's
-                    if fn_effects.contains(callee) {
-                        let callee_effects = fn_effects.get(callee)
-                        let mut ei = 0
-                        while ei < callee_effects.len() {
-                            let eff = callee_effects[ei]
-                            if list_contains_str(caller_effects, eff) == false {
-                                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
-                            }
-                            ei = ei + 1
-                        }
-                    }
-                    ci = ci + 1
-                }
+            errors = function_effect_errors(*decl.func_decl, fn_effects, errors)
+        } else if decl.kind == DECL_IMPL() {
+            let ib = *decl.impl_block
+            let mut mi = 0
+            while mi < ib.methods.len() {
+                errors = function_effect_errors(ib.methods[mi], fn_effects, errors)
+                mi = mi + 1
             }
         }
         i = i + 1

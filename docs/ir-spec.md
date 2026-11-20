@@ -2,7 +2,7 @@
 
 ## Overview
 
-The dAImond IR is an SSA-based, typed intermediate representation that sits between the AST and LLVM IR in the Stage 3 compiler pipeline:
+The dAImond IR is an SSA-based, typed intermediate representation that sits between the AST and LLVM IR in the compiler's pipeline:
 
 ```
 AST -> dAImond IR -> LLVM IR -> Machine Code

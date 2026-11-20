@@ -7,7 +7,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$(dirname "$SCRIPT_DIR")")"
-COMPILER="$ROOT_DIR/stage0/zig-out/bin/daimond"
+COMPILER="${DAIMOND:-$ROOT_DIR/build/daimond}"
 BUILD_DIR="$SCRIPT_DIR/build"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
@@ -28,7 +28,7 @@ echo ""
 HAS_DAIMOND=0; HAS_GCC=0; HAS_RUSTC=0; HAS_GO=0; HAS_ZIG=0; HAS_BUN=0; HAS_HYPERFINE=0
 
 echo -e "${CYAN}Checking tools...${NC}"
-[ -f "$COMPILER" ] && HAS_DAIMOND=1 && echo -e "  ${GREEN}[ok]${NC} daimond found" || echo -e "  ${YELLOW}[--]${NC} daimond not found (run: cd stage0 && zig build)"
+[ -f "$COMPILER" ] && HAS_DAIMOND=1 && echo -e "  ${GREEN}[ok]${NC} daimond found" || echo -e "  ${YELLOW}[--]${NC} daimond not found (run: bash bootstrap.sh)"
 command -v gcc &>/dev/null && HAS_GCC=1 && echo -e "  ${GREEN}[ok]${NC} gcc found" || echo -e "  ${YELLOW}[--]${NC} gcc not found"
 command -v rustc &>/dev/null && HAS_RUSTC=1 && echo -e "  ${GREEN}[ok]${NC} rustc found" || echo -e "  ${YELLOW}[--]${NC} rustc not found"
 command -v go &>/dev/null && HAS_GO=1 && echo -e "  ${GREEN}[ok]${NC} go found" || echo -e "  ${YELLOW}[--]${NC} go not found"

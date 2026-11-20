@@ -1,0 +1,4 @@
+simple_pipe=10
+pipe_with_arg=8
+chained_pipe=20
+string_pipe=HELLO

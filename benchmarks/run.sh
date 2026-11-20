@@ -7,7 +7,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-COMPILER="$ROOT_DIR/stage0/zig-out/bin/daimond"
+COMPILER="${DAIMOND:-$ROOT_DIR/build/daimond}"
 BUILD_DIR="$SCRIPT_DIR/build"
 CC="${CC:-cc}"
 CFLAGS="-O3 -lm"
@@ -23,7 +23,7 @@ NC='\033[0m'
 # Check compiler exists
 if [ ! -f "$COMPILER" ]; then
     echo -e "${YELLOW}Building dAImond compiler...${NC}"
-    (cd "$ROOT_DIR/stage0" && zig build)
+    bash "$ROOT_DIR/bootstrap.sh"
 fi
 
 mkdir -p "$BUILD_DIR"

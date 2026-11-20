@@ -6,7 +6,7 @@ A collection of benchmarks comparing dAImond's performance against C, Rust, Go, 
 
 Required:
 - **hyperfine** -- benchmark runner (`cargo install hyperfine`)
-- **dAImond** -- the dAImond compiler (build with `cd stage0 && zig build`)
+- **dAImond** -- the dAImond compiler (build with `bash bootstrap.sh`, or set `DAIMOND` to a compiler)
 
 Optional (benchmarks are skipped for missing compilers):
 - **gcc** -- C compiler
@@ -93,10 +93,10 @@ The **Relative** column shows how many times slower each command is compared to 
 
 These benchmarks aim to compare performance honestly, but there are inherent differences between languages that affect the comparison:
 
-- **String model**: dAImond and C use immutable reference-counted strings. Rust uses owned `String` / `&str`. Go uses immutable strings with GC. These differences affect string-heavy benchmarks.
+- **String model**: dAImond strings are immutable, and a concatenation allocates a new string that is never freed. The C versions manage their own buffers. Rust uses owned `String` / `&str`. Go uses immutable strings with GC. These differences affect string-heavy benchmarks.
 - **Memory management**: dAImond uses region-based allocation with arenas. C uses manual allocation. Rust uses ownership/borrowing. Go uses garbage collection. Zig uses explicit allocators. This affects allocation-heavy benchmarks.
 - **JavaScript concurrency**: Bun/Node.js does not have true shared-memory threads. The `parallel_fib` JS implementation runs sequentially and measures single-threaded computation only.
-- **Compiler maturity**: GCC, LLVM (Rust/Zig), and Go have decades of optimization work. dAImond's C backend inherits GCC/Clang optimizations for the generated C code.
+- **Compiler maturity**: GCC, LLVM (Rust/Zig), and Go have decades of optimization work. dAImond compiles through LLVM, so it gets LLVM's optimizations for the IR it generates.
 - **Integer sizes**: dAImond uses 64-bit integers by default. Some implementations in other languages may use different default sizes, though all benchmarks aim for 64-bit where possible.
 
 ## Directory Structure

@@ -4,7 +4,7 @@
 
 dAImond is a systems programming language designed to be the fastest compiled language, the most AI-generatable language, self-compiling, memory-safe without garbage collection (region-based with full inference), and fully Turing-complete at compile time.
 
-The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, and the compiler it builds contains no C: the LLVM bridge it uses is `llvm_bridge.dm`. It is built from a seed, `seed/daimond.bc` (the compiler as LLVM bitcode), by `bootstrap.sh`, with LLVM's tools and no Zig or C compiler. Its test harness is a dAImond program too (`tests/harness.dm`), so building and testing Stage 5 needs no Zig. Stage 0 (Zig) can still build it, emitting C and linking the C bridge `llvm_bridge.c`. Programs Stage 5 builds contain no C: their runtime is dAImond code, and the compiler links them with `ld.lld`.
+The repository contains one compiler, written in dAImond, in `stage5/`. The directory's name is historical: it was the fifth compiler stage, and the earlier ones are deleted (see History). It compiles itself, and what it builds contains no C: the runtime of every program (`stage5/runtime/*.dm`) and the compiler's bridge to LLVM (`llvm_bridge.dm`) are dAImond code. A new machine gets its first compiler from a seed, `seed/daimond.bc` (the compiler as LLVM bitcode), which `bootstrap.sh` turns into a compiler with LLVM's `llc` and `ld.lld`. Building needs no C compiler and no other language's toolchain. It needs LLVM and the C library, which the runtime calls.
 
 ## Repository Structure
 
@@ -13,48 +13,11 @@ dAImond-lang/
 ├── CLAUDE.md              # This file
 ├── README.md              # Project documentation and language overview
 ├── LICENSE                # MIT License
-├── bootstrap.sh           # Builds the compiler from the seed with llc and ld.lld (no Zig, no C compiler)
+├── bootstrap.sh           # Builds the compiler from the seed with llc and ld.lld
 ├── seed/
 │   ├── daimond.bc         # The compiler as LLVM bitcode (x86-64 Linux), written by bootstrap.sh --update-seed
 │   ├── BUILD_ID           # The build ID of the source the seed was made from
 │   └── README.md          # What the seed is and when to write it again
-├── stage0/                # Stage 0 bootstrap compiler (Zig)
-│   ├── build.zig          # Zig build configuration
-│   ├── .mise.toml         # Tool version pinning (Zig 0.13.0)
-│   ├── .gitignore         # Ignores .zig-cache/, zig-out/, generated *.c
-│   ├── src/               # Compiler source code
-│   │   ├── main.zig       # CLI entry point, option parsing, pipeline orchestration
-│   │   ├── lexer.zig      # Lexical analyzer (source text -> tokens)
-│   │   ├── parser.zig     # Recursive descent + Pratt parser (tokens -> AST)
-│   │   ├── ast.zig        # AST node type definitions
-│   │   ├── types.zig      # Type system, type interning, inference, effects
-│   │   ├── checker.zig    # Type checker, symbol tables, scope management, unification
-│   │   ├── codegen.zig    # C11 code generation from typed AST
-│   │   ├── errors.zig     # Diagnostic reporting, colored output, error codes
-│   │   ├── package.zig    # Package manager (TOML manifest, dependency resolution)
-│   │   ├── cache.zig      # Compilation cache (SHA-256 content hashing)
-│   │   └── lsp.zig        # Language Server Protocol implementation
-│   ├── runtime/           # C runtime library linked into compiled programs
-│   │   ├── daimond_runtime.h   # Runtime API (strings, arenas, option/result, I/O, sockets, threads)
-│   │   ├── daimond_runtime.c   # Runtime implementation
-│   │   └── test_runtime.c      # Runtime unit tests
-│   └── tests/
-│       └── runner.zig     # Integration test harness
-├── stage1/                # Stage 1 self-hosting compiler (dAImond)
-│   ├── main.dm            # Generated monolithic file (for Stage 0 bootstrap)
-│   ├── main_split.dm      # Entry point with imports (for Stage 1 self-compilation)
-│   ├── token.dm           # Token kind constants, Token struct, keyword_lookup
-│   ├── lexer.dm           # Lexer struct, tokenize, character helpers
-│   ├── compiler.dm        # Compiler struct, parser helpers, type mapping
-│   ├── compile_expr.dm    # Expression compiler chain, lambda, generics
-│   ├── compile_stmt.dm    # Statement compiler, type tracking/inference
-│   ├── compile_match.dm   # Match expressions and statements
-│   ├── compile_decl.dm    # Function/struct/enum/impl declarations, prescan
-│   ├── runtime.dm         # C runtime emission, output assembly
-│   ├── imports.dm         # Multi-file import resolver
-│   ├── package.dm         # Package manager (TOML manifest, pkg init/add/list)
-│   ├── gen_bootstrap.sh   # Concatenates modules into main.dm
-│   └── test_lexer.dm      # Lexer standalone test
 ├── stdlib/                # Standard library modules
 │   ├── io.dm              # I/O functions (print, file operations)
 │   ├── math.dm            # Math functions (sin, cos, sqrt, etc.)
@@ -69,25 +32,17 @@ dAImond-lang/
 │   ├── hello.dm           # Hello World
 │   ├── arithmetic.dm      # Basic math operations
 │   ├── fibonacci.dm       # Recursive functions
-│   └── calculator.dm      # Full scientific calculator demo
+│   ├── calculator.dm      # Full scientific calculator demo
+│   ├── snake.dm           # Snake, in the terminal
+│   └── breakout/          # Breakout, in the terminal, in four modules
+├── benchmarks/            # Benchmarks; some have versions in other languages to compare with
+├── proposals/             # Language features that are proposed and not implemented
+├── tools/                 # Editor and debugger helpers (VS Code tasks, gdb pretty-printers)
 ├── docs/                  # Design documents
 │   ├── ir-spec.md         # dAImond IR specification (SSA-based, typed)
-│   ├── llvm-backend.md    # Stage 3 LLVM backend architecture
-│   └── stage-history.md   # Archived Stage 1/3 documentation
-├── stage3/                # Stage 3 LLVM backend (Zig)
-│   ├── build.zig          # Zig build configuration (links LLVM-C)
-│   ├── src/               # LLVM backend source
-│   │   ├── main.zig       # CLI entry point, pipeline orchestration
-│   │   ├── ir.zig         # dAImond IR definitions (SSA types, instructions, builder)
-│   │   ├── ir_gen.zig     # IR generation from typed AST
-│   │   ├── llvm_gen.zig   # LLVM IR generation from dAImond IR
-│   │   └── llvm_bindings.zig  # Safe Zig wrappers for LLVM-C API
-│   ├── runtime/
-│   │   └── llvm_wrappers.c    # ABI wrappers for string-passing conventions
-│   └── tests/
-│       └── runner.zig         # Integration test harness (254 tests, mirrors Stage 0)
-├── stage5/                # Stage 5 LLVM backend (dAImond; built from the seed, or by Stage 0)
-│   ├── main.dm            # Monolithic bootstrap file (generated, ~22K lines)
+│   └── stage-history.md   # The deleted compilers (Stage 0, 1, 3 and 4) and how this one differs from them
+├── stage5/                # The compiler, written in dAImond
+│   ├── main.dm            # Generated: the modules as one file (~24K lines), which bootstrap.sh compiles
 │   ├── main_split.dm      # Entry point with imports (for modular development)
 │   ├── token.dm           # Token kinds, Token struct, keyword lookup
 │   ├── lexer.dm           # Lexer struct, tokenize, character helpers
@@ -106,7 +61,6 @@ dAImond-lang/
 │   ├── llvm_gen_call.dm   # LLVM call instruction generation
 │   ├── llvm_gen_simd.dm   # LLVM SIMD instruction generation
 │   ├── llvm_bridge.dm     # The LLVM bridge: the dm_llvm_* functions over LLVM's C API, added by --link-llvm
-│   ├── llvm_bridge.c      # The same functions in C, for the compiler Stage 0 builds
 │   ├── prelude.dm         # Generated by gen_bootstrap.sh: the runtime/*.dm files as a string, and the build ID
 │   ├── runtime/
 │   │   ├── string.dm          # Strings: concat, compare, substr, search, trim, replace, case and split, written in dAImond
@@ -133,153 +87,74 @@ dAImond-lang/
 │   └── test_client.dm     # A scripted editor, for the suite's language server cases
 └── tests/                 # Integration tests
     ├── harness.dm         # The test harness, written in dAImond: compiles and runs every case with a given compiler
-    ├── cases/             # The Stage 5 suite: one directory per suite, one X.dm per case with X.stdout, X.exit, X.stderr, X.args, X.errors or X.cmd
-    ├── arithmetic.dm      # Arithmetic validation
-    ├── structs.dm         # Struct/enum/pattern matching tests
-    ├── generics.dm        # Generic functions and traits tests
-    ├── test_nested_for.dm # Nested for-in loop validation (Stage 1)
-    ├── test_for_types.dm  # For-in with List[string]/List[struct] (Stage 1)
-    ├── test_compound_assign.dm # *=, /= operators (Stage 1)
-    ├── test_pipeline.dm   # Pipeline operator |> (Stage 1)
-    ├── test_try_operator.dm   # Error propagation ? (Stage 1)
-    ├── test_box.dm        # Box[T] support (Stage 1)
-    ├── test_builtins.dm   # All builtins (Stage 1)
-    └── test_mono_stress.dm # Generic monomorphization stress test (Stage 1)
+    └── cases/             # The suite: one directory per suite, one X.dm per case with X.stdout, X.exit, X.stderr, X.args, X.errors or X.cmd
 ```
 
 ## Compiler Pipeline
 
-Stage 0 (C backend):
 ```
-Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> Codegen -> C Code -> cc -> Binary
+Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Validation -> Effect Check -> IR Gen -> dAImond IR -> LLVM Gen (via the LLVM bridge) -> LLVM IR -> LLVM -> Object -> ld.lld -> Native Binary
 ```
-
-Stage 3 (LLVM backend, Zig):
-```
-Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Checker -> Typed AST -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR -> LLVM -> Native Binary
-```
-
-Stage 5 (LLVM backend, dAImond):
-```
-Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Validation -> Effect Check -> IR Gen -> dAImond IR -> LLVM Gen (via the LLVM bridge) -> LLVM IR -> LLVM -> Native Binary
-```
-
-Each Stage 0 stage maps to a source file: `lexer.zig` -> `parser.zig` -> `ast.zig`/`types.zig` -> `checker.zig` -> `codegen.zig`.
 
 ## Build Commands
 
-All build commands run from the `stage0/` directory. **Zig 0.13.0** is required (pinned in `.mise.toml`).
+The compiler is built from the seed by `bootstrap.sh`, or by a dAImond compiler you already have. It needs x86-64 Linux with glibc, LLVM 19 or newer with `lld` (LLVM 19 and LLVM 23 have been run), and the C library's development files (`Scrt1.o`, `crti.o`, `crtn.o`, `libc.so`). It needs no C compiler, to build programs or to build itself.
 
 ```bash
-# Build the compiler (produces zig-out/bin/daimond and zig-out/bin/daimond-lsp)
-cd stage0 && zig build
-
-# Run unit tests (all modules: lexer, parser, ast, types, checker, codegen, errors, package, lsp)
-cd stage0 && zig build test
-
-# Run integration tests (compiles and executes .dm test programs)
-cd stage0 && zig build test-integration
-
-# Run the compiler
-cd stage0 && ./zig-out/bin/daimond <file.dm>
-
-# Compile and run in one step
-cd stage0 && ./zig-out/bin/daimond run <file.dm>
-
-# Debug: show tokens
-cd stage0 && ./zig-out/bin/daimond lex <file.dm>
-
-# Debug: show AST
-cd stage0 && ./zig-out/bin/daimond parse <file.dm>
-
-# Type check only
-cd stage0 && ./zig-out/bin/daimond check <file.dm>
-
-# Format source code
-cd stage0 && ./zig-out/bin/daimond fmt <file.dm>
-
-# Run test functions (discovers fn test_*() in source)
-cd stage0 && ./zig-out/bin/daimond test <file.dm>
-
-# Package management
-cd stage0 && ./zig-out/bin/daimond pkg init          # Create daimond.toml
-cd stage0 && ./zig-out/bin/daimond pkg add <name>     # Add dependency
-cd stage0 && ./zig-out/bin/daimond pkg list           # List dependencies
-
-# Start LSP server (for IDE integration, communicates via JSON-RPC/stdio)
-cd stage0 && ./zig-out/bin/daimond-lsp
-```
-
-### Stage 3 (LLVM Backend — Archived)
-
-Stage 3 is frozen. See `docs/stage-history.md` for build commands.
-
-### Stage 5 (LLVM Backend in dAImond)
-
-Stage 5 is built from the seed by `bootstrap.sh`, or by Stage 0. Either way it needs LLVM 19 with `lld` (a newer LLVM should work, but only 19 has been tested), and the C library's development files (`Scrt1.o`, `crti.o`, `crtn.o`, `libc.so`). It needs no C compiler, to build programs or to build itself.
-
-```bash
-# Build the Stage 5 compiler from the seed: no Zig, no C compiler (about five minutes, 2 GB of memory)
+# Build the compiler from the seed (about five minutes, 2 GB of memory)
 bash bootstrap.sh                 # -> build/daimond
-bash bootstrap.sh -o /tmp/stage5_bin
+bash bootstrap.sh -o /tmp/daimond
 
 # After changing the compiler so that an older compiler can no longer build it: write the seed again
 cd stage5 && bash gen_bootstrap.sh && cd .. && bash bootstrap.sh --update-seed
 
-# Or build the Stage 5 compiler with Stage 0 (Stage 0 compiles main.dm to C, then gcc produces the binary)
-cd stage0 && ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
-gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
-gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
-gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
-gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/daimond_runtime.o -o /tmp/stage5_bin -lm -lpthread $(llvm-config --libs --ldflags)
-
-# Compile a dAImond program to native binary via Stage 5
-/tmp/stage5_bin <file.dm> -o output
+# Compile a dAImond program to a native binary
+build/daimond <file.dm> -o output
 
 # Compile with optimization
-/tmp/stage5_bin <file.dm> -o output -O2
+build/daimond <file.dm> -o output -O2
 
 # Emit dAImond IR (debugging)
-/tmp/stage5_bin <file.dm> --emit-ir
+build/daimond <file.dm> --emit-ir
 
 # Emit LLVM IR (debugging)
-/tmp/stage5_bin <file.dm> --emit-llvm
+build/daimond <file.dm> --emit-llvm
 
 # Emit LLVM bitcode, as it goes to code generation (<output>.bc)
-/tmp/stage5_bin <file.dm> --emit-bitcode -o output
+build/daimond <file.dm> --emit-bitcode -o output
 
 # Build with debug info, for gdb and lldb
-/tmp/stage5_bin <file.dm> -g -o output
+build/daimond <file.dm> -g -o output
 
 # Compile and run; the arguments after -- go to the program, and the exit code is the program's
-/tmp/stage5_bin run <file.dm> -- arg1 arg2
+build/daimond run <file.dm> -- arg1 arg2
 
 # Report the file's errors without building anything
-/tmp/stage5_bin check <file.dm>
+build/daimond check <file.dm>
 
 # Indent the file by its braces, in place (or into -o <file>)
-/tmp/stage5_bin fmt <file.dm>
+build/daimond fmt <file.dm>
 
 # Run each fn test_*() of the file in its own process and report PASS or FAIL
-/tmp/stage5_bin test <file.dm>
+build/daimond test <file.dm>
 
 # List the file's declarations, one per line, for editors
-/tmp/stage5_bin symbols <file.dm>
+build/daimond symbols <file.dm>
 
 # Build the language server; it runs the `daimond` next to it (or --compiler <path>, or $DAIMOND)
-/tmp/stage5_bin lsp/main.dm -o /tmp/daimond-lsp
+build/daimond lsp/main.dm -o build/daimond-lsp
 
 # check and symbols (and a plain compilation) can read the program from standard input;
 # the file name is then only its name, and where its imports are looked for
-/tmp/stage5_bin check <file.dm> --stdin < unsaved.dm
+build/daimond check <file.dm> --stdin < unsaved.dm
 
-# Regenerate monolithic main.dm from modules (also after editing runtime/*.dm, llvm_bridge.dm or llvm_bridge.c)
+# Regenerate main.dm and prelude.dm from the modules (also after editing runtime/*.dm or llvm_bridge.dm)
 cd stage5 && bash gen_bootstrap.sh
 
-# Compile Stage 5 with itself (--link-llvm adds llvm_bridge.dm and links libLLVM; no C compiler runs)
-cd stage5 && /tmp/stage5_bin main.dm -o /tmp/stage5_self --link-llvm
+# Compile the compiler with a compiler you already have (--link-llvm adds llvm_bridge.dm and links libLLVM)
+cd stage5 && ../build/daimond main.dm -o /tmp/daimond_new --link-llvm
 
-# Run the integration suite against a Stage 5 binary (438 cases, about a minute; needs no Zig)
+# Run the integration suite against a compiler (467 cases, about a minute)
 build/daimond tests/harness.dm -o build/harness
 build/harness build/daimond                              # every case in tests/cases
 build/harness build/daimond tests/cases 17_lists/        # only the cases whose "suite/name" contains the text
@@ -287,28 +162,13 @@ build/harness build/daimond tests/cases 17_lists/        # only the cases whose 
 
 ## Testing Strategy
 
-Stage 0 has two tiers of tests, and Stage 5 has its own suite:
+1. **The suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. A case with `X.cmd` runs that shell command instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 467 pass, 0 fail. The suite began as the cases of the Zig compiler's test runner. It also holds the 19 memory-safety probes (`74_memory_safety_probes`), and programs that were once loose files in `tests/`, with the README's examples (`86_programs`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory.
 
-1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
+2. **dAImond test framework** (`daimond test <file.dm>`): runs each `test_*` function of the file in its own process, so a panic ends only that test. Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results (stdout, the exit code and, where a case sets `expected_stderr`, stderr). It handles temporary file creation and cleanup. Currently 328 tests pass, 0 fail, 0 skipped.
-
-3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
-
-4. **Stage 5 suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. A case with `X.cmd` runs that shell command instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 438 pass, 0 fail. The suite holds the cases of Stage 0's runner as it was on 2026-11-20 (the two are separate copies now), the Stage 5-only cases, and the 19 memory-safety probes (`74_memory_safety_probes`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory. It also holds the 29 cases of five Stage 0 suites that Stage 5's Zig runner never ran (Constructors, Audit Fixes, Unified Len, Error Quality, Nested Lists); the error cases among them expect Stage 5's wording, not Stage 0's `Error[E0100]`.
-
-**Always run `zig build test` after modifying any Stage 0 source file.** Run `zig build test-integration` after changes that affect Stage 0's code generation or runtime behavior. **After changing Stage 5, run `build/harness` on the new compiler, and `bash bootstrap.sh` to check that it still reproduces itself.**
+**After changing the compiler, run `build/harness` on the new compiler, and `bash bootstrap.sh` to check that it still reproduces itself.** The suite is the record of what the compiler does: add a case for what you change.
 
 ## Code Conventions
-
-### Zig Style (compiler source)
-
-- **Naming**: `camelCase` for variables and functions, `PascalCase` for types and enums
-- **Documentation**: Module-level `//!` doc comments at top of each file; `///` for public declarations
-- **Error handling**: Zig error unions (`!`, `try`, `catch`); no panic in library code
-- **Memory**: All allocations go through `std.mem.Allocator` interface; arena allocators preferred
-- **Section headers**: Use `// ====...` comment bars to separate logical sections within files
-- **Imports**: Explicit field imports from modules (e.g., `const Lexer = @import("lexer.zig").Lexer`)
 
 ### dAImond Style (language source files)
 
@@ -323,129 +183,108 @@ Stage 0 has two tiers of tests, and Stage 5 has its own suite:
 - **Pipe operator**: `|>` for function chaining
 - **File extension**: `.dm`
 
-### AST Design Patterns
+### The Compiler's Source
 
-- Tagged unions (`union(enum)`) for all variant node types
-- Source locations tracked via `Span` (line, column, byte offset)
-- Pointer-based tree structure with allocator ownership
-- Type interning via `TypeId` (u32 indices) for efficient comparison
-
-### Type System
-
-- Hindley-Milner style type inference with unification
-- Generics via parametric polymorphism with `[T]` syntax
-- Traits and `impl` blocks (Rust-style)
-- Effect tracking with `EffectSet`
-- Built-in types: `int`, `float`, `bool`, `string`, `void`
-- Algebraic types: `struct`, `enum` (with variants), `Result[T, E]`, `Option[T]`, `Future[T]`
-
-## C Runtime Library
-
-Generated C code links against the runtime in `stage0/runtime/`. Key components:
-
-- **`dm_string`**: Immutable string type with optional capacity
-- **`dm_arena`**: Arena allocator for region-based memory management
-- **`DM_DEFINE_OPTION` / `DM_DEFINE_RESULT`**: Macro-based generic option/result types
-- **I/O**: `dm_print`, `dm_println`, `dm_read_line`, file operations
-- **Math**: `DM_PI`, `DM_E`, `DM_MIN`, `DM_MAX`, `DM_CLAMP`, `DM_ABS`
-- **Networking**: `dm_tcp_listen`, `dm_tcp_accept`, `dm_tcp_connect`, `dm_tcp_read`, `dm_tcp_write`, `dm_tcp_close` (BSD sockets)
-- **Threading**: `dm_thread_spawn`, `dm_thread_join`, `dm_mutex_new`, `dm_mutex_lock`, `dm_mutex_unlock` (pthreads)
-
-The runtime targets **C11** for portability. Networking requires POSIX sockets. Threading requires pthreads (`-lpthread`).
+- **Integer kind tags**: an AST or IR node is one struct with a `kind` and the fields of every kind (`fn EXPR_FUNCTION_CALL() -> int { return 40 }`). Check the kind before reading a `Box` field: dereferencing a null `Box` panics.
+- **State is passed and returned**: the generator structs (`IRGenerator`, `LLVMGenerator`, `Parser`) are values. A function takes one, changes its copy and returns it: `g = ir_type_error(g, ...)`, `let result = generate_expr(g, b, e)` then `g = result.gen`. A change to a copy that is not returned is lost.
+- **Errors**: a syntax error is `p_error(pp, "expected ... but got ...")`; an error found during IR generation is `g = ir_type_error(g, message, line)`, and the compilation fails after the function is generated.
+- **Section headers**: `-- ====...` comment bars separate the sections of a file.
+- **Types as strings**: a type is its name, in source form (`List[int]`) or IR form (`i64`, `string`, `ptr`); `map_type_name` goes from the first to the second.
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 438/438 integration cases, compiles itself, and is built from a committed seed (`bootstrap.sh`) without Stage 0.
+1. **One compiler, built from a seed**: the compiler is written in dAImond and has no other implementation. `seed/daimond.bc` is an earlier build of it as LLVM bitcode; `bootstrap.sh` turns it into a compiler with `llc` and `ld.lld`, compiles the source with it, and repeats until two generations are the same file.
 
-2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
+2. **LLVM as the backend**: the compiler generates its own SSA IR, then LLVM IR through LLVM's C API, and LLVM writes the object file. `ld.lld` links it with the C library's start-up objects.
 
-3. **No external dependencies**: The Zig compiler uses only the Zig standard library. No package manager or external packages.
+3. **No C**: the runtime is dAImond code that calls libc through `extern fn`, and the compiler calls LLVM's C API the same way. No C source is compiled when the compiler or a program is built.
 
-4. **Region-based memory**: No garbage collector. Memory safety via region inference and arena allocators.
+4. **No garbage collector**: memory is meant to be managed by regions. Today the compiler enforces that a region's values do not leave it, and the runtime frees nothing: strings and what a region allocates stay allocated until the program ends.
+
+5. **One target**: x86-64 Linux with glibc. The OS constants and struct layouts in `runtime/*.dm` and the seed are for that target.
 
 ## CLI Options Reference
 
 | Command / Flag | Description |
 |------|-------------|
-| `daimond <file.dm>` | Compile to executable |
-| `daimond run <file.dm>` | Compile and run |
-| `daimond build <file.dm>` | Compile to C only |
-| `daimond lex <file.dm>` | Show tokens |
-| `daimond parse <file.dm>` | Show AST |
-| `daimond check <file.dm>` | Type check only |
-| `daimond fmt <file.dm>` | Format source code |
-| `daimond test <file.dm>` | Run test_* functions |
-| `daimond pkg init` | Create daimond.toml manifest |
-| `daimond pkg add <name>` | Add a dependency |
-| `daimond pkg list` | List dependencies |
-| `daimond clean` | Remove compilation cache |
-| `-o <file>` | Output file path |
-| `-c` | Compile to C only (no binary) |
-| `--emit-c` | Emit C code alongside binary |
-| `--no-color` | Disable colored diagnostics |
-| `-O0` to `-O3` | Optimization level (passed to C compiler) |
+| `daimond <file.dm>` | Compile to an executable |
+| `daimond run <file.dm> [-- args]` | Compile and run; the exit code is the program's |
+| `daimond check <file.dm>` | Report the file's errors without building |
+| `daimond fmt <file.dm>` | Indent the file by its braces, in place or into `-o <file>` |
+| `daimond test <file.dm>` | Run each `fn test_*()` and report which pass |
+| `daimond symbols <file.dm>` | List the file's declarations, for editors |
+| `-o <file>` | Output file (default: the input without `.dm`) |
+| `-O0` to `-O3` | Optimization level (default `-O0`) |
+| `-g` | Debug info: files, functions, lines and variables, for gdb and lldb |
+| `--emit-ir` | Print dAImond IR and exit |
+| `--emit-llvm` | Write LLVM IR (`.ll`) and exit |
+| `--emit-bitcode` | Write LLVM bitcode (`.bc`), optimized as `-O` says, and exit |
+| `--stdin` | Read the program from standard input; `<file.dm>` still names it |
+| `--link-llvm` | Add the LLVM bridge and link the LLVM libraries (for compiling the compiler itself) |
 | `-v, --verbose` | Verbose output |
 | `-h, --help` | Show help |
-| `--version` | Show version (currently 0.1.0) |
+| `--version` | Show version |
+
+Environment: `DAIMOND_CACHE_DIR` (where the precompiled runtime object is kept), `DAIMOND_LD` (the `ld.lld` to link with), `DAIMOND_LIBC_DIR` (the directory of the C library's `Scrt1.o`, `crti.o`, `crtn.o` and `libc.so`).
 
 ## Common Development Tasks
 
-### Adding a new language feature
-
-1. Add token types in `lexer.zig` if new syntax is needed
-2. Add AST node types in `ast.zig`
-3. Add parsing logic in `parser.zig`
-4. Add type-checking rules in `checker.zig` (with `types.zig` for new types)
-5. Add C code generation in `codegen.zig`
-6. Add unit tests in each modified module
-7. Add integration test `.dm` file in `tests/`
-8. Run `zig build test && zig build test-integration`
-
-### Adding a new compiler diagnostic
-
-1. Define the error code/message in `errors.zig`
-2. Emit the diagnostic from the relevant pipeline stage (parser, checker, etc.)
-3. Add a test case that triggers the new diagnostic
-
-### Changing the Stage 5 compiler
+### Changing the compiler
 
 1. Edit the split modules in `stage5/` (never `main.dm`), then run `cd stage5 && bash gen_bootstrap.sh`
-2. Build it: `bash bootstrap.sh` (from the seed), or with a compiler you already have: `cd stage5 && <compiler> main.dm --link-llvm -o /tmp/stage5_new`
-3. Run the suite: `build/harness /tmp/stage5_new` (build the harness once with `build/daimond tests/harness.dm -o build/harness`); add a case to `tests/cases/` for what you changed
+2. Build it: `bash bootstrap.sh` (from the seed), or with a compiler you already have: `cd stage5 && <compiler> main.dm --link-llvm -o /tmp/daimond_new`
+3. Run the suite: `build/harness /tmp/daimond_new` (build the harness once with `build/daimond tests/harness.dm -o build/harness`); add a case to `tests/cases/` for what you changed
 4. The compiler's own source may only use what the seed's compiler can compile. To use a new language feature in the compiler: add the feature, write the seed again (`bash bootstrap.sh --update-seed`), commit both, and only then use it
-5. `llvm_bridge.dm` and `llvm_bridge.c` define the same functions; change them together
+5. Before committing, `bash bootstrap.sh` must reach a fixed point, and `main.dm` and `prelude.dm` must be what `gen_bootstrap.sh` writes
 
-### Working on the C runtime
+### Adding a language feature
 
-1. Add declarations to `daimond_runtime.h`
-2. Implement in `daimond_runtime.c`
-3. Add tests in `test_runtime.c`
-4. Update `codegen.zig` to emit calls to the new runtime functions
+1. Add token kinds in `token.dm` and `lexer.dm` if new syntax is needed
+2. Add the AST fields in `ast.dm` (and to `names_in_expr`/`names_in_stmts` there, if the node has child expressions: lambda captures and the effect check walk the tree with them) and the parsing in `parser.dm`
+3. Generate IR for it in `ir_gen_expr.dm`, `ir_gen_stmt.dm` or `ir_gen_decl.dm`; a new IR instruction also needs `ir.dm` and `llvm_gen.dm`
+4. Report misuse with `ir_type_error`, and add an `X.errors` case for each message
+5. Add cases to `tests/cases/`, and the keyword or builtin to `lsp/tables.dm`
+
+### Adding a builtin function
+
+1. In `ir_gen.dm`: its runtime name in `map_builtin_name` (`dm_X`), its name in `is_builtin_fn` and its result in `builtin_return_type`
+2. In `ir_gen_decl.dm`: `declare_extern*` with its parameter and result types
+3. In a `runtime/*.dm` file: the function `rt_X` with the same signature (an `int`, the address, where `dm_X` is declared with a pointer). A new runtime file also needs a line in `gen_bootstrap.sh`
+4. In `main_split.dm`: the effect it needs, in `builtin_required_effect`, if it has one
+5. In `lsp/tables.dm`: its signature and description. `tests/cases/83_language_server/completion_and_signatures.stdout` lists every builtin and needs the new one
+6. A case in `tests/cases/`, and a row in the builtins reference below
+
+### Adding a compiler diagnostic
+
+1. Report it where it is found: `p_error` in the parser, `ir_type_error(g, message, line)` in IR generation, `lg_error` in LLVM generation
+2. Add a case `X.dm` with `X.errors`, which holds each line the compiler must print
 
 ## Current Status
 
 ### Implemented
 
-**Language features**: Full type inference (Hindley-Milner), generics (monomorphization), closures with variable capture, traits (static + dynamic dispatch via `dyn Trait`), enums with payloads, Option/Result with `?` propagation, pattern matching, async/await (stackless coroutines), SIMD intrinsics (f32x4/f32x8/f64x2/f64x4/i32x4/i32x8/i64x2/i64x4), effect system (builtin + user-defined), regions (arena-based), comptime Turing-complete evaluation, operator overloading, string interpolation, FFI/extern, all numeric types (i8-i64, u8-u64, f32, f64) with `as` casts, pipeline operator `|>`, concurrency (threads, mutexes)
+**Language features**: generics (monomorphized functions with inferred type arguments, generic structs with explicit ones), lambdas (one that captures variables is called by the name `let` gave it), traits (static dispatch and `dyn Trait`), enums with payloads, Option/Result with `?` propagation, pattern matching, async/await, SIMD vectors (f32x4/f32x8/f64x2/f64x4/i32x4/i32x8/i64x2/i64x4), effects (builtin and user-defined), regions, comptime evaluation, operator overloading, string interpolation, FFI/extern with C-width types and variadic functions, all numeric types (i8-i64, u8-u64, f32, f64) with `as` casts, pipeline operator `|>`, threads and mutexes, TCP sockets
 
-**Data structures**: List[T], Map[K,V], Box[T] with full method support, for-in iteration
+**Data structures**: List[T], Map[K,V], Box[T], for-in iteration
 
-**Tooling**: in Stage 5, the CLI (compile, `run`, `check`, `fmt`, `test`, `symbols`) and the language server in dAImond (`lsp/`). Stage 0 has its own CLI (compile, run, lex, parse, check, fmt, test, pkg), an older LSP server and the package manager (TOML manifest, registry support)
+**Tooling**: the CLI (compile, `run`, `check`, `fmt`, `test`, `symbols`), debug info (`-g`), and the language server in dAImond (`lsp/`)
 
-**Runtime safety**: Division-by-zero protection, list bounds checking, arena OOM panic
+**Runtime safety**: integer overflow, division by zero, list bounds, narrowing casts, null `Box` dereference
 
-**Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
+**Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test. `import std.X` with no `std/X.dm` next to the importing file is `X.dm` in the library: the directory `$DAIMOND_STDLIB`, else `stdlib/` beside the compiler's directory, else `stdlib/` in the compiler's directory, else `stdlib/` in the current directory (`stdlib_file` in `main_split.dm`)
 
-**Compiler stages** (all complete):
-- Stage 0 (Zig → C): Bootstrap compiler, 328/328 integration tests
-- Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
-- Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): built from the seed or by Stage 0, 438/438 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes the suite. Programs it builds contain no C and are linked by `ld.lld`, with no C compiler. That includes the compiler itself: a self-build (`--link-llvm`) takes the LLVM bridge from `llvm_bridge.dm` and runs no C compiler, and the first and second self-built compilers are identical. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+**The compiler**: 467/467 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. `bootstrap.sh` builds it from the seed and checks that it reproduces itself; with LLVM 19 and with LLVM 23.
 
 ### Not Yet Implemented
-- Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
-- Debug info (DWARF) in Stage 3/4
-- In Stage 5, in debug info: one scope for all of a function's variables, no bindings of `match` arms or captured variables, and no fields for `Result` and `Option`. And a type checker (today it reports only a string, a bool or a number given where another of the three is expected, in a `let`, a call's arguments and a `return`; `check` reports what a compilation would). Until then Stage 0, `llvm_bridge.c` and `daimond_runtime.c` stay
+- A type checker. IR generation reports what it cannot type, undefined names, calls whose arguments do not fit, and a string, a bool or a number given where another of the three is expected (`check_basic_type`). Other type errors are found by LLVM's verifier, or not at all
+- Closure values. A lambda that captures variables can only be bound with `let` and called by that name, because its captures are extra parameters that such a call passes; using it as a value is a compile error (`captured_lambda_error` in `ir_gen_expr.dm`)
+- Effect checks of method calls and of calls through a function value. Calls by name are checked at any depth of a function's or method's body (`validate_effects` in `main_split.dm`)
+- Freeing memory: strings are never freed, and `mem_mark`/`mem_sweep` (regions) free nothing
+- Trait bounds on generic functions (`fn f[T: Display]`)
+- Targets other than x86-64 Linux with glibc
+- In debug info: one scope for all of a function's variables, no bindings of `match` arms or captured variables, and no fields for `Result` and `Option`
+- A package manager (the Zig compiler had one; it was not ported)
+- `xs[i] += v` on a list assigns `v`; `for x in xs` panics when the body shrinks the list; `i8` and `i16` arguments to C functions are not extended; a user's `fn exit` is shadowed by the builtin
 
 ## Documentation Maintenance
 
@@ -453,13 +292,13 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 - **README.md**: Update the "Current Status" checklist when features are completed or new milestones are added. Update "Project Structure" if files or directories are added/removed. Update code examples if syntax changes.
 - **CLAUDE.md**: Update the "Repository Structure" tree when files are added/removed. Update "Current Status" sections when features move between implemented and not-yet-implemented. Update "Build Commands", "CLI Options Reference", or "Code Conventions" if those change. Add new entries under "Common Development Tasks" for recurring workflows.
-- **Inline docs**: Update module-level `//!` comments and `///` doc comments in Zig source when public APIs change.
+- **Comments in the compiler's source**: update a function's comment when what it does changes.
 
 Documentation that contradicts the code is worse than no documentation. When in doubt, check the source code -- it is always the ground truth.
 
 ## Language Builtins Reference
 
-These built-in functions are available in dAImond programs across all compiler stages. In Stage 0 they are recognized by name in `checker.zig` and emitted in `codegen.zig`.
+These built-in functions are available in every dAImond program. The compiler recognizes them by name (`is_builtin_fn` in `ir_gen.dm`).
 
 ### I/O Functions
 | Function | Signature | Description |
@@ -572,11 +411,11 @@ Where TYPE is one of: `f32x4`, `f32x8`, `f64x2`, `f64x4`, `i32x4`, `i32x8`, `i64
 - `m[key]` — index access (alias for get)
 - `m[key] = val` — index assignment (alias for insert)
 
-In Stage 5, `Map[K, V]` is the generic struct in `stage5/runtime/map.dm`. Keys must be strings or integers, `keys()`/`values()` and `for k in m` follow insertion order, and `Map_new()` needs a destination type (a typed `let`, a struct field, an assignment target or a return). Copying a map copies its list headers, so the copy shares storage with the original, as Stage 5 lists do. Stage 5 also has the builtin `byte_at(s, i) -> int` (the byte at index `i`, bounds-checked).
+`Map[K, V]` is the generic struct in `stage5/runtime/map.dm`. Keys must be strings or integers, `keys()`/`values()` and `for k in m` follow insertion order, and `Map_new()` needs a destination type (a typed `let`, a struct field, an assignment target or a return). Copying a map copies its list headers, so the copy shares storage with the original, as lists do. There is also the builtin `byte_at(s, i) -> int` (the byte at index `i`, bounds-checked).
 
-### Stage 5 Runtime Primitives
+### Runtime Primitives
 
-Stage 5 alone has the low-level features the runtime is being rewritten with (Stage 0 has none of them). The builtins below need an `unsafe` block. Addresses are `int`s.
+These are the low-level features the runtime is written with. The builtins below need an `unsafe` block. Addresses are `int`s.
 
 | Builtin | Description |
 |---------|-------------|
@@ -595,19 +434,19 @@ Stage 5 alone has the low-level features the runtime is being rewritten with (St
 - **Link names**: `extern fn my_len(s: string) -> u64 = "strlen"` binds the extern to the C symbol `strlen`. Several externs may name one C symbol; each call uses its own declaration's types.
 - **Functions named like C symbols**: a dAImond function whose name is a C symbol the module declares, such as a program's own `fn rename` or `fn strlen`, gets the symbol `<name>.dm` (`dm_symbol_of` in `llvm_gen.dm`), so the runtime's calls of the C function still reach C. The compiler's own calls of libc (`malloc` for `Box_new`, `exit`) go through externs named `dm_libc_<symbol>`, which a program can't shadow.
 
-### Stage 5 Runtime in dAImond
+### The Runtime
 
-The C runtime has been replaced, one function at a time, by dAImond code in `stage5/runtime/*.dm`, which `gen_bootstrap.sh` embeds in the compiler (`prelude.dm`) and the compiler adds to every program. Only Stage 5 parses these files, so they may use Stage 5-only features.
+The runtime of every program is dAImond code in `stage5/runtime/*.dm`, which `gen_bootstrap.sh` embeds in the compiler (`prelude.dm`) and the compiler adds to every program.
 
-- A dAImond function `rt_X` replaces the C runtime function `dm_X`: the compiler binds every call to `dm_X` to `rt_X` (see RUNTIME FUNCTIONS in `llvm_gen.dm`). `rt_X` must keep the signature `dm_X` is declared with in `ir_gen_decl.dm`, except that it takes an `int`, the address, where `dm_X` takes a pointer; a mismatch is a compile error.
+- The IR names a runtime function `dm_X`, and the dAImond function `rt_X` is what runs: the compiler binds every call to `dm_X` to `rt_X` (see RUNTIME FUNCTIONS in `llvm_gen.dm`). `rt_X` must keep the signature `dm_X` is declared with in `ir_gen_decl.dm`, except that it takes an `int`, the address, where `dm_X` takes a pointer; a mismatch is a compile error.
 - To add a runtime function: declare `dm_X` in `ir_gen_decl.dm`, write `rt_X` in a runtime file, and run `gen_bootstrap.sh`. A new runtime file also needs a line in `gen_bootstrap.sh`. A `dm_X` with no `rt_X` fails to link.
-- The runtime's functions: `string_concat`, `string_eq`, `string_cmp`, `char_at`, `substr`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_trim`, `string_replace`, `string_to_upper`, `string_to_lower`, `string_split`, `is_alpha`, `is_digit`, `is_whitespace`, `is_alnum`, `char_to_string` (`runtime/string.dm`); `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float` (`runtime/convert.dm`); the list operations push, pop and contains for int, float, string and other elements, and the element read `for x in xs` makes (`runtime/list.dm`); `file_read`, `file_write`, `file_append`, `file_exists`, `fs_mkdir`, `fs_readdir`, `fs_remove`, `fs_rename`, `fs_getcwd`, `env_get`, `args_len`, `args_get`, `system` (`runtime/os.dm`); `path_dirname`, `path_basename`, `path_extension`, `path_stem`, `path_join` (`runtime/path.dm`); `print`, `println`, `eprint`, `eprintln`, `flush`, `read_line`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `panic` (`runtime/io.dm`); `time_ms`, `sleep_ms` (`runtime/os.dm`); `chr` (`runtime/convert.dm`); `mem_mark`, `mem_sweep` (`runtime/string.dm`); `tcp_listen`, `tcp_accept`, `tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close` (`runtime/net.dm`); `thread_spawn`, `thread_join`, `mutex_new`, `mutex_lock`, `mutex_unlock`, `mutex_destroy` (`runtime/thread.dm`). No C is left: `llvm_wrappers.c` is deleted, and a program does not link `stage0/runtime/daimond_runtime.c`. Floats go through libc's `snprintf("%g")` and `strtod`; integers are formatted and parsed in dAImond.
+- The runtime's functions: `string_concat`, `string_eq`, `string_cmp`, `char_at`, `substr`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_trim`, `string_replace`, `string_to_upper`, `string_to_lower`, `string_split`, `is_alpha`, `is_digit`, `is_whitespace`, `is_alnum`, `char_to_string` (`runtime/string.dm`); `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float` (`runtime/convert.dm`); the list operations push, pop and contains for int, float, string and other elements, and the element read `for x in xs` makes (`runtime/list.dm`); `file_read`, `file_write`, `file_append`, `file_exists`, `fs_mkdir`, `fs_readdir`, `fs_remove`, `fs_rename`, `fs_getcwd`, `env_get`, `args_len`, `args_get`, `system` (`runtime/os.dm`); `path_dirname`, `path_basename`, `path_extension`, `path_stem`, `path_join` (`runtime/path.dm`); `print`, `println`, `eprint`, `eprintln`, `flush`, `read_line`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `panic` (`runtime/io.dm`); `time_ms`, `sleep_ms` (`runtime/os.dm`); `chr` (`runtime/convert.dm`); `mem_mark`, `mem_sweep` (`runtime/string.dm`); `tcp_listen`, `tcp_accept`, `tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close` (`runtime/net.dm`); `thread_spawn`, `thread_join`, `mutex_new`, `mutex_lock`, `mutex_unlock`, `mutex_destroy` (`runtime/thread.dm`). Floats go through libc's `snprintf("%g")` and `strtod`; integers are formatted and parsed in dAImond.
 - A list is `{ data, len, capacity }` and is passed to the runtime as the address of that header.
 - Inline, with no function behind them: `len(s)`, string literals, `xs.len()`, the creation of an empty list, `xs[i]` and `xs[i] = v` (one bounds check, then a load or store at the element's address), and the overflow and range checks on signed arithmetic and narrowing casts (`dm_checked_*`, `dm_cast_check_*`), which lower to LLVM's overflow intrinsics and a branch to a panic block.
-- **Console**: output and `read_line` go through libc's `stdout`, `stderr` and `stdin` streams, reached with `symbol_addr`, so they keep their order with C code that uses the same streams. `read_line` gives a whole line however long it is (Stage 0 cuts a line at 4175 bytes).
+- **Console**: output and `read_line` go through libc's `stdout`, `stderr` and `stdin` streams, reached with `symbol_addr`, so they keep their order with C code that uses the same streams. `read_line` gives a whole line however long it is.
 - **Program start**: `main` begins with a call of `dm_start` (`rt_start` in `runtime/os.dm`), which raises the limit on the stack's size to 64 MB where it is lower, or to the highest value allowed when that is below 64 MB. A C constructor did this before `main`. The stack of a running program grows up to the limit in force, so the raise takes effect at once.
 - **Linking**: the compiler runs `ld.lld -pie` on the program's object, the precompiled runtime object at `-O0`, the C library's start-up objects (`Scrt1.o`, `crti.o`, `crtn.o`) and `-lm -lpthread -lc` (see LINKING in `main_split.dm`). It takes `ld.lld` from `$DAIMOND_LD`, else `PATH`, else the newest `/usr/lib/llvm-<version>/bin`; and the C library's directory from `$DAIMOND_LIBC_DIR`, else `/usr/lib/x86_64-linux-gnu`, `/usr/lib64` or `/usr/lib`. The dynamic loader is glibc's on x86-64 Linux, `/lib64/ld-linux-x86-64.so.2`. With `--link-llvm` it adds `llvm-config`'s libraries.
-- **Terminal and time**: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms` and `sleep_ms` are builtins in Stage 5 as in Stage 0, so `examples/snake.dm` and `examples/breakout` build. `read_key` and `read_key_nb` read libc's `stdin` stream, so they see what `read_line` left in its buffer. `read_key_nb` asks `poll` about file descriptor 0, as the C did: bytes already in the stream's buffer are not seen until the descriptor has more. `sleep_ms` with a negative time does not wait. `mem_mark()` is 0 and `mem_sweep` does nothing, as in Stage 0.
+- **Terminal and time**: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms` and `sleep_ms` are builtins, which `examples/snake.dm` and `examples/breakout` use. `read_key` and `read_key_nb` read libc's `stdin` stream, so they see what `read_line` left in its buffer. `read_key_nb` asks `poll` about file descriptor 0: bytes already in the stream's buffer are not seen until the descriptor has more. `sleep_ms` with a negative time does not wait. `mem_mark()` is 0 and `mem_sweep` does nothing.
 - **OS constants**: `TIOCGWINSZ` (21523), `CLOCK_MONOTONIC` (1), `POLLIN` (1) and the layouts of `struct winsize`, `struct pollfd` and `struct timespec` are those of x86-64 Linux.
 - **Assertions**: `assert(cond)` panics with `assertion failed`. `assert_eq(a, b)` compares with `==`, so it takes whatever `==` does, and panics with `assert_eq failed: strings not equal` or `assert_eq failed: values not equal` (`rt_assert*` in `runtime/io.dm`). A call the IR generator emits of a function that was never declared is a compile error (`internal: call of ...`); it used to be dropped, which is how both assertions did nothing.
 - **Enums and `match`**: an enum is a struct of its tag and then one field for each value of each variant (`Variant_0`, `Variant_1`, ...; `enum_payload_field` in `ir_gen.dm`), so a variant carries any number of values of any types. A pattern binds each value as a variable of its type (`track_bound_variable` records the type, as for a parameter), and so do `Ok`, `Err` and `Some`; a pattern may bind fewer values than the variant carries. An arm that is a name binds the matched value with its type. A string is matched against string literals by its text. The matched value's type comes from the expression (`static_type`), so a call can be matched directly. A wrong number of values, in a constructor or a pattern, and a variant the enum does not have are compile errors.
@@ -616,70 +455,43 @@ The C runtime has been replaced, one function at a time, by dAImond code in `sta
 - **Lines in files**: a line number says which file it is in. Line L of file number F is `F * FILE_LINE_SPAN() + L` (`token.dm`); the file being compiled is number 0, each imported file takes the next number as it is loaded, then the LLVM bridge (`--link-llvm`) and the runtime (`<runtime>`). The lexer numbers lines this way (`tokenize_file`), so every token, AST node and IR instruction carries its file. The names are in `SourceFile.files`, then `IRModule.files`. Print a line with `line_in_file`, and build an error with `error_at` (IR generation) or `lg_error` (LLVM generation): an error in another file than the one being compiled begins with `FILE: `, as in `geometry.dm: Error: undefined variable 'x' at line 6`. The language server shows such an error where the file is imported.
 - **Imports**: a file is loaded once however many files import it (`Imports` in `main_split.dm`). Until 2026-11-20 the set of loaded files was a `Map` passed by value, whose inserts the caller never saw, so a file imported by two files was compiled once for each: the language server's ten modules took 7.5 s and 2.2 GB to compile, and take 0.9 s and 174 MB now. A function, type or constant declared more than once is an error (`duplicate_declarations`; an `extern fn` may be repeated), and so is an import whose file does not exist (it printed an error and built the program anyway).
 - **Language server** (`lsp/`, a dAImond program of its own, not part of the compiler): it reads no dAImond itself. For a document's errors it runs `daimond check <path> --stdin` with the editor's text on standard input and places each line of the output (`add_error_line` in `documents.dm`); for its declarations it runs `daimond symbols`, for the document and, by their time of change, for the files it imports. What is inside a function it reads from the text by its shape: `let name`, `for name in`, parameters, names bound by a match arm (`declaration_kind` in `lookup.dm`). References are found by name, in code only (not in strings or comments); a variable's are those in its function. Hover shows the comment lines above a declaration. A string is never freed in dAImond, so the server makes none while it serves: it works in reused buffers and views of them (`buffer.dm`), and its memory stays flat (77 MB after 5 rounds of every request and after 150). Changed documents are checked once the editor has been quiet for `--debounce` milliseconds (200; 0 checks after every change, which the suite uses for a fixed order of messages). Its cases are `tests/cases/83_language_server/`: each is a directory with the documents and a `messages` script, played by `session.sh` through `lsp/test_client.dm`.
-- **For editors**: `symbols` prints one line per declaration, tab-separated: kind (`import`, `function`, `struct`, `field`, `enum`, `variant`, `trait`, `impl`, `method`, `const`), name, line and column of the name (from 1), last line, the type a field, variant or method belongs to, and the declaration's first line such as `fn add(a: int, b: int) -> int` (the file, for an import). It prints what could be read of a file with syntax errors. `check` accepts a file without `main`. `--stdin` reads the program from standard input. A compiler built by Stage 0 reads nothing from a pipe there (Stage 0's `file_read`), only from a file.
-- **Commands** (COMMANDS in `main_split.dm`): `run` builds into `/tmp` (or the file `-o` names, which it keeps) and gives the program's exit code. `check` runs the pipeline through LLVM verification and builds nothing. `fmt` re-indents by braces, as Stage 0's does. `test` replaces the file's `main` with a generated one that runs the program once per `test_*` function, so a panic ends only that test; it prints `test NAME ... PASS` or `FAIL: <panic message>`, then `N passed, M failed`, and exits with 1 when a test fails (Stage 0 stops at the first panic that is not an assertion).
-- **Panics**: `dm_panic` (`rt_panic` in `runtime/io.dm`) writes `PANIC: <message>` to stderr and exits with code 1, as Stage 0 does. Messages passed to it, by the compiler's checks or by runtime code, do not include the prefix.
-- **Sockets** (`runtime/net.dm`): IPv4 over libc's sockets, with no name lookup. An address is `HOST:PORT`, where `HOST` is a dotted address, `localhost`, or nothing (`0.0.0.0`). `tcp_listen` and `tcp_connect` give -1 when they fail, which includes a host that is not an address and a port above 65535 (Stage 0 listens on every address for a host it cannot read, and cuts the port to 16 bits).
+- **For editors**: `symbols` prints one line per declaration, tab-separated: kind (`import`, `function`, `struct`, `field`, `enum`, `variant`, `trait`, `impl`, `method`, `const`), name, line and column of the name (from 1), last line, the type a field, variant or method belongs to, and the declaration's first line such as `fn add(a: int, b: int) -> int` (the file, for an import). It prints what could be read of a file with syntax errors. `check` accepts a file without `main`. `--stdin` reads the program from standard input.
+- **Commands** (COMMANDS in `main_split.dm`): `run` builds into `/tmp` (or the file `-o` names, which it keeps) and gives the program's exit code. `check` runs the pipeline through LLVM verification and builds nothing. `fmt` re-indents by braces. `test` replaces the file's `main` with a generated one that runs the program once per `test_*` function, so a panic ends only that test; it prints `test NAME ... PASS` or `FAIL: <panic message>`, then `N passed, M failed`, and exits with 1 when a test fails.
+- **Panics**: `dm_panic` (`rt_panic` in `runtime/io.dm`) writes `PANIC: <message>` to stderr and exits with code 1. Messages passed to it, by the compiler's checks or by runtime code, do not include the prefix.
+- **Sockets** (`runtime/net.dm`): IPv4 over libc's sockets, with no name lookup. An address is `HOST:PORT`, where `HOST` is a dotted address, `localhost`, or nothing (`0.0.0.0`). `tcp_listen` and `tcp_connect` give -1 when they fail, which includes a host that is not an address and a port above 65535.
 - **Threads** (`runtime/thread.dm`): `thread_spawn(f)` takes a function that takes no arguments, by its name or as a `fn()` variable; anything else is a compile error. The function itself is the pthread start routine, which relies on the x86-64 calling convention (see the comment on `rt_thread_spawn`). It panics when the thread cannot be started. A mutex is the address of a `pthread_mutex_t`. Nothing in the language shares data between threads safely; `static_addr` storage and a mutex is the way the tests do it.
-- **Functions as values**: a function's name is a value (its address) wherever the function is declared, also further down the file. A lambda in a variable without a type annotation (`let f = |x: int| -> int x + 1`) can be passed where a `fn(int) -> int` is expected; a lambda that captures variables cannot, because its captures are extra parameters.
+- **Functions as values**: a function's name is a value (its address) wherever the function is declared, also further down the file. A lambda in a variable without a type annotation (`let f = |x: int| -> int x + 1`) can be passed where a `fn(int) -> int` is expected; a lambda captures the variables of the enclosing function that its body names, as extra parameters, so one that captures any can only be bound with `let` and called by that name; using it as a value is a compile error.
 - **Float literals** may have an exponent: `6.02e23`, `1.5e-3`, `2E+3`.
 - **Module names** may be dotted: `module tests.arithmetic`.
 - **Deep expressions**: a chain such as `a + b + c + ...` nests one level per operator. `generate_binary` and `infer_expr_type` walk such a chain in a loop, and 400 terms compile. Other nesting still recurses, at 0.2 to 1.7 MB of stack per level in an `-O0` build of the compiler (each `IRGenerator` returned by value gets its own stack slot), so an expression nested several hundred levels deep, or a chain of about 1,000 terms, overflows the compiler's 64 MB stack and it crashes.
 - **Command-line arguments**: `main` stores its argument count and vector in the symbols `dm_argc` (a C `int`) and `dm_argv`, which the compiler defines in the module that has `main`. The runtime reads them through `symbol_addr`. `args_get(i)` gives a string that points at the argument's own bytes.
 - **OS struct layouts**: `fs_readdir` reads the name in libc's `struct dirent` at byte 19 (`rt_dirent_name_offset` in `runtime/os.dm`), which is its place on x86-64 Linux. Another target needs its own offset.
-- **Bitcode**: `--emit-bitcode` writes `<output>.bc`, the module as it goes to code generation: with the host's target triple and data layout, optimized as the `-O` level says, and with the runtime compiled in. `llc -filetype=obj -relocation-model=pic` turns it into the object the compiler would have written. The Stage 0-built and the self-built compilers write the same bytes.
+- **Bitcode**: `--emit-bitcode` writes `<output>.bc`, the module as it goes to code generation: with the host's target triple and data layout, optimized as the `-O` level says, and with the runtime compiled in. `llc -filetype=obj -relocation-model=pic` turns it into the object the compiler would have written.
 - **Precompiled runtime object**: a `-O0` build does not compile the runtime's non-generic functions into the program. It links `runtime-<build ID>.o`, which the compiler builds once with full optimization and keeps in `$DAIMOND_CACHE_DIR`, else `$XDG_CACHE_HOME/daimond`, else `~/.cache/daimond` (see PRECOMPILED RUNTIME in `main_split.dm`). When the object can't be built or stored, the runtime is compiled into the program instead. `--emit-llvm`, `--emit-bitcode`, `--emit-ir` and `-O1` and above always compile it into the program, where the optimizer can inline it.
-- The build ID is a hash of the compiler's source, the runtime sources, `llvm_bridge.dm` and `llvm_bridge.c`, written into `prelude.dm` by `gen_bootstrap.sh`. Rerun `gen_bootstrap.sh` after changing any of them, the bridge files included, or the compiler keeps linking the old object.
+- The build ID is a hash of the compiler's source, the runtime sources and `llvm_bridge.dm`, written into `prelude.dm` by `gen_bootstrap.sh`. Rerun `gen_bootstrap.sh` after changing any of them, the bridge included, or the compiler keeps linking the old object.
 - Generic runtime code (the methods of `Map`) is always compiled into the program. At `-O0` the program's own functions are marked `optnone` and stay as written, while that generic code is optimized.
-- `parse_int` and `parse_float` read the whole string (the C runtime, and so Stage 0, reads at most 31 and 63 bytes).
+- `parse_int` and `parse_float` read the whole string.
 - Runtime code calls libc through link-named externs (`libc_malloc`, `libc_memcpy`, `libc_memcmp`, `libc_memmem`, `libc_fopen`, ...), so a program's own `extern fn malloc` cannot collide with it. It must not use the operators it implements (no `+`, `==` or `<` on strings in `string.dm`).
 - Every string the runtime builds is followed by a NUL byte, as every literal is, so its data can go to C as a `char*`. The file functions and `system` pass paths and commands this way, without a copy.
-- A search pattern longer than the string is not found: `string_split("ab", "abc")` is `["ab"]` and `string_replace("", "a", "b")` is `""` (Stage 0 crashes on both). `string_split(s, "")` gives the bytes of `s` (Stage 0 gives `[s]`), and `is_alpha("_")` is false (true in Stage 0).
-- Files go through libc's stdio. `file_read` reads a file that reports no size piece by piece to its end, so it reads pipes and files in `/proc` (the C runtime, and so Stage 0, gives `""` for them).
-- `substr` with a negative start or length returns `""` in Stage 5 (the C runtime, and so Stage 0, crashes on a negative length).
+- A search pattern longer than the string is not found: `string_split("ab", "abc")` is `["ab"]` and `string_replace("", "a", "b")` is `""`. `string_split(s, "")` gives the bytes of `s`, and `is_alpha("_")` is false.
+- Files go through libc's stdio. `file_read` reads a file that reports no size piece by piece to its end, so it reads pipes and files in `/proc`.
+- `substr` with a negative start or length returns `""`.
 
-## Stage 0 Codegen Quirks and Workarounds
+## History
 
-These are remaining known issues in Stage 0's C code generation:
+The language was first implemented by a compiler written in Zig that emitted C ("Stage 0"), then by a C-emitting compiler in dAImond ("Stage 1"), an LLVM backend in Zig ("Stage 3") and one in dAImond ("Stage 4"). The compiler in `stage5/` began as Stage 4 plus memory-safety checks. The others, the C runtime (`daimond_runtime.c`, `llvm_wrappers.c`) and the C bridge to LLVM (`llvm_bridge.c`) were deleted once this compiler built itself from the seed and had their tools. They are in the repository's history up to commit `2ddc25f`. `docs/stage-history.md` describes them and lists where this compiler behaves differently from Stage 0. Comments in the source that say "Stage 0" mean that compiler.
 
-### 1. `Box.new()` / `Box.null()` vs `Box_new()` / `Box_null()`
-**Problem**: Method-call syntax `Box.new(val)` generates wrong C code. The codegen expects function-call syntax.
+## Compiler Architecture
 
-**Workaround**: Always use `Box_new(value)` and `Box_null()` (underscore, not dot).
-
-### 2. `string.len()` Method Call Syntax
-**Problem**: The `.len()` method on strings generates `dm_string_len()` which returns `size_t` instead of `int64_t`, causing type mismatches in some contexts.
-
-**Workaround**: Use the free function `len(s)` instead of `s.len()` for consistent `int` return type.
-
-### 3. `is_alpha()` / `is_digit()` Expect `char`, Not `string`
-**Problem**: These runtime functions take a C `char`, but dAImond passes `dm_string` from string literals.
-
-**Workaround**: Write your own helpers that compare single-char strings:
-```daimond
-fn is_alpha_char(ch: string) -> bool {
-    if ch >= "a" and ch <= "z" { return true }
-    if ch >= "A" and ch <= "Z" { return true }
-    if ch == "_" { return true }
-    return false
-}
-```
-
-## Stage 1 & Stage 3 (Archived)
-
-Stage 1 (dAImond → C self-hosting) and Stage 3 (LLVM backend in Zig) are complete and frozen. Stage 1 achieved bootstrap fixed-point. Stage 3 achieved 254/254 test parity. Both are superseded by Stage 5. See `docs/stage-history.md` for detailed architecture, module layout, feature lists, and build commands.
-
-## Stage 5 Compiler Architecture
-
-Stage 5 is the LLVM backend rewritten entirely in dAImond. It is compiled by Stage 0 (to C), then gcc. It produces native binaries by calling LLVM's C API through the LLVM bridge.
+The compiler produces native binaries by calling LLVM's C API through the LLVM bridge.
 
 ### Design Decisions
-- **Same architecture as Stage 3**: Lexer → Parser → AST → dAImond IR (SSA) → LLVM IR → native binary. The pipeline mirrors Stage 3 but is implemented in dAImond instead of Zig.
-- **Integer kind tags**: Like Stage 1, uses `fn EXPR_FUNCTION_CALL() -> int { return 40 }` constants instead of Zig tagged unions.
-- **No type checker**: Stage 5 has no checking pass of its own. IR generation reports what it cannot type, calls whose arguments do not fit, and a string, a bool or a number given where another of the three is expected (`check_basic_type` in `ir_gen_expr.dm`: annotated `let`s, arguments of functions, `len`). Stage 0's checker still type-checks the compiler's own source when Stage 0 builds it.
+- **Pipeline**: Lexer → Parser → AST → dAImond IR (SSA) → LLVM IR → native binary.
+- **Integer kind tags**: `fn EXPR_FUNCTION_CALL() -> int { return 40 }` constants; a node is one struct with the fields of every kind.
+- **No type checker**: there is no checking pass. IR generation reports what it cannot type, calls whose arguments do not fit, and a string, a bool or a number given where another of the three is expected (`check_basic_type` in `ir_gen_expr.dm`: annotated `let`s, arguments of functions, `len`). Nothing type-checks the compiler's own source either: a mistake in it shows as an error from IR generation or LLVM's verifier, or as a failing case.
 - **Calls on a type**: `Type.name(args)` calls the function `name` of `impl Type` that takes no `self` (`static_call_target` in `ir_gen_expr.dm`); `Box.new(x)` and `Box.null()` are `Box_new(x)` and `Box_null()`. A variable in scope with the type's name is a value, and the call is a method call on it. `s.len()` on a string is `len(s)`.
-- **LLVM bridge**: the compiler calls LLVM through 125 `dm_llvm_*` functions, which `llvm.dm` declares as `extern fn`. They exist twice. `llvm_bridge.dm` defines them in dAImond over LLVM's C API (`extern fn LLVMBuildAdd(...)`), using Stage 5-only primitives; `--link-llvm` adds that file to the program and each of its functions takes the place of the extern declaration of the same name (`add_llvm_bridge` in `main_split.dm`). Stage 0 cannot parse it, so the compiler Stage 0 builds links `llvm_bridge.c`, the same functions in C. Until Stage 0 goes, a change to one file belongs in the other. The list of types or values LLVM takes as an array is built in `static_addr` storage (`dm_llvm_buf_*`); LLVM's enum numbers are written out in `llvm_bridge.dm`.
-- **Modular source, monolithic bootstrap**: Same pattern as Stage 1 — split `.dm` module files for development, `gen_bootstrap.sh` concatenates into `main.dm` for compilation by Stage 0.
+- **LLVM bridge**: the compiler calls LLVM through 125 `dm_llvm_*` functions, which `llvm.dm` declares as `extern fn`. `llvm_bridge.dm` defines them in dAImond over LLVM's C API (`extern fn LLVMBuildAdd(...)`); `--link-llvm` adds that file to the program and each of its functions takes the place of the extern declaration of the same name (`add_llvm_bridge` in `main_split.dm`). The list of types or values LLVM takes as an array is built in `static_addr` storage (`dm_llvm_buf_*`); LLVM's enum numbers are written out in `llvm_bridge.dm`.
+- **Modular source, one generated file**: the modules are separate `.dm` files; `gen_bootstrap.sh` concatenates them into `main.dm`, which is what `bootstrap.sh` and a self-build compile. Edit the modules, never `main.dm`.
 
 ### Module Layout
 ```
@@ -699,8 +511,7 @@ llvm.dm            — LLVM type definitions and helpers
 llvm_gen.dm        — LLVM IR generation from dAImond IR (main module)
 llvm_gen_call.dm   — LLVM call instruction generation
 llvm_gen_simd.dm   — LLVM SIMD instruction generation
-llvm_bridge.dm     — The LLVM bridge in dAImond: dm_llvm_* over LLVM's C API (Stage 5 only, added by --link-llvm)
-llvm_bridge.c      — The same bridge in C, linked into the compiler Stage 0 builds
+llvm_bridge.dm     — The LLVM bridge: dm_llvm_* over LLVM's C API (added by --link-llvm)
 prelude.dm         — Generated: the runtime/*.dm files embedded as a string, added to every program; and the build ID
 runtime/string.dm  — Strings: rt_string_concat, rt_string_eq, rt_string_cmp, rt_char_at, rt_substr, search, trim, replace, case, rt_string_split
 runtime/convert.dm — Conversions: rt_int_to_string, rt_float_to_string, rt_bool_to_string, rt_chr, rt_parse_int, rt_parse_float
@@ -711,56 +522,31 @@ runtime/path.dm    — Paths: rt_path_dirname, rt_path_basename, rt_path_extensi
 runtime/io.dm      — Console: rt_print, rt_println, rt_eprint, rt_eprintln, rt_flush, rt_read_line, rt_read_key, rt_read_key_nb, rt_term_width, rt_term_height, rt_panic
 runtime/net.dm     — TCP sockets: rt_tcp_listen, rt_tcp_accept, rt_tcp_connect, rt_tcp_read, rt_tcp_write, rt_tcp_close
 runtime/thread.dm  — Threads and mutexes: rt_thread_spawn, rt_thread_join, rt_mutex_new, rt_mutex_lock, rt_mutex_unlock, rt_mutex_destroy
-main_split.dm      — Entry point with imports (for modular development)
-main.dm            — Monolithic bootstrap file (~22K lines, generated)
+main_split.dm      — Entry point: the command line, imports, the commands, linking
+main.dm            — Generated: the modules as one file (~24K lines)
 ```
 
 ### Error Detection
-Stage 5 includes compile-time error detection for:
+The compiler detects at compile time:
 - **Unterminated strings**: Lexer detects EOF inside string literals and exits with error
 - **Syntax errors**: the parser reports `Error at LINE:COL: expected ... but got ...`, the first error of each top-level declaration (what follows an error in a declaration is parsed out of step). An error in an imported file is prefixed with that file's path. The parser is passed by value, so its errors leave in `SourceFile.errors`; until 2026-11-20 they were read from the caller's copy, which was always empty, so no syntax error was ever printed. Loops that parse a list until a closing token skip a token they cannot use (`p_skip_stuck`), so no input makes the parser loop forever. Post-parse validation still catches parameters without types
 - **Undefined functions**: IR generation checks a `known_functions` map before generating calls
-- **Effect violations**: Builtin-to-effect mapping (e.g., `file_read` → `FileSystem`) with callee effect subset checking ensures functions only call operations permitted by their `with [...]` declarations
+- **Effect violations**: Builtin-to-effect mapping (e.g., `file_read` → `FileSystem`) with callee effect subset checking: a function or method that declares effects may only call, by name and at any depth of its body, what its `with [...]` list allows
 
-### Building Stage 5
-```bash
-# Stage 0 compiles Stage 5 (from monolithic main.dm)
-cd stage0 && ./zig-out/bin/daimond ../stage5/main.dm -c -o /tmp/stage5.c
-
-# Compile C output + LLVM bridge + runtime to binary
-gcc -c /tmp/stage5.c -o /tmp/stage5.o -I runtime -Wno-incompatible-pointer-types -Wno-int-conversion
-gcc -c ../stage5/llvm_bridge.c -o /tmp/llvm_bridge.o $(llvm-config --cflags)
-gcc -c runtime/daimond_runtime.c -o /tmp/daimond_runtime.o
-gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/daimond_runtime.o \
-    -o /tmp/stage5_bin -lm -lpthread $(llvm-config --libs --ldflags)
-
-# Stage 5 compiles a test program
-/tmp/stage5_bin test_program.dm -o test_program
-
-# Regenerate monolithic main.dm from modules
-cd stage5 && bash gen_bootstrap.sh
+### Bootstrap Chain
 ```
-
-### Full Bootstrap Chain
-```
-Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
-stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
-Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
-stage5_bin compiles test programs                 → native binaries (438/438 cases pass)
-stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓, no C compiler)
-stage5_self compiles Stage 5                      → identical binary ✓
-
-Without Zig or C (bootstrap.sh):
 llc + ld.lld turn seed/daimond.bc into            → seed compiler
-seed compiler compiles Stage 5                    → gen1
-gen1 compiles Stage 5                             → gen2 (same file as gen1 when the seed is current ✓)
+seed compiler compiles stage5/main.dm             → gen1
+gen1 compiles stage5/main.dm                      → gen2 (same file as gen1 when the seed is current ✓)
+gen2 compiles stage5/main.dm                      → gen3 (same file as gen2 ✓, when the seed is older)
+the compiler compiles tests/harness.dm            → the harness, which runs tests/cases (467/467 cases pass)
 ```
 
 ## Important Notes
 
 - `seed/daimond.bc` is a build product (2.5 MB of LLVM bitcode, written by LLVM 19). `bootstrap.sh --update-seed` writes it; each new version adds its size to the repository's history, so write it again only when the compiler needs a newer compiler to build it. A seed from the same source is byte-identical, so an unneeded update changes nothing.
 - `bootstrap.sh` gives each generation its own runtime-object cache (`DAIMOND_CACHE_DIR`), so that the comparison of generations covers the runtime object too.
-- The `.gitignore` in `stage0/` excludes `*.c` files (generated output) but includes `!src/*.c` to allow runtime C source files.
-- Zig version is pinned to 0.13.0 via `.mise.toml`. Do not upgrade without testing compatibility.
-- The largest source files are `codegen.zig` (~6830 lines), `parser.zig` (~3630 lines), and `checker.zig` (~3116 lines). Changes to these require careful testing.
-- Stage 5's `main.dm` is ~22K lines (the largest dAImond source file). The monolithic file is generated by `gen_bootstrap.sh` — edit the split module files for development.
+- `stage5/main.dm` (~24K lines) and `stage5/prelude.dm` are generated by `gen_bootstrap.sh`. Edit the modules and the `runtime/*.dm` files.
+- The largest module is `ir_gen_expr.dm` (~8K lines). A function there returns its generator; see The Compiler's Source.
+- A self-build takes about 90 seconds and 2 GB of memory at `-O0`. `-O2` of the whole compiler needs more than 4 GB.
+- The test harness and the compiler write files next to nothing they read: programs are built in `/tmp`. Do not run another compiler's output into the source tree either.

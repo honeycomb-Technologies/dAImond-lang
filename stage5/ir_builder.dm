@@ -5,7 +5,6 @@ import ir
 -- ============================================================
 -- IR Builder
 -- Builds instructions within a current function and basic block
--- Port of stage3/src/ir.zig IRBuilder
 -- ============================================================
 
 struct IRBuilder {

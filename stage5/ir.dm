@@ -3,7 +3,6 @@ module ir
 -- ============================================================
 -- dAImond Intermediate Representation
 -- SSA-based typed IR between AST and LLVM IR
--- Port of stage3/src/ir.zig using integer kind tags
 -- ============================================================
 
 -- ============================================================

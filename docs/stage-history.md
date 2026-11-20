@@ -1,6 +1,42 @@
-# Stage History — Archived Documentation
+# Stage History
 
-Archived documentation for completed/frozen compiler stages. For current development, see `CLAUDE.md`.
+dAImond had five compilers. Four are deleted; the fifth, in `stage5/`, is the compiler. This file records what the others were. Their code is in the repository's history up to commit `2ddc25f`: `git show 2ddc25f:stage0/src/main.zig`, or `git checkout 2ddc25f` to build them.
+
+| Stage | What it was | Written in | Deleted |
+| --- | --- | --- | --- |
+| 0 | The first compiler: lexer, parser, Hindley-Milner type checker, C11 code generator, with a C runtime, a package manager, a formatter, a test runner and a language server | Zig 0.13 | 2026-11-20 |
+| 1 | A compiler for a subset of the language, emitting C, that compiled itself to a fixed point | dAImond | 2026-11-20 |
+| 2 | Stage 1 compiled by itself (a build, not separate code) | | |
+| 3 | An LLVM backend behind Stage 0's front end | Zig | 2026-11-20 |
+| 4 | Stage 3's pipeline rewritten in dAImond, with its own front end | dAImond | 2026-11-09 |
+| 5 | Stage 4 plus memory-safety checks; today's compiler | dAImond | |
+
+Stage 5 was first built by Stage 0, which compiled it to C. It then got its own runtime in dAImond in place of `daimond_runtime.c` and `llvm_wrappers.c`, linked with `ld.lld` in place of `cc`, got its bridge to LLVM in dAImond in place of `llvm_bridge.c`, and was given a seed (`seed/daimond.bc`) to build from. With the test harness, `run`, `check`, `fmt`, `test`, the language server and debug info also in dAImond, the Zig compilers and the C were deleted.
+
+## What Stage 0 had that the compiler does not
+
+- A type checker (Hindley-Milner inference with unification), with error codes such as `Error[E0100]`
+- A package manager (`daimond pkg init`, `add`, `list`, with a TOML manifest)
+- A compilation cache, and the `lex` and `parse` commands that printed tokens and the AST
+- Effect checking of every call in a function's body
+- `let x: int` without a value
+- Windows code paths in the generated C for sockets and threads
+
+## Where the compiler behaves differently from Stage 0
+
+- `read_line` gives a whole line however long it is; Stage 0 cut a line at 4095 bytes.
+- `parse_int` and `parse_float` read the whole string; Stage 0 read at most 31 and 63 bytes.
+- `file_read` reads pipes and files in `/proc`; Stage 0 gave `""` for them.
+- `substr` with a negative length returns `""`; Stage 0 crashed.
+- A search pattern longer than the string is not found (`string_split("ab", "abc")` is `["ab"]`); Stage 0 crashed.
+- `string_split(s, "")` gives the bytes of `s`; Stage 0 gave `[s]`.
+- `is_alpha("_")` is false; it was true in Stage 0.
+- `tcp_listen` and `tcp_connect` give -1 for a host that is not an address and for a port above 65535; Stage 0 listened on every address for a host it could not read, and cut the port to 16 bits.
+- `daimond test` runs each test in its own process and goes on after a panic; Stage 0 stopped at the first panic that was not an assertion.
+- Error messages have the form `Error: ... at line N`.
+- A program's function may be named like a C function (`rename`, `strlen`); Stage 0 could not link such a program.
+
+The rest of this file describes Stage 1 and Stage 3 as they were. The commands in it work in a checkout of `2ddc25f`, not in the current tree.
 
 ## Stage 1 Compiler Architecture
 

@@ -7,12 +7,9 @@ module llvm_bridge
 -- module, type, value, block or builder) is an int that holds the
 -- pointer.
 --
--- Stage 5 adds this file to the program it compiles when it is given
--- --link-llvm, which is how it builds itself: each function here
--- takes the place of the extern fn of the same name. Stage 0 cannot
--- parse this file, so the compiler it builds links llvm_bridge.c
--- instead, which defines the same functions in C. Until Stage 0 goes,
--- a change to one file belongs in the other too.
+-- The compiler adds this file to the program it compiles when it is
+-- given --link-llvm, which is how it builds itself: each function
+-- here takes the place of the extern fn of the same name.
 --
 -- C's `unsigned` is u32 here, LLVMBool and enums are i32, and size_t,
 -- uint64_t and every pointer are int. The numbers of LLVM's enums are

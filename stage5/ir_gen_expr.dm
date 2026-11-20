@@ -9,7 +9,6 @@ import ir_gen_stmt
 -- ============================================================
 -- EXPRESSION IR GENERATION
 -- Main dispatcher and all expression kind handlers
--- Port of stage3/src/ir_gen.zig generateExpr
 -- ============================================================
 
 -- Parse the error type from a "Result[T, E]" type annotation string
@@ -335,6 +334,17 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
     }
     if name == "false" {
         return generate_literal_bool(g, b, expr_bool(false, 0, 0))
+    }
+
+    -- A name bound to a lambda that captures variables is only called
+    -- (see generate_lambda_expr); here it is used as a value
+    if g.fn_ptr_vars.contains(name) {
+        let bound_lambda = g.fn_ptr_vars.get(name)
+        if g.lambda_captures.contains(bound_lambda) {
+            let captured = string_split(g.lambda_captures.get(bound_lambda), "|")
+            eprintln(error_at(g.ir_mod.files, captured_lambda_error(captured[0], "the lambda '" + name + "'"), expr.line))
+            exit(1)
+        }
     }
 
     -- Check for "None" (Option None)
@@ -1396,7 +1406,6 @@ fn list_elem_ir_type(elem_src: string) -> string {
 -- Determines the IR type name for an expression without
 -- generating instructions. Used to select the correct opcode
 -- family (integer, float, string) for binary operations.
--- Port of stage3/src/ir_gen.zig inferExprType
 -- ============================================================
 
 fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
@@ -1879,7 +1888,6 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
 -- ============================================================
 -- BINARY EXPRESSION IR GENERATION
 -- Handles arithmetic, comparison, logical, and string operators
--- Port of stage3/src/ir_gen.zig generateBinary
 -- ============================================================
 
 fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -2652,7 +2660,6 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
 -- ============================================================
 -- UNARY EXPRESSION IR GENERATION
 -- Handles negation (-) and logical not (!)
--- Port of stage3/src/ir_gen.zig generateUnary
 -- ============================================================
 
 fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -2784,7 +2791,6 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
 -- ============================================================
 -- CAST EXPRESSION IR GENERATION
 -- Handles explicit type casts via `expr as Type`
--- Port of stage3/src/ir_gen.zig generateCast
 -- ============================================================
 
 fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -2836,7 +2842,6 @@ fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
 -- Dispatches function calls to builtins, special constructors,
 -- generic monomorphization, indirect (lambda) calls, and
 -- regular user-defined function calls.
--- Port of stage3/src/ir_gen.zig generateCall
 -- ============================================================
 
 fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -3423,7 +3428,6 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
 -- GENERIC FUNCTION CALL
 -- Builds a monomorphized name, generates the specialized copy
 -- if not already done, then calls it normally.
--- Port of stage3/src/ir_gen.zig generateGenericCall
 -- ============================================================
 
 fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -3687,7 +3691,6 @@ fn infer_arg_type(gen: IRGenerator, arg: Expr) -> string {
 -- Dispatches method calls on objects to the appropriate handler:
 -- enum constructors, dynamic dispatch, map methods, list methods,
 -- string methods, struct methods.
--- Port of stage3/src/ir_gen.zig generateMethodCall
 -- ============================================================
 
 fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -5991,7 +5994,6 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 -- If expressions, match expressions, block expressions,
 -- lambda expressions, pipeline operator, error propagation,
 -- string interpolation, and comptime expressions.
--- Port of stage3/src/ir_gen.zig complex expression handlers.
 -- ============================================================
 
 -- ============================================================
@@ -7195,9 +7197,18 @@ fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 -- function with a unique name.
 -- ============================================================
 
+-- The error for a lambda that captures `variable` and is used as a
+-- value (passed, returned or stored) instead of being called by name
+fn captured_lambda_error(variable: string, what: string) -> string {
+    return what + " uses '" + variable + "', a variable of the function around it, so it can only be bound to a name with 'let' and called by that name; pass it '" + variable + "' as a parameter to use it as a value"
+}
+
 fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+
+    let bound_by_let = g.lambda_bound_by_let
+    g.lambda_bound_by_let = false
 
     -- Generate unique lambda name
     let lambda_name = gen_next_lambda_name(g)
@@ -7227,17 +7238,27 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         pi = pi + 1
     }
 
-    -- Collect captured variables from the current scope
+    -- Collect captured variables: the variables of the current scope
+    -- that the lambda's body mentions. A lambda that captures nothing
+    -- is a plain function, which can be passed where a fn(...) is
+    -- expected.
     -- Build a pipe-delimited list of captured variable names
     let mut captures = ""
     let mut capture_names: List[string] = []
     let mut capture_types: List[string] = []
+    let body_names = expr_names(*expr.lambda_body)
+    let mut mentioned: Map[string, bool] = Map_new()
+    let mut ni = 0
+    while ni < body_names.len() {
+        mentioned.insert(body_names[ni], true)
+        ni = ni + 1
+    }
     let mut keys = g.variable_map.keys()
     let mut ki = 0
     while ki < keys.len() {
         let var_name = keys[ki]
         -- Skip lambda parameters (they are not captures)
-        let mut is_param = false
+        let mut is_param = mentioned.contains(var_name) == false
         let mut pj = 0
         while pj < expr.lambda_params.len() {
             if expr.lambda_params[pj].name == var_name {
@@ -7263,6 +7284,14 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         ki = ki + 1
     }
 
+    -- A captured variable is an extra parameter of the lambda's function,
+    -- which only a call of the lambda by its name passes. Anywhere else
+    -- the lambda would be called without it.
+    if capture_names.len() > 0 and bound_by_let == false {
+        eprintln(error_at(g.ir_mod.files, captured_lambda_error(capture_names[0], "this lambda"), expr.line))
+        exit(1)
+    }
+
     -- Save current generator state
     let saved_variable_map = g.variable_map
     let saved_variable_types = g.variable_types
@@ -7274,6 +7303,12 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let saved_region_born_vars = g.region_born_vars
     let saved_declared_vars = g.declared_vars
     let saved_region_marks = g.region_marks
+    let saved_completed_blocks = g.completed_blocks
+
+    -- The lambda's blocks are its own: a body with a branch in it (an
+    -- `if`, `and`, a division's zero check) finishes blocks as it goes
+    let empty_lambda_blocks: List[IRBasicBlock] = []
+    g.completed_blocks = empty_lambda_blocks
 
     -- Set up new variable scope for the lambda body. Safety state is
     -- fresh per function; unsafe_depth is lexical and carries in.
@@ -7376,7 +7411,13 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         entry_block.has_terminator = true
     }
 
-    -- Add entry block to the lambda function and push to module
+    -- The lambda's blocks in order: the ones the body finished, then
+    -- the block it ended in (the entry block itself for a simple body)
+    let mut lbi = 0
+    while lbi < g.completed_blocks.len() {
+        lambda_func.blocks.push(g.completed_blocks[lbi])
+        lbi = lbi + 1
+    }
     lambda_func.blocks.push(entry_block)
     g.ir_mod.functions.push(lambda_func)
 
@@ -7391,6 +7432,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     g.region_born_vars = saved_region_born_vars
     g.declared_vars = saved_declared_vars
     g.region_marks = saved_region_marks
+    g.completed_blocks = saved_completed_blocks
 
     -- Record the lambda in fn_ptr_vars and lambda_captures
     g.fn_ptr_vars.insert(lambda_name, lambda_name)
@@ -7927,7 +7969,6 @@ fn generate_comptime_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 -- SIMD Builtin IR Generation
 -- Handles simd_splat_*, simd_set_*, simd_add/sub/mul/div,
 -- and simd_extract intrinsic function calls.
--- Port of stage3/src/ir_gen.zig SIMD handling
 -- ============================================================
 
 -- ============================================================

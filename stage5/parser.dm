@@ -7,7 +7,6 @@ import ast
 -- ============================================================
 -- Parser: Recursive descent + Pratt parser
 -- Builds AST nodes from token stream
--- Adapted from Stage 1 parsing patterns
 -- ============================================================
 
 struct Parser {
@@ -1263,7 +1262,7 @@ fn parse_stmt(p: Parser) -> ParseStmtResult {
         return parse_region_stmt(pp)
     }
 
-    -- Unsafe block (transparent; fence lives in the Stage 0 checker)
+    -- Unsafe block (IR generation enforces the fence)
     if tok.kind == TK_UNSAFE() {
         return parse_unsafe_stmt(pp)
     }
@@ -1339,6 +1338,10 @@ fn parse_let_stmt(p: Parser) -> ParseStmtResult {
         let val = parse_expr(pp)
         pp = val.p
         s.let_value = Box_new(val.expr)
+    } else {
+        -- A variable without a value would be read before it is written
+        pp = p_error(pp, "expected '=' and a value for '" + name_tok.value + "' but got " + token_kind_name(p_peek(pp)))
+        s.let_value = Box_new(expr_new(EXPR_LITERAL_NULL(), tok.line, tok.col))
     }
 
     return ParseStmtResult { p: pp, stmt: s }

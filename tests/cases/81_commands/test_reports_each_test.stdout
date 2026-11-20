@@ -1,0 +1,10 @@
+Found 5 test(s) in t.dm
+
+  test test_add ... PASS
+  test test_wrong_sum ... FAIL: assert_eq failed: values not equal
+  test test_strings ... PASS
+  test test_out_of_bounds ... FAIL: index out of bounds: index 3, length 0 (list)
+  test test_last_still_runs ... PASS
+
+3 passed, 2 failed
+t.dm

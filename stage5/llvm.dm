@@ -3,8 +3,7 @@ module llvm
 -- ============================================================
 -- LLVM-C Bridge Extern Declarations
 -- All LLVM refs are represented as int (int64_t on C side)
--- The dm_llvm_* functions are defined in llvm_bridge.dm, and again in
--- llvm_bridge.c for the compiler that Stage 0 builds
+-- The dm_llvm_* functions are defined in llvm_bridge.dm
 -- ============================================================
 
 -- ============================================================

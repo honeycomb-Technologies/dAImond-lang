@@ -1,8 +1,8 @@
 module ast
 
 -- ============================================================
--- AST Node Definitions for dAImond Stage 4
--- Uses integer kind tags (not tagged unions) following Stage 1 pattern
+-- AST node definitions
+-- A node's kind is an integer tag, and it has the fields of every kind
 -- ============================================================
 
 -- ============================================================
@@ -691,4 +691,171 @@ struct SourceFile {
 
 fn source_file_new(name: string) -> SourceFile {
     return SourceFile { module_name: name, imports: [], declarations: [], errors: [], files: [] }
+}
+
+-- ============================================================
+-- NAMES IN EXPRESSIONS
+-- ============================================================
+
+-- The names in the expression, added to `found`. With calls_only, the
+-- names it calls as `name(...)`; otherwise every name it mentions: the
+-- variables it reads and the functions it calls by name, including the
+-- names the expression itself declares (a `let`, a loop variable, a
+-- lambda's parameter). A name is added each time it occurs.
+fn names_in_expr(e: Expr, found: List[string], calls_only: bool) -> List[string] {
+    let mut names = found
+    let k = e.kind
+    if k == EXPR_IDENTIFIER() {
+        if calls_only == false {
+            names.push(e.name)
+        }
+        return names
+    }
+    if k == EXPR_BINARY() or k == EXPR_RANGE() {
+        names = names_in_expr(*e.left, names, calls_only)
+        return names_in_expr(*e.right, names, calls_only)
+    }
+    if k == EXPR_PIPELINE() {
+        -- `x |> f` calls f
+        let piped_to = *e.pipe_right
+        if calls_only and piped_to.kind == EXPR_IDENTIFIER() {
+            names.push(piped_to.name)
+        }
+        names = names_in_expr(*e.left, names, calls_only)
+        return names_in_expr(*e.pipe_right, names, calls_only)
+    }
+    if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
+        return names_in_expr(*e.operand, names, calls_only)
+    }
+    if k == EXPR_FIELD_ACCESS() {
+        return names_in_expr(*e.object, names, calls_only)
+    }
+    if k == EXPR_INDEX_ACCESS() {
+        names = names_in_expr(*e.object, names, calls_only)
+        return names_in_expr(*e.index, names, calls_only)
+    }
+    if k == EXPR_METHOD_CALL() {
+        names = names_in_expr(*e.object, names, calls_only)
+        return names_in_exprs(e.args, names, calls_only)
+    }
+    if k == EXPR_FUNCTION_CALL() {
+        let callee = *e.callee
+        if calls_only and callee.kind == EXPR_IDENTIFIER() {
+            names.push(callee.name)
+        }
+        names = names_in_expr(callee, names, calls_only)
+        return names_in_exprs(e.args, names, calls_only)
+    }
+    if k == EXPR_STRUCT_LITERAL() {
+        return names_in_exprs(e.field_values, names, calls_only)
+    }
+    if k == EXPR_ENUM_LITERAL() {
+        return names_in_exprs(e.payload, names, calls_only)
+    }
+    if k == EXPR_ARRAY_LITERAL() {
+        return names_in_exprs(e.elements, names, calls_only)
+    }
+    if k == EXPR_STRING_INTERP() {
+        return names_in_exprs(e.interp_parts, names, calls_only)
+    }
+    if k == EXPR_IF() {
+        names = names_in_expr(*e.condition, names, calls_only)
+        names = names_in_expr(*e.then_branch, names, calls_only)
+        if e.has_else {
+            names = names_in_expr(*e.else_branch, names, calls_only)
+        }
+        return names
+    }
+    if k == EXPR_MATCH() {
+        names = names_in_expr(*e.scrutinee, names, calls_only)
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            if arm.has_guard {
+                names = names_in_expr(*arm.guard, names, calls_only)
+            }
+            if arm.is_expr_body {
+                names = names_in_expr(*arm.body_expr, names, calls_only)
+            } else {
+                names = names_in_stmts(arm.body, names, calls_only)
+            }
+            i = i + 1
+        }
+        return names
+    }
+    if k == EXPR_BLOCK() {
+        names = names_in_stmts(e.stmts, names, calls_only)
+        if e.has_result {
+            names = names_in_expr(*e.result, names, calls_only)
+        }
+        return names
+    }
+    if k == EXPR_LAMBDA() {
+        return names_in_expr(*e.lambda_body, names, calls_only)
+    }
+    return names
+}
+
+fn names_in_exprs(exprs: List[Expr], found: List[string], calls_only: bool) -> List[string] {
+    let mut names = found
+    let mut i = 0
+    while i < exprs.len() {
+        names = names_in_expr(exprs[i], names, calls_only)
+        i = i + 1
+    }
+    return names
+}
+
+-- names_in_expr for every expression in the statements
+fn names_in_stmts(stmts: List[Stmt], found: List[string], calls_only: bool) -> List[string] {
+    let mut names = found
+    let mut i = 0
+    while i < stmts.len() {
+        let s = stmts[i]
+        let k = s.kind
+        if k == STMT_LET() {
+            names = names_in_expr(*s.let_value, names, calls_only)
+        } else if k == STMT_RETURN() {
+            if s.has_ret_value {
+                names = names_in_expr(*s.ret_value, names, calls_only)
+            }
+        } else if k == STMT_IF() {
+            names = names_in_expr(*s.if_cond, names, calls_only)
+            names = names_in_stmts(s.if_then, names, calls_only)
+            if s.has_else_branch {
+                names = names_in_stmts(s.if_else, names, calls_only)
+            }
+        } else if k == STMT_MATCH() {
+            names = names_in_expr(*s.match_expr, names, calls_only)
+        } else if k == STMT_FOR() {
+            names = names_in_expr(*s.for_iter, names, calls_only)
+            names = names_in_stmts(s.for_body, names, calls_only)
+        } else if k == STMT_WHILE() {
+            names = names_in_expr(*s.while_cond, names, calls_only)
+            names = names_in_stmts(s.while_body, names, calls_only)
+        } else if k == STMT_LOOP() {
+            names = names_in_stmts(s.loop_body, names, calls_only)
+        } else if k == STMT_REGION() {
+            names = names_in_stmts(s.region_body, names, calls_only)
+        } else if k == STMT_EXPRESSION() {
+            names = names_in_expr(*s.expr, names, calls_only)
+        } else if k == STMT_ASSIGNMENT() {
+            names = names_in_expr(*s.assign_target, names, calls_only)
+            names = names_in_expr(*s.assign_value, names, calls_only)
+        }
+        i = i + 1
+    }
+    return names
+}
+
+-- Every name the expression mentions (see names_in_expr)
+fn expr_names(e: Expr) -> List[string] {
+    let none: List[string] = []
+    return names_in_expr(e, none, false)
+}
+
+-- Every name the statements call as `name(...)`, at any depth
+fn stmts_calls(stmts: List[Stmt]) -> List[string] {
+    let none: List[string] = []
+    return names_in_stmts(stmts, none, true)
 }

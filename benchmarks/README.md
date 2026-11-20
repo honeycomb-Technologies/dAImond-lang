@@ -28,8 +28,8 @@ benchmarks/
 ## Running
 
 ```bash
-# Build the compiler first
-cd stage0 && zig build
+# Build the compiler first (build/daimond; or set DAIMOND to another compiler)
+bash bootstrap.sh
 
 # Run all benchmarks
 cd benchmarks && bash run.sh

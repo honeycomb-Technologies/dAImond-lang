@@ -666,11 +666,6 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
 }
 
 -- ============================================================
--- AST Node Definitions for dAImond Stage 4
--- Uses integer kind tags (not tagged unions) following Stage 1 pattern
--- ============================================================
-
--- ============================================================
 -- EXPRESSION KINDS
 -- ============================================================
 
@@ -717,8 +712,8 @@ fn unescape_string(s: string) -> string {
 }
 
 -- ============================================================
--- AST Node Definitions for dAImond Stage 4
--- Uses integer kind tags (not tagged unions) following Stage 1 pattern
+-- AST node definitions
+-- A node's kind is an integer tag, and it has the fields of every kind
 -- ============================================================
 
 -- ============================================================
@@ -1410,9 +1405,175 @@ fn source_file_new(name: string) -> SourceFile {
 }
 
 -- ============================================================
+-- NAMES IN EXPRESSIONS
+-- ============================================================
+
+-- The names in the expression, added to `found`. With calls_only, the
+-- names it calls as `name(...)`; otherwise every name it mentions: the
+-- variables it reads and the functions it calls by name, including the
+-- names the expression itself declares (a `let`, a loop variable, a
+-- lambda's parameter). A name is added each time it occurs.
+fn names_in_expr(e: Expr, found: List[string], calls_only: bool) -> List[string] {
+    let mut names = found
+    let k = e.kind
+    if k == EXPR_IDENTIFIER() {
+        if calls_only == false {
+            names.push(e.name)
+        }
+        return names
+    }
+    if k == EXPR_BINARY() or k == EXPR_RANGE() {
+        names = names_in_expr(*e.left, names, calls_only)
+        return names_in_expr(*e.right, names, calls_only)
+    }
+    if k == EXPR_PIPELINE() {
+        -- `x |> f` calls f
+        let piped_to = *e.pipe_right
+        if calls_only and piped_to.kind == EXPR_IDENTIFIER() {
+            names.push(piped_to.name)
+        }
+        names = names_in_expr(*e.left, names, calls_only)
+        return names_in_expr(*e.pipe_right, names, calls_only)
+    }
+    if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
+        return names_in_expr(*e.operand, names, calls_only)
+    }
+    if k == EXPR_FIELD_ACCESS() {
+        return names_in_expr(*e.object, names, calls_only)
+    }
+    if k == EXPR_INDEX_ACCESS() {
+        names = names_in_expr(*e.object, names, calls_only)
+        return names_in_expr(*e.index, names, calls_only)
+    }
+    if k == EXPR_METHOD_CALL() {
+        names = names_in_expr(*e.object, names, calls_only)
+        return names_in_exprs(e.args, names, calls_only)
+    }
+    if k == EXPR_FUNCTION_CALL() {
+        let callee = *e.callee
+        if calls_only and callee.kind == EXPR_IDENTIFIER() {
+            names.push(callee.name)
+        }
+        names = names_in_expr(callee, names, calls_only)
+        return names_in_exprs(e.args, names, calls_only)
+    }
+    if k == EXPR_STRUCT_LITERAL() {
+        return names_in_exprs(e.field_values, names, calls_only)
+    }
+    if k == EXPR_ENUM_LITERAL() {
+        return names_in_exprs(e.payload, names, calls_only)
+    }
+    if k == EXPR_ARRAY_LITERAL() {
+        return names_in_exprs(e.elements, names, calls_only)
+    }
+    if k == EXPR_STRING_INTERP() {
+        return names_in_exprs(e.interp_parts, names, calls_only)
+    }
+    if k == EXPR_IF() {
+        names = names_in_expr(*e.condition, names, calls_only)
+        names = names_in_expr(*e.then_branch, names, calls_only)
+        if e.has_else {
+            names = names_in_expr(*e.else_branch, names, calls_only)
+        }
+        return names
+    }
+    if k == EXPR_MATCH() {
+        names = names_in_expr(*e.scrutinee, names, calls_only)
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            if arm.has_guard {
+                names = names_in_expr(*arm.guard, names, calls_only)
+            }
+            if arm.is_expr_body {
+                names = names_in_expr(*arm.body_expr, names, calls_only)
+            } else {
+                names = names_in_stmts(arm.body, names, calls_only)
+            }
+            i = i + 1
+        }
+        return names
+    }
+    if k == EXPR_BLOCK() {
+        names = names_in_stmts(e.stmts, names, calls_only)
+        if e.has_result {
+            names = names_in_expr(*e.result, names, calls_only)
+        }
+        return names
+    }
+    if k == EXPR_LAMBDA() {
+        return names_in_expr(*e.lambda_body, names, calls_only)
+    }
+    return names
+}
+
+fn names_in_exprs(exprs: List[Expr], found: List[string], calls_only: bool) -> List[string] {
+    let mut names = found
+    let mut i = 0
+    while i < exprs.len() {
+        names = names_in_expr(exprs[i], names, calls_only)
+        i = i + 1
+    }
+    return names
+}
+
+-- names_in_expr for every expression in the statements
+fn names_in_stmts(stmts: List[Stmt], found: List[string], calls_only: bool) -> List[string] {
+    let mut names = found
+    let mut i = 0
+    while i < stmts.len() {
+        let s = stmts[i]
+        let k = s.kind
+        if k == STMT_LET() {
+            names = names_in_expr(*s.let_value, names, calls_only)
+        } else if k == STMT_RETURN() {
+            if s.has_ret_value {
+                names = names_in_expr(*s.ret_value, names, calls_only)
+            }
+        } else if k == STMT_IF() {
+            names = names_in_expr(*s.if_cond, names, calls_only)
+            names = names_in_stmts(s.if_then, names, calls_only)
+            if s.has_else_branch {
+                names = names_in_stmts(s.if_else, names, calls_only)
+            }
+        } else if k == STMT_MATCH() {
+            names = names_in_expr(*s.match_expr, names, calls_only)
+        } else if k == STMT_FOR() {
+            names = names_in_expr(*s.for_iter, names, calls_only)
+            names = names_in_stmts(s.for_body, names, calls_only)
+        } else if k == STMT_WHILE() {
+            names = names_in_expr(*s.while_cond, names, calls_only)
+            names = names_in_stmts(s.while_body, names, calls_only)
+        } else if k == STMT_LOOP() {
+            names = names_in_stmts(s.loop_body, names, calls_only)
+        } else if k == STMT_REGION() {
+            names = names_in_stmts(s.region_body, names, calls_only)
+        } else if k == STMT_EXPRESSION() {
+            names = names_in_expr(*s.expr, names, calls_only)
+        } else if k == STMT_ASSIGNMENT() {
+            names = names_in_expr(*s.assign_target, names, calls_only)
+            names = names_in_expr(*s.assign_value, names, calls_only)
+        }
+        i = i + 1
+    }
+    return names
+}
+
+-- Every name the expression mentions (see names_in_expr)
+fn expr_names(e: Expr) -> List[string] {
+    let none: List[string] = []
+    return names_in_expr(e, none, false)
+}
+
+-- Every name the statements call as `name(...)`, at any depth
+fn stmts_calls(stmts: List[Stmt]) -> List[string] {
+    let none: List[string] = []
+    return names_in_stmts(stmts, none, true)
+}
+
+-- ============================================================
 -- dAImond Intermediate Representation
 -- SSA-based typed IR between AST and LLVM IR
--- Port of stage3/src/ir.zig using integer kind tags
 -- ============================================================
 
 -- ============================================================
@@ -1995,7 +2156,6 @@ fn ir_val_break() -> IRValue {
 -- ============================================================
 -- IR Builder
 -- Builds instructions within a current function and basic block
--- Port of stage3/src/ir.zig IRBuilder
 -- ============================================================
 
 struct IRBuilder {
@@ -2468,8 +2628,7 @@ fn builder_last_id(b: IRBuilder) -> int {
 -- ============================================================
 -- LLVM-C Bridge Extern Declarations
 -- All LLVM refs are represented as int (int64_t on C side)
--- The dm_llvm_* functions are defined in llvm_bridge.dm, and again in
--- llvm_bridge.c for the compiler that Stage 0 builds
+-- The dm_llvm_* functions are defined in llvm_bridge.dm
 -- ============================================================
 
 -- ============================================================
@@ -2723,7 +2882,6 @@ extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int
 -- ============================================================
 -- Parser: Recursive descent + Pratt parser
 -- Builds AST nodes from token stream
--- Adapted from Stage 1 parsing patterns
 -- ============================================================
 
 struct Parser {
@@ -3979,7 +4137,7 @@ fn parse_stmt(p: Parser) -> ParseStmtResult {
         return parse_region_stmt(pp)
     }
 
-    -- Unsafe block (transparent; fence lives in the Stage 0 checker)
+    -- Unsafe block (IR generation enforces the fence)
     if tok.kind == TK_UNSAFE() {
         return parse_unsafe_stmt(pp)
     }
@@ -4055,6 +4213,10 @@ fn parse_let_stmt(p: Parser) -> ParseStmtResult {
         let val = parse_expr(pp)
         pp = val.p
         s.let_value = Box_new(val.expr)
+    } else {
+        -- A variable without a value would be read before it is written
+        pp = p_error(pp, "expected '=' and a value for '" + name_tok.value + "' but got " + token_kind_name(p_peek(pp)))
+        s.let_value = Box_new(expr_new(EXPR_LITERAL_NULL(), tok.line, tok.col))
     }
 
     return ParseStmtResult { p: pp, stmt: s }
@@ -4901,7 +5063,6 @@ fn parse(source: string) -> SourceFile {
 -- ============================================================
 -- IR Generator Core
 -- Central struct and initialization, type mapping
--- Port of stage3/src/ir_gen.zig IRGenerator struct
 -- ============================================================
 
 -- Struct info for tracking registered structs
@@ -5016,6 +5177,9 @@ struct IRGenerator {
     fn_ptr_vars: Map[string, string],
     -- Lambda name -> pipe-delimited capture list
     lambda_captures: Map[string, string],
+    -- True while the value of a `let` that is a lambda is generated:
+    -- the one place a lambda that captures variables may be written
+    lambda_bound_by_let: bool,
     -- Method name -> struct type name
     method_struct_map: Map[string, string],
     -- The functions of impl blocks that take no self, by mangled name
@@ -5131,6 +5295,7 @@ fn ir_generator_new() -> IRGenerator {
         type_substitutions: Map_new(),
         fn_ptr_vars: Map_new(),
         lambda_captures: Map_new(),
+        lambda_bound_by_let: false,
         method_struct_map: Map_new(),
         static_fns: Map_new(),
         var_struct_types: Map_new(),
@@ -5484,7 +5649,7 @@ fn classify_list_elem(elem_type: string) -> int {
 -- walk, where variable types, struct definitions, and the
 -- extern registry already live. A violation prints a
 -- source-located diagnostic and exits before LLVM emission.
--- Mirrors stage0/src/checker.zig (inferCast, unsafe fence
+-- The rules of the Zig compiler's checker (inferCast, unsafe fence
 -- provenance, REGION ESCAPE RULE).
 -- ============================================================
 
@@ -7427,6 +7592,13 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
     let mut g = gen
+    -- A lambda bound to a name may capture variables; the calls of that
+    -- name pass them. A name bound to anything else is not a lambda's.
+    let bound_value = *stmt.let_value
+    g.lambda_bound_by_let = bound_value.kind == EXPR_LAMBDA()
+    if g.lambda_bound_by_let == false and g.fn_ptr_vars.contains(stmt.let_name) {
+        g.fn_ptr_vars.remove(stmt.let_name)
+    }
     let mut b = block
     let var_name = stmt.let_name
     let mut type_str = stmt.let_type
@@ -9002,14 +9174,12 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
 -- ============================================================
 -- EXPRESSION IR GENERATION
 -- Main dispatcher and all expression kind handlers
--- Port of stage3/src/ir_gen.zig generateExpr
 -- ============================================================
 
 
 -- ============================================================
 -- EXPRESSION IR GENERATION
 -- Main dispatcher and all expression kind handlers
--- Port of stage3/src/ir_gen.zig generateExpr
 -- ============================================================
 
 -- Parse the error type from a "Result[T, E]" type annotation string
@@ -9335,6 +9505,17 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
     }
     if name == "false" {
         return generate_literal_bool(g, b, expr_bool(false, 0, 0))
+    }
+
+    -- A name bound to a lambda that captures variables is only called
+    -- (see generate_lambda_expr); here it is used as a value
+    if g.fn_ptr_vars.contains(name) {
+        let bound_lambda = g.fn_ptr_vars.get(name)
+        if g.lambda_captures.contains(bound_lambda) {
+            let captured = string_split(g.lambda_captures.get(bound_lambda), "|")
+            eprintln(error_at(g.ir_mod.files, captured_lambda_error(captured[0], "the lambda '" + name + "'"), expr.line))
+            exit(1)
+        }
     }
 
     -- Check for "None" (Option None)
@@ -10396,7 +10577,6 @@ fn list_elem_ir_type(elem_src: string) -> string {
 -- Determines the IR type name for an expression without
 -- generating instructions. Used to select the correct opcode
 -- family (integer, float, string) for binary operations.
--- Port of stage3/src/ir_gen.zig inferExprType
 -- ============================================================
 
 fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
@@ -10879,7 +11059,6 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
 -- ============================================================
 -- BINARY EXPRESSION IR GENERATION
 -- Handles arithmetic, comparison, logical, and string operators
--- Port of stage3/src/ir_gen.zig generateBinary
 -- ============================================================
 
 fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -11652,7 +11831,6 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
 -- ============================================================
 -- UNARY EXPRESSION IR GENERATION
 -- Handles negation (-) and logical not (!)
--- Port of stage3/src/ir_gen.zig generateUnary
 -- ============================================================
 
 fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -11784,7 +11962,6 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
 -- ============================================================
 -- CAST EXPRESSION IR GENERATION
 -- Handles explicit type casts via `expr as Type`
--- Port of stage3/src/ir_gen.zig generateCast
 -- ============================================================
 
 fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -11836,7 +12013,6 @@ fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
 -- Dispatches function calls to builtins, special constructors,
 -- generic monomorphization, indirect (lambda) calls, and
 -- regular user-defined function calls.
--- Port of stage3/src/ir_gen.zig generateCall
 -- ============================================================
 
 fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -12423,7 +12599,6 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
 -- GENERIC FUNCTION CALL
 -- Builds a monomorphized name, generates the specialized copy
 -- if not already done, then calls it normally.
--- Port of stage3/src/ir_gen.zig generateGenericCall
 -- ============================================================
 
 fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -12687,7 +12862,6 @@ fn infer_arg_type(gen: IRGenerator, arg: Expr) -> string {
 -- Dispatches method calls on objects to the appropriate handler:
 -- enum constructors, dynamic dispatch, map methods, list methods,
 -- string methods, struct methods.
--- Port of stage3/src/ir_gen.zig generateMethodCall
 -- ============================================================
 
 fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
@@ -14991,7 +15165,6 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 -- If expressions, match expressions, block expressions,
 -- lambda expressions, pipeline operator, error propagation,
 -- string interpolation, and comptime expressions.
--- Port of stage3/src/ir_gen.zig complex expression handlers.
 -- ============================================================
 
 -- ============================================================
@@ -16195,9 +16368,18 @@ fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 -- function with a unique name.
 -- ============================================================
 
+-- The error for a lambda that captures `variable` and is used as a
+-- value (passed, returned or stored) instead of being called by name
+fn captured_lambda_error(variable: string, what: string) -> string {
+    return what + " uses '" + variable + "', a variable of the function around it, so it can only be bound to a name with 'let' and called by that name; pass it '" + variable + "' as a parameter to use it as a value"
+}
+
 fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+
+    let bound_by_let = g.lambda_bound_by_let
+    g.lambda_bound_by_let = false
 
     -- Generate unique lambda name
     let lambda_name = gen_next_lambda_name(g)
@@ -16227,17 +16409,27 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         pi = pi + 1
     }
 
-    -- Collect captured variables from the current scope
+    -- Collect captured variables: the variables of the current scope
+    -- that the lambda's body mentions. A lambda that captures nothing
+    -- is a plain function, which can be passed where a fn(...) is
+    -- expected.
     -- Build a pipe-delimited list of captured variable names
     let mut captures = ""
     let mut capture_names: List[string] = []
     let mut capture_types: List[string] = []
+    let body_names = expr_names(*expr.lambda_body)
+    let mut mentioned: Map[string, bool] = Map_new()
+    let mut ni = 0
+    while ni < body_names.len() {
+        mentioned.insert(body_names[ni], true)
+        ni = ni + 1
+    }
     let mut keys = g.variable_map.keys()
     let mut ki = 0
     while ki < keys.len() {
         let var_name = keys[ki]
         -- Skip lambda parameters (they are not captures)
-        let mut is_param = false
+        let mut is_param = mentioned.contains(var_name) == false
         let mut pj = 0
         while pj < expr.lambda_params.len() {
             if expr.lambda_params[pj].name == var_name {
@@ -16263,6 +16455,14 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         ki = ki + 1
     }
 
+    -- A captured variable is an extra parameter of the lambda's function,
+    -- which only a call of the lambda by its name passes. Anywhere else
+    -- the lambda would be called without it.
+    if capture_names.len() > 0 and bound_by_let == false {
+        eprintln(error_at(g.ir_mod.files, captured_lambda_error(capture_names[0], "this lambda"), expr.line))
+        exit(1)
+    }
+
     -- Save current generator state
     let saved_variable_map = g.variable_map
     let saved_variable_types = g.variable_types
@@ -16274,6 +16474,12 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let saved_region_born_vars = g.region_born_vars
     let saved_declared_vars = g.declared_vars
     let saved_region_marks = g.region_marks
+    let saved_completed_blocks = g.completed_blocks
+
+    -- The lambda's blocks are its own: a body with a branch in it (an
+    -- `if`, `and`, a division's zero check) finishes blocks as it goes
+    let empty_lambda_blocks: List[IRBasicBlock] = []
+    g.completed_blocks = empty_lambda_blocks
 
     -- Set up new variable scope for the lambda body. Safety state is
     -- fresh per function; unsafe_depth is lexical and carries in.
@@ -16376,7 +16582,13 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         entry_block.has_terminator = true
     }
 
-    -- Add entry block to the lambda function and push to module
+    -- The lambda's blocks in order: the ones the body finished, then
+    -- the block it ended in (the entry block itself for a simple body)
+    let mut lbi = 0
+    while lbi < g.completed_blocks.len() {
+        lambda_func.blocks.push(g.completed_blocks[lbi])
+        lbi = lbi + 1
+    }
     lambda_func.blocks.push(entry_block)
     g.ir_mod.functions.push(lambda_func)
 
@@ -16391,6 +16603,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     g.region_born_vars = saved_region_born_vars
     g.declared_vars = saved_declared_vars
     g.region_marks = saved_region_marks
+    g.completed_blocks = saved_completed_blocks
 
     -- Record the lambda in fn_ptr_vars and lambda_captures
     g.fn_ptr_vars.insert(lambda_name, lambda_name)
@@ -16927,7 +17140,6 @@ fn generate_comptime_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 -- SIMD Builtin IR Generation
 -- Handles simd_splat_*, simd_set_*, simd_add/sub/mul/div,
 -- and simd_extract intrinsic function calls.
--- Port of stage3/src/ir_gen.zig SIMD handling
 -- ============================================================
 
 -- ============================================================
@@ -17030,7 +17242,6 @@ fn join_types(types: List[string]) -> string {
 -- SIMD Builtin IR Generation
 -- Handles simd_splat_*, simd_set_*, simd_add/sub/mul/div,
 -- and simd_extract intrinsic function calls.
--- Port of stage3/src/ir_gen.zig SIMD handling
 -- ============================================================
 
 -- ============================================================
@@ -17669,7 +17880,6 @@ fn generate_string_split_call(gen: IRGenerator, block: IRBasicBlock, args: List[
 -- Compile-Time Expression Evaluation
 -- Evaluates expressions at compile time, producing IRValues
 -- directly without emitting IR instructions.
--- Port of stage3/src/ir_gen.zig comptime evaluation logic.
 -- ============================================================
 
 -- Maximum recursion depth for comptime function calls
@@ -22490,20 +22700,6 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     }
 }
 
-
--- ============================================================
--- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
---
--- Compiles dAImond source to native binaries via LLVM.
--- Uses its own frontend (lexer.dm, parser.dm) instead of
--- reusing Stage 0's Zig frontend.
---
--- Pipeline:
---   Source (.dm) -> Lexer -> Tokens -> Parser -> AST
---   -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR
---   -> Object File -> Linker -> Native Binary
--- ============================================================
-
 -- Generated by gen_bootstrap.sh from runtime/string.dm runtime/convert.dm runtime/list.dm runtime/map.dm runtime/os.dm runtime/path.dm runtime/io.dm runtime/net.dm runtime/thread.dm; edit those files instead.
 -- The compiler parses this source into every program it compiles.
 
@@ -22513,16 +22709,14 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "9fe2493a2c57ebaf"
+    return "f9fe80b3892beb0a"
 }
 
 
 -- ============================================================
--- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
+-- The dAImond compiler
 --
 -- Compiles dAImond source to native binaries via LLVM.
--- Uses its own frontend (lexer.dm, parser.dm) instead of
--- reusing Stage 0's Zig frontend.
 --
 -- Pipeline:
 --   Source (.dm) -> Lexer -> Tokens -> Parser -> AST
@@ -22841,8 +23035,7 @@ fn parse_llvm_bridge(path: string, file: int) -> SourceFile {
 }
 
 -- Add the LLVM bridge to the compiler's declarations. The compiler
--- declares each bridge function as an extern fn (llvm.dm), which is
--- what the compiler built by Stage 0 calls in llvm_bridge.c. Here the
+-- declares each bridge function as an extern fn (llvm.dm). The
 -- bridge's own function of that name takes the declaration's place.
 fn add_llvm_bridge(sf: SourceFile, bridge_sf: SourceFile) -> SourceFile {
     let mut defined: Map[string, bool] = Map_new()
@@ -23043,6 +23236,46 @@ fn resolve_import_path(import_path: string, base_dir: string) -> string {
     return result + ".dm"
 }
 
+extern fn compiler_realpath(path: string, resolved: int) -> int = "realpath"
+extern fn compiler_strlen(s: int) -> int = "strlen"
+
+-- The directory the running compiler is in, or "" when it can't be found
+fn compiler_dir() -> string {
+    unsafe {
+        -- Given no buffer, realpath allocates one of the size it needs
+        let exe = compiler_realpath("/proc/self/exe", 0)
+        if exe == 0 {
+            return ""
+        }
+        let n = compiler_strlen(exe)
+        return dirname(string_from_raw(exe, n, n + 1))
+    }
+}
+
+-- The file of the standard library module `import std.<module>` names,
+-- or "" when there is none. The library is the directory
+-- $DAIMOND_STDLIB, else stdlib/ beside the compiler's directory (the
+-- compiler is build/daimond in a checkout), else stdlib/ in the
+-- compiler's directory, else stdlib/ in the current directory.
+fn stdlib_file(module_path: string) -> string {
+    let chosen = env_get("DAIMOND_STDLIB")
+    if chosen != "" {
+        let in_chosen = resolve_import_path(module_path, chosen)
+        if file_exists(in_chosen) { return in_chosen }
+        return ""
+    }
+    let beside = compiler_dir()
+    if beside != "" {
+        let in_checkout = resolve_import_path(module_path, beside + "/../stdlib")
+        if file_exists(in_checkout) { return in_checkout }
+        let in_compiler_dir = resolve_import_path(module_path, beside + "/stdlib")
+        if file_exists(in_compiler_dir) { return in_compiler_dir }
+    }
+    let in_current = resolve_import_path(module_path, "stdlib")
+    if file_exists(in_current) { return in_current }
+    return ""
+}
+
 -- The files imported so far and their declarations. It is passed to
 -- process_import and returned by it, so that a file imported by two
 -- files is known to both. `loaded` begins with the file being
@@ -23056,7 +23289,15 @@ struct Imports {
 fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: bool) -> Imports {
     let mut state = imports
 
-    let file_path = resolve_import_path(imp.path, base_dir)
+    -- An import names a file next to the importing file. `std.<module>`
+    -- with no such file is a module of the standard library.
+    let mut file_path = resolve_import_path(imp.path, base_dir)
+    if starts_with(imp.path, "std.") and file_exists(file_path) == false {
+        let in_stdlib = stdlib_file(substr(imp.path, 4, len(imp.path) - 4))
+        if in_stdlib != "" {
+            file_path = in_stdlib
+        }
+    }
 
     -- A file is loaded once, however many files import it
     let mut li = 1
@@ -23075,7 +23316,11 @@ fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: 
 
     -- Check if file exists
     if file_exists(file_path) == false {
-        eprintln("Error: import file not found: " + file_path)
+        if starts_with(imp.path, "std.") {
+            eprintln("Error: import file not found: " + file_path + ", and the standard library has no module '" + imp.path + "' (set DAIMOND_STDLIB to the library's directory)")
+        } else {
+            eprintln("Error: import file not found: " + file_path)
+        }
         exit(1)
     }
 
@@ -23987,54 +24232,6 @@ fn builtin_required_effect(name: string) -> string {
     return ""
 }
 
-fn collect_call_names_from_expr(e: Expr) -> List[string] {
-    let mut names: List[string] = []
-    if e.kind == EXPR_FUNCTION_CALL() {
-        let callee_expr = *e.callee
-        if len(callee_expr.name) > 0 {
-            names.push(callee_expr.name)
-        }
-    }
-    return names
-}
-
-fn collect_call_names_from_stmts(stmts: List[Stmt]) -> List[string] {
-    let mut names: List[string] = []
-    let mut i = 0
-    while i < stmts.len() {
-        let s = stmts[i]
-        if s.kind == STMT_EXPRESSION() {
-            let e = *s.expr
-            let sub = collect_call_names_from_expr(e)
-            let mut j = 0
-            while j < sub.len() {
-                names.push(sub[j])
-                j = j + 1
-            }
-        } else if s.kind == STMT_RETURN() {
-            if s.has_ret_value {
-                let e = *s.ret_value
-                let sub = collect_call_names_from_expr(e)
-                let mut j = 0
-                while j < sub.len() {
-                    names.push(sub[j])
-                    j = j + 1
-                }
-            }
-        } else if s.kind == STMT_LET() {
-            let e = *s.let_value
-            let sub = collect_call_names_from_expr(e)
-            let mut j = 0
-            while j < sub.len() {
-                names.push(sub[j])
-                j = j + 1
-            }
-        }
-        i = i + 1
-    }
-    return names
-}
-
 fn list_contains_str(lst: List[string], val: string) -> bool {
     let mut i = 0
     while i < lst.len() {
@@ -24044,6 +24241,44 @@ fn list_contains_str(lst: List[string], val: string) -> bool {
     return false
 }
 
+-- An error for each call in the function's body that needs an effect
+-- the function does not declare, added to `found`. A function that
+-- declares no effects is not checked. The calls are the ones made by
+-- name, at any depth of the body: a builtin needs its effect, and a
+-- function needs the effects it declares (fn_effects). Calls of methods
+-- and calls through a function value are not checked.
+fn function_effect_errors(fd: FunctionDecl, fn_effects: Map[string, List[string]], found: List[string]) -> List[string] {
+    let mut errors = found
+    if fd.effects.len() == 0 {
+        return errors
+    }
+    let call_names = stmts_calls(fd.body)
+    let mut ci = 0
+    while ci < call_names.len() {
+        let callee = call_names[ci]
+        let req = builtin_required_effect(callee)
+        if len(req) > 0 {
+            if list_contains_str(fd.effects, req) == false {
+                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
+            }
+        }
+        if fn_effects.contains(callee) {
+            let callee_effects = fn_effects.get(callee)
+            let mut ei = 0
+            while ei < callee_effects.len() {
+                let eff = callee_effects[ei]
+                if list_contains_str(fd.effects, eff) == false {
+                    errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
+                }
+                ei = ei + 1
+            }
+        }
+        ci = ci + 1
+    }
+    return errors
+}
+
+-- The effect errors of every function and method in the file
 fn validate_effects(sf: SourceFile) -> List[string] {
     let mut errors: List[string] = []
     -- Build map: function name -> declared effects
@@ -24060,39 +24295,17 @@ fn validate_effects(sf: SourceFile) -> List[string] {
         i = i + 1
     }
 
-    -- For each function with effects, check its calls
     i = 0
     while i < sf.declarations.len() {
         let decl = sf.declarations[i]
         if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            if fd.effects.len() > 0 {
-                let caller_effects = fd.effects
-                let call_names = collect_call_names_from_stmts(fd.body)
-                let mut ci = 0
-                while ci < call_names.len() {
-                    let callee = call_names[ci]
-                    -- Check builtin required effects
-                    let req = builtin_required_effect(callee)
-                    if len(req) > 0 {
-                        if list_contains_str(caller_effects, req) == false {
-                            errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
-                        }
-                    }
-                    -- Check callee's declared effects are subset of caller's
-                    if fn_effects.contains(callee) {
-                        let callee_effects = fn_effects.get(callee)
-                        let mut ei = 0
-                        while ei < callee_effects.len() {
-                            let eff = callee_effects[ei]
-                            if list_contains_str(caller_effects, eff) == false {
-                                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
-                            }
-                            ei = ei + 1
-                        }
-                    }
-                    ci = ci + 1
-                }
+            errors = function_effect_errors(*decl.func_decl, fn_effects, errors)
+        } else if decl.kind == DECL_IMPL() {
+            let ib = *decl.impl_block
+            let mut mi = 0
+            while mi < ib.methods.len() {
+                errors = function_effect_errors(ib.methods[mi], fn_effects, errors)
+                mi = mi + 1
             }
         }
         i = i + 1

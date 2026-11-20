@@ -312,17 +312,3 @@ fn lg_generate_simd_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         return g
     }
 }
-
-
--- ============================================================
--- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
---
--- Compiles dAImond source to native binaries via LLVM.
--- Uses its own frontend (lexer.dm, parser.dm) instead of
--- reusing Stage 0's Zig frontend.
---
--- Pipeline:
---   Source (.dm) -> Lexer -> Tokens -> Parser -> AST
---   -> IR Gen -> dAImond IR -> LLVM Gen -> LLVM IR
---   -> Object File -> Linker -> Native Binary
--- ============================================================

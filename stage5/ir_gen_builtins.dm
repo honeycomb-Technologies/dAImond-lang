@@ -10,7 +10,6 @@ import ir_gen_stmt
 -- SIMD Builtin IR Generation
 -- Handles simd_splat_*, simd_set_*, simd_add/sub/mul/div,
 -- and simd_extract intrinsic function calls.
--- Port of stage3/src/ir_gen.zig SIMD handling
 -- ============================================================
 
 -- ============================================================

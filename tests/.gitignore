@@ -1,11 +1,5 @@
-# Generated C files from test compilation
-*.c
-
-# Generated LLVM IR files
-*.ll
-
-# Compiled test binaries
+# Compiled test programs and what the compiler writes next to them
 *.o
 *.out
-test_*
-!test_*.dm
+*.ll
+*.bc

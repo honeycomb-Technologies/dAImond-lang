@@ -1,5 +1,7 @@
 # dAImond Front-to-Back Release Readiness Audit
 
+> Written on 2026-02-25, when the compiler was written in Zig and emitted C. That compiler and the build steps this audit describes are gone: the compiler is now the dAImond program in `stage5/`, built by `bootstrap.sh`. The findings about releases, packaging and CI still stand.
+
 ## Scope
 
 This audit evaluates what is required to ship dAImond as a **releasable, downloadable language distribution** (compiler + runtime + standard library + tooling + packaging + release process), similar to mature language ecosystems.

@@ -1,0 +1,13 @@
+parse_float=3.14
+to_upper=HELLO
+to_lower=world
+modulo=2
+len=5
+contains=true
+find=2
+starts=true
+ends=true
+replace=herro
+trim=hi
+substr=ell
+char_at=h

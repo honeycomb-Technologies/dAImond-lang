@@ -21,7 +21,7 @@
 #
 # Needs x86-64 Linux with glibc, the C library's development files, and
 # LLVM with lld. The seed was written by LLVM 19: an older LLVM cannot
-# read it, and a newer one should, though only LLVM 19 has been tested.
+# read it. LLVM 19 and LLVM 23 have been run.
 
 set -e
 
