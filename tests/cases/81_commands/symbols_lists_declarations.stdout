@@ -1,0 +1,21 @@
+import	lib	3	8	3		./lib.dm
+import	utils	4	8	4		./utils.dm
+const	LIMIT	6	7	6		const LIMIT: int
+struct	Point	8	8	11		struct Point[T]
+field	x	9	5	9	Point	x: T
+field	y	10	5	10	Point	y: T
+enum	Shape	13	6	17		enum Shape
+variant	Circle	14	5	14	Shape	Circle(float)
+variant	Rect	15	5	15	Shape	Rect(float, float)
+variant	Empty	16	5	16	Shape	Empty
+trait	Area	19	7	21		trait Area
+method	area	20	8	20	Area	fn area(self) -> float
+impl	Shape	23	15	27		impl Area for Shape
+method	area	24	8	26	Shape	fn area(self) -> float
+impl	Point	29	6	36		impl Point[T]
+method	new	30	8	32	Point	fn new(x: T, y: T) -> Point[T]
+method	swap	33	8	35	Point	fn swap(mut self, other: Point[T]) with [IO]
+function	printf	38	11	38		extern fn printf(fmt: string, ...) -> i32
+function	first	40	4	44		fn first[T](xs: List[T], fallback: T) -> T
+function	square	46	4	46		fn square(n: int) -> int
+function	main	48	4	50		fn main() -> int

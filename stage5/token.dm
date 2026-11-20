@@ -134,7 +134,7 @@ fn keyword_lookup(name: string) -> int {
 }
 
 fn token_kind_name(kind: int) -> string {
-    if kind == TK_EOF() { return "EOF" }
+    if kind == TK_EOF() { return "the end of the file" }
     if kind == TK_INTEGER() { return "integer" }
     if kind == TK_FLOAT() { return "float" }
     if kind == TK_STRING() { return "string" }
@@ -187,5 +187,32 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_ASYNC() { return "'async'" }
     if kind == TK_AWAIT() { return "'await'" }
     if kind == TK_UNSAFE() { return "'unsafe'" }
+    if kind == TK_AMP() { return "'&'" }
+    if kind == TK_AND() { return "'and'" }
+    if kind == TK_AT() { return "'@'" }
+    if kind == TK_BANG() { return "'!'" }
+    if kind == TK_BREAK() { return "'break'" }
+    if kind == TK_COLONCOLON() { return "'::'" }
+    if kind == TK_CONST() { return "'const'" }
+    if kind == TK_CONTINUE() { return "'continue'" }
+    if kind == TK_DOTDOT() { return "'..'" }
+    if kind == TK_DOTDOTEQ() { return "'..='" }
+    if kind == TK_HASH() { return "'#'" }
+    if kind == TK_IN() { return "'in'" }
+    if kind == TK_LOOP() { return "'loop'" }
+    if kind == TK_MINUSEQ() { return "'-='" }
+    if kind == TK_NOT() { return "'not'" }
+    if kind == TK_OR() { return "'or'" }
+    if kind == TK_PERCENT() { return "'%'" }
+    if kind == TK_PIPE() { return "'|'" }
+    if kind == TK_PIPEGT() { return "'|>'" }
+    if kind == TK_PLUSEQ() { return "'+='" }
+    if kind == TK_QUESTION() { return "'?'" }
+    if kind == TK_SELF() { return "'self'" }
+    if kind == TK_SEMICOLON() { return "';'" }
+    if kind == TK_SLASHEQ() { return "'/='" }
+    if kind == TK_STAREQ() { return "'*='" }
+    if kind == TK_UNDERSCORE() { return "'_'" }
+    if kind == TK_WITH() { return "'with'" }
     return "token(" + int_to_string(kind) + ")"
 }

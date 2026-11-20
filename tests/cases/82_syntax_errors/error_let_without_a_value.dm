@@ -1,0 +1,6 @@
+module test
+
+fn main() -> int {
+    let x =
+    return 0
+}

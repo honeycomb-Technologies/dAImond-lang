@@ -1,0 +1,3 @@
+function	ok	3	4	5		fn ok() -> int
+struct	Half	7	8	10		struct Half
+field	x	8	5	8	Half	x: int

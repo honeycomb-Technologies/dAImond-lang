@@ -1,0 +1,3 @@
+Error at 5:1: expected an expression but got '}'
+Error at 11:17: expected ',' or ')' but got identifier
+Error at 14:1: expected a declaration but got '}'

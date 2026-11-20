@@ -633,6 +633,7 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
     }
 
     if stmt.has_ret_value {
+        g = check_basic_type(g, g.current_return_type, *stmt.ret_value, "the return value")
         let ret_expr = map_ctor_as(g, *stmt.ret_value, g.current_return_type)
         let mut result = generate_expr(g, b, ret_expr)
         result = convert_int_value(result.gen, result.block, result.val_id, ret_expr, infer_expr_type(result.gen, ret_expr), map_type_name(g.current_return_type), "the return value")

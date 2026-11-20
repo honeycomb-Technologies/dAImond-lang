@@ -680,9 +680,11 @@ fn import_decl_new(path: string, line: int, col: int) -> ImportDecl {
 struct SourceFile {
     module_name: string,
     imports: List[ImportDecl],
-    declarations: List[Declaration]
+    declarations: List[Declaration],
+    -- The syntax errors the parser found, in source order
+    errors: List[string]
 }
 
 fn source_file_new(name: string) -> SourceFile {
-    return SourceFile { module_name: name, imports: [], declarations: [] }
+    return SourceFile { module_name: name, imports: [], declarations: [], errors: [] }
 }

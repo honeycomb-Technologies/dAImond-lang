@@ -48,6 +48,7 @@ fn print_usage() {
     println("  check         Report the file's errors without building a program")
     println("  fmt           Indent the file by its braces, in place or into -o <file>")
     println("  test          Run each fn test_*() of the file and report which pass")
+    println("  symbols       List the file's declarations, for editors")
     println("")
     println("Options:")
     println("  -o <file>     Output binary name (default: input without .dm)")
@@ -58,6 +59,8 @@ fn print_usage() {
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
     println("  --emit-bitcode  Emit LLVM bitcode (.bc), optimized as -O says, and exit")
+    println("  --stdin       Read the program from standard input; <file.dm> still names it")
+    println("                (compiling, check and symbols)")
     println("  --link-llvm   Add the LLVM bridge and link the LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
@@ -73,8 +76,11 @@ fn print_usage() {
 -- ============================================================
 
 struct CLIArgs {
-    -- "" to compile, or "run", "check", "fmt" or "test"
+    -- "" to compile, or "run", "check", "fmt", "test" or "symbols"
     command: string,
+    -- --stdin: the program's text comes from standard input, and
+    -- input_file is only its name
+    from_stdin: bool,
     input_file: string,
     output_file: string,
     -- Whether -o named the output file
@@ -96,6 +102,7 @@ struct CLIArgs {
 fn parse_cli_args() -> CLIArgs {
     let mut args = CLIArgs {
         command: "",
+        from_stdin: false,
         input_file: "",
         output_file: "",
         has_output: false,
@@ -123,7 +130,7 @@ fn parse_cli_args() -> CLIArgs {
     while i < argc {
         let arg = args_get(i)
 
-        if i == 1 and (arg == "run" or arg == "check" or arg == "fmt" or arg == "test") {
+        if i == 1 and (arg == "run" or arg == "check" or arg == "fmt" or arg == "test" or arg == "symbols") {
             args.command = arg
         } else if arg == "--" and args.command == "run" {
             -- The rest goes to the program
@@ -164,6 +171,8 @@ fn parse_cli_args() -> CLIArgs {
             args.emit_bitcode = true
         } else if arg == "--link-llvm" {
             args.link_llvm = true
+        } else if arg == "--stdin" {
+            args.from_stdin = true
         } else if arg == "-v" or arg == "--verbose" {
             args.verbose = true
         } else if starts_with(arg, "-") {
@@ -187,6 +196,11 @@ fn parse_cli_args() -> CLIArgs {
     if args.input_file == "" {
         args.has_error = true
         args.error_msg = "Error: no input file specified"
+        return args
+    }
+    if args.from_stdin and (args.command == "fmt" or args.command == "test") {
+        args.has_error = true
+        args.error_msg = "Error: --stdin does not go with " + args.command
         return args
     }
 
@@ -305,7 +319,7 @@ fn find_bridge_file(input_dir: string) -> string {
 fn parse_llvm_bridge(path: string) -> SourceFile {
     let p = parser_new(tokenize(file_read(path)))
     let bridge_sf = parse_source_file(p)
-    let mut errors = p.errors
+    let mut errors = bridge_sf.errors
     if errors.len() == 0 {
         errors = validate_source_file(bridge_sf)
     }
@@ -549,6 +563,14 @@ fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], 
     let tokens = tokenize(source)
     let p = parser_new(tokens)
     let imp_sf = parse_source_file(p)
+    if imp_sf.errors.len() > 0 {
+        let mut ei = 0
+        while ei < imp_sf.errors.len() {
+            eprintln(file_path + ": " + imp_sf.errors[ei])
+            ei = ei + 1
+        }
+        exit(1)
+    }
 
     -- Recursively process imports from the imported file
     let import_dir = dirname(file_path)
@@ -789,13 +811,13 @@ fn test_file(cli: CLIArgs) -> int {
         eprintln("Error: file not found: " + cli.input_file)
         return 1
     }
-    let p = parser_new(tokenize(file_read(cli.input_file)))
-    let names = test_function_names(parse_source_file(p))
-    if p.errors.len() == 0 and names.len() == 0 {
+    let parsed = parse_source_file(parser_new(tokenize(file_read(cli.input_file))))
+    let names = test_function_names(parsed)
+    if parsed.errors.len() == 0 and names.len() == 0 {
         println("No test functions found (functions starting with 'test_').")
         return 0
     }
-    if p.errors.len() == 0 {
+    if parsed.errors.len() == 0 {
         println("Found " + int_to_string(names.len()) + " test(s) in " + cli.input_file)
         println("")
         flush()
@@ -810,6 +832,268 @@ fn test_file(cli: CLIArgs) -> int {
     let code = exit_code_of(system(build.output_file))
     fs_remove(build.output_file)
     return code
+}
+
+-- The text of the program to compile
+fn source_text(cli: CLIArgs) -> string {
+    if cli.from_stdin {
+        return file_read("/dev/stdin")
+    }
+    return file_read(cli.input_file)
+}
+
+-- ============================================================
+-- SYMBOLS: the declarations of a file, for editors
+-- One line per declaration, its parts separated by tabs:
+--   kind  name  line  column  last line  container  detail
+-- kind is import, function, struct, field, enum, variant, trait, impl,
+-- method or const. Line and column are where the name is, counted from
+-- 1. The container is the type a field, variant or method belongs to.
+-- The detail is the declaration as its source would start, such as
+-- "fn add(a: int, b: int) -> int"; for an import it is the file.
+-- ============================================================
+
+-- The index of the first token at or after (line, col), from token
+-- `from` on; the last token when there is none
+fn token_at(tokens: List[Token], from: int, line: int, col: int) -> int {
+    let mut i = from
+    while i < tokens.len() {
+        let tok = tokens[i]
+        if tok.line > line or (tok.line == line and tok.col >= col) {
+            return i
+        }
+        i = i + 1
+    }
+    return tokens.len() - 1
+}
+
+-- The index of the first identifier `name` from token `from` on;
+-- `from` when there is none
+fn name_token(tokens: List[Token], from: int, name: string) -> int {
+    let mut i = from
+    while i < tokens.len() {
+        if tokens[i].kind == TK_IDENT() and tokens[i].value == name {
+            return i
+        }
+        i = i + 1
+    }
+    return from
+}
+
+-- The last line of the declaration that starts at token `start`: the
+-- line its braces close on, or the line it is written on when it has
+-- none
+fn declaration_end_line(tokens: List[Token], start: int) -> int {
+    let mut depth = 0
+    let mut last_line = tokens[start].line
+    let mut i = start
+    while i < tokens.len() {
+        let kind = tokens[i].kind
+        if kind == TK_EOF() {
+            return last_line
+        }
+        if kind == TK_NEWLINE() {
+            if depth == 0 {
+                -- The body may open on the next line
+                let mut next = i
+                while next < tokens.len() and tokens[next].kind == TK_NEWLINE() {
+                    next = next + 1
+                }
+                if next >= tokens.len() or tokens[next].kind != TK_LBRACE() {
+                    return last_line
+                }
+            }
+        } else {
+            last_line = tokens[i].line
+            if kind == TK_LBRACE() or kind == TK_LPAREN() or kind == TK_LBRACKET() {
+                depth = depth + 1
+            } else if kind == TK_RPAREN() or kind == TK_RBRACKET() {
+                depth = depth - 1
+            } else if kind == TK_RBRACE() {
+                depth = depth - 1
+                if depth <= 0 {
+                    return last_line
+                }
+            }
+        }
+        i = i + 1
+    }
+    return last_line
+}
+
+-- "[T, U]" for the type parameters of a declaration; "" when it has none
+fn type_parameters_text(names: List[string]) -> string {
+    if names.len() == 0 {
+        return ""
+    }
+    let mut text = "["
+    let mut i = 0
+    while i < names.len() {
+        if i > 0 {
+            text = text + ", "
+        }
+        text = text + names[i]
+        i = i + 1
+    }
+    return text + "]"
+}
+
+-- A function as its declaration starts: "fn add(a: int, b: int) -> int"
+fn function_signature(fd: FunctionDecl) -> string {
+    let mut sig = "fn " + fd.name + type_parameters_text(fd.generic_params) + "("
+    if fd.is_extern {
+        sig = "extern " + sig
+    }
+    let mut i = 0
+    while i < fd.params.len() {
+        let param = fd.params[i]
+        if i > 0 {
+            sig = sig + ", "
+        }
+        if param.is_mut {
+            sig = sig + "mut "
+        }
+        if param.name == "self" {
+            sig = sig + "self"
+        } else {
+            sig = sig + param.name + ": " + param.type_name
+        }
+        i = i + 1
+    }
+    if fd.is_variadic {
+        sig = sig + ", ..."
+    }
+    sig = sig + ")"
+    if fd.return_type != "void" and fd.return_type != "" {
+        sig = sig + " -> " + fd.return_type
+    }
+    if fd.effects.len() > 0 {
+        sig = sig + " with " + type_parameters_text(fd.effects)
+    }
+    return sig
+}
+
+-- Print a declaration. One that the parser read out of a syntax error
+-- may have a name that is no name; it is left out.
+fn print_symbol(kind: string, name: string, at: Token, end_line: int, container: string, detail: string) {
+    if kind != "import" and (at.kind != TK_IDENT() or at.value != name) {
+        return
+    }
+    println(kind + "\t" + name + "\t" + int_to_string(at.line) + "\t" + int_to_string(at.col) + "\t" + int_to_string(end_line) + "\t" + container + "\t" + detail)
+}
+
+-- Print the function whose `fn` is at token `start`
+fn print_function_symbol(kind: string, fd: FunctionDecl, container: string, tokens: List[Token], start: int) {
+    print_symbol(kind, fd.name, tokens[name_token(tokens, start, fd.name)], declaration_end_line(tokens, start), container, function_signature(fd))
+}
+
+-- symbols: print the declarations of the file. A file with syntax
+-- errors gives the declarations that could be read.
+fn symbols_file(cli: CLIArgs) -> int {
+    if cli.from_stdin == false and file_exists(cli.input_file) == false {
+        eprintln("Error: file not found: " + cli.input_file)
+        return 1
+    }
+    let tokens = tokenize(source_text(cli))
+    let sf = parse_source_file(parser_new(tokens))
+    if tokens.len() == 0 {
+        return 0
+    }
+    let base_dir = dirname(cli.input_file)
+
+    let mut i = 0
+    while i < sf.imports.len() {
+        let imp = sf.imports[i]
+        let at = tokens[token_at(tokens, 0, imp.line, imp.col)]
+        print_symbol("import", imp.path, at, at.line, "", resolve_import_path(imp.path, base_dir))
+        i = i + 1
+    }
+
+    -- Declarations are in source order, so each search starts where the
+    -- declaration before began
+    let mut from = 0
+    i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.name != "__error__" {
+                from = token_at(tokens, from, fd.line, fd.col)
+                print_function_symbol("function", fd, "", tokens, from)
+            }
+        } else if decl.kind == DECL_STRUCT() {
+            let sd = *decl.struct_decl
+            from = token_at(tokens, from, sd.line, sd.col)
+            let mut at = name_token(tokens, from, sd.name)
+            print_symbol("struct", sd.name, tokens[at], declaration_end_line(tokens, from), "", "struct " + sd.name + type_parameters_text(sd.generic_params))
+            let mut fi = 0
+            while fi < sd.fields.len() {
+                let field = sd.fields[fi]
+                at = name_token(tokens, at + 1, field.name)
+                print_symbol("field", field.name, tokens[at], tokens[at].line, sd.name, field.name + ": " + field.type_name)
+                fi = fi + 1
+            }
+        } else if decl.kind == DECL_ENUM() {
+            let ed = *decl.enum_decl
+            from = token_at(tokens, from, ed.line, ed.col)
+            let mut at = name_token(tokens, from, ed.name)
+            print_symbol("enum", ed.name, tokens[at], declaration_end_line(tokens, from), "", "enum " + ed.name + type_parameters_text(ed.generic_params))
+            let mut vi = 0
+            while vi < ed.variants.len() {
+                let variant = ed.variants[vi]
+                at = name_token(tokens, at + 1, variant.name)
+                let mut detail = variant.name
+                if variant.has_payload {
+                    let mut payload = ""
+                    let mut pi = 0
+                    while pi < variant.payload_types.len() {
+                        if pi > 0 {
+                            payload = payload + ", "
+                        }
+                        payload = payload + variant.payload_types[pi]
+                        pi = pi + 1
+                    }
+                    detail = detail + "(" + payload + ")"
+                }
+                print_symbol("variant", variant.name, tokens[at], tokens[at].line, ed.name, detail)
+                vi = vi + 1
+            }
+        } else if decl.kind == DECL_TRAIT() {
+            let td = *decl.trait_decl
+            from = token_at(tokens, from, td.line, td.col)
+            print_symbol("trait", td.name, tokens[name_token(tokens, from, td.name)], declaration_end_line(tokens, from), "", "trait " + td.name + type_parameters_text(td.generic_params))
+            let mut mi = 0
+            while mi < td.methods.len() {
+                let method = td.methods[mi]
+                print_function_symbol("method", method, td.name, tokens, token_at(tokens, from, method.line, method.col))
+                mi = mi + 1
+            }
+        } else if decl.kind == DECL_IMPL() {
+            let ib = *decl.impl_block
+            from = token_at(tokens, from, ib.line, ib.col)
+            let mut detail = "impl " + ib.target_type + type_parameters_text(ib.generic_params)
+            if ib.trait_name != "" {
+                detail = "impl " + ib.trait_name + " for " + ib.target_type
+            }
+            print_symbol("impl", ib.target_type, tokens[name_token(tokens, from, ib.target_type)], declaration_end_line(tokens, from), "", detail)
+            let mut mi = 0
+            while mi < ib.methods.len() {
+                let method = ib.methods[mi]
+                print_function_symbol("method", method, ib.target_type, tokens, token_at(tokens, from, method.line, method.col))
+                mi = mi + 1
+            }
+        } else if decl.kind == DECL_CONST() {
+            let cd = *decl.const_decl
+            from = token_at(tokens, from, cd.line, cd.col)
+            let mut detail = "const " + cd.name
+            if cd.type_name != "" {
+                detail = detail + ": " + cd.type_name
+            }
+            print_symbol("const", cd.name, tokens[name_token(tokens, from, cd.name)], declaration_end_line(tokens, from), "", detail)
+        }
+        i = i + 1
+    }
+    return 0
 }
 
 -- ============================================================
@@ -831,12 +1115,12 @@ fn compile(cli: CLIArgs) -> int {
     -- Phase 1: Read source file
     if verbose { println("  [1/6] Reading source...") }
 
-    if file_exists(input_file) == false {
+    if cli.from_stdin == false and file_exists(input_file) == false {
         eprintln("Error: file not found: " + input_file)
         return 1
     }
 
-    let source = file_read(input_file)
+    let source = source_text(cli)
 
     -- Phase 2: Tokenize
     if verbose { println("  [2/6] Lexing...") }
@@ -850,10 +1134,10 @@ fn compile(cli: CLIArgs) -> int {
     let mut sf = parse_source_file(p)
 
     -- Check for parse errors
-    if p.errors.len() > 0 {
+    if sf.errors.len() > 0 {
         let mut ei = 0
-        while ei < p.errors.len() {
-            eprintln(p.errors[ei])
+        while ei < sf.errors.len() {
+            eprintln(sf.errors[ei])
             ei = ei + 1
         }
         exit(1)
@@ -973,7 +1257,8 @@ fn compile(cli: CLIArgs) -> int {
         }
         di = di + 1
     }
-    if has_main == false {
+    -- check takes a file that is only imported by others, too
+    if has_main == false and cli.command != "check" {
         eprintln("Error: no main function found")
         exit(1)
     }
@@ -1146,6 +1431,9 @@ fn main() -> int {
     }
     if cli.command == "test" {
         return test_file(cli)
+    }
+    if cli.command == "symbols" {
+        return symbols_file(cli)
     }
     return compile(cli)
 }

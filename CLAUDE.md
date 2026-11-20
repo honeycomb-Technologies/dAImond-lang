@@ -246,13 +246,20 @@ gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/daimond_runtime.o -o /tmp/stage5_bin -
 # Run each fn test_*() of the file in its own process and report PASS or FAIL
 /tmp/stage5_bin test <file.dm>
 
+# List the file's declarations, one per line, for editors
+/tmp/stage5_bin symbols <file.dm>
+
+# check and symbols (and a plain compilation) can read the program from standard input;
+# the file name is then only its name, and where its imports are looked for
+/tmp/stage5_bin check <file.dm> --stdin < unsaved.dm
+
 # Regenerate monolithic main.dm from modules (also after editing runtime/*.dm, llvm_bridge.dm or llvm_bridge.c)
 cd stage5 && bash gen_bootstrap.sh
 
 # Compile Stage 5 with itself (--link-llvm adds llvm_bridge.dm and links libLLVM; no C compiler runs)
 cd stage5 && /tmp/stage5_bin main.dm -o /tmp/stage5_self --link-llvm
 
-# Run the integration suite against a Stage 5 binary (390 cases, about a minute; needs no Zig)
+# Run the integration suite against a Stage 5 binary (409 cases, about a minute; needs no Zig)
 build/daimond tests/harness.dm -o build/harness
 build/harness build/daimond                              # every case in tests/cases
 build/harness build/daimond tests/cases 17_lists/        # only the cases whose "suite/name" contains the text
@@ -268,7 +275,7 @@ Stage 0 has two tiers of tests, and Stage 5 has its own suite:
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
-4. **Stage 5 suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case with `X.cmd` runs that shell command instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 390 pass, 0 fail. The suite holds the cases of Stage 0's runner as it was on 2026-11-20 (the two are separate copies now), the Stage 5-only cases, and the 19 memory-safety probes (`74_memory_safety_probes`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory. It also holds the 29 cases of five Stage 0 suites that Stage 5's Zig runner never ran (Constructors, Audit Fixes, Unified Len, Error Quality, Nested Lists); the error cases among them expect Stage 5's wording, not Stage 0's `Error[E0100]`.
+4. **Stage 5 suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case with `X.cmd` runs that shell command instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 409 pass, 0 fail. The suite holds the cases of Stage 0's runner as it was on 2026-11-20 (the two are separate copies now), the Stage 5-only cases, and the 19 memory-safety probes (`74_memory_safety_probes`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory. It also holds the 29 cases of five Stage 0 suites that Stage 5's Zig runner never ran (Constructors, Audit Fixes, Unified Len, Error Quality, Nested Lists); the error cases among them expect Stage 5's wording, not Stage 0's `Error[E0100]`.
 
 **Always run `zig build test` after modifying any Stage 0 source file.** Run `zig build test-integration` after changes that affect Stage 0's code generation or runtime behavior. **After changing Stage 5, run `build/harness` on the new compiler, and `bash bootstrap.sh` to check that it still reproduces itself.**
 
@@ -328,7 +335,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 390/390 integration cases, compiles itself, and is built from a committed seed (`bootstrap.sh`) without Stage 0.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 409/409 integration cases, compiles itself, and is built from a committed seed (`bootstrap.sh`) without Stage 0.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -413,12 +420,12 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Stage 0 (Zig → C): Bootstrap compiler, 328/328 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): built from the seed or by Stage 0, 390/390 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes the suite. Programs it builds contain no C and are linked by `ld.lld`, with no C compiler. That includes the compiler itself: a self-build (`--link-llvm`) takes the LLVM bridge from `llvm_bridge.dm` and runs no C compiler, and the first and second self-built compilers are identical. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+- Stage 5 (dAImond + LLVM): built from the seed or by Stage 0, 409/409 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes the suite. Programs it builds contain no C and are linked by `ld.lld`, with no C compiler. That includes the compiler itself: a self-build (`--link-llvm`) takes the LLVM bridge from `llvm_bridge.dm` and runs no C compiler, and the first and second self-built compilers are identical. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
 - Debug info (DWARF) in Stage 3/4
-- In Stage 5: the LSP, and a type checker (today it reports only a string, a bool or a number given where another of the three is expected; `check` reports what a compilation would). Until then Stage 0, `llvm_bridge.c` and `daimond_runtime.c` stay
+- In Stage 5: the LSP, and a type checker (today it reports only a string, a bool or a number given where another of the three is expected, in a `let`, a call's arguments and a `return`; `check` reports what a compilation would). Until then Stage 0, `llvm_bridge.c` and `daimond_runtime.c` stay
 
 ## Documentation Maintenance
 
@@ -583,6 +590,7 @@ The C runtime has been replaced, one function at a time, by dAImond code in `sta
 - **Terminal and time**: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms` and `sleep_ms` are builtins in Stage 5 as in Stage 0, so `examples/snake.dm` and `examples/breakout` build. `read_key` and `read_key_nb` read libc's `stdin` stream, so they see what `read_line` left in its buffer. `read_key_nb` asks `poll` about file descriptor 0, as the C did: bytes already in the stream's buffer are not seen until the descriptor has more. `sleep_ms` with a negative time does not wait. `mem_mark()` is 0 and `mem_sweep` does nothing, as in Stage 0.
 - **OS constants**: `TIOCGWINSZ` (21523), `CLOCK_MONOTONIC` (1), `POLLIN` (1) and the layouts of `struct winsize`, `struct pollfd` and `struct timespec` are those of x86-64 Linux.
 - **Assertions**: `assert(cond)` panics with `assertion failed`. `assert_eq(a, b)` compares with `==`, so it takes whatever `==` does, and panics with `assert_eq failed: strings not equal` or `assert_eq failed: values not equal` (`rt_assert*` in `runtime/io.dm`). A call the IR generator emits of a function that was never declared is a compile error (`internal: call of ...`); it used to be dropped, which is how both assertions did nothing.
+- **For editors**: `symbols` prints one line per declaration, tab-separated: kind (`import`, `function`, `struct`, `field`, `enum`, `variant`, `trait`, `impl`, `method`, `const`), name, line and column of the name (from 1), last line, the type a field, variant or method belongs to, and the declaration's first line such as `fn add(a: int, b: int) -> int` (the file, for an import). It prints what could be read of a file with syntax errors. `check` accepts a file without `main`. `--stdin` reads the program from standard input. A compiler built by Stage 0 reads nothing from a pipe there (Stage 0's `file_read`), only from a file.
 - **Commands** (COMMANDS in `main_split.dm`): `run` builds into `/tmp` (or the file `-o` names, which it keeps) and gives the program's exit code. `check` runs the pipeline through LLVM verification and builds nothing. `fmt` re-indents by braces, as Stage 0's does. `test` replaces the file's `main` with a generated one that runs the program once per `test_*` function, so a panic ends only that test; it prints `test NAME ... PASS` or `FAIL: <panic message>`, then `N passed, M failed`, and exits with 1 when a test fails (Stage 0 stops at the first panic that is not an assertion).
 - **Panics**: `dm_panic` (`rt_panic` in `runtime/io.dm`) writes `PANIC: <message>` to stderr and exits with code 1, as Stage 0 does. Messages passed to it, by the compiler's checks or by runtime code, do not include the prefix.
 - **Command-line arguments**: `main` stores its argument count and vector in the symbols `dm_argc` (a C `int`) and `dm_argv`, which the compiler defines in the module that has `main`. The runtime reads them through `symbol_addr`. `args_get(i)` gives a string that points at the argument's own bytes.
@@ -676,7 +684,7 @@ main.dm            — Monolithic bootstrap file (~22K lines, generated)
 ### Error Detection
 Stage 5 includes compile-time error detection for:
 - **Unterminated strings**: Lexer detects EOF inside string literals and exits with error
-- **Syntax errors**: Post-parse AST validation catches malformed function declarations (e.g., missing parameter types)
+- **Syntax errors**: the parser reports `Error at LINE:COL: expected ... but got ...`, the first error of each top-level declaration (what follows an error in a declaration is parsed out of step). An error in an imported file is prefixed with that file's path. The parser is passed by value, so its errors leave in `SourceFile.errors`; until 2026-11-20 they were read from the caller's copy, which was always empty, so no syntax error was ever printed. Loops that parse a list until a closing token skip a token they cannot use (`p_skip_stuck`), so no input makes the parser loop forever. Post-parse validation still catches parameters without types
 - **Undefined functions**: IR generation checks a `known_functions` map before generating calls
 - **Effect violations**: Builtin-to-effect mapping (e.g., `file_read` → `FileSystem`) with callee effect subset checking ensures functions only call operations permitted by their `with [...]` declarations
 
@@ -704,7 +712,7 @@ cd stage5 && bash gen_bootstrap.sh
 Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
 stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
 Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
-stage5_bin compiles test programs                 → native binaries (390/390 cases pass)
+stage5_bin compiles test programs                 → native binaries (409/409 cases pass)
 stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓, no C compiler)
 stage5_self compiles Stage 5                      → identical binary ✓
 

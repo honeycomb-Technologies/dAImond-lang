@@ -134,7 +134,7 @@ fn keyword_lookup(name: string) -> int {
 }
 
 fn token_kind_name(kind: int) -> string {
-    if kind == TK_EOF() { return "EOF" }
+    if kind == TK_EOF() { return "the end of the file" }
     if kind == TK_INTEGER() { return "integer" }
     if kind == TK_FLOAT() { return "float" }
     if kind == TK_STRING() { return "string" }
@@ -187,6 +187,33 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_ASYNC() { return "'async'" }
     if kind == TK_AWAIT() { return "'await'" }
     if kind == TK_UNSAFE() { return "'unsafe'" }
+    if kind == TK_AMP() { return "'&'" }
+    if kind == TK_AND() { return "'and'" }
+    if kind == TK_AT() { return "'@'" }
+    if kind == TK_BANG() { return "'!'" }
+    if kind == TK_BREAK() { return "'break'" }
+    if kind == TK_COLONCOLON() { return "'::'" }
+    if kind == TK_CONST() { return "'const'" }
+    if kind == TK_CONTINUE() { return "'continue'" }
+    if kind == TK_DOTDOT() { return "'..'" }
+    if kind == TK_DOTDOTEQ() { return "'..='" }
+    if kind == TK_HASH() { return "'#'" }
+    if kind == TK_IN() { return "'in'" }
+    if kind == TK_LOOP() { return "'loop'" }
+    if kind == TK_MINUSEQ() { return "'-='" }
+    if kind == TK_NOT() { return "'not'" }
+    if kind == TK_OR() { return "'or'" }
+    if kind == TK_PERCENT() { return "'%'" }
+    if kind == TK_PIPE() { return "'|'" }
+    if kind == TK_PIPEGT() { return "'|>'" }
+    if kind == TK_PLUSEQ() { return "'+='" }
+    if kind == TK_QUESTION() { return "'?'" }
+    if kind == TK_SELF() { return "'self'" }
+    if kind == TK_SEMICOLON() { return "';'" }
+    if kind == TK_SLASHEQ() { return "'/='" }
+    if kind == TK_STAREQ() { return "'*='" }
+    if kind == TK_UNDERSCORE() { return "'_'" }
+    if kind == TK_WITH() { return "'with'" }
     return "token(" + int_to_string(kind) + ")"
 }
 
@@ -1260,11 +1287,13 @@ fn import_decl_new(path: string, line: int, col: int) -> ImportDecl {
 struct SourceFile {
     module_name: string,
     imports: List[ImportDecl],
-    declarations: List[Declaration]
+    declarations: List[Declaration],
+    -- The syntax errors the parser found, in source order
+    errors: List[string]
 }
 
 fn source_file_new(name: string) -> SourceFile {
-    return SourceFile { module_name: name, imports: [], declarations: [] }
+    return SourceFile { module_name: name, imports: [], declarations: [], errors: [] }
 }
 
 -- ============================================================
@@ -2571,13 +2600,48 @@ fn p_cur(p: Parser) -> Token {
     return token_new(TK_EOF(), "", 0, 0)
 }
 
+-- For a loop that parses one item a turn until a closing token: when
+-- a turn consumed nothing, the loop would never end. Report the token
+-- it is stuck at and skip it.
+fn p_skip_stuck(p: Parser) -> Parser {
+    let reported = p_error(p, "unexpected " + token_kind_name(p_peek(p)))
+    return p_advance(reported)
+}
+
+-- After an item of a list that ends at the token `closer`: take the
+-- comma after it. Anything but a comma or the closer there is an error.
+fn p_comma_or(p: Parser, closer: int) -> Parser {
+    let pp = p_skip_newlines(p)
+    if p_peek(pp) == TK_COMMA() {
+        return p_advance(pp)
+    }
+    if p_peek(pp) == closer or p_peek(pp) == TK_EOF() {
+        return p
+    }
+    return p_error(pp, "expected ',' or " + token_kind_name(closer) + " but got " + token_kind_name(p_peek(pp)))
+}
+
+-- Report an error unless the current token can be a name. `what` says
+-- what is named, such as "a function name".
+fn p_need_name(p: Parser, what: string) -> Parser {
+    let tok = p_cur(p)
+    if tok.kind == TK_IDENT() or tok.kind == TK_SELF() {
+        return p
+    }
+    return p_error(p, "expected " + what + " but got " + token_kind_name(tok.kind))
+}
+
 fn p_peek(p: Parser) -> int {
     return p_cur(p).kind
 }
 
+-- The parser at the next token. It stays at the last token, the end of
+-- the file, so that an error there has the file's last line.
 fn p_advance(p: Parser) -> Parser {
     let mut pp = p
-    pp.pos = pp.pos + 1
+    if pp.pos + 1 < pp.tokens.len() {
+        pp.pos = pp.pos + 1
+    }
     return pp
 }
 
@@ -2663,7 +2727,14 @@ fn parse_type(p: Parser) -> ParseTypeResult {
         pp = p_expect(pp, TK_LPAREN())
         let mut type_str = "fn("
         let mut first = true
+        let mut turn1 = -1
         while p_peek(p_skip_newlines(pp)) != TK_RPAREN() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            if pp.pos == turn1 {
+                pp = p_skip_stuck(pp)
+                turn1 = -1
+                continue
+            }
+            turn1 = pp.pos
             if first == false {
                 pp = p_expect(pp, TK_COMMA())
                 type_str = type_str + ", "
@@ -2708,6 +2779,9 @@ fn parse_type(p: Parser) -> ParseTypeResult {
             pp = p_advance(pp)
             pp = p_skip_newlines(pp)
             let size_tok = p_cur(pp)
+            if size_tok.kind != TK_INTEGER() and size_tok.kind != TK_IDENT() {
+                pp = p_error(pp, "expected the size of the array but got " + token_kind_name(size_tok.kind))
+            }
             pp = p_advance(pp)
             pp = p_skip_newlines(pp)
             pp = p_expect(pp, TK_RBRACKET())
@@ -2720,6 +2794,7 @@ fn parse_type(p: Parser) -> ParseTypeResult {
     }
 
     if tok.kind != TK_IDENT() and tok.kind != TK_SELF() {
+        pp = p_error(pp, "expected a type but got " + token_kind_name(tok.kind))
         return ParseTypeResult { p: pp, type_name: "" }
     }
 
@@ -2731,7 +2806,14 @@ fn parse_type(p: Parser) -> ParseTypeResult {
         pp = p_advance(pp)
         let mut type_str = name + "["
         let mut first = true
+        let mut turn2 = -1
         while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            if pp.pos == turn2 {
+                pp = p_skip_stuck(pp)
+                turn2 = -1
+                continue
+            }
+            turn2 = pp.pos
             if first == false {
                 pp = p_expect(pp, TK_COMMA())
                 type_str = type_str + ", "
@@ -2814,6 +2896,7 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
                     left = expr_field_access(left, field_tok.value, field_tok.line, field_tok.col)
                 }
             } else {
+                pp = p_error(pp, "expected a field or method name after '.' but got " + token_kind_name(field_tok.kind))
                 cont = false
             }
         } else if kind == TK_LBRACKET() {
@@ -3048,8 +3131,11 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
     }
 
     -- Unknown token - return a dummy expression
-    pp = p_error(pp, "unexpected token: " + token_kind_name(tok.kind))
-    pp = p_advance(pp)
+    pp = p_error(pp, "expected an expression but got " + token_kind_name(tok.kind))
+    -- A closing token stays: it ends what is around this expression
+    if tok.kind != TK_RBRACE() and tok.kind != TK_RPAREN() and tok.kind != TK_RBRACKET() {
+        pp = p_advance(pp)
+    }
     return ParseExprResult { p: pp, expr: expr_int(0, tok.line, tok.col) }
 }
 
@@ -3142,8 +3228,16 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             let mut field_names: List[string] = []
             let mut field_values: List[Expr] = []
             pp = p_skip_newlines(pp)
+            let mut turn3 = -1
             while p_peek(pp) != TK_RBRACE() and p_peek(pp) != TK_EOF() {
+                if pp.pos == turn3 {
+                    pp = p_skip_stuck(pp)
+                    turn3 = -1
+                    continue
+                }
+                turn3 = pp.pos
                 pp = p_skip_newlines(pp)
+                pp = p_need_name(pp, "a field name")
                 let fname = p_cur(pp).value
                 pp = p_advance(pp)
                 -- Support both explicit (field: expr) and shorthand (field) syntax
@@ -3159,9 +3253,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
                     field_values.push(expr_ident(fname, tok.line, tok.col))
                 }
                 pp = p_skip_newlines(pp)
-                if p_peek(pp) == TK_COMMA() {
-                    pp = p_advance(pp)
-                }
+                pp = p_comma_or(pp, TK_RBRACE())
             }
             pp = p_expect(pp, TK_RBRACE())
             let mut e = expr_new(EXPR_STRUCT_LITERAL(), tok.line, tok.col)
@@ -3234,7 +3326,14 @@ fn parse_array_literal(p: Parser) -> ParseExprResult {
     pp = p_advance(pp) -- skip [
     let mut elems: List[Expr] = []
     pp = p_skip_newlines(pp)
+    let mut turn4 = -1
     while p_peek(pp) != TK_RBRACKET() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn4 {
+            pp = p_skip_stuck(pp)
+            turn4 = -1
+            continue
+        }
+        turn4 = pp.pos
         let elem = parse_expr(pp)
         pp = elem.p
         elems.push(elem.expr)
@@ -3263,9 +3362,7 @@ fn parse_array_literal(p: Parser) -> ParseExprResult {
             e.elements = expanded
             return ParseExprResult { p: pp, expr: e }
         }
-        if p_peek(pp) == TK_COMMA() {
-            pp = p_advance(pp)
-        }
+        pp = p_comma_or(pp, TK_RBRACKET())
         pp = p_skip_newlines(pp)
     }
     pp = p_expect(pp, TK_RBRACKET())
@@ -3279,7 +3376,15 @@ fn parse_lambda(p: Parser) -> ParseExprResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip |
     let mut params: List[LambdaParam] = []
+    let mut turn5 = -1
     while p_peek(pp) != TK_PIPE() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn5 {
+            pp = p_skip_stuck(pp)
+            turn5 = -1
+            continue
+        }
+        turn5 = pp.pos
+        pp = p_need_name(pp, "a parameter name")
         let name = p_cur(pp).value
         pp = p_advance(pp)
         let mut type_name = ""
@@ -3290,9 +3395,7 @@ fn parse_lambda(p: Parser) -> ParseExprResult {
             type_name = ty.type_name
         }
         params.push(lambda_param_new(name, type_name))
-        if p_peek(pp) == TK_COMMA() {
-            pp = p_advance(pp)
-        }
+        pp = p_comma_or(pp, TK_PIPE())
     }
     pp = p_expect(pp, TK_PIPE())
     -- Optional return type
@@ -3366,7 +3469,14 @@ fn parse_match_expr(p: Parser) -> ParseExprResult {
     pp = p_expect(pp, TK_LBRACE())
     let mut arms: List[MatchArm] = []
     pp = p_skip_newlines(pp)
+    let mut turn6 = -1
     while p_peek(pp) != TK_RBRACE() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn6 {
+            pp = p_skip_stuck(pp)
+            turn6 = -1
+            continue
+        }
+        turn6 = pp.pos
         let arm_result = parse_match_arm(pp)
         pp = arm_result.p
         arms.push(arm_result.arm)
@@ -3545,14 +3655,19 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
             -- Enum variant with payload: Some(x), Ok(v), Err(e)
             pp = p_advance(pp)
             let mut bindings: List[string] = []
+            let mut turn7 = -1
             while p_peek(p_skip_newlines(pp)) != TK_RPAREN() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+                if pp.pos == turn7 {
+                    pp = p_skip_stuck(pp)
+                    turn7 = -1
+                    continue
+                }
+                turn7 = pp.pos
                 pp = p_skip_newlines(pp)
                 let bind_tok = p_cur(pp)
                 pp = p_advance(pp)
                 bindings.push(bind_tok.value)
-                if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-                    pp = p_advance(pp)
-                }
+                pp = p_comma_or(pp, TK_RPAREN())
             }
             pp = p_expect(pp, TK_RPAREN())
             return ParsePatternResult { p: pp, pattern: pattern_enum_variant("", name, bindings) }
@@ -3561,19 +3676,25 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
         if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
             -- Qualified enum: EnumName.Variant or EnumName::Variant
             pp = p_advance(pp)
+            pp = p_need_name(pp, "a variant name")
             let variant_tok = p_cur(pp)
             pp = p_advance(pp)
             let mut bindings: List[string] = []
             if p_peek(pp) == TK_LPAREN() {
                 pp = p_advance(pp)
+                let mut turn8 = -1
                 while p_peek(p_skip_newlines(pp)) != TK_RPAREN() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+                    if pp.pos == turn8 {
+                        pp = p_skip_stuck(pp)
+                        turn8 = -1
+                        continue
+                    }
+                    turn8 = pp.pos
                     pp = p_skip_newlines(pp)
                     let bind_tok = p_cur(pp)
                     pp = p_advance(pp)
                     bindings.push(bind_tok.value)
-                    if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-                        pp = p_advance(pp)
-                    }
+                    pp = p_comma_or(pp, TK_RPAREN())
                 }
                 pp = p_expect(pp, TK_RPAREN())
             }
@@ -3605,14 +3726,31 @@ struct ParseBlockResult {
     stmts: List[Stmt]
 }
 
+-- Skip what separates the statements of a block: line ends, and the
+-- `;` between statements written on one line
+fn p_skip_separators(p: Parser) -> Parser {
+    let mut pp = p
+    while p_peek(pp) == TK_NEWLINE() or p_peek(pp) == TK_SEMICOLON() {
+        pp = p_advance(pp)
+    }
+    return pp
+}
+
 fn parse_block_body(p: Parser) -> ParseBlockResult {
-    let mut pp = p_skip_newlines(p)
+    let mut pp = p_skip_separators(p)
     let mut stmts: List[Stmt] = []
+    let mut turn9 = -1
     while p_peek(pp) != TK_RBRACE() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn9 {
+            pp = p_skip_stuck(pp)
+            turn9 = -1
+            continue
+        }
+        turn9 = pp.pos
         let result = parse_stmt(pp)
         pp = result.p
         stmts.push(result.stmt)
-        pp = p_skip_newlines(pp)
+        pp = p_skip_separators(pp)
     }
     return ParseBlockResult { p: pp, stmts: stmts }
 }
@@ -3735,6 +3873,7 @@ fn parse_let_stmt(p: Parser) -> ParseStmtResult {
     }
 
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a variable name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
 
@@ -3768,6 +3907,7 @@ fn parse_const_stmt(p: Parser) -> ParseStmtResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'const'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a constant name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
     pp = p_expect(pp, TK_EQ())
@@ -3854,6 +3994,7 @@ fn parse_for_stmt(p: Parser) -> ParseStmtResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'for'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a loop variable")
     let var_tok = p_cur(pp)
     pp = p_advance(pp)
     pp = p_expect(pp, TK_IN())
@@ -3888,6 +4029,7 @@ fn parse_region_stmt(p: Parser) -> ParseStmtResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'region'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a region name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
     pp = p_expect(pp, TK_LBRACE())
@@ -3926,6 +4068,7 @@ fn parse_source_file(p: Parser) -> SourceFile {
     if p_peek(pp) == TK_MODULE() {
         pp = p_advance(pp)
         pp = p_skip_newlines(pp)
+        pp = p_need_name(pp, "a module name")
         let name_tok = p_cur(pp)
         sf.module_name = name_tok.value
         pp = p_advance(pp)
@@ -3936,24 +4079,67 @@ fn parse_source_file(p: Parser) -> SourceFile {
     while p_peek(pp) == TK_IMPORT() {
         pp = p_advance(pp)
         pp = p_skip_newlines(pp)
-        let mut path = p_cur(pp).value
+        pp = p_need_name(pp, "a module name")
+        let path_tok = p_cur(pp)
+        let mut path = path_tok.value
         pp = p_advance(pp)
         -- Handle dotted paths: import std.io and import foo::bar
         while p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
             pp = p_advance(pp)
+            pp = p_need_name(pp, "a module name")
             path = path + "." + p_cur(pp).value
             pp = p_advance(pp)
         }
-        sf.imports.push(import_decl_new(path, 0, 0))
+        sf.imports.push(import_decl_new(path, path_tok.line, path_tok.col))
+        -- import m { a, b } names what the file uses of m. Everything
+        -- m declares is visible either way.
+        if p_peek(pp) == TK_LBRACE() {
+            pp = p_advance(pp)
+            let mut turn10 = -1
+            while p_peek(p_skip_newlines(pp)) != TK_RBRACE() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+                if pp.pos == turn10 {
+                    pp = p_skip_stuck(pp)
+                    turn10 = -1
+                    continue
+                }
+                turn10 = pp.pos
+                pp = p_skip_newlines(pp)
+                pp = p_need_name(pp, "the name of a declaration")
+                pp = p_advance(pp)
+                pp = p_comma_or(pp, TK_RBRACE())
+            }
+            pp = p_skip_newlines(pp)
+            pp = p_expect(pp, TK_RBRACE())
+        }
         pp = p_skip_newlines(pp)
     }
 
+    -- The first error of the module line and the imports. The parser
+    -- is passed by value, so its errors are in the last copy, not in
+    -- the caller's: they leave in the SourceFile.
+    if pp.errors.len() > 0 {
+        sf.errors.push(pp.errors[0])
+    }
+
     -- Declarations
+    let mut turn11 = -1
     while p_peek(pp) != TK_EOF() {
+        if pp.pos == turn11 {
+            pp = p_skip_stuck(pp)
+            turn11 = -1
+            continue
+        }
+        turn11 = pp.pos
         pp = p_skip_newlines(pp)
         if p_peek(pp) == TK_EOF() { break }
+        let errors_before = pp.errors.len()
         let decl_result = parse_declaration(pp)
         pp = decl_result.p
+        -- After its first error a declaration is parsed out of step,
+        -- and what follows that error is noise
+        if pp.errors.len() > errors_before {
+            sf.errors.push(pp.errors[errors_before])
+        }
         sf.declarations.push(decl_result.decl)
     }
 
@@ -3986,9 +4172,13 @@ fn parse_declaration(p: Parser) -> ParseDeclResult {
         return parse_const_decl(pp)
     }
 
-    -- Unknown declaration - skip
-    pp = p_error(pp, "unexpected declaration: " + token_kind_name(tok.kind))
+    -- Not a declaration: report it, and skip to the next token that
+    -- starts one
+    pp = p_error(pp, "expected a declaration but got " + token_kind_name(tok.kind))
     pp = p_advance(pp)
+    while p_peek(pp) != TK_EOF() and p_peek(pp) != TK_FN() and p_peek(pp) != TK_ASYNC() and p_peek(pp) != TK_EXTERN() and p_peek(pp) != TK_STRUCT() and p_peek(pp) != TK_ENUM() and p_peek(pp) != TK_TRAIT() and p_peek(pp) != TK_IMPL() and p_peek(pp) != TK_CONST() {
+        pp = p_advance(pp)
+    }
     -- Return a dummy
     let fd = func_decl_new("__error__", tok.line, tok.col)
     return ParseDeclResult { p: pp, decl: decl_function(fd) }
@@ -4006,6 +4196,7 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
     }
     pp = p_advance(pp) -- skip 'fn'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a function name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
 
@@ -4015,14 +4206,20 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
     -- Generic params [T, U]
     if p_peek(pp) == TK_LBRACKET() {
         pp = p_advance(pp)
+        let mut turn12 = -1
         while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            if pp.pos == turn12 {
+                pp = p_skip_stuck(pp)
+                turn12 = -1
+                continue
+            }
+            turn12 = pp.pos
             pp = p_skip_newlines(pp)
+            pp = p_need_name(pp, "a type parameter")
             let gp = p_cur(pp)
             pp = p_advance(pp)
             fd.generic_params.push(gp.value)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-                pp = p_advance(pp)
-            }
+            pp = p_comma_or(pp, TK_RBRACKET())
         }
         pp = p_expect(pp, TK_RBRACKET())
     }
@@ -4030,7 +4227,14 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
     -- Parameters
     pp = p_expect(pp, TK_LPAREN())
     pp = p_skip_newlines(pp)
+    let mut turn13 = -1
     while p_peek(pp) != TK_RPAREN() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn13 {
+            pp = p_skip_stuck(pp)
+            turn13 = -1
+            continue
+        }
+        turn13 = pp.pos
         let mut is_mut = false
         pp = p_skip_newlines(pp)
         -- Handle bare 'self' or 'mut self'
@@ -4043,9 +4247,7 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
                 self_param.is_mut = true
                 fd.params.push(self_param)
                 pp = p_advance(pp)
-                if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-                    pp = p_advance(pp)
-                }
+                pp = p_comma_or(pp, TK_RPAREN())
                 pp = p_skip_newlines(pp)
                 continue
             }
@@ -4065,13 +4267,12 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
             let mut self_param = func_param_new("self", self_type)
             self_param.is_mut = is_mut
             fd.params.push(self_param)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-                pp = p_advance(pp)
-            }
+            pp = p_comma_or(pp, TK_RPAREN())
             pp = p_skip_newlines(pp)
             continue
         }
 
+        pp = p_need_name(pp, "a parameter name")
         let pname = p_cur(pp).value
         pp = p_advance(pp)
         pp = p_expect(pp, TK_COLON())
@@ -4082,9 +4283,7 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
         param.is_mut = is_mut
         param.is_ref = pty_ref
         fd.params.push(param)
-        if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-            pp = p_advance(pp)
-        }
+        pp = p_comma_or(pp, TK_RPAREN())
         pp = p_skip_newlines(pp)
     }
     pp = p_expect(pp, TK_RPAREN())
@@ -4103,14 +4302,20 @@ fn parse_fn_decl(p: Parser) -> ParseDeclResult {
         pp = p_skip_newlines(pp)
         pp = p_advance(pp)
         pp = p_expect(pp, TK_LBRACKET())
+        let mut turn14 = -1
         while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            if pp.pos == turn14 {
+                pp = p_skip_stuck(pp)
+                turn14 = -1
+                continue
+            }
+            turn14 = pp.pos
             pp = p_skip_newlines(pp)
+            pp = p_need_name(pp, "an effect name")
             let eff = p_cur(pp).value
             pp = p_advance(pp)
             fd.effects.push(eff)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-                pp = p_advance(pp)
-            }
+            pp = p_comma_or(pp, TK_RBRACKET())
         }
         pp = p_expect(pp, TK_RBRACKET())
     }
@@ -4153,6 +4358,7 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
     pp = p_skip_newlines(pp)
     pp = p_advance(pp) -- skip 'fn'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a function name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
 
@@ -4162,7 +4368,14 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
     -- Parameters
     pp = p_expect(pp, TK_LPAREN())
     pp = p_skip_newlines(pp)
+    let mut turn15 = -1
     while p_peek(pp) != TK_RPAREN() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn15 {
+            pp = p_skip_stuck(pp)
+            turn15 = -1
+            continue
+        }
+        turn15 = pp.pos
         pp = p_skip_newlines(pp)
         if p_peek(pp) == TK_DOTDOT() {
             -- `...` (lexed as `..` then `.`): further arguments are C varargs
@@ -4175,6 +4388,7 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
                 exit(1)
             }
         } else {
+            pp = p_need_name(pp, "a parameter name")
             let pname = p_cur(pp).value
             pp = p_advance(pp)
             pp = p_expect(pp, TK_COLON())
@@ -4184,9 +4398,7 @@ fn parse_extern_decl(p: Parser) -> ParseDeclResult {
             let mut eparam = func_param_new(pname, pty.type_name)
             eparam.is_ref = pty_ref
             fd.params.push(eparam)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() {
-                pp = p_advance(pp)
-            }
+            pp = p_comma_or(pp, TK_RPAREN())
             pp = p_skip_newlines(pp)
         }
     }
@@ -4220,6 +4432,7 @@ fn parse_struct_decl(p: Parser) -> ParseDeclResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'struct'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a struct name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
 
@@ -4228,19 +4441,35 @@ fn parse_struct_decl(p: Parser) -> ParseDeclResult {
     -- Generic params
     if p_peek(pp) == TK_LBRACKET() {
         pp = p_advance(pp)
-        while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() {
+        let mut turn16 = -1
+        while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            if pp.pos == turn16 {
+                pp = p_skip_stuck(pp)
+                turn16 = -1
+                continue
+            }
+            turn16 = pp.pos
             pp = p_skip_newlines(pp)
+            pp = p_need_name(pp, "a type parameter")
             sd.generic_params.push(p_cur(pp).value)
             pp = p_advance(pp)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
+            pp = p_comma_or(pp, TK_RBRACKET())
         }
         pp = p_expect(pp, TK_RBRACKET())
     }
 
     pp = p_expect(pp, TK_LBRACE())
     pp = p_skip_newlines(pp)
+    let mut turn17 = -1
     while p_peek(pp) != TK_RBRACE() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn17 {
+            pp = p_skip_stuck(pp)
+            turn17 = -1
+            continue
+        }
+        turn17 = pp.pos
         pp = p_skip_newlines(pp)
+        pp = p_need_name(pp, "a field name")
         let fname = p_cur(pp).value
         pp = p_advance(pp)
         pp = p_expect(pp, TK_COLON())
@@ -4248,7 +4477,7 @@ fn parse_struct_decl(p: Parser) -> ParseDeclResult {
         pp = fty.p
         sd.fields.push(struct_field_new(fname, fty.type_name))
         pp = p_skip_newlines(pp)
-        if p_peek(pp) == TK_COMMA() { pp = p_advance(pp) }
+        pp = p_comma_or(pp, TK_RBRACE())
         pp = p_skip_newlines(pp)
     }
     pp = p_expect(pp, TK_RBRACE())
@@ -4261,6 +4490,7 @@ fn parse_enum_decl(p: Parser) -> ParseDeclResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'enum'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "an enum name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
 
@@ -4269,19 +4499,35 @@ fn parse_enum_decl(p: Parser) -> ParseDeclResult {
     -- Generic params
     if p_peek(pp) == TK_LBRACKET() {
         pp = p_advance(pp)
-        while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() {
+        let mut turn18 = -1
+        while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            if pp.pos == turn18 {
+                pp = p_skip_stuck(pp)
+                turn18 = -1
+                continue
+            }
+            turn18 = pp.pos
             pp = p_skip_newlines(pp)
+            pp = p_need_name(pp, "a type parameter")
             ed.generic_params.push(p_cur(pp).value)
             pp = p_advance(pp)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
+            pp = p_comma_or(pp, TK_RBRACKET())
         }
         pp = p_expect(pp, TK_RBRACKET())
     }
 
     pp = p_expect(pp, TK_LBRACE())
     pp = p_skip_newlines(pp)
+    let mut turn19 = -1
     while p_peek(pp) != TK_RBRACE() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn19 {
+            pp = p_skip_stuck(pp)
+            turn19 = -1
+            continue
+        }
+        turn19 = pp.pos
         pp = p_skip_newlines(pp)
+        pp = p_need_name(pp, "a variant name")
         let vname = p_cur(pp).value
         pp = p_advance(pp)
         let mut variant = enum_variant_new(vname)
@@ -4289,18 +4535,25 @@ fn parse_enum_decl(p: Parser) -> ParseDeclResult {
         if p_peek(pp) == TK_LPAREN() {
             pp = p_advance(pp)
             variant.has_payload = true
+            let mut turn20 = -1
             while p_peek(p_skip_newlines(pp)) != TK_RPAREN() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+                if pp.pos == turn20 {
+                    pp = p_skip_stuck(pp)
+                    turn20 = -1
+                    continue
+                }
+                turn20 = pp.pos
                 pp = p_skip_newlines(pp)
                 let pty = parse_type(pp)
                 pp = pty.p
                 variant.payload_types.push(pty.type_name)
-                if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
+                pp = p_comma_or(pp, TK_RPAREN())
             }
             pp = p_expect(pp, TK_RPAREN())
         }
         ed.variants.push(variant)
         pp = p_skip_newlines(pp)
-        if p_peek(pp) == TK_COMMA() { pp = p_advance(pp) }
+        pp = p_comma_or(pp, TK_RBRACE())
         pp = p_skip_newlines(pp)
     }
     pp = p_expect(pp, TK_RBRACE())
@@ -4313,6 +4566,7 @@ fn parse_trait_decl(p: Parser) -> ParseDeclResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'trait'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a trait name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
 
@@ -4320,13 +4574,21 @@ fn parse_trait_decl(p: Parser) -> ParseDeclResult {
 
     pp = p_expect(pp, TK_LBRACE())
     pp = p_skip_newlines(pp)
+    let mut turn21 = -1
     while p_peek(pp) != TK_RBRACE() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn21 {
+            pp = p_skip_stuck(pp)
+            turn21 = -1
+            continue
+        }
+        turn21 = pp.pos
         pp = p_skip_newlines(pp)
         if p_peek(pp) == TK_FN() {
             let method_result = parse_fn_decl(pp)
             pp = method_result.p
             td.methods.push(*method_result.decl.func_decl)
         } else {
+            pp = p_error(pp, "expected 'fn' in a trait but got " + token_kind_name(p_peek(pp)))
             pp = p_advance(pp)
         }
         pp = p_skip_newlines(pp)
@@ -4344,6 +4606,7 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
 
     -- Parse: impl Type { ... } or impl Type[A, B] { ... }
     --    or impl Trait for Type { ... }
+    pp = p_need_name(pp, "a type name")
     let first_name = p_cur(pp).value
     pp = p_advance(pp)
 
@@ -4352,11 +4615,19 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
     -- Parse optional generic params [A, B] after the type name
     if p_peek(pp) == TK_LBRACKET() {
         pp = p_advance(pp)
+        let mut turn22 = -1
         while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+            if pp.pos == turn22 {
+                pp = p_skip_stuck(pp)
+                turn22 = -1
+                continue
+            }
+            turn22 = pp.pos
             pp = p_skip_newlines(pp)
+            pp = p_need_name(pp, "a type parameter")
             ib.generic_params.push(p_cur(pp).value)
             pp = p_advance(pp)
-            if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
+            pp = p_comma_or(pp, TK_RBRACKET())
         }
         pp = p_expect(pp, TK_RBRACKET())
     }
@@ -4366,6 +4637,7 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
         -- impl Trait for Type
         pp = p_advance(pp)
         pp = p_skip_newlines(pp)
+        pp = p_need_name(pp, "a type name")
         let target_name = p_cur(pp).value
         pp = p_advance(pp)
         ib.trait_name = first_name
@@ -4373,11 +4645,19 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
         -- Parse optional generic params on the target type too
         if p_peek(pp) == TK_LBRACKET() {
             pp = p_advance(pp)
+            let mut turn23 = -1
             while p_peek(p_skip_newlines(pp)) != TK_RBRACKET() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
+                if pp.pos == turn23 {
+                    pp = p_skip_stuck(pp)
+                    turn23 = -1
+                    continue
+                }
+                turn23 = pp.pos
                 pp = p_skip_newlines(pp)
+                pp = p_need_name(pp, "a type parameter")
                 ib.generic_params.push(p_cur(pp).value)
                 pp = p_advance(pp)
-                if p_peek(p_skip_newlines(pp)) == TK_COMMA() { pp = p_advance(pp) }
+                pp = p_comma_or(pp, TK_RBRACKET())
             }
             pp = p_expect(pp, TK_RBRACKET())
         }
@@ -4385,13 +4665,21 @@ fn parse_impl_decl(p: Parser) -> ParseDeclResult {
 
     pp = p_expect(pp, TK_LBRACE())
     pp = p_skip_newlines(pp)
+    let mut turn24 = -1
     while p_peek(pp) != TK_RBRACE() and p_peek(pp) != TK_EOF() {
+        if pp.pos == turn24 {
+            pp = p_skip_stuck(pp)
+            turn24 = -1
+            continue
+        }
+        turn24 = pp.pos
         pp = p_skip_newlines(pp)
         if p_peek(pp) == TK_FN() or p_peek(pp) == TK_ASYNC() {
             let method_result = parse_fn_decl(pp)
             pp = method_result.p
             ib.methods.push(*method_result.decl.func_decl)
         } else {
+            pp = p_error(pp, "expected 'fn' in an impl but got " + token_kind_name(p_peek(pp)))
             pp = p_advance(pp)
         }
         pp = p_skip_newlines(pp)
@@ -4406,10 +4694,19 @@ fn parse_const_decl(p: Parser) -> ParseDeclResult {
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'const'
     pp = p_skip_newlines(pp)
+    pp = p_need_name(pp, "a constant name")
     let name_tok = p_cur(pp)
     pp = p_advance(pp)
 
     let mut cd = const_decl_new(name_tok.value, tok.line, tok.col)
+
+    -- Optional type: const FOO: int = expr
+    if p_peek(pp) == TK_COLON() {
+        pp = p_advance(pp)
+        let cty = parse_type(pp)
+        pp = cty.p
+        cd.type_name = cty.type_name
+    }
 
     -- Check for comptime: const FOO = comptime expr
     pp = p_expect(pp, TK_EQ())
@@ -7232,6 +7529,7 @@ fn generate_return(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResu
     }
 
     if stmt.has_ret_value {
+        g = check_basic_type(g, g.current_return_type, *stmt.ret_value, "the return value")
         let ret_expr = map_ctor_as(g, *stmt.ret_value, g.current_return_type)
         let mut result = generate_expr(g, b, ret_expr)
         result = convert_int_value(result.gen, result.block, result.val_id, ret_expr, infer_expr_type(result.gen, ret_expr), map_type_name(g.current_return_type), "the return value")
@@ -21332,7 +21630,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "5120320a680203e3"
+    return "4fbffdcfb275b6db"
 }
 
 
@@ -21366,6 +21664,7 @@ fn print_usage() {
     println("  check         Report the file's errors without building a program")
     println("  fmt           Indent the file by its braces, in place or into -o <file>")
     println("  test          Run each fn test_*() of the file and report which pass")
+    println("  symbols       List the file's declarations, for editors")
     println("")
     println("Options:")
     println("  -o <file>     Output binary name (default: input without .dm)")
@@ -21376,6 +21675,8 @@ fn print_usage() {
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
     println("  --emit-bitcode  Emit LLVM bitcode (.bc), optimized as -O says, and exit")
+    println("  --stdin       Read the program from standard input; <file.dm> still names it")
+    println("                (compiling, check and symbols)")
     println("  --link-llvm   Add the LLVM bridge and link the LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
@@ -21391,8 +21692,11 @@ fn print_usage() {
 -- ============================================================
 
 struct CLIArgs {
-    -- "" to compile, or "run", "check", "fmt" or "test"
+    -- "" to compile, or "run", "check", "fmt", "test" or "symbols"
     command: string,
+    -- --stdin: the program's text comes from standard input, and
+    -- input_file is only its name
+    from_stdin: bool,
     input_file: string,
     output_file: string,
     -- Whether -o named the output file
@@ -21414,6 +21718,7 @@ struct CLIArgs {
 fn parse_cli_args() -> CLIArgs {
     let mut args = CLIArgs {
         command: "",
+        from_stdin: false,
         input_file: "",
         output_file: "",
         has_output: false,
@@ -21441,7 +21746,7 @@ fn parse_cli_args() -> CLIArgs {
     while i < argc {
         let arg = args_get(i)
 
-        if i == 1 and (arg == "run" or arg == "check" or arg == "fmt" or arg == "test") {
+        if i == 1 and (arg == "run" or arg == "check" or arg == "fmt" or arg == "test" or arg == "symbols") {
             args.command = arg
         } else if arg == "--" and args.command == "run" {
             -- The rest goes to the program
@@ -21482,6 +21787,8 @@ fn parse_cli_args() -> CLIArgs {
             args.emit_bitcode = true
         } else if arg == "--link-llvm" {
             args.link_llvm = true
+        } else if arg == "--stdin" {
+            args.from_stdin = true
         } else if arg == "-v" or arg == "--verbose" {
             args.verbose = true
         } else if starts_with(arg, "-") {
@@ -21505,6 +21812,11 @@ fn parse_cli_args() -> CLIArgs {
     if args.input_file == "" {
         args.has_error = true
         args.error_msg = "Error: no input file specified"
+        return args
+    }
+    if args.from_stdin and (args.command == "fmt" or args.command == "test") {
+        args.has_error = true
+        args.error_msg = "Error: --stdin does not go with " + args.command
         return args
     }
 
@@ -21623,7 +21935,7 @@ fn find_bridge_file(input_dir: string) -> string {
 fn parse_llvm_bridge(path: string) -> SourceFile {
     let p = parser_new(tokenize(file_read(path)))
     let bridge_sf = parse_source_file(p)
-    let mut errors = p.errors
+    let mut errors = bridge_sf.errors
     if errors.len() == 0 {
         errors = validate_source_file(bridge_sf)
     }
@@ -21867,6 +22179,14 @@ fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], 
     let tokens = tokenize(source)
     let p = parser_new(tokens)
     let imp_sf = parse_source_file(p)
+    if imp_sf.errors.len() > 0 {
+        let mut ei = 0
+        while ei < imp_sf.errors.len() {
+            eprintln(file_path + ": " + imp_sf.errors[ei])
+            ei = ei + 1
+        }
+        exit(1)
+    }
 
     -- Recursively process imports from the imported file
     let import_dir = dirname(file_path)
@@ -22107,13 +22427,13 @@ fn test_file(cli: CLIArgs) -> int {
         eprintln("Error: file not found: " + cli.input_file)
         return 1
     }
-    let p = parser_new(tokenize(file_read(cli.input_file)))
-    let names = test_function_names(parse_source_file(p))
-    if p.errors.len() == 0 and names.len() == 0 {
+    let parsed = parse_source_file(parser_new(tokenize(file_read(cli.input_file))))
+    let names = test_function_names(parsed)
+    if parsed.errors.len() == 0 and names.len() == 0 {
         println("No test functions found (functions starting with 'test_').")
         return 0
     }
-    if p.errors.len() == 0 {
+    if parsed.errors.len() == 0 {
         println("Found " + int_to_string(names.len()) + " test(s) in " + cli.input_file)
         println("")
         flush()
@@ -22128,6 +22448,268 @@ fn test_file(cli: CLIArgs) -> int {
     let code = exit_code_of(system(build.output_file))
     fs_remove(build.output_file)
     return code
+}
+
+-- The text of the program to compile
+fn source_text(cli: CLIArgs) -> string {
+    if cli.from_stdin {
+        return file_read("/dev/stdin")
+    }
+    return file_read(cli.input_file)
+}
+
+-- ============================================================
+-- SYMBOLS: the declarations of a file, for editors
+-- One line per declaration, its parts separated by tabs:
+--   kind  name  line  column  last line  container  detail
+-- kind is import, function, struct, field, enum, variant, trait, impl,
+-- method or const. Line and column are where the name is, counted from
+-- 1. The container is the type a field, variant or method belongs to.
+-- The detail is the declaration as its source would start, such as
+-- "fn add(a: int, b: int) -> int"; for an import it is the file.
+-- ============================================================
+
+-- The index of the first token at or after (line, col), from token
+-- `from` on; the last token when there is none
+fn token_at(tokens: List[Token], from: int, line: int, col: int) -> int {
+    let mut i = from
+    while i < tokens.len() {
+        let tok = tokens[i]
+        if tok.line > line or (tok.line == line and tok.col >= col) {
+            return i
+        }
+        i = i + 1
+    }
+    return tokens.len() - 1
+}
+
+-- The index of the first identifier `name` from token `from` on;
+-- `from` when there is none
+fn name_token(tokens: List[Token], from: int, name: string) -> int {
+    let mut i = from
+    while i < tokens.len() {
+        if tokens[i].kind == TK_IDENT() and tokens[i].value == name {
+            return i
+        }
+        i = i + 1
+    }
+    return from
+}
+
+-- The last line of the declaration that starts at token `start`: the
+-- line its braces close on, or the line it is written on when it has
+-- none
+fn declaration_end_line(tokens: List[Token], start: int) -> int {
+    let mut depth = 0
+    let mut last_line = tokens[start].line
+    let mut i = start
+    while i < tokens.len() {
+        let kind = tokens[i].kind
+        if kind == TK_EOF() {
+            return last_line
+        }
+        if kind == TK_NEWLINE() {
+            if depth == 0 {
+                -- The body may open on the next line
+                let mut next = i
+                while next < tokens.len() and tokens[next].kind == TK_NEWLINE() {
+                    next = next + 1
+                }
+                if next >= tokens.len() or tokens[next].kind != TK_LBRACE() {
+                    return last_line
+                }
+            }
+        } else {
+            last_line = tokens[i].line
+            if kind == TK_LBRACE() or kind == TK_LPAREN() or kind == TK_LBRACKET() {
+                depth = depth + 1
+            } else if kind == TK_RPAREN() or kind == TK_RBRACKET() {
+                depth = depth - 1
+            } else if kind == TK_RBRACE() {
+                depth = depth - 1
+                if depth <= 0 {
+                    return last_line
+                }
+            }
+        }
+        i = i + 1
+    }
+    return last_line
+}
+
+-- "[T, U]" for the type parameters of a declaration; "" when it has none
+fn type_parameters_text(names: List[string]) -> string {
+    if names.len() == 0 {
+        return ""
+    }
+    let mut text = "["
+    let mut i = 0
+    while i < names.len() {
+        if i > 0 {
+            text = text + ", "
+        }
+        text = text + names[i]
+        i = i + 1
+    }
+    return text + "]"
+}
+
+-- A function as its declaration starts: "fn add(a: int, b: int) -> int"
+fn function_signature(fd: FunctionDecl) -> string {
+    let mut sig = "fn " + fd.name + type_parameters_text(fd.generic_params) + "("
+    if fd.is_extern {
+        sig = "extern " + sig
+    }
+    let mut i = 0
+    while i < fd.params.len() {
+        let param = fd.params[i]
+        if i > 0 {
+            sig = sig + ", "
+        }
+        if param.is_mut {
+            sig = sig + "mut "
+        }
+        if param.name == "self" {
+            sig = sig + "self"
+        } else {
+            sig = sig + param.name + ": " + param.type_name
+        }
+        i = i + 1
+    }
+    if fd.is_variadic {
+        sig = sig + ", ..."
+    }
+    sig = sig + ")"
+    if fd.return_type != "void" and fd.return_type != "" {
+        sig = sig + " -> " + fd.return_type
+    }
+    if fd.effects.len() > 0 {
+        sig = sig + " with " + type_parameters_text(fd.effects)
+    }
+    return sig
+}
+
+-- Print a declaration. One that the parser read out of a syntax error
+-- may have a name that is no name; it is left out.
+fn print_symbol(kind: string, name: string, at: Token, end_line: int, container: string, detail: string) {
+    if kind != "import" and (at.kind != TK_IDENT() or at.value != name) {
+        return
+    }
+    println(kind + "\t" + name + "\t" + int_to_string(at.line) + "\t" + int_to_string(at.col) + "\t" + int_to_string(end_line) + "\t" + container + "\t" + detail)
+}
+
+-- Print the function whose `fn` is at token `start`
+fn print_function_symbol(kind: string, fd: FunctionDecl, container: string, tokens: List[Token], start: int) {
+    print_symbol(kind, fd.name, tokens[name_token(tokens, start, fd.name)], declaration_end_line(tokens, start), container, function_signature(fd))
+}
+
+-- symbols: print the declarations of the file. A file with syntax
+-- errors gives the declarations that could be read.
+fn symbols_file(cli: CLIArgs) -> int {
+    if cli.from_stdin == false and file_exists(cli.input_file) == false {
+        eprintln("Error: file not found: " + cli.input_file)
+        return 1
+    }
+    let tokens = tokenize(source_text(cli))
+    let sf = parse_source_file(parser_new(tokens))
+    if tokens.len() == 0 {
+        return 0
+    }
+    let base_dir = dirname(cli.input_file)
+
+    let mut i = 0
+    while i < sf.imports.len() {
+        let imp = sf.imports[i]
+        let at = tokens[token_at(tokens, 0, imp.line, imp.col)]
+        print_symbol("import", imp.path, at, at.line, "", resolve_import_path(imp.path, base_dir))
+        i = i + 1
+    }
+
+    -- Declarations are in source order, so each search starts where the
+    -- declaration before began
+    let mut from = 0
+    i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.name != "__error__" {
+                from = token_at(tokens, from, fd.line, fd.col)
+                print_function_symbol("function", fd, "", tokens, from)
+            }
+        } else if decl.kind == DECL_STRUCT() {
+            let sd = *decl.struct_decl
+            from = token_at(tokens, from, sd.line, sd.col)
+            let mut at = name_token(tokens, from, sd.name)
+            print_symbol("struct", sd.name, tokens[at], declaration_end_line(tokens, from), "", "struct " + sd.name + type_parameters_text(sd.generic_params))
+            let mut fi = 0
+            while fi < sd.fields.len() {
+                let field = sd.fields[fi]
+                at = name_token(tokens, at + 1, field.name)
+                print_symbol("field", field.name, tokens[at], tokens[at].line, sd.name, field.name + ": " + field.type_name)
+                fi = fi + 1
+            }
+        } else if decl.kind == DECL_ENUM() {
+            let ed = *decl.enum_decl
+            from = token_at(tokens, from, ed.line, ed.col)
+            let mut at = name_token(tokens, from, ed.name)
+            print_symbol("enum", ed.name, tokens[at], declaration_end_line(tokens, from), "", "enum " + ed.name + type_parameters_text(ed.generic_params))
+            let mut vi = 0
+            while vi < ed.variants.len() {
+                let variant = ed.variants[vi]
+                at = name_token(tokens, at + 1, variant.name)
+                let mut detail = variant.name
+                if variant.has_payload {
+                    let mut payload = ""
+                    let mut pi = 0
+                    while pi < variant.payload_types.len() {
+                        if pi > 0 {
+                            payload = payload + ", "
+                        }
+                        payload = payload + variant.payload_types[pi]
+                        pi = pi + 1
+                    }
+                    detail = detail + "(" + payload + ")"
+                }
+                print_symbol("variant", variant.name, tokens[at], tokens[at].line, ed.name, detail)
+                vi = vi + 1
+            }
+        } else if decl.kind == DECL_TRAIT() {
+            let td = *decl.trait_decl
+            from = token_at(tokens, from, td.line, td.col)
+            print_symbol("trait", td.name, tokens[name_token(tokens, from, td.name)], declaration_end_line(tokens, from), "", "trait " + td.name + type_parameters_text(td.generic_params))
+            let mut mi = 0
+            while mi < td.methods.len() {
+                let method = td.methods[mi]
+                print_function_symbol("method", method, td.name, tokens, token_at(tokens, from, method.line, method.col))
+                mi = mi + 1
+            }
+        } else if decl.kind == DECL_IMPL() {
+            let ib = *decl.impl_block
+            from = token_at(tokens, from, ib.line, ib.col)
+            let mut detail = "impl " + ib.target_type + type_parameters_text(ib.generic_params)
+            if ib.trait_name != "" {
+                detail = "impl " + ib.trait_name + " for " + ib.target_type
+            }
+            print_symbol("impl", ib.target_type, tokens[name_token(tokens, from, ib.target_type)], declaration_end_line(tokens, from), "", detail)
+            let mut mi = 0
+            while mi < ib.methods.len() {
+                let method = ib.methods[mi]
+                print_function_symbol("method", method, ib.target_type, tokens, token_at(tokens, from, method.line, method.col))
+                mi = mi + 1
+            }
+        } else if decl.kind == DECL_CONST() {
+            let cd = *decl.const_decl
+            from = token_at(tokens, from, cd.line, cd.col)
+            let mut detail = "const " + cd.name
+            if cd.type_name != "" {
+                detail = detail + ": " + cd.type_name
+            }
+            print_symbol("const", cd.name, tokens[name_token(tokens, from, cd.name)], declaration_end_line(tokens, from), "", detail)
+        }
+        i = i + 1
+    }
+    return 0
 }
 
 -- ============================================================
@@ -22149,12 +22731,12 @@ fn compile(cli: CLIArgs) -> int {
     -- Phase 1: Read source file
     if verbose { println("  [1/6] Reading source...") }
 
-    if file_exists(input_file) == false {
+    if cli.from_stdin == false and file_exists(input_file) == false {
         eprintln("Error: file not found: " + input_file)
         return 1
     }
 
-    let source = file_read(input_file)
+    let source = source_text(cli)
 
     -- Phase 2: Tokenize
     if verbose { println("  [2/6] Lexing...") }
@@ -22168,10 +22750,10 @@ fn compile(cli: CLIArgs) -> int {
     let mut sf = parse_source_file(p)
 
     -- Check for parse errors
-    if p.errors.len() > 0 {
+    if sf.errors.len() > 0 {
         let mut ei = 0
-        while ei < p.errors.len() {
-            eprintln(p.errors[ei])
+        while ei < sf.errors.len() {
+            eprintln(sf.errors[ei])
             ei = ei + 1
         }
         exit(1)
@@ -22291,7 +22873,8 @@ fn compile(cli: CLIArgs) -> int {
         }
         di = di + 1
     }
-    if has_main == false {
+    -- check takes a file that is only imported by others, too
+    if has_main == false and cli.command != "check" {
         eprintln("Error: no main function found")
         exit(1)
     }
@@ -22464,6 +23047,9 @@ fn main() -> int {
     }
     if cli.command == "test" {
         return test_file(cli)
+    }
+    if cli.command == "symbols" {
+        return symbols_file(cli)
     }
     return compile(cli)
 }
