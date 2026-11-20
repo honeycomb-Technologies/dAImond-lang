@@ -509,7 +509,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Runtime primitives: raw memory loads and stores, `addr_of`, `size_of`, string internals, C-width integer types and variadic `extern fn`
 - [x] Runtime port started: the string core (concat, compare, `char_at`, `substr`) and the number conversions (`int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float`) are dAImond code in `stage5/runtime/`, replacing their C versions
 - [x] Integer overflow and cast checks are inline (LLVM overflow intrinsics) instead of calls into C
-- [x] The dAImond runtime is optimized at every `-O` level, including `-O0`
+- [x] The dAImond runtime is optimized at every `-O` level: `-O0` builds link a precompiled, optimized runtime object that the compiler builds once and caches (`~/.cache/daimond`, or `$DAIMOND_CACHE_DIR`)
 - [ ] Rest of the runtime in dAImond (formatting, parsing, lists, I/O, files, sockets, threads)
 
 ### Upcoming

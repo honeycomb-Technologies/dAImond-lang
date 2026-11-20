@@ -148,6 +148,9 @@ struct IRGenerator {
     region_marks: List[int],
     -- All source-declared extern fn names (unsafe fence; includes dm_*)
     all_extern_fns: Map[string, bool],
+    -- Functions defined by the precompiled runtime object that the
+    -- program is linked with: they are declared here, not generated
+    linked_fns: Map[string, bool],
     -- Expressions IR generation could not resolve, reported as compile
     -- errors after IR generation instead of being lowered to placeholders
     type_errors: List[string],
@@ -218,6 +221,7 @@ fn ir_generator_new() -> IRGenerator {
         declared_vars: [],
         region_marks: [],
         all_extern_fns: Map_new(),
+        linked_fns: Map_new(),
         type_errors: [],
         fn_src_return_types: Map_new(),
         var_src_types: Map_new(),
@@ -814,7 +818,7 @@ fn map_builtin_name(name: string) -> string {
     if name == "fs_mkdir" { return "dm_fs_mkdir" }
     if name == "fs_remove" { return "dm_fs_remove" }
     -- OS builtins
-    if name == "os_getenv" { return "dm_os_getenv" }
+    if name == "os_getenv" or name == "env_get" { return "dm_os_getenv" }
     return name
 }
 
@@ -888,7 +892,7 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "path_join" { return true }
     if name == "fs_getcwd" or name == "fs_readdir" or name == "fs_rename" { return true }
     if name == "fs_mkdir" or name == "fs_remove" { return true }
-    if name == "os_getenv" { return true }
+    if name == "os_getenv" or name == "env_get" { return true }
     return false
 }
 
@@ -941,7 +945,7 @@ fn builtin_return_type(name: string) -> string {
     if name == "fs_mkdir" { return "i64" }
     if name == "fs_remove" { return "i64" }
     -- OS builtins
-    if name == "os_getenv" { return "string" }
+    if name == "os_getenv" or name == "env_get" { return "string" }
     return "void"
 }
 

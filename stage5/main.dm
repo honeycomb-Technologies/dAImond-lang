@@ -4606,6 +4606,9 @@ struct IRGenerator {
     region_marks: List[int],
     -- All source-declared extern fn names (unsafe fence; includes dm_*)
     all_extern_fns: Map[string, bool],
+    -- Functions defined by the precompiled runtime object that the
+    -- program is linked with: they are declared here, not generated
+    linked_fns: Map[string, bool],
     -- Expressions IR generation could not resolve, reported as compile
     -- errors after IR generation instead of being lowered to placeholders
     type_errors: List[string],
@@ -4676,6 +4679,7 @@ fn ir_generator_new() -> IRGenerator {
         declared_vars: [],
         region_marks: [],
         all_extern_fns: Map_new(),
+        linked_fns: Map_new(),
         type_errors: [],
         fn_src_return_types: Map_new(),
         var_src_types: Map_new(),
@@ -5272,7 +5276,7 @@ fn map_builtin_name(name: string) -> string {
     if name == "fs_mkdir" { return "dm_fs_mkdir" }
     if name == "fs_remove" { return "dm_fs_remove" }
     -- OS builtins
-    if name == "os_getenv" { return "dm_os_getenv" }
+    if name == "os_getenv" or name == "env_get" { return "dm_os_getenv" }
     return name
 }
 
@@ -5346,7 +5350,7 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "path_join" { return true }
     if name == "fs_getcwd" or name == "fs_readdir" or name == "fs_rename" { return true }
     if name == "fs_mkdir" or name == "fs_remove" { return true }
-    if name == "os_getenv" { return true }
+    if name == "os_getenv" or name == "env_get" { return true }
     return false
 }
 
@@ -5399,7 +5403,7 @@ fn builtin_return_type(name: string) -> string {
     if name == "fs_mkdir" { return "i64" }
     if name == "fs_remove" { return "i64" }
     -- OS builtins
-    if name == "os_getenv" { return "string" }
+    if name == "os_getenv" or name == "env_get" { return "string" }
     return "void"
 }
 
@@ -5996,6 +6000,11 @@ fn generate_function(gen: IRGenerator, fd: FunctionDecl) -> IRGenerator {
 
     -- Skip extern functions without body
     if fd.is_extern {
+        return g
+    }
+
+    -- The precompiled runtime object holds this function's body
+    if g.linked_fns.contains(name) {
         return g
     }
 
@@ -21025,6 +21034,11 @@ fn prelude_source() -> string {
     return "\n-- ============================================================\n-- Strings\n-- The string functions behind every program Stage 5 compiles.\n-- gen_bootstrap.sh embeds this file in the compiler (prelude.dm),\n-- which adds it to each program's declarations.\n--\n-- A string is { data, len, cap }: the address of its bytes, their\n-- count, and the size of the allocation that holds them. cap is 0\n-- when the string does not own its bytes, as a literal doesn't.\n-- Every string built here is followed by a NUL byte, so its data\n-- can go to C as a char*.\n--\n-- The compiler calls rt_X wherever its IR names the runtime\n-- function dm_X (see RUNTIME FUNCTIONS in llvm_gen.dm), so each\n-- rt_X keeps the signature that dm_X is declared with in\n-- ir_gen_decl.dm. len(s) and string literals are inline and call\n-- nothing. Code here must not use the string operators it\n-- implements: no +, == or < on strings, and no char_at or substr.\n-- ============================================================\n\n-- libc, under names that a program's own extern declarations of\n-- the same C functions cannot collide with\nextern fn libc_malloc(n: int) -> int = \"malloc\"\nextern fn libc_memcpy(dst: int, src: int, n: int) -> int = \"memcpy\"\nextern fn libc_memcmp(a: int, b: int, n: int) -> i32 = \"memcmp\"\n\n-- A new string holding the n bytes at address src\nfn rt_string_copy(src: int, n: int) -> string {\n    if n <= 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, src, n)\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a + b\nfn rt_string_concat(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    let n = na + nb\n    if n == 0 {\n        return \"\"\n    }\n    unsafe {\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        if na > 0 {\n            libc_memcpy(buf, string_data(a), na)\n        }\n        if nb > 0 {\n            libc_memcpy(buf + na, string_data(b), nb)\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- a == b\nfn rt_string_eq(a: string, b: string) -> bool {\n    let n = len(a)\n    if n != len(b) {\n        return false\n    }\n    if n == 0 {\n        return true\n    }\n    unsafe {\n        return libc_memcmp(string_data(a), string_data(b), n) == 0\n    }\n}\n\n-- Byte order of a and b: negative when a sorts first, 0 when they\n-- are equal, positive when b sorts first. A prefix sorts before\n-- the longer string.\nfn rt_string_cmp(a: string, b: string) -> int {\n    let na = len(a)\n    let nb = len(b)\n    let mut n = na\n    if nb < na {\n        n = nb\n    }\n    if n > 0 {\n        unsafe {\n            let c = libc_memcmp(string_data(a), string_data(b), n)\n            if c != 0 {\n                return c as int\n            }\n        }\n    }\n    if na < nb {\n        return -1\n    }\n    if na > nb {\n        return 1\n    }\n    return 0\n}\n\n-- char_at(s, i): the byte at index i as a one-byte string, or \"\"\n-- when i is outside s\nfn rt_char_at(s: string, i: int) -> string {\n    if i < 0 or i >= len(s) {\n        return \"\"\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + i, 1)\n    }\n}\n\n-- substr(s, start, length): up to length bytes of s from index\n-- start. The range is clamped to s: a start outside s or a length\n-- below 1 gives \"\", and a length past the end stops at the end.\nfn rt_substr(s: string, start: int, length: int) -> string {\n    let n = len(s)\n    if start < 0 or start >= n {\n        return \"\"\n    }\n    let mut count = length\n    if count > n - start {\n        count = n - start\n    }\n    unsafe {\n        return rt_string_copy(string_data(s) + start, count)\n    }\n}\n\n-- ============================================================\n-- Conversions between numbers, booleans and strings\n-- int_to_string, float_to_string, bool_to_string, parse_int and\n-- parse_float. See runtime/string.dm for how rt_X functions\n-- replace the C runtime and for the layout of a string.\n--\n-- Integers are formatted and parsed here. Floats go through\n-- libc (snprintf \"%g\" and strtod), which round correctly.\n-- ============================================================\n\nextern fn libc_free(p: int) = \"free\"\nextern fn libc_memmove(dst: int, src: int, n: int) -> int = \"memmove\"\nextern fn libc_snprintf(buf: int, n: int, fmt: string, ...) -> i32 = \"snprintf\"\nextern fn libc_strtod(s: int, end: int) -> float = \"strtod\"\n\n-- int_to_string(n): n in decimal, with a leading \"-\" when negative\nfn rt_int_to_string(n: int) -> string {\n    -- The two digits of every number below 100, side by side\n    let pairs = \"00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899\"\n    -- Work on -|n|: every int has a negative counterpart, but the\n    -- lowest int has no positive one\n    let mut v = n\n    if n > 0 {\n        v = 0 - n\n    }\n    unsafe {\n        let table = string_data(pairs)\n        -- The longest result, \"-9223372036854775808\", is 20 bytes\n        let size = 21\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        -- Digits come out lowest first, two per division, so they are\n        -- written from the end of the buffer backwards\n        let end = buf + size - 1\n        store_u8(end, 0)\n        let mut at = end\n        while v <= 0 - 100 {\n            let rest = v / 100\n            let pair = table + (rest * 100 - v) * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n            v = rest\n        }\n        if v <= 0 - 10 {\n            let pair = table - v * 2\n            at = at - 2\n            store_u8(at, load_u8(pair))\n            store_u8(at + 1, load_u8(pair + 1))\n        } else {\n            at = at - 1\n            store_u8(at, 48 - v)\n        }\n        if n < 0 {\n            at = at - 1\n            store_u8(at, 45)\n        }\n        -- Move the text, with its NUL, to the start of the buffer\n        let length = end - at\n        if at != buf {\n            libc_memmove(buf, at, length + 1)\n        }\n        return string_from_raw(buf, length, size)\n    }\n}\n\n-- float_to_string(f): f as C's \"%g\" prints it, with up to six\n-- significant digits (\"3.14159\", \"1e+20\", \"inf\", \"nan\")\nfn rt_float_to_string(f: float) -> string {\n    unsafe {\n        -- The longest \"%g\" output is 13 bytes, such as \"-1.79769e+308\"\n        let size = 32\n        let buf = libc_malloc(size)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        let n = libc_snprintf(buf, size, \"%g\", f) as int\n        if n < 0 or n >= size {\n            libc_free(buf)\n            return \"\"\n        }\n        return string_from_raw(buf, n, size)\n    }\n}\n\n-- bool_to_string(b): \"true\" or \"false\"\nfn rt_bool_to_string(b: bool) -> string {\n    if b {\n        return \"true\"\n    }\n    return \"false\"\n}\n\n-- Whether byte c is whitespace to C's isspace: space, or tab\n-- through carriage return\nfn rt_is_space(c: int) -> bool {\n    return c == 32 or (c >= 9 and c <= 13)\n}\n\n-- parse_int(s): the decimal integer at the start of s, as C's\n-- atoll reads it. Leading whitespace is skipped, a \"+\" or \"-\" may\n-- come first, and the number ends at the first byte that is not a\n-- digit. Without a digit the result is 0. A number outside the\n-- range of int gives the nearest int.\nfn rt_parse_int(s: string) -> int {\n    let n = len(s)\n    let int_max = 9223372036854775807\n    -- The lowest int is lowest_tenth * 10 - 8\n    let lowest_tenth = 0 - 922337203685477580\n    unsafe {\n        let p = string_data(s)\n        let mut i = 0\n        while i < n and rt_is_space(load_u8(p + i)) {\n            i = i + 1\n        }\n        let mut negative = false\n        if i < n {\n            let c = load_u8(p + i)\n            if c == 45 {\n                negative = true\n                i = i + 1\n            } else if c == 43 {\n                i = i + 1\n            }\n        }\n        -- Accumulate -|value|, which can hold the lowest int\n        let mut v = 0\n        let mut in_range = true\n        while i < n {\n            let d = load_u8(p + i) - 48\n            if d < 0 or d > 9 {\n                i = n\n            } else {\n                if v < lowest_tenth or (v == lowest_tenth and d > 8) {\n                    in_range = false\n                    i = n\n                } else {\n                    v = v * 10 - d\n                    i = i + 1\n                }\n            }\n        }\n        if negative {\n            if in_range {\n                return v\n            }\n            return 0 - int_max - 1\n        }\n        if in_range and v >= 0 - int_max {\n            return 0 - v\n        }\n        return int_max\n    }\n}\n\n-- parse_float(s): the number at the start of s, as C's strtod\n-- reads it (\"3.5\", \"-1e3\", \"inf\"); 0.0 when s does not start with\n-- a number. Leading whitespace is skipped.\nfn rt_parse_float(s: string) -> float {\n    let n = len(s)\n    if n == 0 {\n        return 0.0\n    }\n    unsafe {\n        -- strtod reads up to a NUL byte, which s need not end with\n        let buf = libc_malloc(n + 1)\n        if buf == 0 {\n            panic(\"out of memory\")\n        }\n        libc_memcpy(buf, string_data(s), n)\n        store_u8(buf + n, 0)\n        let value = libc_strtod(buf, 0)\n        libc_free(buf)\n        return value\n    }\n}\n\n-- ============================================================\n-- Map[K, V]\n-- The hash map behind Map[K, V] in every program Stage 5\n-- compiles. gen_bootstrap.sh embeds this file in the compiler\n-- (prelude.dm), which adds it to each program's declarations.\n-- Keys are strings or integers; hash_key picks the hash.\n--\n-- Entries are kept in insertion order in entry_keys,\n-- entry_vals and entry_hashes, so keys() and values() return\n-- them in that order. slots is an open-addressing table of\n-- indexes into those lists: -1 marks an empty slot and -2 a\n-- removed entry. A removed entry's hash is -1 until rebuild()\n-- drops it.\n--\n-- Copying a map copies its list headers, so a copy shares the\n-- slot table with the original until either one rebuilds. A slot\n-- that names an entry past this map's own entries was written by\n-- another copy; lookups skip it and inserts may take it.\n-- ============================================================\n\nstruct Map[K, V] {\n    entry_keys: List[K],\n    entry_vals: List[V],\n    entry_hashes: List[int],\n    slots: List[int],\n    count: int\n}\n\nimpl Map[K, V] {\n    fn insert(mut self, k: K, v: V) {\n        let h = hash_key(k)\n        let s = self.find_slot(k, h)\n        if s >= 0 {\n            self.entry_vals[self.slots[s]] = v\n            return\n        }\n        -- Keep at least a quarter of the slots empty so probes end\n        if (self.entry_keys.len() + 1) * 4 > self.slots.len() * 3 {\n            self.rebuild()\n        }\n        let cap = self.slots.len()\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 and self.slots[i] < n {\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        self.slots[i] = n\n        self.entry_keys.push(k)\n        self.entry_vals.push(v)\n        self.entry_hashes.push(h)\n        self.count = self.count + 1\n    }\n\n    fn set(mut self, k: K, v: V) {\n        self.insert(k, v)\n    }\n\n    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries and size the table for twice the live ones\n    fn rebuild(mut self) {\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n"
 }
 
+-- A hash of the compiler's and the runtime's source
+fn runtime_build_id() -> string {
+    return "9764b12bb1c22e06"
+}
+
 
 -- ============================================================
 -- dAImond Stage 4 Compiler - LLVM Backend (Self-Hosted)
@@ -21062,6 +21076,10 @@ fn print_usage() {
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
     println("  --version     Show version")
+    println("")
+    println("Environment:")
+    println("  DAIMOND_CACHE_DIR  Where the precompiled runtime object is kept")
+    println("                     (default: $XDG_CACHE_HOME/daimond or ~/.cache/daimond)")
 }
 
 -- ============================================================
@@ -21322,18 +21340,112 @@ fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFi
     return merged
 }
 
--- Add the runtime written in dAImond (prelude.dm, generated from
--- runtime/map.dm) to a program's declarations. Its generic
+-- The runtime written in dAImond (prelude.dm, generated from
+-- runtime/*.dm), parsed
+fn parse_prelude() -> SourceFile {
+    return parse_source_file(parser_new(tokenize(prelude_source())))
+}
+
+-- Add the runtime to a program's declarations. Its generic
 -- declarations cost nothing until the program uses them.
-fn add_prelude(sf: SourceFile) -> SourceFile {
+fn add_prelude(sf: SourceFile, prelude_sf: SourceFile) -> SourceFile {
     let mut out = sf
-    let prelude_sf = parse_source_file(parser_new(tokenize(prelude_source())))
     let mut i = 0
     while i < prelude_sf.declarations.len() {
         out.declarations.push(prelude_sf.declarations[i])
         i = i + 1
     }
     return out
+}
+
+-- ============================================================
+-- PRECOMPILED RUNTIME
+-- A -O0 build does not compile the runtime's functions into the
+-- program. It links an object file that holds them, compiled once
+-- with full optimization. The object is kept in a cache directory
+-- under a name that carries this compiler's build ID, so each build
+-- of the compiler makes and uses its own.
+--
+-- Generic runtime code, such as Map[K, V], has no object code until
+-- a program names its types, so it is still compiled into the
+-- program. At -O1 and above the whole runtime is, so that the
+-- optimizer can inline it into the program.
+-- ============================================================
+
+extern fn getpid() -> i32
+
+-- The directory that holds runtime objects, or "" when the
+-- environment names none. There is no shared fallback such as /tmp,
+-- where another user could leave an object for this one to link.
+fn runtime_cache_dir() -> string {
+    let chosen = env_get("DAIMOND_CACHE_DIR")
+    if chosen != "" { return chosen }
+    let xdg_cache = env_get("XDG_CACHE_HOME")
+    if xdg_cache != "" { return xdg_cache + "/daimond" }
+    let home = env_get("HOME")
+    if home != "" { return home + "/.cache/daimond" }
+    return ""
+}
+
+-- The functions the runtime object defines: every prelude function
+-- that is neither generic nor a declaration of a C function
+fn precompiled_function_names(prelude_sf: SourceFile) -> Map[string, bool] {
+    let mut names: Map[string, bool] = Map_new()
+    let mut i = 0
+    while i < prelude_sf.declarations.len() {
+        let decl = prelude_sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.is_extern == false and fd.generic_params.len() == 0 {
+                names.insert(fd.name, true)
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+-- Compile the runtime alone, optimized, to object file `obj_file`.
+-- Returns 0 on success. It reports nothing on failure: the caller
+-- then compiles the runtime into the program, which reports whatever
+-- is wrong with it.
+fn build_runtime_object(prelude_sf: SourceFile, obj_file: string) -> int {
+    let mut ir_gen = ir_generator_new()
+    ir_gen = generate_module(ir_gen, prelude_sf)
+    if ir_gen.type_errors.len() > 0 { return 1 }
+    let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_runtime")
+    lg = lg_generate_module(lg)
+    let mut result = 1
+    if lg.type_errors.len() == 0 and verify_module(lg) == 0 {
+        result = emit_to_object(lg, obj_file, 2)
+    }
+    llvm_gen_dispose(lg)
+    return result
+}
+
+-- The path of this compiler's runtime object, which is built first
+-- when the cache does not have it. "" when it cannot be built or
+-- kept in the cache directory.
+fn find_or_build_runtime_object(prelude_sf: SourceFile, verbose: bool) -> string {
+    let cache_dir = runtime_cache_dir()
+    if cache_dir == "" { return "" }
+    let obj_file = cache_dir + "/runtime-" + runtime_build_id() + ".o"
+    if file_exists(obj_file) { return obj_file }
+    if verbose { println("  Building the runtime object: " + obj_file) }
+    -- Build it under a name of this process's own and then rename it,
+    -- so that other compilers running now see a whole object or none
+    let mut pid = 0
+    unsafe { pid = getpid() as int }
+    let own_file = obj_file + "." + int_to_string(pid)
+    let mut built = fs_mkdir(cache_dir) == 0
+    if built { built = build_runtime_object(prelude_sf, own_file) == 0 }
+    if built { built = fs_rename(own_file, obj_file) == 0 }
+    if built == false {
+        fs_remove(own_file)
+        if verbose { println("  No runtime object: compiling the runtime into the program") }
+        return ""
+    }
+    return obj_file
 }
 
 -- Resolve an import path to a filesystem path.
@@ -21466,7 +21578,8 @@ fn compile(cli: CLIArgs) -> int {
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
     }
-    sf = add_prelude(sf)
+    let prelude_sf = parse_prelude()
+    sf = add_prelude(sf, prelude_sf)
 
     -- Effect system enforcement
     let effect_errors = validate_effects(sf)
@@ -21482,7 +21595,18 @@ fn compile(cli: CLIArgs) -> int {
     -- Phase 4: Generate IR
     if verbose { println("  [4/6] Generating IR...") }
 
+    -- A -O0 binary takes the runtime's functions from the precompiled
+    -- runtime object (see PRECOMPILED RUNTIME). --emit-ir and --emit-llvm
+    -- show the whole program, runtime included.
+    let mut runtime_obj = ""
+    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false {
+        runtime_obj = find_or_build_runtime_object(prelude_sf, verbose)
+    }
+
     let mut ir_gen = ir_generator_new()
+    if runtime_obj != "" {
+        ir_gen.linked_fns = precompiled_function_names(prelude_sf)
+    }
     ir_gen = generate_module(ir_gen, sf)
     if ir_gen.type_errors.len() > 0 {
         let mut te = 0
@@ -21613,10 +21737,13 @@ fn compile(cli: CLIArgs) -> int {
     let wrappers_c = wrappers_dir + "/llvm_wrappers.c"
 
     -- Build the link command
-    -- cc -o <output> <obj> <runtime.c> <wrappers.c> -I<runtime_dir> -lm -lpthread
+    -- cc -o <output> <obj> [<runtime.o>] <runtime.c> <wrappers.c> -I<runtime_dir> -lm -lpthread
     let mut link_cmd = "cc"
     link_cmd = link_cmd + " -o " + output_file
     link_cmd = link_cmd + " " + obj_file
+    if runtime_obj != "" {
+        link_cmd = link_cmd + " " + runtime_obj
+    }
 
     -- Add runtime source (compile inline)
     if file_exists(runtime_c) {

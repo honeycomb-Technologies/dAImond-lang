@@ -6,9 +6,19 @@ set -e
 
 OUTPUT="main.dm"
 
-# Embed the dAImond runtime sources (runtime/*.dm) in the compiler as one
-# string, so compiled programs need no runtime files on disk
+# Order matters: dependencies before dependents
+MODULES="token.dm lexer.dm ast.dm ir.dm ir_builder.dm llvm.dm parser.dm \
+    ir_gen.dm ir_gen_decl.dm ir_gen_stmt.dm ir_gen_expr.dm ir_gen_builtins.dm \
+    ir_gen_comptime.dm llvm_gen.dm llvm_gen_call.dm llvm_gen_simd.dm"
+
+# The dAImond runtime sources (runtime/*.dm), which the compiler embeds
+# as one string, so compiled programs need no runtime files on disk
 RUNTIME_SOURCES="runtime/string.dm runtime/convert.dm runtime/map.dm"
+
+# Identifies this compiler's source. It names the precompiled runtime
+# object in the cache, so a changed compiler builds its own.
+BUILD_ID=$(cat $MODULES main_split.dm $RUNTIME_SOURCES llvm_bridge.c | sha256sum | cut -c1-16)
+
 {
     echo "module prelude"
     echo ""
@@ -18,28 +28,12 @@ RUNTIME_SOURCES="runtime/string.dm runtime/convert.dm runtime/map.dm"
     printf 'fn prelude_source() -> string {\n    return "'
     cat $RUNTIME_SOURCES | sed '/^module /d' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk '{ printf "%s\\n", $0 }'
     printf '"\n}\n'
+    echo ""
+    echo "-- A hash of the compiler's and the runtime's source"
+    printf 'fn runtime_build_id() -> string {\n    return "%s"\n}\n' "$BUILD_ID"
 } > prelude.dm
 
-# Order matters: dependencies before dependents
-cat \
-    token.dm \
-    lexer.dm \
-    ast.dm \
-    ir.dm \
-    ir_builder.dm \
-    llvm.dm \
-    parser.dm \
-    ir_gen.dm \
-    ir_gen_decl.dm \
-    ir_gen_stmt.dm \
-    ir_gen_expr.dm \
-    ir_gen_builtins.dm \
-    ir_gen_comptime.dm \
-    llvm_gen.dm \
-    llvm_gen_call.dm \
-    llvm_gen_simd.dm \
-    prelude.dm \
-    main_split.dm \
+cat $MODULES prelude.dm main_split.dm \
 | sed '/^module /d' | sed '/^import /d' > "$OUTPUT"
 
 # Add module declaration at the top

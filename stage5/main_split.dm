@@ -54,6 +54,10 @@ fn print_usage() {
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
     println("  --version     Show version")
+    println("")
+    println("Environment:")
+    println("  DAIMOND_CACHE_DIR  Where the precompiled runtime object is kept")
+    println("                     (default: $XDG_CACHE_HOME/daimond or ~/.cache/daimond)")
 }
 
 -- ============================================================
@@ -314,18 +318,112 @@ fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFi
     return merged
 }
 
--- Add the runtime written in dAImond (prelude.dm, generated from
--- runtime/map.dm) to a program's declarations. Its generic
+-- The runtime written in dAImond (prelude.dm, generated from
+-- runtime/*.dm), parsed
+fn parse_prelude() -> SourceFile {
+    return parse_source_file(parser_new(tokenize(prelude_source())))
+}
+
+-- Add the runtime to a program's declarations. Its generic
 -- declarations cost nothing until the program uses them.
-fn add_prelude(sf: SourceFile) -> SourceFile {
+fn add_prelude(sf: SourceFile, prelude_sf: SourceFile) -> SourceFile {
     let mut out = sf
-    let prelude_sf = parse_source_file(parser_new(tokenize(prelude_source())))
     let mut i = 0
     while i < prelude_sf.declarations.len() {
         out.declarations.push(prelude_sf.declarations[i])
         i = i + 1
     }
     return out
+}
+
+-- ============================================================
+-- PRECOMPILED RUNTIME
+-- A -O0 build does not compile the runtime's functions into the
+-- program. It links an object file that holds them, compiled once
+-- with full optimization. The object is kept in a cache directory
+-- under a name that carries this compiler's build ID, so each build
+-- of the compiler makes and uses its own.
+--
+-- Generic runtime code, such as Map[K, V], has no object code until
+-- a program names its types, so it is still compiled into the
+-- program. At -O1 and above the whole runtime is, so that the
+-- optimizer can inline it into the program.
+-- ============================================================
+
+extern fn getpid() -> i32
+
+-- The directory that holds runtime objects, or "" when the
+-- environment names none. There is no shared fallback such as /tmp,
+-- where another user could leave an object for this one to link.
+fn runtime_cache_dir() -> string {
+    let chosen = env_get("DAIMOND_CACHE_DIR")
+    if chosen != "" { return chosen }
+    let xdg_cache = env_get("XDG_CACHE_HOME")
+    if xdg_cache != "" { return xdg_cache + "/daimond" }
+    let home = env_get("HOME")
+    if home != "" { return home + "/.cache/daimond" }
+    return ""
+}
+
+-- The functions the runtime object defines: every prelude function
+-- that is neither generic nor a declaration of a C function
+fn precompiled_function_names(prelude_sf: SourceFile) -> Map[string, bool] {
+    let mut names: Map[string, bool] = Map_new()
+    let mut i = 0
+    while i < prelude_sf.declarations.len() {
+        let decl = prelude_sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.is_extern == false and fd.generic_params.len() == 0 {
+                names.insert(fd.name, true)
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+-- Compile the runtime alone, optimized, to object file `obj_file`.
+-- Returns 0 on success. It reports nothing on failure: the caller
+-- then compiles the runtime into the program, which reports whatever
+-- is wrong with it.
+fn build_runtime_object(prelude_sf: SourceFile, obj_file: string) -> int {
+    let mut ir_gen = ir_generator_new()
+    ir_gen = generate_module(ir_gen, prelude_sf)
+    if ir_gen.type_errors.len() > 0 { return 1 }
+    let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_runtime")
+    lg = lg_generate_module(lg)
+    let mut result = 1
+    if lg.type_errors.len() == 0 and verify_module(lg) == 0 {
+        result = emit_to_object(lg, obj_file, 2)
+    }
+    llvm_gen_dispose(lg)
+    return result
+}
+
+-- The path of this compiler's runtime object, which is built first
+-- when the cache does not have it. "" when it cannot be built or
+-- kept in the cache directory.
+fn find_or_build_runtime_object(prelude_sf: SourceFile, verbose: bool) -> string {
+    let cache_dir = runtime_cache_dir()
+    if cache_dir == "" { return "" }
+    let obj_file = cache_dir + "/runtime-" + runtime_build_id() + ".o"
+    if file_exists(obj_file) { return obj_file }
+    if verbose { println("  Building the runtime object: " + obj_file) }
+    -- Build it under a name of this process's own and then rename it,
+    -- so that other compilers running now see a whole object or none
+    let mut pid = 0
+    unsafe { pid = getpid() as int }
+    let own_file = obj_file + "." + int_to_string(pid)
+    let mut built = fs_mkdir(cache_dir) == 0
+    if built { built = build_runtime_object(prelude_sf, own_file) == 0 }
+    if built { built = fs_rename(own_file, obj_file) == 0 }
+    if built == false {
+        fs_remove(own_file)
+        if verbose { println("  No runtime object: compiling the runtime into the program") }
+        return ""
+    }
+    return obj_file
 }
 
 -- Resolve an import path to a filesystem path.
@@ -458,7 +556,8 @@ fn compile(cli: CLIArgs) -> int {
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
     }
-    sf = add_prelude(sf)
+    let prelude_sf = parse_prelude()
+    sf = add_prelude(sf, prelude_sf)
 
     -- Effect system enforcement
     let effect_errors = validate_effects(sf)
@@ -474,7 +573,18 @@ fn compile(cli: CLIArgs) -> int {
     -- Phase 4: Generate IR
     if verbose { println("  [4/6] Generating IR...") }
 
+    -- A -O0 binary takes the runtime's functions from the precompiled
+    -- runtime object (see PRECOMPILED RUNTIME). --emit-ir and --emit-llvm
+    -- show the whole program, runtime included.
+    let mut runtime_obj = ""
+    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false {
+        runtime_obj = find_or_build_runtime_object(prelude_sf, verbose)
+    }
+
     let mut ir_gen = ir_generator_new()
+    if runtime_obj != "" {
+        ir_gen.linked_fns = precompiled_function_names(prelude_sf)
+    }
     ir_gen = generate_module(ir_gen, sf)
     if ir_gen.type_errors.len() > 0 {
         let mut te = 0
@@ -605,10 +715,13 @@ fn compile(cli: CLIArgs) -> int {
     let wrappers_c = wrappers_dir + "/llvm_wrappers.c"
 
     -- Build the link command
-    -- cc -o <output> <obj> <runtime.c> <wrappers.c> -I<runtime_dir> -lm -lpthread
+    -- cc -o <output> <obj> [<runtime.o>] <runtime.c> <wrappers.c> -I<runtime_dir> -lm -lpthread
     let mut link_cmd = "cc"
     link_cmd = link_cmd + " -o " + output_file
     link_cmd = link_cmd + " " + obj_file
+    if runtime_obj != "" {
+        link_cmd = link_cmd + " " + runtime_obj
+    }
 
     -- Add runtime source (compile inline)
     if file_exists(runtime_c) {

@@ -435,6 +435,11 @@ fn generate_function(gen: IRGenerator, fd: FunctionDecl) -> IRGenerator {
         return g
     }
 
+    -- The precompiled runtime object holds this function's body
+    if g.linked_fns.contains(name) {
+        return g
+    }
+
     -- Generate function body (variable source types are per function)
     let saved_src_types = g.var_src_types
     g.var_src_types = Map_new()
