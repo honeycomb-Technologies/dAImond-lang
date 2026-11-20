@@ -308,6 +308,29 @@ const stage5_file_tests = [_]TestCase{
     },
 };
 
+/// read_line gives a whole line however long it is. Stage 0 cuts a line
+/// at 4095 bytes.
+const stage5_console_tests = [_]TestCase{
+    .{
+        .name = "read_line_long_line",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    if args_len() > 1 {
+            \\        let line = read_line()
+            \\        println(int_to_string(len(line)) + " " + substr(line, 4990, 20) + " [" + read_line() + "]")
+            \\        return
+            \\    }
+            \\    -- A line of 5000 bytes, then a short one
+            \\    let r = system("{ head -c 5000 /dev/zero | tr '\\0' x; printf '\\nnext\\n'; } | " + args_get(0) + " child")
+            \\    println(int_to_string(r))
+            \\}
+        ,
+        .expected_output = "5000 xxxxxxxxxx [next]\n0\n",
+    },
+};
+
 /// A program's function may have the name of a C function the runtime
 /// or the compiler calls. Each call reaches its own function. Stage 0
 /// fails to link such a program.
@@ -734,6 +757,7 @@ pub fn main() !void {
         .{ .name = "Lists (Stage 5)", .tests = &stage5_list_tests },
         .{ .name = "Strings (Stage 5)", .tests = &stage5_string_tests },
         .{ .name = "Files (Stage 5)", .tests = &stage5_file_tests },
+        .{ .name = "Console (Stage 5)", .tests = &stage5_console_tests },
         .{ .name = "C Symbol Names (Stage 5)", .tests = &stage5_symbol_tests },
         .{ .name = "Runtime Primitives", .tests = &stage5_primitive_tests },
     };

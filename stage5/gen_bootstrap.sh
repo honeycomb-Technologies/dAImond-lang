@@ -13,7 +13,7 @@ MODULES="token.dm lexer.dm ast.dm ir.dm ir_builder.dm llvm.dm parser.dm \
 
 # The dAImond runtime sources (runtime/*.dm), which the compiler embeds
 # as one string, so compiled programs need no runtime files on disk
-RUNTIME_SOURCES="runtime/string.dm runtime/convert.dm runtime/list.dm runtime/map.dm runtime/os.dm runtime/path.dm"
+RUNTIME_SOURCES="runtime/string.dm runtime/convert.dm runtime/list.dm runtime/map.dm runtime/os.dm runtime/path.dm runtime/io.dm"
 
 # Identifies this compiler's source. It names the precompiled runtime
 # object in the cache, so a changed compiler builds its own.

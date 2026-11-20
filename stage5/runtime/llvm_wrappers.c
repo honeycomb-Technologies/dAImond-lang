@@ -31,45 +31,6 @@ static void dm_increase_stack_size(void) {
 }
 
 // =====================================================================
-// String creation (return via output pointer)
-// =====================================================================
-
-void llvm_dm_read_line(dm_string* out) {
-    *out = dm_read_line();
-    if (out->data && out->cap > 0) _dm_str_track((char*)out->data);
-}
-
-// =====================================================================
-// I/O (take string via pointer)
-// =====================================================================
-
-void llvm_dm_print(const dm_string* s) {
-    dm_print(*s);
-}
-
-void llvm_dm_println(const dm_string* s) {
-    dm_println(*s);
-}
-
-void llvm_dm_eprint(const dm_string* s) {
-    fwrite(s->data, 1, s->len, stderr);
-}
-
-void llvm_dm_eprintln(const dm_string* s) {
-    fwrite(s->data, 1, s->len, stderr);
-    fputc('\n', stderr);
-}
-
-// A panic writes "PANIC: <message>" to stderr and exits with code 1, as
-// in Stage 0. Callers pass the message without the prefix.
-void llvm_dm_panic(const dm_string* s) {
-    fputs("PANIC: ", stderr);
-    fwrite(s->data, 1, s->len, stderr);
-    fputc('\n', stderr);
-    exit(1);
-}
-
-// =====================================================================
 // Game/Terminal Builtins
 // =====================================================================
 

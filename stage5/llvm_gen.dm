@@ -1911,29 +1911,17 @@ fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
 -- PANIC
 -- ============================================================
 
+-- panic(message): a call of the runtime's panic function. The block's
+-- `unreachable` terminator follows (end_block_after_panic).
 fn generate_panic(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
-    unsafe {
-        let mut g = gen
-        let b = g.builder
-        let msg = resolve_value(g, inst.operand)
-        g = resolve_value_with_counter(g, inst.operand)
-        let fn_name = "dm_panic"
-        if g.function_map.contains(fn_name) {
-            let func = g.function_map.get(fn_name)
-            let fn_ty = g.fn_type_map.get(fn_name)
-            -- If operand is const_string, wrap in dm_string
-            let mut msg_val = msg
-            if inst.operand.kind == VAL_CONST_STRING() {
-                msg_val = create_dm_string(g, inst.operand, msg)
-            }
-            dm_llvm_buf_clear()
-            dm_llvm_buf_push(msg_val)
-            g = check_call_args(g, fn_ty, func)
-            dm_llvm_build_call2_buf(b, fn_ty, func, "")
-        }
-        -- The block's `unreachable` terminator follows (end_block_after_panic)
-        return g
-    }
+    let mut panic_call = ir_inst_new(inst.id, OP_CALL())
+    panic_call.callee = "dm_panic"
+    let mut panic_args: List[IRValue] = []
+    panic_args.push(inst.operand)
+    panic_call.call_args = panic_args
+    panic_call.result_type = "void"
+    panic_call.has_result = false
+    return generate_call(gen, panic_call)
 }
 
 -- ============================================================
