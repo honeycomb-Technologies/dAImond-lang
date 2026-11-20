@@ -430,7 +430,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 323/323 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig) and its link step still compiles C
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 323/323 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig) and its link step still runs `cc` (18 lines of runtime C and the LLVM bridge)
 
 ## Current Status
 
@@ -518,6 +518,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Integer overflow and cast checks are inline (LLVM overflow intrinsics) instead of calls into C
 - [x] The dAImond runtime is optimized at every `-O` level: `-O0` builds link a precompiled, optimized runtime object that the compiler builds once and caches (`~/.cache/daimond`, or `$DAIMOND_CACHE_DIR`)
 - [x] Terminal and time builtins in dAImond: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms`, `sleep_ms`; `examples/snake.dm` and `examples/breakout` build with Stage 5
+- [x] Programs no longer link `stage0/runtime/daimond_runtime.c`
 - [ ] The last runtime C (the start-up stack-size increase in `llvm_wrappers.c`), then linking with `ld.lld` instead of `cc`
 
 ### Upcoming

@@ -195,36 +195,8 @@ fn dirname(path: string) -> string {
     return substr(path, 0, last_slash)
 }
 
--- Find the project root by looking for stage0/runtime/daimond_runtime.c
--- relative to the executable's working directory. Tries several strategies:
---   1. Relative to input file directory: ../stage0/runtime/
---   2. CWD-relative: ../stage0/runtime/ (if running from stage5/)
---   3. CWD-relative: stage0/runtime/ (if running from project root)
-fn find_runtime_dir(input_dir: string) -> string {
-    -- Strategy 1: Go up from input file dir
-    let try1 = input_dir + "/../stage0/runtime"
-    if file_exists(try1 + "/daimond_runtime.c") {
-        return try1
-    }
-
-    -- Strategy 2: Relative (assume running from stage5/)
-    if file_exists("../stage0/runtime/daimond_runtime.c") {
-        return "../stage0/runtime"
-    }
-
-    -- Strategy 3: From project root
-    if file_exists("stage0/runtime/daimond_runtime.c") {
-        return "stage0/runtime"
-    }
-
-    -- Strategy 4: Absolute fallback (common development path)
-    return "../stage0/runtime"
-}
-
--- Find the Stage 5 runtime (llvm_wrappers.c) directory. Stage5's own
--- wrappers must win over the stage3 copy: generated code calls
--- stage5-only runtime helpers (checked arithmetic, cast checks, list
--- set, mem builtins), so linking an older copy fails or misbehaves.
+-- Find the directory of llvm_wrappers.c, the C that is left of the
+-- runtime and is compiled into every program
 fn find_wrappers_dir(input_dir: string) -> string {
     -- Strategy 1: Go up from input file dir
     let try5 = input_dir + "/../stage5/runtime"
@@ -243,18 +215,6 @@ fn find_wrappers_dir(input_dir: string) -> string {
     -- Strategy 3: From project root
     if file_exists("stage5/runtime/llvm_wrappers.c") {
         return "stage5/runtime"
-    }
-
-    -- Legacy fallbacks (pre-stage5 layouts)
-    let try1 = input_dir + "/../stage3/runtime"
-    if file_exists(try1 + "/llvm_wrappers.c") {
-        return try1
-    }
-    if file_exists("../stage3/runtime/llvm_wrappers.c") {
-        return "../stage3/runtime"
-    }
-    if file_exists("stage3/runtime/llvm_wrappers.c") {
-        return "stage3/runtime"
     }
 
     -- Fallback
@@ -705,17 +665,12 @@ fn compile(cli: CLIArgs) -> int {
     -- Dispose LLVM resources before linking
     llvm_gen_dispose(lg)
 
-    -- Find runtime and wrapper source paths
+    -- Find the wrapper source
     let input_dir = dirname(input_file)
-    let runtime_dir = find_runtime_dir(input_dir)
-    let wrappers_dir = find_wrappers_dir(input_dir)
-
-    let runtime_c = runtime_dir + "/daimond_runtime.c"
-    let runtime_h_dir = runtime_dir
-    let wrappers_c = wrappers_dir + "/llvm_wrappers.c"
+    let wrappers_c = find_wrappers_dir(input_dir) + "/llvm_wrappers.c"
 
     -- Build the link command
-    -- cc -o <output> <obj> [<runtime.o>] <runtime.c> <wrappers.c> -I<runtime_dir> -lm -lpthread
+    -- cc -o <output> <obj> [<runtime.o>] <wrappers.c> -lm -lpthread
     let mut link_cmd = "cc"
     link_cmd = link_cmd + " -o " + output_file
     link_cmd = link_cmd + " " + obj_file
@@ -723,22 +678,12 @@ fn compile(cli: CLIArgs) -> int {
         link_cmd = link_cmd + " " + runtime_obj
     }
 
-    -- Add runtime source (compile inline)
-    if file_exists(runtime_c) {
-        link_cmd = link_cmd + " " + runtime_c
-    } else {
-        eprintln("Warning: runtime not found at " + runtime_c)
-    }
-
-    -- Add ABI wrappers source
+    -- Add the wrapper source (compiled by this command)
     if file_exists(wrappers_c) {
         link_cmd = link_cmd + " " + wrappers_c
     } else {
         eprintln("Warning: LLVM wrappers not found at " + wrappers_c)
     }
-
-    -- Include path for runtime headers
-    link_cmd = link_cmd + " -I" + runtime_h_dir
 
     -- Link system libraries
     link_cmd = link_cmd + " -lm -lpthread"
@@ -749,7 +694,7 @@ fn compile(cli: CLIArgs) -> int {
         if bridge_file != "" {
             -- Compile bridge with LLVM cflags via a temp object
             let bridge_obj = output_file + "_bridge.o"
-            let bridge_cmd = "cc -c " + bridge_file + " -o " + bridge_obj + " $(llvm-config --cflags) -I" + runtime_h_dir
+            let bridge_cmd = "cc -c " + bridge_file + " -o " + bridge_obj + " $(llvm-config --cflags)"
             if verbose {
                 println("  Bridge: " + bridge_cmd)
             }

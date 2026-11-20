@@ -18,9 +18,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* Include the dAImond runtime for dm_string interop */
-#include "../stage0/runtime/daimond_runtime.h"
-
 /* ================================================================
  * Helper macros for pointer <-> int64_t conversion
  * ================================================================ */
