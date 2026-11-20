@@ -50,7 +50,7 @@ fn print_usage() {
     println("  -O3           Aggressive optimization")
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
-    println("  --link-llvm   Link LLVM libraries (for compiling the compiler itself)")
+    println("  --link-llvm   Add the LLVM bridge and link the LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
     println("  --version     Show version")
@@ -200,8 +200,7 @@ fn dirname(path: string) -> string {
 -- The compiler links a program itself, with LLVM's linker ld.lld. A
 -- program is its own object, the runtime's object when that is
 -- precompiled, the C library's start-up objects (Scrt1.o, crti.o and
--- crtn.o) and the C library. No C compiler takes part, except to
--- compile llvm_bridge.c when the compiler builds itself (--link-llvm).
+-- crtn.o) and the C library. No C compiler takes part.
 -- ============================================================
 
 -- The dynamic loader of a glibc program on x86-64 Linux
@@ -254,30 +253,83 @@ fn find_libc_dir() -> string {
     return ""
 }
 
--- Find llvm_bridge.c for self-compilation (--link-llvm)
+-- The path of llvm_bridge.dm, the LLVM bridge that --link-llvm adds to
+-- the program, or "" when it is not found: next to the input file,
+-- else in stage5/ of the current directory, else in the current
+-- directory
 fn find_bridge_file(input_dir: string) -> string {
-    -- Strategy 1: Same directory as input file
-    let try1 = input_dir + "/llvm_bridge.c"
-    if file_exists(try1) {
-        return try1
+    if file_exists(input_dir + "/llvm_bridge.dm") {
+        return input_dir + "/llvm_bridge.dm"
     }
-
-    -- Strategy 2: src/ relative paths
-    if file_exists("src/llvm_bridge.c") {
-        return "src/llvm_bridge.c"
+    if file_exists("stage5/llvm_bridge.dm") {
+        return "stage5/llvm_bridge.dm"
     }
-
-    -- Strategy 3: from project root
-    if file_exists("stage5/llvm_bridge.c") {
-        return "stage5/llvm_bridge.c"
+    if file_exists("llvm_bridge.dm") {
+        return "llvm_bridge.dm"
     }
-
-    -- Strategy 4: Relative (assume running from stage5/)
-    if file_exists("llvm_bridge.c") {
-        return "llvm_bridge.c"
-    }
-
     return ""
+}
+
+-- The LLVM bridge at path, parsed. Exits when it does not parse.
+fn parse_llvm_bridge(path: string) -> SourceFile {
+    let p = parser_new(tokenize(file_read(path)))
+    let bridge_sf = parse_source_file(p)
+    let mut errors = p.errors
+    if errors.len() == 0 {
+        errors = validate_source_file(bridge_sf)
+    }
+    if errors.len() > 0 {
+        let mut i = 0
+        while i < errors.len() {
+            eprintln(path + ": " + errors[i])
+            i = i + 1
+        }
+        exit(1)
+    }
+    return bridge_sf
+}
+
+-- Add the LLVM bridge to the compiler's declarations. The compiler
+-- declares each bridge function as an extern fn (llvm.dm), which is
+-- what the compiler built by Stage 0 calls in llvm_bridge.c. Here the
+-- bridge's own function of that name takes the declaration's place.
+fn add_llvm_bridge(sf: SourceFile, bridge_sf: SourceFile) -> SourceFile {
+    let mut defined: Map[string, bool] = Map_new()
+    let mut i = 0
+    while i < bridge_sf.declarations.len() {
+        let decl = bridge_sf.declarations[i]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.is_extern == false {
+                defined.insert(fd.name, true)
+            }
+        }
+        i = i + 1
+    }
+    let mut out = sf
+    let mut decls: List[Declaration] = []
+    i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        let mut replaced = false
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.is_extern and defined.contains(fd.name) {
+                replaced = true
+            }
+        }
+        if replaced == false {
+            decls.push(decl)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < bridge_sf.declarations.len() {
+        decls.push(bridge_sf.declarations[i])
+        i = i + 1
+    }
+    out.declarations = decls
+    return out
 }
 
 -- ============================================================
@@ -549,6 +601,16 @@ fn compile(cli: CLIArgs) -> int {
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
     }
+    -- --link-llvm: the program is the compiler, which needs the LLVM bridge
+    if cli.link_llvm {
+        let bridge_file = find_bridge_file(dirname(input_file))
+        if bridge_file == "" {
+            eprintln("Error: --link-llvm needs llvm_bridge.dm, which was not found next to " + input_file)
+            return 1
+        }
+        if verbose { println("  LLVM bridge: " + bridge_file) }
+        sf = add_llvm_bridge(sf, parse_llvm_bridge(bridge_file))
+    }
     let prelude_sf = parse_prelude()
     sf = add_prelude(sf, prelude_sf)
 
@@ -658,7 +720,7 @@ fn compile(cli: CLIArgs) -> int {
     }
 
     -- Verify LLVM module (fatal: invalid IR must not produce any output;
-    -- dm_llvm_module_verify in llvm_bridge.c prints the detailed diagnostic)
+    -- dm_llvm_module_verify prints the detailed diagnostic)
     let verify_result = verify_module(lg)
     if verify_result != 0 {
         eprintln("Error: LLVM module verification failed")
@@ -721,27 +783,8 @@ fn compile(cli: CLIArgs) -> int {
     }
     link_cmd = link_cmd + " -L" + libc_dir
 
-    -- If --link-llvm, add llvm_bridge.c and LLVM libraries
-    let bridge_obj = output_file + "_bridge.o"
+    -- --link-llvm: the LLVM libraries
     if cli.link_llvm {
-        let bridge_file = find_bridge_file(dirname(input_file))
-        if bridge_file != "" {
-            -- The bridge is the one C file left, compiled by the C compiler
-            let bridge_cmd = "cc -c " + bridge_file + " -o " + bridge_obj + " $(llvm-config --cflags)"
-            if verbose {
-                println("  Bridge: " + bridge_cmd)
-            }
-            let bridge_result = system(bridge_cmd)
-            if bridge_result != 0 {
-                eprintln("Error: failed to compile llvm_bridge.c")
-                fs_remove(obj_file)
-                return 1
-            }
-            link_cmd = link_cmd + " " + bridge_obj
-        } else {
-            eprintln("Warning: llvm_bridge.c not found, LLVM functions will be unresolved")
-        }
-        -- Add LLVM link flags
         link_cmd = link_cmd + " $(llvm-config --libs --ldflags --system-libs)"
     }
 
@@ -754,11 +797,8 @@ fn compile(cli: CLIArgs) -> int {
 
     let link_result = system(link_cmd)
 
-    -- Remove the temporary object file(s)
+    -- Remove the temporary object file
     fs_remove(obj_file)
-    if cli.link_llvm {
-        fs_remove(bridge_obj)
-    }
 
     if link_result != 0 {
         eprintln("Error: linking failed (exit code " + int_to_string(link_result) + ")")

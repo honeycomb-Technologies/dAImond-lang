@@ -1,5 +1,10 @@
 /*
- * LLVM-C Bridge for dAImond Stage 4
+ * LLVM-C Bridge for the Stage 5 compiler that Stage 0 builds
+ *
+ * Stage 0 emits C and cannot parse llvm_bridge.dm, which defines these
+ * same functions in dAImond and is what Stage 5 uses when it builds
+ * itself. Until Stage 0 goes, a change to one file belongs in the
+ * other too.
  *
  * All LLVM-C opaque pointer types (LLVMContextRef, LLVMValueRef, etc.)
  * are cast to/from int64_t so dAImond can use them as plain `int` values.

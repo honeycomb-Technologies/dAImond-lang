@@ -782,8 +782,6 @@ fn comptime_value_type(val: IRValue) -> string {
 -- String values in LLVM IR are pointers to stack-allocated dm_string structs.
 -- ============================================================
 
--- Bridge functions declared in llvm_bridge.c but not yet in llvm.dm
-
 fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
     if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
         let a = lhs.int_val
