@@ -50,6 +50,7 @@ fn print_usage() {
     println("  -O3           Aggressive optimization")
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
+    println("  --emit-bitcode  Emit LLVM bitcode (.bc), optimized as -O says, and exit")
     println("  --link-llvm   Add the LLVM bridge and link the LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
@@ -70,6 +71,7 @@ struct CLIArgs {
     opt_level: int,
     emit_ir: bool,
     emit_llvm: bool,
+    emit_bitcode: bool,
     link_llvm: bool,
     verbose: bool,
     show_help: bool,
@@ -85,6 +87,7 @@ fn parse_cli_args() -> CLIArgs {
         opt_level: 0,
         emit_ir: false,
         emit_llvm: false,
+        emit_bitcode: false,
         link_llvm: false,
         verbose: false,
         show_help: false,
@@ -131,6 +134,8 @@ fn parse_cli_args() -> CLIArgs {
             args.emit_ir = true
         } else if arg == "--emit-llvm" {
             args.emit_llvm = true
+        } else if arg == "--emit-bitcode" {
+            args.emit_bitcode = true
         } else if arg == "--link-llvm" {
             args.link_llvm = true
         } else if arg == "-v" or arg == "--verbose" {
@@ -629,10 +634,10 @@ fn compile(cli: CLIArgs) -> int {
     if verbose { println("  [4/6] Generating IR...") }
 
     -- A -O0 binary takes the runtime's functions from the precompiled
-    -- runtime object (see PRECOMPILED RUNTIME). --emit-ir and --emit-llvm
-    -- show the whole program, runtime included.
+    -- runtime object (see PRECOMPILED RUNTIME). --emit-ir, --emit-llvm
+    -- and --emit-bitcode give the whole program, runtime included.
     let mut runtime_obj = ""
-    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false {
+    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false and cli.emit_bitcode == false {
         runtime_obj = find_or_build_runtime_object(prelude_sf, verbose)
     }
 
@@ -743,6 +748,24 @@ fn compile(cli: CLIArgs) -> int {
             println(ll_file)
         }
         llvm_gen_dispose(lg)
+        return 0
+    }
+
+    -- If --emit-bitcode, emit the module as it goes to code generation
+    -- and exit
+    if cli.emit_bitcode {
+        let bc_file = output_file + ".bc"
+        let bc_result = emit_to_bitcode(lg, bc_file, opt_level)
+        llvm_gen_dispose(lg)
+        if bc_result != 0 {
+            eprintln("Error: failed to emit LLVM bitcode to " + bc_file)
+            return 1
+        }
+        if verbose {
+            println("  Emitted LLVM bitcode: " + bc_file)
+        } else {
+            println(bc_file)
+        }
         return 0
     }
 

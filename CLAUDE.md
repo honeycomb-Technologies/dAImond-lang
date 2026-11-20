@@ -221,6 +221,9 @@ gcc /tmp/stage5.o /tmp/llvm_bridge.o /tmp/daimond_runtime.o -o /tmp/stage5_bin -
 # Emit LLVM IR (debugging)
 /tmp/stage5_bin <file.dm> --emit-llvm
 
+# Emit LLVM bitcode, as it goes to code generation (<output>.bc)
+/tmp/stage5_bin <file.dm> --emit-bitcode -o output
+
 # Regenerate monolithic main.dm from modules (also after editing runtime/*.dm, llvm_bridge.dm or llvm_bridge.c)
 cd stage5 && bash gen_bootstrap.sh
 
@@ -548,7 +551,8 @@ The C runtime has been replaced, one function at a time, by dAImond code in `sta
 - **Panics**: `dm_panic` (`rt_panic` in `runtime/io.dm`) writes `PANIC: <message>` to stderr and exits with code 1, as Stage 0 does. Messages passed to it, by the compiler's checks or by runtime code, do not include the prefix.
 - **Command-line arguments**: `main` stores its argument count and vector in the symbols `dm_argc` (a C `int`) and `dm_argv`, which the compiler defines in the module that has `main`. The runtime reads them through `symbol_addr`. `args_get(i)` gives a string that points at the argument's own bytes.
 - **OS struct layouts**: `fs_readdir` reads the name in libc's `struct dirent` at byte 19 (`rt_dirent_name_offset` in `runtime/os.dm`), which is its place on x86-64 Linux. Another target needs its own offset.
-- **Precompiled runtime object**: a `-O0` build does not compile the runtime's non-generic functions into the program. It links `runtime-<build ID>.o`, which the compiler builds once with full optimization and keeps in `$DAIMOND_CACHE_DIR`, else `$XDG_CACHE_HOME/daimond`, else `~/.cache/daimond` (see PRECOMPILED RUNTIME in `main_split.dm`). When the object can't be built or stored, the runtime is compiled into the program instead. `--emit-llvm`, `--emit-ir` and `-O1` and above always compile it into the program, where the optimizer can inline it.
+- **Bitcode**: `--emit-bitcode` writes `<output>.bc`, the module as it goes to code generation: with the host's target triple and data layout, optimized as the `-O` level says, and with the runtime compiled in. `llc -filetype=obj -relocation-model=pic` turns it into the object the compiler would have written. The Stage 0-built and the self-built compilers write the same bytes.
+- **Precompiled runtime object**: a `-O0` build does not compile the runtime's non-generic functions into the program. It links `runtime-<build ID>.o`, which the compiler builds once with full optimization and keeps in `$DAIMOND_CACHE_DIR`, else `$XDG_CACHE_HOME/daimond`, else `~/.cache/daimond` (see PRECOMPILED RUNTIME in `main_split.dm`). When the object can't be built or stored, the runtime is compiled into the program instead. `--emit-llvm`, `--emit-bitcode`, `--emit-ir` and `-O1` and above always compile it into the program, where the optimizer can inline it.
 - The build ID is a hash of the compiler's source, the runtime sources, `llvm_bridge.dm` and `llvm_bridge.c`, written into `prelude.dm` by `gen_bootstrap.sh`. Rerun `gen_bootstrap.sh` after changing any of them, the bridge files included, or the compiler keeps linking the old object.
 - Generic runtime code (the methods of `Map`) is always compiled into the program. At `-O0` the program's own functions are marked `optnone` and stay as written, while that generic code is optimized.
 - `parse_int` and `parse_float` read the whole string (the C runtime, and so Stage 0, reads at most 31 and 63 bytes).

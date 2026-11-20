@@ -24,6 +24,7 @@ extern fn dm_llvm_module_add_global(mod: int, ty: int, name: string) -> int
 extern fn dm_llvm_module_verify(mod: int) -> int
 extern fn dm_llvm_module_print_to_file(mod: int, filename: string) -> int
 extern fn dm_llvm_run_passes(mod: int, passes: string, tm: int) -> int
+extern fn dm_llvm_module_write_bitcode(mod: int, filename: string) -> int
 
 -- ============================================================
 -- Types

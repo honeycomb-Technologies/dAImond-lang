@@ -35,6 +35,7 @@ extern fn LLVMAddFunction(m: int, name: string, fn_type: int) -> int
 extern fn LLVMAddGlobal(m: int, ty: int, name: string) -> int
 extern fn LLVMVerifyModule(m: int, action: i32, message: int) -> i32
 extern fn LLVMPrintModuleToFile(m: int, filename: string, message: int) -> i32
+extern fn LLVMWriteBitcodeToFile(m: int, filename: string) -> i32
 extern fn LLVMDisposeMessage(message: int)
 extern fn LLVMGetModuleContext(m: int) -> int
 extern fn LLVMGetGlobalParent(global: int) -> int
@@ -296,6 +297,17 @@ fn dm_llvm_module_print_to_file(m: int, filename: string) -> int {
             LLVMDisposeMessage(message)
         }
         return failed
+    }
+}
+
+-- Write the module as LLVM bitcode. Gives 0, or 1 when the file cannot
+-- be written.
+fn dm_llvm_module_write_bitcode(m: int, filename: string) -> int {
+    unsafe {
+        if LLVMWriteBitcodeToFile(m, filename) != 0 {
+            return 1
+        }
+        return 0
     }
 }
 

@@ -93,6 +93,11 @@ int64_t dm_llvm_module_print_to_file(int64_t mod, const char* filename) {
     return (int64_t)result;
 }
 
+/* Write the module as LLVM bitcode. Returns 0, or 1 when the file cannot be written. */
+int64_t dm_llvm_module_write_bitcode(int64_t mod, const char* filename) {
+    return LLVMWriteBitcodeToFile(TO_PTR(LLVMModuleRef, mod), filename) != 0 ? 1 : 0;
+}
+
 /* Pass manager */
 int64_t dm_llvm_run_passes(int64_t mod, const char* passes, int64_t tm) {
     LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();

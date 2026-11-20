@@ -510,6 +510,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Self-hosting: Stage 5 compiles itself; the self-built compiler emits byte-identical LLVM IR for its own source and passes 327/327
 - [x] A self-build contains no C and runs no C compiler; the first and second self-built compilers are identical
 - [ ] Bootstrap without Stage 0 (Zig) and the C it emits (a committed seed)
+- [x] `--emit-bitcode` writes a program as LLVM bitcode, as it goes to code generation
 - [x] Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1)
 - [x] Runtime primitives: raw memory loads and stores, `addr_of`, `size_of`, string internals, `symbol_addr`, `static_addr` (program-owned static storage), C-width integer types and variadic `extern fn`
 - [x] Runtime port started: the string functions (concat, compare, `char_at`, `substr`, search, trim, replace, case, `string_split`, the character classes), console I/O and `panic`, files, directories, paths, the environment, command-line arguments, `system` and the number conversions (`int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float`) are dAImond code in `stage5/runtime/`, replacing their C versions

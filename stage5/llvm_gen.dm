@@ -2103,7 +2103,10 @@ fn keep_program_unoptimized(gen: LLVMGenerator) {
     }
 }
 
-fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
+-- Make the module ready for code generation: give it the host's target
+-- triple and data layout, and run the optimization passes of opt_level
+-- over it. Gives the target machine, or 0 after printing the error.
+fn prepare_for_target(gen: LLVMGenerator, opt_level: int) -> int {
     unsafe {
         dm_llvm_initialize_all_targets()
         let triple_ptr = dm_llvm_get_default_target_triple()
@@ -2114,7 +2117,7 @@ fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
         let tm = dm_llvm_create_target_machine(triple, opt_level)
         if tm == 0 {
             eprintln("Error: Failed to create target machine")
-            return 1
+            return 0
         }
         -- Set module target triple and data layout
         dm_llvm_module_set_target(gen.llvm_module, triple)
@@ -2129,8 +2132,29 @@ fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
         if opt_level == 1 { passes = "default<O1>" }
         if opt_level >= 3 { passes = "default<O3>" }
         dm_llvm_run_passes(gen.llvm_module, passes, tm)
-        -- Emit object file
+        return tm
+    }
+}
+
+fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
+    unsafe {
+        let tm = prepare_for_target(gen, opt_level)
+        if tm == 0 { return 1 }
         let result = dm_llvm_target_machine_emit_to_file(tm, gen.llvm_module, filename, dm_llvm_object_file())
+        dm_llvm_dispose_target_machine(tm)
+        return result
+    }
+}
+
+-- Write the module as LLVM bitcode, in the state it has just before
+-- code generation: with its target triple and data layout, and
+-- optimized as opt_level says. LLVM's llc turns the file into the
+-- object that emit_to_object would have written.
+fn emit_to_bitcode(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
+    unsafe {
+        let tm = prepare_for_target(gen, opt_level)
+        if tm == 0 { return 1 }
+        let result = dm_llvm_module_write_bitcode(gen.llvm_module, filename)
         dm_llvm_dispose_target_machine(tm)
         return result
     }

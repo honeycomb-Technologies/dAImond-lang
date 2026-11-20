@@ -2333,6 +2333,7 @@ extern fn dm_llvm_module_add_global(mod: int, ty: int, name: string) -> int
 extern fn dm_llvm_module_verify(mod: int) -> int
 extern fn dm_llvm_module_print_to_file(mod: int, filename: string) -> int
 extern fn dm_llvm_run_passes(mod: int, passes: string, tm: int) -> int
+extern fn dm_llvm_module_write_bitcode(mod: int, filename: string) -> int
 
 -- ============================================================
 -- Types
@@ -19954,7 +19955,10 @@ fn keep_program_unoptimized(gen: LLVMGenerator) {
     }
 }
 
-fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
+-- Make the module ready for code generation: give it the host's target
+-- triple and data layout, and run the optimization passes of opt_level
+-- over it. Gives the target machine, or 0 after printing the error.
+fn prepare_for_target(gen: LLVMGenerator, opt_level: int) -> int {
     unsafe {
         dm_llvm_initialize_all_targets()
         let triple_ptr = dm_llvm_get_default_target_triple()
@@ -19965,7 +19969,7 @@ fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
         let tm = dm_llvm_create_target_machine(triple, opt_level)
         if tm == 0 {
             eprintln("Error: Failed to create target machine")
-            return 1
+            return 0
         }
         -- Set module target triple and data layout
         dm_llvm_module_set_target(gen.llvm_module, triple)
@@ -19980,8 +19984,29 @@ fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
         if opt_level == 1 { passes = "default<O1>" }
         if opt_level >= 3 { passes = "default<O3>" }
         dm_llvm_run_passes(gen.llvm_module, passes, tm)
-        -- Emit object file
+        return tm
+    }
+}
+
+fn emit_to_object(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
+    unsafe {
+        let tm = prepare_for_target(gen, opt_level)
+        if tm == 0 { return 1 }
         let result = dm_llvm_target_machine_emit_to_file(tm, gen.llvm_module, filename, dm_llvm_object_file())
+        dm_llvm_dispose_target_machine(tm)
+        return result
+    }
+}
+
+-- Write the module as LLVM bitcode, in the state it has just before
+-- code generation: with its target triple and data layout, and
+-- optimized as opt_level says. LLVM's llc turns the file into the
+-- object that emit_to_object would have written.
+fn emit_to_bitcode(gen: LLVMGenerator, filename: string, opt_level: int) -> int {
+    unsafe {
+        let tm = prepare_for_target(gen, opt_level)
+        if tm == 0 { return 1 }
+        let result = dm_llvm_module_write_bitcode(gen.llvm_module, filename)
         dm_llvm_dispose_target_machine(tm)
         return result
     }
@@ -21161,7 +21186,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "9e24e72d9653e859"
+    return "c31cf79a1f092714"
 }
 
 
@@ -21197,6 +21222,7 @@ fn print_usage() {
     println("  -O3           Aggressive optimization")
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
+    println("  --emit-bitcode  Emit LLVM bitcode (.bc), optimized as -O says, and exit")
     println("  --link-llvm   Add the LLVM bridge and link the LLVM libraries (for compiling the compiler itself)")
     println("  -v, --verbose Verbose output")
     println("  -h, --help    Show this help")
@@ -21217,6 +21243,7 @@ struct CLIArgs {
     opt_level: int,
     emit_ir: bool,
     emit_llvm: bool,
+    emit_bitcode: bool,
     link_llvm: bool,
     verbose: bool,
     show_help: bool,
@@ -21232,6 +21259,7 @@ fn parse_cli_args() -> CLIArgs {
         opt_level: 0,
         emit_ir: false,
         emit_llvm: false,
+        emit_bitcode: false,
         link_llvm: false,
         verbose: false,
         show_help: false,
@@ -21278,6 +21306,8 @@ fn parse_cli_args() -> CLIArgs {
             args.emit_ir = true
         } else if arg == "--emit-llvm" {
             args.emit_llvm = true
+        } else if arg == "--emit-bitcode" {
+            args.emit_bitcode = true
         } else if arg == "--link-llvm" {
             args.link_llvm = true
         } else if arg == "-v" or arg == "--verbose" {
@@ -21776,10 +21806,10 @@ fn compile(cli: CLIArgs) -> int {
     if verbose { println("  [4/6] Generating IR...") }
 
     -- A -O0 binary takes the runtime's functions from the precompiled
-    -- runtime object (see PRECOMPILED RUNTIME). --emit-ir and --emit-llvm
-    -- show the whole program, runtime included.
+    -- runtime object (see PRECOMPILED RUNTIME). --emit-ir, --emit-llvm
+    -- and --emit-bitcode give the whole program, runtime included.
     let mut runtime_obj = ""
-    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false {
+    if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false and cli.emit_bitcode == false {
         runtime_obj = find_or_build_runtime_object(prelude_sf, verbose)
     }
 
@@ -21890,6 +21920,24 @@ fn compile(cli: CLIArgs) -> int {
             println(ll_file)
         }
         llvm_gen_dispose(lg)
+        return 0
+    }
+
+    -- If --emit-bitcode, emit the module as it goes to code generation
+    -- and exit
+    if cli.emit_bitcode {
+        let bc_file = output_file + ".bc"
+        let bc_result = emit_to_bitcode(lg, bc_file, opt_level)
+        llvm_gen_dispose(lg)
+        if bc_result != 0 {
+            eprintln("Error: failed to emit LLVM bitcode to " + bc_file)
+            return 1
+        }
+        if verbose {
+            println("  Emitted LLVM bitcode: " + bc_file)
+        } else {
+            println(bc_file)
+        }
         return 0
     }
 
