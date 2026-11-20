@@ -157,6 +157,8 @@ struct IRGenerator {
     -- Expressions IR generation could not resolve, reported as compile
     -- errors after IR generation instead of being lowered to placeholders
     type_errors: List[string],
+    -- -g: say where each variable lives (OP_DEBUG_VAR)
+    debug_info: bool,
     -- Declared source return types of functions and impl methods
     -- (methods keyed Type_method), as written in the source
     fn_src_return_types: Map[string, string],
@@ -229,6 +231,7 @@ fn ir_generator_new() -> IRGenerator {
         all_extern_fns: Map_new(),
         linked_fns: Map_new(),
         type_errors: [],
+        debug_info: false,
         fn_src_return_types: Map_new(),
         fn_src_param_types: Map_new(),
         var_src_types: Map_new(),

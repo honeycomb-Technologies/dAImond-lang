@@ -494,6 +494,7 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
     }
 
     let mut func = ir_function_new(name, ret_type)
+    func.source_line = fd.line
     func.is_extern = fd.is_extern
     func.is_variadic = fd.is_variadic
     func.link_name = fd.link_name
@@ -755,6 +756,9 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
         }
 
         g.var_src_types.insert(pname, ptype_str)
+        let param_debug = debug_var(g, blk, pname, fd.line, i + 1)
+        g = param_debug.gen
+        blk = param_debug.block
 
         -- Track struct/enum/list/box typed parameters
         if g.struct_defs.contains(ptype_str) {

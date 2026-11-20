@@ -1,0 +1,42 @@
+root!52.5200
+48
+fn area at shapes.dm:10
+  parameter p: Point
+  variable width: int, line 11
+  variable height: int, line 12
+fn scale at main.dm:15
+  parameter p: Point
+  parameter k: int
+fn describe at main.dm:20
+  parameter n: Node
+  parameter depth: int
+  variable label: string, line 21
+  variable total: int, line 22
+  variable ratio: float, line 23
+  variable ok: bool, line 24
+  variable counts: List[int], line 25
+  variable tag: string, line 27
+  variable i: int, line 30
+  variable narrow: u8, line 33
+fn main at main.dm:40
+  variable p: Point, line 41
+  variable tags: List[string], line 43
+  variable leaf: Node, line 46
+  variable root: Node, line 47
+  variable add: int, line 48
+fn __lambda_0 at main.dm:48
+  parameter a: int
+  parameter b: int
+struct List[int] { data: int * at 0, len: int at 8, capacity: int at 16 }, 24 bytes
+struct List[string] { data: string * at 0, len: int at 8, capacity: int at 16 }, 24 bytes
+struct Node { name: string at 0, weight: float at 24, at: Point at 32, tags: List[string] at 48, next: Node * at 72, small: i32 at 80, on: bool at 84 }, 88 bytes
+struct Point { x: int at 0, y: int at 8 }, 16 bytes
+struct string { data: char * at 0, len: int at 8, capacity: int at 16 }, 24 bytes
+type bool, 1 bytes
+type char, 1 bytes
+type float, 8 bytes
+type i32, 4 bytes
+type int, 8 bytes
+type u8, 1 bytes
+lines of shapes.dm: 10 11 12 13
+lines of main.dm: 15 16 17 20 21 22 23 24 25 26 27 28 30 31 33 34 35 37 40 41 42 43 44 45 46 47 48 49 50 51

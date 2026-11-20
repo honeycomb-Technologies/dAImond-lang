@@ -1,0 +1,1 @@
+cd {work} && {compiler} {source} -g -O2 -o optimized && ./optimized && {compiler} {source} -g -o plain && ./plain > plain.out && {compiler} {source} -o bare && ./bare > bare.out && cmp plain.out bare.out

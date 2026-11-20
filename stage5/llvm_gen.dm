@@ -69,6 +69,26 @@ struct LLVMGenerator {
     current_func_name: string,
     -- Source line of the IR instruction being lowered (0 if unknown)
     current_line: int,
+    -- Debug info (see DEBUG INFO). Whether to write it, and whether
+    -- the program is being optimized, are set before
+    -- lg_generate_module.
+    debug_info: bool,
+    debug_optimized: bool,
+    -- The builder of debug info, 0 when none is written
+    di_builder: int,
+    -- The debug info's file of each of the program's files, at its
+    -- number; 0 for one that is no file
+    di_files: List[int],
+    -- The function being generated, in debug info (0 when it has
+    -- none), and the number of the file it is in
+    di_scope: int,
+    di_file: int,
+    -- The line that function is declared at, and whether one of its
+    -- instructions has been given a line yet
+    di_function_line: int,
+    di_located: bool,
+    -- The debug info's type of each dAImond type met so far, by name
+    di_types: Map[string, int],
     -- Call argument type mismatches found while lowering; reported as
     -- compile errors instead of handing invalid IR to the LLVM verifier
     type_errors: List[string]
@@ -110,6 +130,15 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             ir_module: ir_mod,
             current_func_name: "",
             current_line: 0,
+            debug_info: false,
+            debug_optimized: false,
+            di_builder: 0,
+            di_files: [],
+            di_scope: 0,
+            di_file: 0,
+            di_function_line: 0,
+            di_located: false,
+            di_types: Map_new(),
             type_errors: []
         }
     }
@@ -789,6 +818,260 @@ fn declare_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
 -- 1. Declare the real C function `getenv` as `ptr getenv(ptr)`
 -- 2. Generate a wrapper `llvm_getenv` that converts dm_string <-> char*
 
+-- ============================================================
+-- DEBUG INFO
+-- With -g the program carries debug info (DWARF): its files, each
+-- function's place, and the line of each instruction, which is what a
+-- debugger needs to set breakpoints by file and line, step by lines
+-- and print a backtrace; and each variable's name, type and storage
+-- (OP_DEBUG_VAR), which is what it needs to print one. A function's
+-- variables are all in one scope, so of two with one name a debugger
+-- shows either.
+--
+-- A function has debug info when it is declared in a file. The
+-- runtime's functions and those the compiler makes have none, so a
+-- debugger steps over them.
+-- ============================================================
+
+-- Start the module's debug info: its files and its compile unit
+fn di_begin(gen: LLVMGenerator) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let files = g.ir_module.files
+        if files.len() == 0 or is_file_name(files[0]) == false { return g }
+        -- The sizes of types come from the module's data layout
+        let tm = set_module_target(g, 0)
+        if tm == 0 { return g }
+        dm_llvm_dispose_target_machine(tm)
+        g.di_builder = dm_llvm_di_builder_create(g.llvm_module)
+        -- A debugger finds a file by its name in the directory the
+        -- compiler ran in
+        let directory = env_get("PWD")
+        let mut i = 0
+        while i < files.len() {
+            let mut file = 0
+            if is_file_name(files[i]) {
+                if starts_with(files[i], "/") {
+                    file = dm_llvm_di_file(g.di_builder, files[i], "")
+                } else {
+                    file = dm_llvm_di_file(g.di_builder, files[i], directory)
+                }
+            }
+            g.di_files.push(file)
+            i = i + 1
+        }
+        let mut optimized = 0
+        if g.debug_optimized { optimized = 1 }
+        dm_llvm_di_compile_unit(g.di_builder, g.di_files[0], "daimond", optimized)
+        return g
+    }
+}
+
+-- Give the function being generated its debug info, when it is
+-- declared in a file, and make it the scope of the lines that follow
+fn di_enter_function(gen: LLVMGenerator, func: IRFunction, llvm_fn: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        g.di_scope = 0
+        if g.di_builder == 0 { return g }
+        -- The instructions before the function's first line have no place
+        dm_llvm_set_debug_location(g.builder, g.context, 0, 0, 0)
+        let file = file_of_line(func.source_line)
+        if func.source_line <= 0 or file >= g.di_files.len() { return g }
+        if g.di_files[file] == 0 { return g }
+        let mut optimized = 0
+        if g.debug_optimized { optimized = 1 }
+        g.di_file = file
+        g.di_function_line = func.source_line
+        g.di_located = false
+        g.di_scope = dm_llvm_di_function(g.di_builder, g.di_files[file], func.name, dm_llvm_get_value_name(llvm_fn), line_in_file(func.source_line), optimized)
+        dm_llvm_set_subprogram(llvm_fn, g.di_scope)
+        return g
+    }
+}
+
+-- Give the instructions built from now on the line of the IR
+-- instruction being lowered. The stores that put a function's
+-- parameters in their variables come first and have no line: they stay
+-- without one, which makes them part of the function's prologue, so a
+-- breakpoint on the function stops after them. Any other instruction
+-- with no line, before the first that has one, is at the function's
+-- line (a call must be at some line).
+fn di_at_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.di_scope == 0 or inst.op == OP_ALLOCA() { return g }
+        let mut line = inst.source_line
+        if line <= 0 or file_of_line(line) != g.di_file {
+            if g.di_located or inst.op == OP_STORE() { return g }
+            line = g.di_function_line
+        }
+        dm_llvm_set_debug_location(g.builder, g.context, line_in_file(line), inst.source_col, g.di_scope)
+        g.di_located = true
+        return g
+    }
+}
+
+-- Whether values of a type are addresses: boxes, pointers and functions
+fn di_is_pointer_type(t: string) -> bool {
+    return starts_with(t, "Box[") or t == "ptr" or starts_with(t, "ptr(") or starts_with(t, "fn(")
+}
+
+-- A struct type of three words, which is what a string and a list are:
+-- the address of the data, of type `data`, a length and a capacity
+fn di_header_struct(gen: LLVMGenerator, name: string, data: int) -> int {
+    unsafe {
+        let dib = gen.di_builder
+        let word = gen.di_types.get("i64")
+        let begun = dm_llvm_di_struct_begin(dib, name, 192)
+        let data_member = dm_llvm_di_member(dib, begun, "data", 64, 0, data)
+        let len_member = dm_llvm_di_member(dib, begun, "len", 64, 64, word)
+        let capacity_member = dm_llvm_di_member(dib, begun, "capacity", 64, 128, word)
+        dm_llvm_buf_clear()
+        dm_llvm_buf_push(data_member)
+        dm_llvm_buf_push(len_member)
+        dm_llvm_buf_push(capacity_member)
+        return dm_llvm_di_struct_end_buf(dib, begun, name, 192)
+    }
+}
+
+-- Make the debug info's type of the type named `t`. gen.di_types has
+-- it afterwards: 0 for a type that has no values.
+fn di_make_type(gen: LLVMGenerator, t: string) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.di_types.contains(t) { return g }
+        let dib = g.di_builder
+        -- The encodings are DWARF's: 2 boolean, 4 float, 5 signed,
+        -- 7 unsigned, 8 unsigned char
+        let mut made = 0
+        if t == "i64" or t == "int" {
+            made = dm_llvm_di_basic_type(dib, "int", 64, 5)
+        } else if t == "i32" {
+            made = dm_llvm_di_basic_type(dib, "i32", 32, 5)
+        } else if t == "i16" {
+            made = dm_llvm_di_basic_type(dib, "i16", 16, 5)
+        } else if t == "i8" {
+            made = dm_llvm_di_basic_type(dib, "i8", 8, 5)
+        } else if t == "u64" {
+            made = dm_llvm_di_basic_type(dib, "u64", 64, 7)
+        } else if t == "u32" {
+            made = dm_llvm_di_basic_type(dib, "u32", 32, 7)
+        } else if t == "u16" {
+            made = dm_llvm_di_basic_type(dib, "u16", 16, 7)
+        } else if t == "u8" {
+            made = dm_llvm_di_basic_type(dib, "u8", 8, 7)
+        } else if t == "bool" {
+            made = dm_llvm_di_basic_type(dib, "bool", 8, 2)
+        } else if t == "f64" or t == "float" {
+            made = dm_llvm_di_basic_type(dib, "float", 64, 4)
+        } else if t == "f32" {
+            made = dm_llvm_di_basic_type(dib, "f32", 32, 4)
+        } else if t == "string" {
+            -- A debugger prints the address of characters as text
+            g = di_make_type(g, "i64")
+            let char_type = dm_llvm_di_basic_type(dib, "char", 8, 8)
+            made = di_header_struct(g, "string", dm_llvm_di_pointer_type(dib, char_type, ""))
+        } else if starts_with(t, "List[") or t == "list" or starts_with(t, "dm_list_") {
+            g = di_make_type(g, "i64")
+            let mut elem = 0
+            if starts_with(t, "List[") and ends_with(t, "]") {
+                let elem_name = substr(t, 5, len(t) - 6)
+                g = di_make_type(g, elem_name)
+                elem = g.di_types.get(elem_name)
+            }
+            made = di_header_struct(g, t, dm_llvm_di_pointer_type(dib, elem, ""))
+        } else if starts_with(t, "Box[") and ends_with(t, "]") {
+            let inner_name = substr(t, 4, len(t) - 5)
+            g = di_make_type(g, inner_name)
+            made = dm_llvm_di_pointer_type(dib, g.di_types.get(inner_name), t)
+        } else if di_is_pointer_type(t) {
+            made = dm_llvm_di_pointer_type(dib, 0, t)
+        } else {
+            -- A struct, with its fields where the program declares it
+            -- with as many as it is lowered to; any other type of a
+            -- known size, without
+            let llvm_ty = map_ir_type_to_llvm(g, t)
+            let kind = dm_llvm_get_type_kind(llvm_ty)
+            let field_count = dm_llvm_struct_field_count(llvm_ty)
+            -- 2 float, 3 double, 8 integer, 10 struct, 11 array,
+            -- 12 pointer, 13 vector
+            let sized = kind == 2 or kind == 3 or kind == 8 or (kind == 10 and field_count > 0) or kind == 11 or kind == 12 or kind == 13
+            if sized {
+                let bits = dm_llvm_abi_size_of(g.llvm_module, llvm_ty) * 8
+                let begun = dm_llvm_di_struct_begin(dib, t, bits)
+                -- The struct's fields may be of its own type
+                g.di_types.insert(t, begun)
+                let mut members: List[int] = []
+                if g.ir_module.struct_defs.contains(t) {
+                    let def = g.ir_module.struct_defs.get(t)
+                    if def.fields.len() == field_count {
+                        let mut fi = 0
+                        while fi < field_count {
+                            let field = def.fields[fi]
+                            g = di_make_type(g, field.type_id)
+                            let field_type = g.di_types.get(field.type_id)
+                            let field_kind = dm_llvm_get_type_kind(map_ir_type_to_llvm(g, field.type_id))
+                            if field_type != 0 and field_kind != 0 and field_kind != 9 {
+                                let field_bits = dm_llvm_abi_size_of(g.llvm_module, map_ir_type_to_llvm(g, field.type_id)) * 8
+                                let offset_bits = dm_llvm_offset_of_element(g.llvm_module, llvm_ty, fi) * 8
+                                members.push(dm_llvm_di_member(dib, begun, field.name, field_bits, offset_bits, field_type))
+                            }
+                            fi = fi + 1
+                        }
+                    }
+                }
+                dm_llvm_buf_clear()
+                let mut mi = 0
+                while mi < members.len() {
+                    dm_llvm_buf_push(members[mi])
+                    mi = mi + 1
+                }
+                made = dm_llvm_di_struct_end_buf(dib, begun, t, bits)
+            }
+        }
+        g.di_types.insert(t, made)
+        return g
+    }
+}
+
+-- Describe a variable to the debugger (OP_DEBUG_VAR): its name, its
+-- type and the storage it lives in
+fn di_declare_variable(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let line = inst.source_line
+        if g.di_scope == 0 or line <= 0 or file_of_line(line) != g.di_file { return g }
+        if inst.operand.kind == VAL_INST_REF() {
+            if g.value_map.contains(int_to_string(inst.operand.ref_id)) == false { return g }
+        } else if inst.operand.kind != VAL_PARAM_REF() {
+            return g
+        }
+        g = di_make_type(g, inst.alloc_type)
+        let ty = g.di_types.get(inst.alloc_type)
+        if ty == 0 { return g }
+        let mut storage = resolve_value(g, inst.operand)
+        let mut deref = 0
+        if dm_llvm_is_alloca(storage) == 0 {
+            -- The variable is a value with no storage of its own: keep
+            -- it where a debugger can find it. A string, list or struct
+            -- that is a pointer is the address of the variable.
+            let value_ty = dm_llvm_type_of(storage)
+            let value_kind = dm_llvm_get_type_kind(value_ty)
+            if value_kind == 0 or value_kind == 7 or value_kind == 9 { return g }
+            if value_kind == 12 and (inst.field_type == "ref" or di_is_pointer_type(inst.alloc_type) == false) {
+                deref = 1
+            }
+            let kept = dm_llvm_build_alloca(g.builder, value_ty, "debug." + inst.callee)
+            dm_llvm_build_store(g.builder, storage, kept)
+            storage = kept
+        }
+        let variable = dm_llvm_di_variable(g.di_builder, g.di_scope, inst.callee, g.di_files[g.di_file], line_in_file(line), ty, inst.field_index)
+        dm_llvm_di_declare(g.di_builder, g.builder, storage, variable, g.context, line_in_file(line), g.di_scope, deref)
+        return g
+    }
+}
+
 fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     unsafe {
         let mut g = gen
@@ -920,6 +1203,7 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         if g.function_map.contains(func.name) == false { return g }
         let llvm_fn = g.function_map.get(func.name)
         g.current_func_name = func.name
+        g = di_enter_function(g, func, llvm_fn)
         -- Create basic blocks
         -- Clear block_map for this function
         g.block_map = Map_new()
@@ -1229,6 +1513,10 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         g.current_line = inst.source_line
         let b = g.builder
         let op = inst.op
+        if op == OP_DEBUG_VAR() {
+            return di_declare_variable(g, inst)
+        }
+        g = di_at_instruction(g, inst)
         let id_key = int_to_string(inst.id)
         -- Arithmetic
         if op == OP_ADD() {
@@ -2056,6 +2344,9 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = get_dm_string_type(g)
     -- Phase 1: Declare struct types
     g = declare_struct_types(g)
+    if g.debug_info {
+        g = di_begin(g)
+    }
     -- Phase 2: Generate global variables
     g = generate_globals(g)
     g = declare_main_args(g)
@@ -2075,6 +2366,12 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
             g = lg_generate_function(g, func)
         }
         i = i + 1
+    }
+    if g.di_builder != 0 {
+        unsafe {
+            dm_llvm_di_builder_finalize(g.di_builder)
+        }
+        g.di_builder = 0
     }
     return g
 }
@@ -2108,10 +2405,9 @@ fn keep_program_unoptimized(gen: LLVMGenerator) {
     }
 }
 
--- Make the module ready for code generation: give it the host's target
--- triple and data layout, and run the optimization passes of opt_level
--- over it. Gives the target machine, or 0 after printing the error.
-fn prepare_for_target(gen: LLVMGenerator, opt_level: int) -> int {
+-- Give the module the host's target triple and data layout. Gives the
+-- target machine, or 0 after printing the error.
+fn set_module_target(gen: LLVMGenerator, opt_level: int) -> int {
     unsafe {
         dm_llvm_initialize_all_targets()
         let triple_ptr = dm_llvm_get_default_target_triple()
@@ -2130,6 +2426,17 @@ fn prepare_for_target(gen: LLVMGenerator, opt_level: int) -> int {
         let layout = dm_llvm_c_str_to_string(layout_ptr)
         dm_llvm_free_c_string(layout_ptr)
         dm_llvm_module_set_data_layout(gen.llvm_module, layout)
+        return tm
+    }
+}
+
+-- Make the module ready for code generation: give it the host's target
+-- triple and data layout, and run the optimization passes of opt_level
+-- over it. Gives the target machine, or 0 after printing the error.
+fn prepare_for_target(gen: LLVMGenerator, opt_level: int) -> int {
+    unsafe {
+        let tm = set_module_target(gen, opt_level)
+        if tm == 0 { return 0 }
         -- Optimize: the whole program at -O1 and above, the runtime alone
         -- at -O0
         let mut passes = "default<O2>"

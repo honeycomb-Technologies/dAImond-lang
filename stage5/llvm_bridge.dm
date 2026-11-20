@@ -40,6 +40,38 @@ extern fn LLVMDisposeMessage(message: int)
 extern fn LLVMGetModuleContext(m: int) -> int
 extern fn LLVMGetGlobalParent(global: int) -> int
 
+-- Debug info. LLVMBool, the enums and `unsigned` are 32 bits wide; a
+-- length is a size_t.
+extern fn LLVMAddModuleFlag(m: int, behavior: i32, key: string, key_len: int, val: int)
+extern fn LLVMValueAsMetadata(val: int) -> int
+extern fn LLVMDebugMetadataVersion() -> u32
+extern fn LLVMCreateDIBuilder(m: int) -> int
+extern fn LLVMDIBuilderFinalize(dib: int)
+extern fn LLVMDisposeDIBuilder(dib: int)
+extern fn LLVMDIBuilderCreateFile(dib: int, name: string, name_len: int, directory: string, directory_len: int) -> int
+extern fn LLVMDIBuilderCreateCompileUnit(dib: int, lang: i32, file: int, producer: string, producer_len: int, optimized: i32, flags: string, flags_len: int, runtime_version: u32, split_name: string, split_name_len: int, kind: i32, dwo_id: u32, split_debug_inlining: i32, debug_info_for_profiling: i32, sysroot: string, sysroot_len: int, sdk: string, sdk_len: int) -> int
+extern fn LLVMDIBuilderCreateSubroutineType(dib: int, file: int, types: int, count: u32, flags: i32) -> int
+extern fn LLVMDIBuilderCreateFunction(dib: int, scope: int, name: string, name_len: int, linkage_name: string, linkage_name_len: int, file: int, line: u32, ty: int, is_local: i32, is_definition: i32, scope_line: u32, flags: i32, optimized: i32) -> int
+extern fn LLVMSetSubprogram(func: int, subprogram: int)
+extern fn LLVMDIBuilderCreateDebugLocation(ctx: int, line: u32, column: u32, scope: int, inlined_at: int) -> int
+extern fn LLVMSetCurrentDebugLocation2(b: int, loc: int)
+extern fn LLVMGetCurrentDebugLocation2(b: int) -> int
+extern fn LLVMDIBuilderCreateBasicType(dib: int, name: string, name_len: int, bits: int, encoding: u32, flags: i32) -> int
+extern fn LLVMDIBuilderCreatePointerType(dib: int, pointee: int, bits: int, align_bits: u32, address_space: u32, name: string, name_len: int) -> int
+extern fn LLVMDIBuilderCreateMemberType(dib: int, scope: int, name: string, name_len: int, file: int, line: u32, bits: int, align_bits: u32, offset_bits: int, flags: i32, ty: int) -> int
+extern fn LLVMDIBuilderCreateReplaceableCompositeType(dib: int, tag: u32, name: string, name_len: int, scope: int, file: int, line: u32, runtime_lang: u32, bits: int, align_bits: u32, flags: i32, unique_id: string, unique_id_len: int) -> int
+extern fn LLVMDIBuilderCreateStructType(dib: int, scope: int, name: string, name_len: int, file: int, line: u32, bits: int, align_bits: u32, flags: i32, derived_from: int, elements: int, count: u32, runtime_lang: u32, vtable_holder: int, unique_id: string, unique_id_len: int) -> int
+extern fn LLVMMetadataReplaceAllUsesWith(temporary: int, replacement: int)
+extern fn LLVMDIBuilderCreateAutoVariable(dib: int, scope: int, name: string, name_len: int, file: int, line: u32, ty: int, always_preserve: i32, flags: i32, align_bits: u32) -> int
+extern fn LLVMDIBuilderCreateParameterVariable(dib: int, scope: int, name: string, name_len: int, arg: u32, file: int, line: u32, ty: int, always_preserve: i32, flags: i32) -> int
+extern fn LLVMDIBuilderCreateExpression(dib: int, ops: int, count: int) -> int
+extern fn LLVMDIBuilderInsertDeclareRecordAtEnd(dib: int, storage: int, variable: int, expr: int, loc: int, block: int) -> int
+extern fn LLVMGetModuleDataLayout(m: int) -> int
+extern fn LLVMABISizeOfType(target_data: int, ty: int) -> int
+extern fn LLVMOffsetOfElement(target_data: int, struct_ty: int, element: u32) -> int
+extern fn LLVMIsOpaqueStruct(ty: int) -> i32
+extern fn LLVMCountStructElementTypes(ty: int) -> u32
+
 -- Passes
 extern fn LLVMCreatePassBuilderOptions() -> int
 extern fn LLVMRunPasses(m: int, passes: string, tm: int, options: int) -> int
@@ -656,13 +688,19 @@ fn dm_llvm_build_alloca(b: int, ty: int, name: string) -> int {
                 at = LLVMGetNextInstruction(at)
             }
         }
+        -- Moving the builder before an instruction gives it that
+        -- instruction's debug location: the alloca gets none, and the
+        -- builder gets its own back
+        let location = LLVMGetCurrentDebugLocation2(b)
         if at != 0 {
             LLVMPositionBuilderBefore(b, at)
         } else {
             LLVMPositionBuilderAtEnd(b, entry)
         }
+        LLVMSetCurrentDebugLocation2(b, 0)
         let result = LLVMBuildAlloca(b, ty, name)
         LLVMPositionBuilderAtEnd(b, current)
+        LLVMSetCurrentDebugLocation2(b, location)
         return result
     }
 }
@@ -1161,5 +1199,179 @@ fn dm_llvm_param_type_at(fn_ty: int, index: int) -> int {
 fn dm_llvm_is_function_var_arg(fn_ty: int) -> int {
     unsafe {
         return LLVMIsFunctionVarArg(fn_ty) as int
+    }
+}
+
+-- ============================================================
+-- Debug info (DWARF)
+-- ============================================================
+
+-- A builder of debug info for the module, which is marked as having
+-- debug info of the version this LLVM writes, as DWARF 4
+fn dm_llvm_di_builder_create(m: int) -> int {
+    unsafe {
+        let i32_type = LLVMInt32TypeInContext(LLVMGetModuleContext(m))
+        let version = LLVMDebugMetadataVersion() as int
+        -- 1 is LLVMModuleFlagBehaviorWarning
+        LLVMAddModuleFlag(m, 1, "Debug Info Version", 18, LLVMValueAsMetadata(LLVMConstInt(i32_type, version, 0)))
+        LLVMAddModuleFlag(m, 1, "Dwarf Version", 13, LLVMValueAsMetadata(LLVMConstInt(i32_type, 4, 0)))
+        return LLVMCreateDIBuilder(m)
+    }
+}
+
+-- Complete the module's debug info and dispose of the builder
+fn dm_llvm_di_builder_finalize(dib: int) {
+    unsafe {
+        LLVMDIBuilderFinalize(dib)
+        LLVMDisposeDIBuilder(dib)
+    }
+}
+
+fn dm_llvm_di_file(dib: int, name: string, directory: string) -> int {
+    unsafe {
+        return LLVMDIBuilderCreateFile(dib, name, len(name), directory, len(directory))
+    }
+}
+
+-- The compile unit of the program whose main file is `file`. A
+-- debugger treats the language as C99, the nearest it knows.
+fn dm_llvm_di_compile_unit(dib: int, file: int, producer: string, optimized: int) -> int {
+    unsafe {
+        -- 11 is LLVMDWARFSourceLanguageC99, 1 is LLVMDWARFEmissionFull
+        return LLVMDIBuilderCreateCompileUnit(dib, 11, file, producer, len(producer), bridge_bool(optimized), "", 0, 0, "", 0, 1, 0, 0, 0, "", 0, "", 0)
+    }
+}
+
+-- A function defined at `line` of `file`. Its type says nothing of its
+-- parameters.
+fn dm_llvm_di_function(dib: int, file: int, name: string, symbol: string, line: int, optimized: int) -> int {
+    unsafe {
+        let ty = LLVMDIBuilderCreateSubroutineType(dib, file, 0, 0, 0)
+        return LLVMDIBuilderCreateFunction(dib, file, name, len(name), symbol, len(symbol), file, line as u32, ty, 0, 1, line as u32, 0, bridge_bool(optimized))
+    }
+}
+
+fn dm_llvm_set_subprogram(func: int, subprogram: int) {
+    unsafe {
+        LLVMSetSubprogram(func, subprogram)
+    }
+}
+
+-- The place of the instructions the builder makes from now on: a line
+-- and column of the function `scope`, or no place when scope is 0
+fn dm_llvm_set_debug_location(b: int, ctx: int, line: int, col: int, scope: int) {
+    unsafe {
+        let mut loc = 0
+        if scope != 0 {
+            loc = LLVMDIBuilderCreateDebugLocation(ctx, line as u32, col as u32, scope, 0)
+        }
+        LLVMSetCurrentDebugLocation2(b, loc)
+    }
+}
+
+fn dm_llvm_di_basic_type(dib: int, name: string, bits: int, encoding: int) -> int {
+    unsafe {
+        return LLVMDIBuilderCreateBasicType(dib, name, len(name), bits, encoding as u32, 0)
+    }
+}
+
+-- A pointer to `pointee`, or to nothing in particular when it is 0
+fn dm_llvm_di_pointer_type(dib: int, pointee: int, name: string) -> int {
+    unsafe {
+        return LLVMDIBuilderCreatePointerType(dib, pointee, 64, 0, 0, name, len(name))
+    }
+}
+
+-- A field of the struct `scope`
+fn dm_llvm_di_member(dib: int, scope: int, name: string, bits: int, offset_bits: int, ty: int) -> int {
+    unsafe {
+        return LLVMDIBuilderCreateMemberType(dib, scope, name, len(name), 0, 0, bits, 0, offset_bits, 0, ty)
+    }
+}
+
+-- A struct type whose fields are not known yet: it stands for the
+-- struct, in its own fields' types too, until dm_llvm_di_struct_end_buf
+-- replaces it. 19 is DW_TAG_structure_type.
+fn dm_llvm_di_struct_begin(dib: int, name: string, bits: int) -> int {
+    unsafe {
+        return LLVMDIBuilderCreateReplaceableCompositeType(dib, 19, name, len(name), 0, 0, 0, 0, bits, 0, 0, "", 0)
+    }
+}
+
+-- The struct type whose fields are the listed members, which takes the
+-- place of `begun`
+fn dm_llvm_di_struct_end_buf(dib: int, begun: int, name: string, bits: int) -> int {
+    unsafe {
+        let count = load_i64(bridge_buf_count())
+        let made = LLVMDIBuilderCreateStructType(dib, 0, name, len(name), 0, 0, bits, 0, 0, 0, bridge_buf(), count as u32, 0, 0, "", 0)
+        store_i64(bridge_buf_count(), 0)
+        LLVMMetadataReplaceAllUsesWith(begun, made)
+        return made
+    }
+}
+
+-- A variable of the function `scope`: its parameter number `arg`, from
+-- 1, or a local when arg is 0
+fn dm_llvm_di_variable(dib: int, scope: int, name: string, file: int, line: int, ty: int, arg: int) -> int {
+    unsafe {
+        if arg > 0 {
+            return LLVMDIBuilderCreateParameterVariable(dib, scope, name, len(name), arg as u32, file, line as u32, ty, 1, 0)
+        }
+        return LLVMDIBuilderCreateAutoVariable(dib, scope, name, len(name), file, line as u32, ty, 1, 0, 0)
+    }
+}
+
+-- Say, at the end of the builder's block, that the variable lives in
+-- `storage`; with deref, that storage holds the variable's address
+fn dm_llvm_di_declare(dib: int, b: int, storage: int, variable: int, ctx: int, line: int, scope: int, deref: int) {
+    unsafe {
+        -- 6 is DW_OP_deref
+        let mut op = 6
+        let mut count = 0
+        if deref != 0 {
+            count = 1
+        }
+        let expr = LLVMDIBuilderCreateExpression(dib, addr_of(op), count)
+        let loc = LLVMDIBuilderCreateDebugLocation(ctx, line as u32, 0, scope, 0)
+        LLVMDIBuilderInsertDeclareRecordAtEnd(dib, storage, variable, expr, loc, LLVMGetInsertBlock(b))
+    }
+}
+
+fn dm_llvm_is_alloca(val: int) -> int {
+    unsafe {
+        if LLVMIsAAllocaInst(val) != 0 {
+            return 1
+        }
+        return 0
+    }
+}
+
+-- The size in bytes of a type in the module's data layout, which must
+-- be set
+fn dm_llvm_abi_size_of(m: int, ty: int) -> int {
+    unsafe {
+        return LLVMABISizeOfType(LLVMGetModuleDataLayout(m), ty)
+    }
+}
+
+-- The offset in bytes of a struct type's field
+fn dm_llvm_offset_of_element(m: int, struct_ty: int, index: int) -> int {
+    unsafe {
+        return LLVMOffsetOfElement(LLVMGetModuleDataLayout(m), struct_ty, index as u32)
+    }
+}
+
+-- The number of fields of a struct type; 0 for a struct type with no
+-- body and for a type that is no struct
+fn dm_llvm_struct_field_count(ty: int) -> int {
+    unsafe {
+        -- 10 is LLVMStructTypeKind
+        if LLVMGetTypeKind(ty) as int != 10 {
+            return 0
+        }
+        if LLVMIsOpaqueStruct(ty) as int != 0 {
+            return 0
+        }
+        return LLVMCountStructElementTypes(ty) as int
     }
 }

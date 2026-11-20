@@ -305,6 +305,12 @@ fn OP_SIMD_MUL() -> int { return 104 }
 fn OP_SIMD_DIV() -> int { return 105 }
 fn OP_SIMD_EXTRACT() -> int { return 106 }
 fn OP_PANIC() -> int { return 110 }
+-- Debug info: the variable named `callee`, of type `alloc_type`, lives
+-- in the storage `operand`. field_index is its number among the
+-- function's parameters, from 1, or 0 for a local; field_type is "ref"
+-- when the operand is the address of the value, passed by the caller.
+-- It generates no code.
+fn OP_DEBUG_VAR() -> int { return 120 }
 
 -- IR Instruction
 struct IRInst {
@@ -504,14 +510,18 @@ struct IRFunction {
     is_variadic: bool,
     -- The C symbol an extern function is bound to; "" means its name
     link_name: string,
-    is_comptime: bool
+    is_comptime: bool,
+    -- The line the function is declared at (see LINES IN FILES in
+    -- token.dm); 0 for a function the compiler makes
+    source_line: int
 }
 
 fn ir_function_new(name: string, ret_type: string) -> IRFunction {
     return IRFunction {
         name: name, params: [], return_type: ret_type,
         blocks: [],
-        is_async: false, is_extern: false, is_variadic: false, link_name: "", is_comptime: false
+        is_async: false, is_extern: false, is_variadic: false, link_name: "", is_comptime: false,
+        source_line: 0
     }
 }
 

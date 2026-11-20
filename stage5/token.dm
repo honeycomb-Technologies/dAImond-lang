@@ -109,6 +109,19 @@ fn token_new(kind: int, value: string, line: int, col: int) -> Token {
 
 fn FILE_LINE_SPAN() -> int { return 1000000 }
 
+-- The name of the runtime in errors. Its line numbers are those of the
+-- runtime/*.dm files joined, as gen_bootstrap.sh joins them.
+fn PRELUDE_NAME() -> string { return "<runtime>" }
+
+-- The name of the main that `test` writes to run a file's tests
+fn TEST_MAIN_NAME() -> string { return "<test main>" }
+
+-- Whether a name in the list of files is a file's. The compiler's own
+-- sources are named in angle brackets.
+fn is_file_name(name: string) -> bool {
+    return starts_with(name, "<") == false
+}
+
 -- The line within its file
 fn line_in_file(line: int) -> int {
     return line % FILE_LINE_SPAN()

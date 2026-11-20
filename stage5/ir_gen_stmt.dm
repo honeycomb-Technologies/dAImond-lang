@@ -64,6 +64,69 @@ fn resolve_field_original_type(gen: IRGenerator, expr: Expr) -> string {
 }
 
 -- ============================================================
+-- DEBUG INFO
+-- ============================================================
+
+-- The type of a variable for debug info: its source type where IR
+-- generation knows it, else the type it is lowered with
+fn debug_var_type(gen: IRGenerator, name: string) -> string {
+    if gen.var_src_types.contains(name) {
+        let src = gen.var_src_types.get(name)
+        if len(src) > 0 {
+            return map_type_name(canon_type(gen, src))
+        }
+    }
+    if gen.variable_types.contains(name) == false {
+        return "i64"
+    }
+    let t = gen.variable_types.get(name)
+    if t == "list" and gen.list_elem_kinds.contains(name) {
+        let kind = gen.list_elem_kinds.get(name)
+        if kind == LIST_ELEM_INT() { return "List[i64]" }
+        if kind == LIST_ELEM_FLOAT() { return "List[f64]" }
+        if kind == LIST_ELEM_STRING() { return "List[string]" }
+        if gen.list_elem_types.contains(name) {
+            return "List[" + gen.list_elem_types.get(name) + "]"
+        }
+    }
+    if t == "ptr" and gen.box_inner_types.contains(name) {
+        return "Box[" + gen.box_inner_types.get(name) + "]"
+    }
+    return t
+}
+
+-- With -g, say where the variable `name`, declared at `line`, lives
+-- (OP_DEBUG_VAR). `arg` is its number among the function's parameters,
+-- from 1, or 0 for a local.
+fn debug_var(gen: IRGenerator, block: IRBasicBlock, name: string, line: int, arg: int) -> GenResult {
+    if gen.debug_info == false or line <= 0 or name == "_" or gen.variable_map.contains(name) == false {
+        return gen_result(gen, block)
+    }
+    let mut g = gen
+    let mut b = block
+    let storage = g.variable_map.get(name)
+    let mut inst = ir_inst_new(g.builder.next_id, OP_DEBUG_VAR())
+    if storage < 0 {
+        -- The variable is a parameter itself, not a copy of one
+        inst.operand = ir_val_param(0 - storage - 1)
+        if g.mut_ptr_vars.contains(name) {
+            inst.field_type = "ref"
+        }
+    } else {
+        inst.operand = ir_val_inst(storage)
+    }
+    inst.callee = name
+    inst.alloc_type = debug_var_type(g, name)
+    inst.field_index = arg
+    inst.result_type = "void"
+    inst.has_result = false
+    inst.source_line = line
+    b.instructions.push(inst)
+    g.builder.next_id = g.builder.next_id + 1
+    return gen_result(g, b)
+}
+
+-- ============================================================
 -- STATEMENT GENERATION
 -- ============================================================
 
@@ -107,7 +170,8 @@ fn generate_statement(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenR
 
 fn generate_statement_kind(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
     if stmt.kind == STMT_LET() {
-        return generate_let_binding(gen, block, stmt)
+        let bound = generate_let_binding(gen, block, stmt)
+        return debug_var(bound.gen, bound.block, stmt.let_name, stmt.line, 0)
     }
     if stmt.kind == STMT_RETURN() {
         return generate_return(gen, block, stmt)
@@ -897,7 +961,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
         if g.struct_defs.contains(loop_elem_src) {
             g.var_struct_types.insert(var_name, loop_elem_src)
         }
+    } else if g.var_src_types.contains(var_name) {
+        -- Not the type of an earlier variable of this name
+        g.var_src_types.remove(var_name)
     }
+    let elem_debug = debug_var(g, b, var_name, stmt.line, 0)
+    g = elem_debug.gen
+    b = elem_debug.block
 
     -- Labels
     let header_label = gen_next_label(g, "for_header")
@@ -1084,6 +1154,12 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
 
     g.variable_map.insert(var_name, idx_alloca_id)
     g.variable_types.insert(var_name, "i64")
+    if g.var_src_types.contains(var_name) {
+        g.var_src_types.remove(var_name)
+    }
+    let idx_debug = debug_var(g, b, var_name, stmt.line, 0)
+    g = idx_debug.gen
+    b = idx_debug.block
 
     -- Labels
     let header_label = gen_next_label(g, "range_header")
@@ -1236,6 +1312,12 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
 
     g.variable_map.insert(var_name, elem_alloca_id)
     g.variable_types.insert(var_name, "string")
+    if g.var_src_types.contains(var_name) {
+        g.var_src_types.remove(var_name)
+    }
+    let key_debug = debug_var(g, b, var_name, stmt.line, 0)
+    g = key_debug.gen
+    b = key_debug.block
 
     let header_label = gen_next_label(g, "strfor_header")
     g = gen_advance_label(g)

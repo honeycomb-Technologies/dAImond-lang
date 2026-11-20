@@ -17,6 +17,7 @@
 #include <llvm-c/Target.h>
 #include <llvm-c/TargetMachine.h>
 #include <llvm-c/BitWriter.h>
+#include <llvm-c/DebugInfo.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <stdint.h>
 #include <string.h>
@@ -359,10 +360,16 @@ int64_t dm_llvm_build_alloca(int64_t b, int64_t ty, const char* name) {
     LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(LLVMGetBasicBlockParent(cur));
     LLVMValueRef at = LLVMGetFirstInstruction(entry);
     while (at && LLVMIsAAllocaInst(at)) at = LLVMGetNextInstruction(at);
+    /* Moving the builder before an instruction gives it that
+     * instruction's debug location: the alloca gets none, and the
+     * builder gets its own back */
+    LLVMMetadataRef location = LLVMGetCurrentDebugLocation2(builder);
     if (at) LLVMPositionBuilderBefore(builder, at);
     else LLVMPositionBuilderAtEnd(builder, entry);
+    LLVMSetCurrentDebugLocation2(builder, NULL);
     LLVMValueRef result = LLVMBuildAlloca(builder, TO_PTR(LLVMTypeRef, ty), name);
     LLVMPositionBuilderAtEnd(builder, cur);
+    LLVMSetCurrentDebugLocation2(builder, location);
     return TO_INT(result);
 }
 
@@ -808,4 +815,170 @@ void dm_llvm_add_incoming_one(int64_t phi, int64_t val, int64_t block) {
     LLVMValueRef vals[1] = { TO_PTR(LLVMValueRef, val) };
     LLVMBasicBlockRef blocks[1] = { TO_PTR(LLVMBasicBlockRef, block) };
     LLVMAddIncoming(TO_PTR(LLVMValueRef, phi), vals, blocks, 1);
+}
+
+
+/* ================================================================
+ * Debug info (DWARF)
+ * ================================================================ */
+
+/* A builder of debug info for the module, which is marked as having
+ * debug info of the version this LLVM writes, as DWARF 4. */
+int64_t dm_llvm_di_builder_create(int64_t mod) {
+    LLVMModuleRef m = TO_PTR(LLVMModuleRef, mod);
+    LLVMTypeRef i32 = LLVMInt32TypeInContext(LLVMGetModuleContext(m));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Debug Info Version", 18,
+                      LLVMValueAsMetadata(LLVMConstInt(i32, LLVMDebugMetadataVersion(), 0)));
+    LLVMAddModuleFlag(m, LLVMModuleFlagBehaviorWarning, "Dwarf Version", 13,
+                      LLVMValueAsMetadata(LLVMConstInt(i32, 4, 0)));
+    return TO_INT(LLVMCreateDIBuilder(m));
+}
+
+/* Complete the module's debug info and dispose of the builder. */
+void dm_llvm_di_builder_finalize(int64_t dib) {
+    LLVMDIBuilderFinalize(TO_PTR(LLVMDIBuilderRef, dib));
+    LLVMDisposeDIBuilder(TO_PTR(LLVMDIBuilderRef, dib));
+}
+
+int64_t dm_llvm_di_file(int64_t dib, const char* name, const char* directory) {
+    return TO_INT(LLVMDIBuilderCreateFile(TO_PTR(LLVMDIBuilderRef, dib),
+                                          name, strlen(name), directory, strlen(directory)));
+}
+
+/* The compile unit of the program whose main file is `file`. A
+ * debugger treats the language as C99, the nearest it knows. */
+int64_t dm_llvm_di_compile_unit(int64_t dib, int64_t file, const char* producer, int64_t optimized) {
+    return TO_INT(LLVMDIBuilderCreateCompileUnit(
+        TO_PTR(LLVMDIBuilderRef, dib), LLVMDWARFSourceLanguageC99,
+        TO_PTR(LLVMMetadataRef, file), producer, strlen(producer), (LLVMBool)optimized,
+        "", 0, 0, "", 0, LLVMDWARFEmissionFull, 0, 0, 0, "", 0, "", 0));
+}
+
+/* A function defined at `line` of `file`. Its type says nothing of
+ * its parameters. */
+int64_t dm_llvm_di_function(int64_t dib, int64_t file, const char* name, const char* symbol,
+                            int64_t line, int64_t optimized) {
+    LLVMDIBuilderRef b = TO_PTR(LLVMDIBuilderRef, dib);
+    LLVMMetadataRef f = TO_PTR(LLVMMetadataRef, file);
+    LLVMMetadataRef ty = LLVMDIBuilderCreateSubroutineType(b, f, NULL, 0, LLVMDIFlagZero);
+    return TO_INT(LLVMDIBuilderCreateFunction(b, f, name, strlen(name), symbol, strlen(symbol),
+                                              f, (unsigned)line, ty, 0, 1, (unsigned)line,
+                                              LLVMDIFlagZero, (LLVMBool)optimized));
+}
+
+void dm_llvm_set_subprogram(int64_t func, int64_t subprogram) {
+    LLVMSetSubprogram(TO_PTR(LLVMValueRef, func), TO_PTR(LLVMMetadataRef, subprogram));
+}
+
+/* The place of the instructions the builder makes from now on: a line
+ * and column of the function `scope`, or no place when scope is 0. */
+void dm_llvm_set_debug_location(int64_t b, int64_t ctx, int64_t line, int64_t col, int64_t scope) {
+    LLVMMetadataRef loc = NULL;
+    if (scope != 0) {
+        loc = LLVMDIBuilderCreateDebugLocation(TO_PTR(LLVMContextRef, ctx), (unsigned)line,
+                                               (unsigned)col, TO_PTR(LLVMMetadataRef, scope), NULL);
+    }
+    LLVMSetCurrentDebugLocation2(TO_PTR(LLVMBuilderRef, b), loc);
+}
+
+int64_t dm_llvm_di_basic_type(int64_t dib, const char* name, int64_t bits, int64_t encoding) {
+    return TO_INT(LLVMDIBuilderCreateBasicType(TO_PTR(LLVMDIBuilderRef, dib), name, strlen(name),
+                                               (uint64_t)bits, (LLVMDWARFTypeEncoding)encoding,
+                                               LLVMDIFlagZero));
+}
+
+/* A pointer to `pointee`, or to nothing in particular when it is 0 */
+int64_t dm_llvm_di_pointer_type(int64_t dib, int64_t pointee, const char* name) {
+    return TO_INT(LLVMDIBuilderCreatePointerType(TO_PTR(LLVMDIBuilderRef, dib),
+                                                 TO_PTR(LLVMMetadataRef, pointee), 64, 0, 0,
+                                                 name, strlen(name)));
+}
+
+/* A field of the struct `scope` */
+int64_t dm_llvm_di_member(int64_t dib, int64_t scope, const char* name, int64_t bits,
+                          int64_t offset_bits, int64_t ty) {
+    return TO_INT(LLVMDIBuilderCreateMemberType(TO_PTR(LLVMDIBuilderRef, dib),
+                                                TO_PTR(LLVMMetadataRef, scope), name, strlen(name),
+                                                NULL, 0, (uint64_t)bits, 0, (uint64_t)offset_bits,
+                                                LLVMDIFlagZero, TO_PTR(LLVMMetadataRef, ty)));
+}
+
+/* A struct type whose fields are not known yet: it stands for the
+ * struct, in its own fields' types too, until dm_llvm_di_struct_end_buf
+ * replaces it. 0x13 is DW_TAG_structure_type. */
+int64_t dm_llvm_di_struct_begin(int64_t dib, const char* name, int64_t bits) {
+    return TO_INT(LLVMDIBuilderCreateReplaceableCompositeType(
+        TO_PTR(LLVMDIBuilderRef, dib), 0x13, name, strlen(name), NULL, NULL, 0, 0,
+        (uint64_t)bits, 0, LLVMDIFlagZero, "", 0));
+}
+
+/* The struct type whose fields are the listed members, which takes
+ * the place of `begun` */
+int64_t dm_llvm_di_struct_end_buf(int64_t dib, int64_t begun, const char* name, int64_t bits) {
+    LLVMMetadataRef members[DM_LLVM_BUF_MAX];
+    for (int i = 0; i < dm_llvm_buf_count; i++) {
+        members[i] = TO_PTR(LLVMMetadataRef, dm_llvm_buf[i]);
+    }
+    LLVMMetadataRef made = LLVMDIBuilderCreateStructType(
+        TO_PTR(LLVMDIBuilderRef, dib), NULL, name, strlen(name), NULL, 0, (uint64_t)bits, 0,
+        LLVMDIFlagZero, NULL, members, (unsigned)dm_llvm_buf_count, 0, NULL, "", 0);
+    dm_llvm_buf_count = 0;
+    LLVMMetadataReplaceAllUsesWith(TO_PTR(LLVMMetadataRef, begun), made);
+    return TO_INT(made);
+}
+
+/* A variable of the function `scope`: its parameter number `arg`,
+ * from 1, or a local when arg is 0 */
+int64_t dm_llvm_di_variable(int64_t dib, int64_t scope, const char* name, int64_t file,
+                            int64_t line, int64_t ty, int64_t arg) {
+    LLVMDIBuilderRef b = TO_PTR(LLVMDIBuilderRef, dib);
+    if (arg > 0) {
+        return TO_INT(LLVMDIBuilderCreateParameterVariable(
+            b, TO_PTR(LLVMMetadataRef, scope), name, strlen(name), (unsigned)arg,
+            TO_PTR(LLVMMetadataRef, file), (unsigned)line, TO_PTR(LLVMMetadataRef, ty), 1,
+            LLVMDIFlagZero));
+    }
+    return TO_INT(LLVMDIBuilderCreateAutoVariable(
+        b, TO_PTR(LLVMMetadataRef, scope), name, strlen(name), TO_PTR(LLVMMetadataRef, file),
+        (unsigned)line, TO_PTR(LLVMMetadataRef, ty), 1, LLVMDIFlagZero, 0));
+}
+
+/* Say, at the end of the builder's block, that the variable lives in
+ * `storage`; with deref, that storage holds the variable's address.
+ * 0x06 is DW_OP_deref. */
+void dm_llvm_di_declare(int64_t dib, int64_t b, int64_t storage, int64_t variable, int64_t ctx,
+                        int64_t line, int64_t scope, int64_t deref) {
+    LLVMDIBuilderRef builder = TO_PTR(LLVMDIBuilderRef, dib);
+    uint64_t ops[1] = { 0x06 };
+    LLVMMetadataRef expr = LLVMDIBuilderCreateExpression(builder, ops, deref ? 1 : 0);
+    LLVMMetadataRef loc = LLVMDIBuilderCreateDebugLocation(
+        TO_PTR(LLVMContextRef, ctx), (unsigned)line, 0, TO_PTR(LLVMMetadataRef, scope), NULL);
+    LLVMDIBuilderInsertDeclareRecordAtEnd(builder, TO_PTR(LLVMValueRef, storage),
+                                          TO_PTR(LLVMMetadataRef, variable), expr, loc,
+                                          LLVMGetInsertBlock(TO_PTR(LLVMBuilderRef, b)));
+}
+
+int64_t dm_llvm_is_alloca(int64_t val) {
+    return LLVMIsAAllocaInst(TO_PTR(LLVMValueRef, val)) != NULL;
+}
+
+/* The size in bytes of a type in the module's data layout, which must
+ * be set */
+int64_t dm_llvm_abi_size_of(int64_t mod, int64_t ty) {
+    return (int64_t)LLVMABISizeOfType(LLVMGetModuleDataLayout(TO_PTR(LLVMModuleRef, mod)),
+                                      TO_PTR(LLVMTypeRef, ty));
+}
+
+/* The offset in bytes of a struct type's field */
+int64_t dm_llvm_offset_of_element(int64_t mod, int64_t struct_ty, int64_t index) {
+    return (int64_t)LLVMOffsetOfElement(LLVMGetModuleDataLayout(TO_PTR(LLVMModuleRef, mod)),
+                                        TO_PTR(LLVMTypeRef, struct_ty), (unsigned)index);
+}
+
+/* The number of fields of a struct type; 0 for a struct type with no
+ * body and for a type that is no struct */
+int64_t dm_llvm_struct_field_count(int64_t ty) {
+    LLVMTypeRef t = TO_PTR(LLVMTypeRef, ty);
+    if (LLVMGetTypeKind(t) != LLVMStructTypeKind || LLVMIsOpaqueStruct(t)) return 0;
+    return LLVMCountStructElementTypes(t);
 }

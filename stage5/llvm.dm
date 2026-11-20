@@ -191,6 +191,27 @@ extern fn dm_llvm_function_type_buf(ret: int, is_var_arg: int) -> int
 extern fn dm_llvm_build_call2_buf(b: int, fn_ty: int, func: int, name: string) -> int
 extern fn dm_llvm_add_incoming_one(phi: int, val: int, block: int)
 
+-- Debug info (DWARF). A file, compile unit, function or place is a
+-- reference to LLVM metadata.
+extern fn dm_llvm_di_builder_create(mod: int) -> int
+extern fn dm_llvm_di_builder_finalize(dib: int)
+extern fn dm_llvm_di_file(dib: int, name: string, directory: string) -> int
+extern fn dm_llvm_di_compile_unit(dib: int, file: int, producer: string, optimized: int) -> int
+extern fn dm_llvm_di_function(dib: int, file: int, name: string, symbol: string, line: int, optimized: int) -> int
+extern fn dm_llvm_set_subprogram(func: int, subprogram: int)
+extern fn dm_llvm_set_debug_location(b: int, ctx: int, line: int, col: int, scope: int)
+extern fn dm_llvm_di_basic_type(dib: int, name: string, bits: int, encoding: int) -> int
+extern fn dm_llvm_di_pointer_type(dib: int, pointee: int, name: string) -> int
+extern fn dm_llvm_di_member(dib: int, scope: int, name: string, bits: int, offset_bits: int, ty: int) -> int
+extern fn dm_llvm_di_struct_begin(dib: int, name: string, bits: int) -> int
+extern fn dm_llvm_di_struct_end_buf(dib: int, begun: int, name: string, bits: int) -> int
+extern fn dm_llvm_di_variable(dib: int, scope: int, name: string, file: int, line: int, ty: int, arg: int) -> int
+extern fn dm_llvm_di_declare(dib: int, b: int, storage: int, variable: int, ctx: int, line: int, scope: int, deref: int)
+extern fn dm_llvm_is_alloca(val: int) -> int
+extern fn dm_llvm_abi_size_of(mod: int, ty: int) -> int
+extern fn dm_llvm_offset_of_element(mod: int, struct_ty: int, index: int) -> int
+extern fn dm_llvm_struct_field_count(ty: int) -> int
+
 -- ============================================================
 -- Convenience wrapper functions (dAImond-friendly API)
 -- ============================================================

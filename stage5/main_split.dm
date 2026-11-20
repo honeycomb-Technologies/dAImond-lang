@@ -56,6 +56,7 @@ fn print_usage() {
     println("  -O1           Basic optimization")
     println("  -O2           Full optimization")
     println("  -O3           Aggressive optimization")
+    println("  -g            Debug info: files, functions, lines and variables, for gdb and lldb")
     println("  --emit-ir     Print dAImond IR and exit")
     println("  --emit-llvm   Emit LLVM IR file (.ll) and exit")
     println("  --emit-bitcode  Emit LLVM bitcode (.bc), optimized as -O says, and exit")
@@ -92,6 +93,8 @@ struct CLIArgs {
     emit_llvm: bool,
     emit_bitcode: bool,
     link_llvm: bool,
+    -- -g: the program carries debug info
+    debug_info: bool,
     verbose: bool,
     show_help: bool,
     show_version: bool,
@@ -112,6 +115,7 @@ fn parse_cli_args() -> CLIArgs {
         emit_llvm: false,
         emit_bitcode: false,
         link_llvm: false,
+        debug_info: false,
         verbose: false,
         show_help: false,
         show_version: false,
@@ -163,6 +167,8 @@ fn parse_cli_args() -> CLIArgs {
             args.opt_level = 2
         } else if arg == "-O3" {
             args.opt_level = 3
+        } else if arg == "-g" {
+            args.debug_info = true
         } else if arg == "--emit-ir" {
             args.emit_ir = true
         } else if arg == "--emit-llvm" {
@@ -409,10 +415,6 @@ fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFi
     merged.files = state.loaded
     return merged
 }
-
--- The name of the runtime in errors. Its line numbers are those of the
--- runtime/*.dm files joined, as gen_bootstrap.sh joins them.
-fn PRELUDE_NAME() -> string { return "<runtime>" }
 
 -- The runtime written in dAImond (prelude.dm, generated from
 -- runtime/*.dm), parsed as file number `file` of the program
@@ -799,8 +801,9 @@ fn test_main_source(names: List[string]) -> string {
 -- The file's declarations with a main that runs its tests in place of
 -- its own main
 fn with_test_main(sf: SourceFile) -> SourceFile {
-    let test_sf = parse_source_file(parser_new(tokenize(test_main_source(test_function_names(sf)))))
+    let test_sf = parse_source_file(parser_new(tokenize_file(test_main_source(test_function_names(sf)), TEST_MAIN_NAME(), sf.files.len())))
     let mut out = sf
+    out.files.push(TEST_MAIN_NAME())
     let mut decls: List[Declaration] = []
     let mut i = 0
     while i < sf.declarations.len() {
@@ -1237,6 +1240,7 @@ fn compile(cli: CLIArgs) -> int {
     if runtime_obj != "" {
         ir_gen.linked_fns = precompiled_function_names(prelude_sf)
     }
+    ir_gen.debug_info = cli.debug_info
     ir_gen = generate_module(ir_gen, sf)
     if ir_gen.type_errors.len() > 0 {
         let mut te = 0
@@ -1301,6 +1305,8 @@ fn compile(cli: CLIArgs) -> int {
     if verbose { println("  [5/6] Generating LLVM IR...") }
 
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_module")
+    lg.debug_info = cli.debug_info
+    lg.debug_optimized = opt_level > 0
     lg = lg_generate_module(lg)
 
     -- Calls with mismatched argument types and field reads from non-structs

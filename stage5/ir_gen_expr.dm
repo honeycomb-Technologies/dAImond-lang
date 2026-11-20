@@ -7031,6 +7031,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 
     -- Create a new IR function for the lambda
     let mut lambda_func = ir_function_new(lambda_name, ret_type)
+    lambda_func.source_line = expr.line
 
     -- Add lambda parameters
     let mut pi = 0
@@ -7142,6 +7143,12 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         g.variable_map.insert(lp.name, alloca_id)
         g.variable_types.insert(lp.name, ptype)
         g.declared_vars.push(lp.name)
+        if g.var_src_types.contains(lp.name) {
+            g.var_src_types.remove(lp.name)
+        }
+        let param_debug = debug_var(g, entry_block, lp.name, expr.line, param_idx + 1)
+        g = param_debug.gen
+        entry_block = param_debug.block
         param_idx = param_idx + 1
     }
 
