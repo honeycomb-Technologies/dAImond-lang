@@ -289,6 +289,25 @@ const stage5_string_tests = [_]TestCase{
     },
 };
 
+/// file_read reads a file that reports no size to its end. Stage 0
+/// reads as many bytes as the size says, which is none for a file in
+/// /proc.
+const stage5_file_tests = [_]TestCase{
+    .{
+        .name = "file_read_file_without_a_size",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    -- A file in /proc reports a size of 0
+            \\    let status = file_read("/proc/self/status")
+            \\    println(bool_to_string(string_contains(status, "Pid:")))
+            \\}
+        ,
+        .expected_output = "true\n",
+    },
+};
+
 /// Raw memory, C-width integers and variadic externs: the primitives
 /// the runtime is written with. Stage 0 has none of them.
 const stage5_primitive_tests = [_]TestCase{
@@ -509,6 +528,64 @@ const stage5_primitive_tests = [_]TestCase{
         ,
         .expected_output = "42 5 2.5\n",
     },
+    .{
+        .name = "symbol_addr_primitive",
+        .source =
+            \\module test
+            \\extern fn fputs(s: string, stream: int) -> i32
+            \\extern fn fflush(stream: int) -> i32
+            \\
+            \\fn main() {
+            \\    unsafe {
+            \\        -- stdout is a variable of the C library that holds a FILE*
+            \\        let out = load_i64(symbol_addr("stdout"))
+            \\        fputs("through stdout\n", out)
+            \\        fflush(out)
+            \\        if symbol_addr("stdout") == symbol_addr("stdout") and symbol_addr("stdout") != symbol_addr("stderr") {
+            \\            println("one address per symbol")
+            \\        }
+            \\        -- The compiler's own symbol for main's argument count
+            \\        println(int_to_string(load_i32(symbol_addr("dm_argc"))))
+            \\    }
+            \\}
+        ,
+        .expected_output = "through stdout\none address per symbol\n1\n",
+    },
+    .{
+        .name = "symbol_addr_misuse",
+        .source =
+            \\module test
+            \\fn name() -> string { return "stdout" }
+            \\fn main() {
+            \\    let a = symbol_addr("stdout")
+            \\    unsafe {
+            \\        let b = symbol_addr(name())
+            \\        let c = symbol_addr("")
+            \\        let d = symbol_addr("stdout", "stderr")
+            \\    }
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"symbol_addr() works on raw memory and requires an unsafe block at line 4", "symbol_addr() takes the name of a symbol as a string literal at line 6", "symbol_addr() takes the name of a symbol as a string literal at line 7", "symbol_addr() takes 1 arguments, not 2 at line 8"},
+    },
+    .{
+        .name = "symbol_addr_of_function",
+        .source =
+            \\module test
+            \\extern fn puts(s: string) -> i32
+            \\fn helper() -> int { return 1 }
+            \\fn main() {
+            \\    unsafe {
+            \\        let e = symbol_addr("puts")
+            \\        let f = symbol_addr("helper")
+            \\    }
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"symbol_addr(\"puts\") names a function, not a data symbol", "symbol_addr(\"helper\") names a function, not a data symbol"},
+    },
 };
 
 pub fn main() !void {
@@ -594,6 +671,7 @@ pub fn main() !void {
         .{ .name = "Maps (Stage 5)", .tests = &stage5_map_tests },
         .{ .name = "Lists (Stage 5)", .tests = &stage5_list_tests },
         .{ .name = "Strings (Stage 5)", .tests = &stage5_string_tests },
+        .{ .name = "Files (Stage 5)", .tests = &stage5_file_tests },
         .{ .name = "Runtime Primitives", .tests = &stage5_primitive_tests },
     };
 

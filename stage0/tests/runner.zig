@@ -2073,6 +2073,77 @@ pub const io_tests = [_]TestCase{
         ,
         .expected_output = "ok\n",
     },
+    // file_write, file_append, file_read and file_exists on empty, short and
+    // large files; args_len and args_get; system.
+    .{
+        .name = "file_write_append_read_and_args",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    -- The program's own path names a place no other test writes to
+            \\    let p = args_get(0) + ".data"
+            \\    println(int_to_string(args_len()) + " [" + args_get(1) + "][" + args_get(0 - 1) + "]")
+            \\    println(bool_to_string(file_exists(p)))
+            \\    file_write(p, "hello\n")
+            \\    println(bool_to_string(file_exists(p)))
+            \\    print(file_read(p))
+            \\    file_append(p, "world\n")
+            \\    file_append(p, "")
+            \\    let both = file_read(p)
+            \\    println(int_to_string(len(both)) + ":" + string_replace(both, "\n", "|"))
+            \\    file_write(p, "short")
+            \\    println(file_read(p))
+            \\    file_write(p, "")
+            \\    println("[" + file_read(p) + "] " + bool_to_string(file_exists(p)))
+            \\    file_append(p + "2", "made by append")
+            \\    println(file_read(p + "2"))
+            \\    -- A file larger than one read buffer
+            \\    let mut big = ""
+            \\    let mut i = 0
+            \\    while i < 3000 {
+            \\        big = big + "line " + int_to_string(i) + "\t\r\n"
+            \\        i = i + 1
+            \\    }
+            \\    file_write(p, big)
+            \\    let back = file_read(p)
+            \\    println(int_to_string(len(back)) + " " + bool_to_string(back == big))
+            \\    println(bool_to_string(file_exists(p + "/missing")) + " " + bool_to_string(file_exists("")))
+            \\    println(int_to_string(system("exit 3")) + " " + int_to_string(system("true")))
+            \\}
+        ,
+        .expected_output = "1 [][]\nfalse\ntrue\nhello\n12:hello|world|\nshort\n[] true\nmade by append\n34890 true\nfalse false\n768 0\n",
+    },
+    .{
+        .name = "file_read_missing_file_panics",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println("before")
+            \\    let s = file_read(args_get(0) + ".missing")
+            \\    println("not reached")
+            \\}
+        ,
+        .expected_output = "before\n",
+        .expected_exit_code = 1,
+        .expected_stderr = "PANIC: file_read: cannot open file\n",
+    },
+    .{
+        .name = "file_write_missing_directory_panics",
+        .source =
+            \\module test
+            \\
+            \\fn main() {
+            \\    println("before")
+            \\    file_write(args_get(0) + ".missing/x", "x")
+            \\    println("not reached")
+            \\}
+        ,
+        .expected_output = "before\n",
+        .expected_exit_code = 1,
+        .expected_stderr = "PANIC: file_write: cannot open file\n",
+    },
 };
 
 // Phase D: Process Execution

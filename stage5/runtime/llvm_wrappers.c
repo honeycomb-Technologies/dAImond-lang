@@ -30,10 +30,6 @@ static void dm_increase_stack_size(void) {
     }
 }
 
-// --- Argc/Argv globals (set by main wrapper or linker) ---
-int dm_argc = 0;
-char** dm_argv = NULL;
-
 // =====================================================================
 // String creation (return via output pointer)
 // =====================================================================
@@ -71,100 +67,6 @@ void llvm_dm_panic(const dm_string* s) {
     fwrite(s->data, 1, s->len, stderr);
     fputc('\n', stderr);
     exit(1);
-}
-
-static void panic_cstr(const char* message) {
-    fprintf(stderr, "PANIC: %s\n", message);
-    exit(1);
-}
-
-// =====================================================================
-// File I/O (not in runtime with matching names — implemented inline)
-// =====================================================================
-
-void llvm_dm_file_read(dm_string* out, const dm_string* path) {
-    char* cpath = (char*)malloc(path->len + 1);
-    memcpy(cpath, path->data, path->len);
-    cpath[path->len] = '\0';
-    FILE* f = fopen(cpath, "rb");
-    free(cpath);
-    if (!f) {
-        panic_cstr("file_read: cannot open file");
-    }
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    char* buf = (char*)malloc((size_t)file_size + 1);
-    size_t read_size = fread(buf, 1, (size_t)file_size, f);
-    fclose(f);
-    buf[read_size] = '\0';
-    *out = (dm_string){ .data = buf, .len = read_size, .cap = (size_t)file_size };
-}
-
-void llvm_dm_file_write(const dm_string* path, const dm_string* content) {
-    char* cpath = (char*)malloc(path->len + 1);
-    memcpy(cpath, path->data, path->len);
-    cpath[path->len] = '\0';
-    FILE* f = fopen(cpath, "wb");
-    free(cpath);
-    if (!f) {
-        panic_cstr("file_write: cannot open file");
-    }
-    fwrite(content->data, 1, content->len, f);
-    fclose(f);
-}
-
-void llvm_dm_file_append(const dm_string* path, const dm_string* content) {
-    char* cpath = (char*)malloc(path->len + 1);
-    memcpy(cpath, path->data, path->len);
-    cpath[path->len] = '\0';
-    FILE* f = fopen(cpath, "ab");
-    free(cpath);
-    if (!f) {
-        panic_cstr("file_append: cannot open file");
-    }
-    fwrite(content->data, 1, content->len, f);
-    fclose(f);
-}
-
-int llvm_dm_file_exists(const dm_string* path) {
-    char* cpath = (char*)malloc(path->len + 1);
-    memcpy(cpath, path->data, path->len);
-    cpath[path->len] = '\0';
-    FILE* f = fopen(cpath, "r");
-    free(cpath);
-    if (f) { fclose(f); return 1; }
-    return 0;
-}
-
-// =====================================================================
-// System/process
-// =====================================================================
-
-int64_t llvm_dm_system(const dm_string* cmd) {
-    char* c = (char*)malloc(cmd->len + 1);
-    memcpy(c, cmd->data, cmd->len);
-    c[cmd->len] = '\0';
-    int result = system(c);
-    free(c);
-    return (int64_t)result;
-}
-
-int64_t dm_args_len(void) {
-    return (int64_t)dm_argc;
-}
-
-// Keep the llvm_ prefix version for backward compat
-int64_t llvm_dm_args_len(void) {
-    return dm_args_len();
-}
-
-void llvm_dm_args_get(dm_string* out, int64_t idx) {
-    if (idx < 0 || idx >= (int64_t)dm_argc) {
-        *out = (dm_string){ .data = "", .len = 0, .cap = 0 };
-        return;
-    }
-    *out = dm_string_new(dm_argv[idx]);
 }
 
 // =====================================================================

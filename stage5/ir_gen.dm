@@ -831,9 +831,12 @@ fn map_builtin_name(name: string) -> string {
 --     sign-extended by T); float loads widen to float. Stores narrow v.
 --   addr_of(place): the address of a variable, field or list element
 --   size_of[T](): the size of type T in bytes
---   string_data(s): the address of a string's bytes (not NUL-terminated)
+--   string_data(s): the address of a string's bytes, which a NUL byte
+--     follows unless string_from_raw made the string without one
 --   string_from_raw(ptr, len, cap): the string at ptr; cap 0 marks
 --     memory the string does not own
+--   symbol_addr("name"): the address of the data symbol `name`, such
+--     as a C library's global variable
 -- ============================================================
 
 -- The memory type a load_T or store_T builtin accesses, or ""
@@ -853,7 +856,7 @@ fn raw_mem_type(name: string) -> string {
 
 fn is_raw_builtin(name: string) -> bool {
     if raw_mem_type(name) != "" { return true }
-    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw"
+    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw" or name == "symbol_addr"
 }
 
 fn raw_builtin_return_type(name: string) -> string {

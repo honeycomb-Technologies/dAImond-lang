@@ -806,6 +806,25 @@ fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
         return emit_ir_cast(g, b, ir_val_sizeof(map_type_name(t)), "i64", "i64")
     }
 
+    -- symbol_addr("name"): lowered where the call is, see generate_call
+    if fn_name == "symbol_addr" {
+        if args[0].kind != EXPR_LITERAL_STRING() or args[0].str_val == "" {
+            g = ir_type_error(g, "symbol_addr() takes the name of a symbol as a string literal", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let sym = g.builder.next_id
+        let mut sym_inst = ir_inst_new(sym, OP_CALL())
+        sym_inst.callee = "dm_symbol_addr"
+        let mut sym_args: List[IRValue] = []
+        sym_args.push(ir_val_string(args[0].str_val))
+        sym_inst.call_args = sym_args
+        sym_inst.result_type = "i64"
+        sym_inst.has_result = true
+        b.instructions.push(sym_inst)
+        g.builder.next_id = sym + 1
+        return expr_result(g, b, sym)
+    }
+
     -- load_T(addr)
     if starts_with(fn_name, "load_") {
         let p = generate_raw_ptr_arg(g, b, fn_name, args[0])

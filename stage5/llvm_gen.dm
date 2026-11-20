@@ -56,6 +56,9 @@ struct LLVMGenerator {
     -- functions bound to the same symbol share it; each keeps its own
     -- function type in fn_type_map.
     c_symbols: Map[string, int],
+    -- The LLVM global of each data symbol declared so far: main's
+    -- argument count and vector, and the symbols symbol_addr names
+    data_symbols: Map[string, int],
     -- Runtime functions written in dAImond: "dm_X" is here when the
     -- program defines rt_X, which then stands in for the C function
     rt_ports: Map[string, bool],
@@ -101,6 +104,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
             c_symbols: Map_new(),
+            data_symbols: Map_new(),
             rt_ports: Map_new(),
             panic_blocks: Map_new(),
             ir_module: ir_mod,
@@ -534,6 +538,33 @@ fn is_list_new_fn(name: string) -> bool {
     return name == "dm_list_int64_new" or name == "dm_list_double_new" or name == "dm_list_string_new" or name == "dm_list_generic_new"
 }
 
+-- Declare the data symbol `symbol` as a variable of type `ty`, unless
+-- it is declared already; afterwards gen.data_symbols.get(symbol) is
+-- its LLVM global. It is defined elsewhere unless it is later given
+-- an initializer.
+fn declare_data_symbol(gen: LLVMGenerator, symbol: string, ty: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.data_symbols.contains(symbol) == false {
+            let global = dm_llvm_module_add_global(g.llvm_module, ty, symbol)
+            dm_llvm_set_linkage(global, dm_llvm_external_linkage())
+            g.data_symbols.insert(symbol, global)
+        }
+        return g
+    }
+}
+
+-- Declare dm_argc and dm_argv, where main keeps its argument count and
+-- vector for the runtime's args_len and args_get. The module that has
+-- main defines them.
+fn declare_main_args(gen: LLVMGenerator) -> LLVMGenerator {
+    unsafe {
+        let mut g = declare_data_symbol(gen, "dm_argc", dm_llvm_int32_type(gen.context))
+        g = declare_data_symbol(g, "dm_argv", dm_llvm_pointer_type(gen.context))
+        return g
+    }
+}
+
 -- Whether rt_X may stand in for a parameter or return of type
 -- `declared`: with the same type, or with an int where dm_X has a pointer
 fn port_type_matches(declared: string, ported: string) -> bool {
@@ -849,12 +880,13 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                 dm_llvm_position_at_end(g.builder, entry_bb)
                 -- Pre-generate argc/argv for main
                 if func.name == "main" {
-                    let i32_ty = dm_llvm_int32_type(ctx)
-                    let ptr_ty = dm_llvm_pointer_type(ctx)
-                    let argc_global = dm_llvm_module_add_global(g.llvm_module, i32_ty, "dm_argc")
-                    dm_llvm_set_linkage(argc_global, dm_llvm_external_linkage())
-                    let argv_global = dm_llvm_module_add_global(g.llvm_module, ptr_ty, "dm_argv")
-                    dm_llvm_set_linkage(argv_global, dm_llvm_external_linkage())
+                    -- This module defines the two symbols: giving them
+                    -- an initial value makes them definitions
+                    g = declare_main_args(g)
+                    let argc_global = g.data_symbols.get("dm_argc")
+                    let argv_global = g.data_symbols.get("dm_argv")
+                    dm_llvm_set_initializer(argc_global, dm_llvm_const_null(dm_llvm_int32_type(ctx)))
+                    dm_llvm_set_initializer(argv_global, dm_llvm_const_null(dm_llvm_pointer_type(ctx)))
                     let argc_param = dm_llvm_get_param(llvm_fn, func.params.len())
                     let argv_param = dm_llvm_get_param(llvm_fn, func.params.len() + 1)
                     dm_llvm_build_store(g.builder, argc_param, argc_global)
@@ -1974,6 +2006,7 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = declare_struct_types(g)
     -- Phase 2: Generate global variables
     g = generate_globals(g)
+    g = declare_main_args(g)
     -- Phase 3: Declare all functions
     g = find_runtime_ports(g)
     let mut i = 0

@@ -230,6 +230,17 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         if is_range_check_fn(callee_name) and inst.call_args.len() >= 2 {
             return generate_range_check(g, inst)
         }
+        -- symbol_addr("name"): the address of a data symbol
+        if callee_name == "dm_symbol_addr" and inst.call_args.len() == 1 {
+            let symbol = inst.call_args[0].str_val
+            if g.function_map.contains(symbol) or g.c_symbols.contains(symbol) {
+                g.type_errors.push("Error: symbol_addr(\"" + symbol + "\") names a function, not a data symbol" + type_error_location(g))
+            }
+            g = declare_data_symbol(g, symbol, dm_llvm_int8_type(g.context))
+            let symbol_addr = dm_llvm_build_ptr_to_int(b, g.data_symbols.get(symbol), dm_llvm_int64_type(g.context), "symbol.addr")
+            if inst.has_result { g.value_map.insert(id_key, symbol_addr) }
+            return g
+        }
         -- len(s) reads the string's length field
         if callee_name == "dm_string_len" and inst.call_args.len() == 1 {
             let s_arg = inst.call_args[0]
