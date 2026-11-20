@@ -78,6 +78,9 @@ struct IRGenerator {
     lambda_captures: Map[string, string],
     -- Method name -> struct type name
     method_struct_map: Map[string, string],
+    -- The functions of impl blocks that take no self, by mangled name
+    -- ("Point_new"): they are called on the type, as Point.new(...)
+    static_fns: Map[string, bool],
     -- Variable name -> struct type name
     var_struct_types: Map[string, string],
     -- Function name -> pipe-delimited mut param flags
@@ -157,6 +160,8 @@ struct IRGenerator {
     -- Declared source return types of functions and impl methods
     -- (methods keyed Type_method), as written in the source
     fn_src_return_types: Map[string, string],
+    -- Function name -> its parameters' source types, joined with "|"
+    fn_src_param_types: Map[string, string],
     -- Source type of each variable in the current function, as written
     -- or as resolved by static_type; reset per function
     var_src_types: Map[string, string],
@@ -185,6 +190,7 @@ fn ir_generator_new() -> IRGenerator {
         fn_ptr_vars: Map_new(),
         lambda_captures: Map_new(),
         method_struct_map: Map_new(),
+        static_fns: Map_new(),
         var_struct_types: Map_new(),
         mut_param_fns: Map_new(),
         enum_defs: Map_new(),
@@ -224,6 +230,7 @@ fn ir_generator_new() -> IRGenerator {
         linked_fns: Map_new(),
         type_errors: [],
         fn_src_return_types: Map_new(),
+        fn_src_param_types: Map_new(),
         var_src_types: Map_new(),
         generic_struct_decls: Map_new(),
         generic_struct_params: Map_new(),
@@ -234,6 +241,20 @@ fn ir_generator_new() -> IRGenerator {
 
 -- Record a compile error for an expression IR generation cannot resolve.
 -- Generation continues with a placeholder so every error is reported.
+-- The source types of a function's parameters, joined with "|"
+fn param_src_types(fd: FunctionDecl) -> string {
+    let mut joined = ""
+    let mut i = 0
+    while i < fd.params.len() {
+        if i > 0 {
+            joined = joined + "|"
+        }
+        joined = joined + fd.params[i].type_name
+        i = i + 1
+    }
+    return joined
+}
+
 fn ir_type_error(gen: IRGenerator, msg: string, line: int) -> IRGenerator {
     let mut g = gen
     g.type_errors.push("Error: " + msg + " at line " + int_to_string(line))
@@ -1049,6 +1070,7 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
             }
             g.fn_return_types.insert(fd.name, ret)
             g.fn_src_return_types.insert(fd.name, ret_src)
+            g.fn_src_param_types.insert(fd.name, param_src_types(fd))
             -- Mut params change how callers pass arguments, so calls that
             -- precede the declaration must know about them too
             let mut mut_flags = ""
@@ -1090,6 +1112,7 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
                 }
                 g.fn_return_types.insert(method_name, mret)
                 g.fn_src_return_types.insert(method_name, msrc)
+                g.fn_src_param_types.insert(method_name, param_src_types(method))
                 mi = mi + 1
             }
         }

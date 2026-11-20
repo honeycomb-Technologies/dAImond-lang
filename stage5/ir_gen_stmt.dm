@@ -231,6 +231,12 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         type_str = canon_type(g, type_str)
     }
 
+    -- A string, a bool or a number where the annotation asks for
+    -- another of them
+    if len(type_str) > 0 {
+        g = check_basic_type(g, type_str, *stmt.let_value, "the value of '" + var_name + "'")
+    }
+
     -- Record the variable's source type: the annotation, else the type
     -- resolved from the value expression
     let src_type = if len(type_str) > 0 { type_str } else { static_type(g, *stmt.let_value) }

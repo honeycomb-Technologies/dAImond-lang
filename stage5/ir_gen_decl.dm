@@ -207,6 +207,14 @@ fn register_impl_methods(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
         -- instance type, never by method name alone
         if ib.generic_params.len() == 0 {
             g.method_struct_map.insert(ib.methods[i].name, struct_name)
+            let method = ib.methods[i]
+            let mut takes_self = false
+            if method.params.len() > 0 {
+                takes_self = method.params[0].name == "self"
+            }
+            if takes_self == false {
+                g.static_fns.insert(struct_name + "_" + method.name, true)
+            }
         }
 
         -- For generic impl blocks, register each method as a generic fn decl

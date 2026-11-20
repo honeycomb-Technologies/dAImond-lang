@@ -111,6 +111,10 @@ fn generate_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResul
         return generate_function_call(gen, block, expr)
     }
     if expr.kind == EXPR_METHOD_CALL() {
+        let static_target = static_call_target(gen, expr)
+        if static_target != "" {
+            return generate_function_call(gen, block, static_call_expr(expr, static_target))
+        }
         return generate_method_call(gen, block, expr)
     }
     if expr.kind == EXPR_FIELD_ACCESS() {
@@ -595,6 +599,51 @@ fn map_instance_arg(gen: IRGenerator, t: string, which: int) -> string {
     return ""
 }
 
+-- Which of the basic kinds a source type is: "string", "bool" or
+-- "number" (an integer or a float type). "" for every other type.
+fn basic_type_kind(t: string) -> string {
+    if t == "string" or t == "bool" { return t }
+    if t == "int" or t == "float" or t == "f32" or t == "f64" { return "number" }
+    if t == "i8" or t == "i16" or t == "i32" or t == "i64" { return "number" }
+    if t == "u8" or t == "u16" or t == "u32" or t == "u64" { return "number" }
+    return ""
+}
+
+-- Report a string, a bool or a number given where another of the
+-- three is expected. `what` names the place, such as "argument 1 of
+-- 'f'". Values of other types, and values whose type is not known
+-- here, are left to the checks of code generation.
+fn check_basic_type(gen: IRGenerator, expected: string, value: Expr, what: string) -> IRGenerator {
+    let want = basic_type_kind(expected)
+    if want == "" { return gen }
+    let found = static_type(gen, value)
+    let got = basic_type_kind(found)
+    if got == "" or got == want { return gen }
+    return ir_type_error(gen, "type mismatch in " + what + ": expected " + expected + ", found " + found, value.line)
+}
+
+-- The function that a call written Type.name(args) calls, or "" when
+-- the call is a method call on a value. Box.new and Box.null are the
+-- builtins Box_new and Box_null; a function of an impl block that
+-- takes no self is called on its struct or enum. A variable in scope
+-- with the type's name is a value, so a call on it is a method call.
+fn static_call_target(gen: IRGenerator, expr: Expr) -> string {
+    let obj = *expr.object
+    if obj.kind != EXPR_IDENTIFIER() { return "" }
+    if gen.variable_map.contains(obj.name) { return "" }
+    if obj.name == "Box" and (expr.method == "new" or expr.method == "null") {
+        return "Box_" + expr.method
+    }
+    let target = obj.name + "_" + expr.method
+    if gen.static_fns.contains(target) { return target }
+    return ""
+}
+
+-- The call Type.name(args) as the call of the function `target`
+fn static_call_expr(expr: Expr, target: string) -> Expr {
+    return expr_call(expr_ident(target, expr.line, expr.col), expr.args, expr.line, expr.col)
+}
+
 -- Map_new() or Map.new()
 fn is_map_ctor(e: Expr) -> bool {
     if e.kind == EXPR_FUNCTION_CALL() and e.args.len() == 0 {
@@ -969,6 +1018,14 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_BOOL() { return "bool" }
     if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
     if k == EXPR_GROUPED() { return static_type(gen, *expr.operand) }
+    if k == EXPR_BINARY() {
+        -- Two strings joined are a string; other operators may be
+        -- overloaded, so their type is not known here
+        if expr.op == BINOP_ADD() and static_type(gen, *expr.left) == "string" and static_type(gen, *expr.right) == "string" {
+            return "string"
+        }
+        return ""
+    }
     if k == EXPR_IDENTIFIER() {
         if gen.var_src_types.contains(expr.name) { return gen.var_src_types.get(expr.name) }
         if gen.var_struct_types.contains(expr.name) { return gen.var_struct_types.get(expr.name) }
@@ -1009,6 +1066,10 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
         return ""
     }
     if k == EXPR_METHOD_CALL() {
+        let static_target = static_call_target(gen, expr)
+        if static_target != "" {
+            return static_type(gen, static_call_expr(expr, static_target))
+        }
         let recv_t = strip_box_type(static_type(gen, *expr.object))
         let m = expr.method
         if gen.generic_instances.contains(recv_t) {
@@ -1023,6 +1084,7 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
             if gen.fn_src_return_types.contains(key) { return gen.fn_src_return_types.get(key) }
             return ""
         }
+        if recv_t == "string" and m == "len" { return "int" }
         if starts_with(recv_t, "List[") {
             if m == "len" { return "int" }
             if m == "pop" or m == "get" { return extract_inner_type(recv_t, "List[") }
@@ -1639,6 +1701,10 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
         return "i64"
     }
     if expr.kind == EXPR_METHOD_CALL() {
+        let static_target = static_call_target(gen, expr)
+        if static_target != "" {
+            return infer_expr_type(gen, static_call_expr(expr, static_target))
+        }
         let method = expr.method
         -- Methods of generic struct instances have exact signatures
         if gen.generic_instances.contains(strip_box_type(static_type(gen, *expr.object))) {
@@ -2769,6 +2835,16 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return generate_expr(g, b, expr_call(expr_ident(hash_fn, expr.line, expr.col), hash_args, expr.line, expr.col))
     }
 
+    -- len() of a number or a bool is an error
+    if fn_name == "len" and expr.args.len() == 1 {
+        let len_arg_type = static_type(g, expr.args[0])
+        let len_arg_kind = basic_type_kind(len_arg_type)
+        if len_arg_kind == "number" or len_arg_kind == "bool" {
+            g = ir_type_error(g, "len() takes a string, a list, a map or an array, not " + len_arg_type, expr.line)
+            return expr_result(g, b, 0)
+        }
+    }
+
     -- len(m) on a map is m.len()
     if fn_name == "len" and expr.args.len() == 1 {
         if is_map_type(g, static_type(g, expr.args[0])) {
@@ -2835,7 +2911,7 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     }
 
     -- Check if function is defined
-    if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false {
+    if g.known_functions.contains(fn_name) == false and is_builtin_fn(fn_name) == false and g.generic_fn_decls.contains(fn_name) == false and g.user_extern_fns.contains(fn_name) == false and g.method_struct_map.contains(fn_name) == false and g.static_fns.contains(fn_name) == false {
         eprintln("Error: undefined function '" + fn_name + "' at line " + int_to_string(expr.line))
         exit(1)
     }
@@ -2870,10 +2946,19 @@ fn generate_normal_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
         mut_flags_list = string_split(mut_flags_str, "|")
     }
 
+    -- The parameters' source types, for the type-mismatch check
+    let mut param_types: List[string] = []
+    if g.fn_src_param_types.contains(fn_name) {
+        param_types = string_split(g.fn_src_param_types.get(fn_name), "|")
+    }
+
     -- Generate all argument expressions
     let mut call_args: List[IRValue] = []
     let mut i = 0
     while i < args.len() {
+        if i < param_types.len() {
+            g = check_basic_type(g, param_types[i], args[i], "argument " + int_to_string(i + 1) + " of '" + fn_name + "'")
+        }
         -- Check if this arg position is a mut parameter
         let is_mut_arg = if i < mut_flags_list.len() {
             mut_flags_list[i] == "1"
@@ -3532,8 +3617,8 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     -- --------------------------------------------------------
     if obj_expr.kind == EXPR_IDENTIFIER() {
         let obj_name = obj_expr.name
-        if g.enum_defs.contains(obj_name) {
-            return generate_enum_method_construct(g, b, obj_name, method_name, args)
+        if g.enum_defs.contains(obj_name) and g.variable_map.contains(obj_name) == false {
+            return generate_enum_method_construct(g, b, obj_name, method_name, args, expr.line)
         }
     }
 
@@ -3594,6 +3679,18 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     -- --------------------------------------------------------
     -- String .len() method
     -- --------------------------------------------------------
+    -- s.len() on any string-typed expression is len(s), and on a boxed
+    -- string it is the length of the string in the box
+    let len_recv_type = if method_name == "len" and args.len() == 0 { static_type(g, obj_expr) } else { "" }
+    if len_recv_type == "string" or len_recv_type == "Box[string]" {
+        let mut len_args: List[Expr] = []
+        if len_recv_type == "string" {
+            len_args.push(obj_expr)
+        } else {
+            len_args.push(expr_unary(UNOP_DEREF(), obj_expr, expr.line, expr.col))
+        }
+        return generate_function_call(g, b, expr_call(expr_ident("len", expr.line, expr.col), len_args, expr.line, expr.col))
+    }
     if method_name == "len" and args.len() == 0 {
         if len(obj_var_name) > 0 and g.variable_types.contains(obj_var_name) {
             let vtype = g.variable_types.get(obj_var_name)
@@ -3691,7 +3788,7 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 -- Handles EnumName.Variant(payload...) as a method call.
 -- ============================================================
 
-fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_name: string, variant_name: string, args: List[Expr]) -> ExprResult {
+fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_name: string, variant_name: string, args: List[Expr], line: int) -> ExprResult {
     let mut g = gen
     let mut b = block
 
@@ -3710,7 +3807,7 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
     }
 
     if tag < 0 {
-        -- Variant not found; return undef
+        g = ir_type_error(g, "enum '" + enum_name + "' has no variant or function '" + variant_name + "'", line)
         return expr_result(g, b, 0)
     }
 
@@ -7712,7 +7809,13 @@ fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
     }
     let arm = arms[0]
     if arm.is_expr_body {
-        return infer_expr_type(gen, *arm.body_expr)
+        -- Arms that give no value, such as calls of println, leave the
+        -- result slot unused; it still needs a type that has a size
+        let arm_type = infer_expr_type(gen, *arm.body_expr)
+        if arm_type == "void" {
+            return "i64"
+        }
+        return arm_type
     }
     return "i64"
 }

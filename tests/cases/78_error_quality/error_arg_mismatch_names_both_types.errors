@@ -1,0 +1,2 @@
+type mismatch in argument 1 of 'take_int': expected int, found string at line 6
+Error: 1 type errors
