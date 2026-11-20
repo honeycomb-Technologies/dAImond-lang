@@ -257,6 +257,38 @@ const stage5_list_tests = [_]TestCase{
     },
 };
 
+/// String functions where Stage 0 behaves differently: it crashes on a
+/// pattern longer than the string, leaves a string whole when split on
+/// "", and counts "_" as a letter.
+const stage5_string_tests = [_]TestCase{
+    .{
+        .name = "string_pattern_edges",
+        .source =
+            \\module test
+            \\
+            \\fn show(parts: List[string]) -> string {
+            \\    let mut out = int_to_string(parts.len()) + ":"
+            \\    for p in parts {
+            \\        out = out + "[" + p + "]"
+            \\    }
+            \\    return out
+            \\}
+            \\
+            \\fn main() {
+            \\    -- A pattern longer than the string is not found
+            \\    println(show(string_split("ab", "abc")))
+            \\    println("[" + string_replace("", "a", "b") + "][" + string_replace("ab", "abc", "x") + "]")
+            \\    -- An empty delimiter splits a string into its bytes
+            \\    println(show(string_split("abc", "")))
+            \\    if is_alpha("_") {
+            \\        println("underscore is a letter")
+            \\    }
+            \\}
+        ,
+        .expected_output = "1:[ab]\n[][ab]\n3:[a][b][c]\n",
+    },
+};
+
 /// Raw memory, C-width integers and variadic externs: the primitives
 /// the runtime is written with. Stage 0 has none of them.
 const stage5_primitive_tests = [_]TestCase{
@@ -561,6 +593,7 @@ pub fn main() !void {
         .{ .name = "Generic Structs", .tests = &generic_struct_tests },
         .{ .name = "Maps (Stage 5)", .tests = &stage5_map_tests },
         .{ .name = "Lists (Stage 5)", .tests = &stage5_list_tests },
+        .{ .name = "Strings (Stage 5)", .tests = &stage5_string_tests },
         .{ .name = "Runtime Primitives", .tests = &stage5_primitive_tests },
     };
 
