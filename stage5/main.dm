@@ -21630,7 +21630,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "4fbffdcfb275b6db"
+    return "d02c405d2bf8d781"
 }
 
 
@@ -22002,25 +22002,23 @@ fn add_llvm_bridge(sf: SourceFile, bridge_sf: SourceFile) -> SourceFile {
 -- Handles transitive and diamond imports via deduplication.
 fn resolve_imports(sf: SourceFile, input_dir: string, verbose: bool) -> SourceFile {
     let mut merged = source_file_new(sf.module_name)
-    let mut loaded: Map[string, bool] = Map_new()
-    let mut decls: List[Declaration] = []
+    let mut state = Imports { loaded: [], decls: [] }
 
     -- Process each import
     let mut i = 0
     while i < sf.imports.len() {
-        let imp = sf.imports[i]
-        decls = process_import(imp, input_dir, loaded, decls, verbose)
+        state = process_import(sf.imports[i], input_dir, state, verbose)
         i = i + 1
     }
 
     -- Add the original file's declarations after imported ones
     let mut j = 0
     while j < sf.declarations.len() {
-        decls.push(sf.declarations[j])
+        state.decls.push(sf.declarations[j])
         j = j + 1
     }
 
-    merged.declarations = decls
+    merged.declarations = state.decls
     return merged
 }
 
@@ -22152,17 +22150,29 @@ fn resolve_import_path(import_path: string, base_dir: string) -> string {
     return result + ".dm"
 }
 
+-- The files imported so far and their declarations. It is passed to
+-- process_import and returned by it, so that a file imported by two
+-- files is known to both.
+struct Imports {
+    loaded: List[string],
+    decls: List[Declaration]
+}
+
 -- Process a single import, recursively loading transitive imports
-fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], decls: List[Declaration], verbose: bool) -> List[Declaration] {
-    let mut result_decls = decls
+fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: bool) -> Imports {
+    let mut state = imports
 
     let file_path = resolve_import_path(imp.path, base_dir)
 
-    -- Skip already-loaded imports (diamond import deduplication)
-    if loaded.contains(file_path) {
-        return result_decls
+    -- A file is loaded once, however many files import it
+    let mut li = 0
+    while li < state.loaded.len() {
+        if state.loaded[li] == file_path {
+            return state
+        }
+        li = li + 1
     }
-    loaded.insert(file_path, true)
+    state.loaded.push(file_path)
 
     if verbose {
         println("  Loading import: " + file_path)
@@ -22171,7 +22181,7 @@ fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], 
     -- Check if file exists
     if file_exists(file_path) == false {
         eprintln("Error: import file not found: " + file_path)
-        return result_decls
+        exit(1)
     }
 
     -- Read, tokenize, and parse the imported file
@@ -22192,18 +22202,18 @@ fn process_import(imp: ImportDecl, base_dir: string, loaded: Map[string, bool], 
     let import_dir = dirname(file_path)
     let mut k = 0
     while k < imp_sf.imports.len() {
-        result_decls = process_import(imp_sf.imports[k], import_dir, loaded, result_decls, verbose)
+        state = process_import(imp_sf.imports[k], import_dir, state, verbose)
         k = k + 1
     }
 
     -- Add declarations from the imported file
     let mut m = 0
     while m < imp_sf.declarations.len() {
-        result_decls.push(imp_sf.declarations[m])
+        state.decls.push(imp_sf.declarations[m])
         m = m + 1
     }
 
-    return result_decls
+    return state
 }
 
 -- ============================================================
@@ -22776,6 +22786,17 @@ fn compile(cli: CLIArgs) -> int {
         let input_dir = dirname(input_file)
         sf = resolve_imports(sf, input_dir, verbose)
     }
+    -- A name declared twice, in the file or in two of the files it is
+    -- made of
+    let duplicate_errors = duplicate_declarations(sf)
+    if duplicate_errors.len() > 0 {
+        let mut di2 = 0
+        while di2 < duplicate_errors.len() {
+            eprintln(duplicate_errors[di2])
+            di2 = di2 + 1
+        }
+        exit(1)
+    }
     -- --link-llvm: the program is the compiler, which needs the LLVM bridge
     if cli.link_llvm {
         let bridge_file = find_bridge_file(dirname(input_file))
@@ -23180,6 +23201,73 @@ fn validate_effects(sf: SourceFile) -> List[string] {
 -- ============================================================
 -- COMPILATION PIPELINE
 -- ============================================================
+
+-- An error for each function, type or constant that is declared more
+-- than once. Functions are one set of names; structs, enums and traits
+-- another; constants a third. An extern fn may be declared in several
+-- files.
+fn duplicate_declarations(sf: SourceFile) -> List[string] {
+    let mut errors: List[string] = []
+    let mut functions: Map[string, int] = Map_new()
+    let mut types: Map[string, int] = Map_new()
+    let mut constants: Map[string, int] = Map_new()
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        let mut what = ""
+        let mut name = ""
+        let mut line = 0
+        let mut first_line = -1
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.is_extern == false and fd.name != "__error__" {
+                what = "function"
+                name = fd.name
+                line = fd.line
+                if functions.contains(name) {
+                    first_line = functions.get(name)
+                } else {
+                    functions.insert(name, line)
+                }
+            }
+        } else if decl.kind == DECL_STRUCT() or decl.kind == DECL_ENUM() or decl.kind == DECL_TRAIT() {
+            what = "type"
+            if decl.kind == DECL_STRUCT() {
+                let sd = *decl.struct_decl
+                name = sd.name
+                line = sd.line
+            } else if decl.kind == DECL_ENUM() {
+                let ed = *decl.enum_decl
+                name = ed.name
+                line = ed.line
+            } else {
+                let td = *decl.trait_decl
+                name = td.name
+                line = td.line
+            }
+            if types.contains(name) {
+                first_line = types.get(name)
+            } else {
+                types.insert(name, line)
+            }
+        } else if decl.kind == DECL_CONST() {
+            let cd = *decl.const_decl
+            what = "constant"
+            name = cd.name
+            line = cd.line
+            if constants.contains(name) {
+                first_line = constants.get(name)
+            } else {
+                constants.insert(name, line)
+            }
+        }
+        if first_line >= 0 {
+            errors.push("Error: " + what + " '" + name + "' is declared more than once (first at line " + int_to_string(first_line) + ") at line " + int_to_string(line))
+        }
+        i = i + 1
+    }
+    return errors
+}
 
 fn validate_source_file(sf: SourceFile) -> List[string] {
     let mut errors: List[string] = []

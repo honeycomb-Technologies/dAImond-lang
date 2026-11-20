@@ -1,0 +1,16 @@
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}
+open main.dm
+# 1: the outline
+ask documentSymbol main.dm
+# 2: the whole document, formatted
+ask formatting main.dm
+# 3: hover on `name`, after é and an emoji: a character is a UTF-16 code unit,
+# of which é is one and the emoji two
+ask hover main.dm 29 23
+# 4: a place past the end of its line is the end of the line
+ask hover main.dm 30 200
+change main.dm formatted.dm
+# 5: a formatted document needs no edit
+ask formatting main.dm
+{"jsonrpc":"2.0","id":99,"method":"shutdown"}
+{"jsonrpc":"2.0","method":"exit"}

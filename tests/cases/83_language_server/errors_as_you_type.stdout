@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","id":"start","result":{"capabilities":{"textDocumentSync":{"openClose":true,"change":1,"save":true},"completionProvider":{"triggerCharacters":["."]},"hoverProvider":true,"definitionProvider":true,"referencesProvider":true,"documentSymbolProvider":true,"signatureHelpProvider":{"triggerCharacters":["(",","]},"documentFormattingProvider":true},"serverInfo":{"name":"daimond-lsp","version":"0.1.0"}}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$DIR/main.dm","diagnostics":[{"range":{"start":{"line":7,"character":4},"end":{"line":7,"character":26}},"severity":1,"source":"daimond","message":"type mismatch in the value of 'total': expected int, found string"}]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$DIR/main.dm","diagnostics":[{"range":{"start":{"line":9,"character":4},"end":{"line":9,"character":10}},"severity":1,"source":"daimond","message":"expected ')' but got 'return'"}]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$DIR/main.dm","diagnostics":[]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$DIR/main.dm","diagnostics":[]}}
+{"jsonrpc":"2.0","id":100,"error":{"code":-32601,"message":"method not found"}}
+{"jsonrpc":"2.0","id":101,"result":null}

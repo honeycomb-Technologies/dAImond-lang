@@ -1,0 +1,48 @@
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}
+open main.dm
+# 1: hover on paint_needed, a function of the imported file, with its comment
+ask hover main.dm 19 26
+# 2: on room, a local
+ask hover main.dm 19 39
+# 3: on coat, the variable of the for loop
+ask hover main.dm 19 45
+# 4: on level, bound by a match arm
+ask hover main.dm 9 63
+# 5: on shade, a parameter
+ask hover main.dm 7 12
+# 6: on width after a dot, a field
+ask hover main.dm 22 67
+# 7: on int_to_string, a builtin
+ask hover main.dm 22 15
+# 8: on match, a keyword
+ask hover main.dm 7 5
+# 9: on Rect, a struct, with its two lines of comment and no rule
+ask hover main.dm 15 16
+# 10: on the module name of the import
+ask hover main.dm 2 9
+# 11: on a blank place
+ask hover main.dm 3 0
+# 12: definition of paint_needed, in the other file
+ask definition main.dm 19 26
+# 13: of square after Rect.
+ask definition main.dm 15 22
+# 14: of total, a local
+ask definition main.dm 22 28
+# 15: of COATS, from its use
+ask definition main.dm 17 31
+# 16: of shapes, the imported file
+ask definition main.dm 2 9
+# 17: of Tint
+ask definition main.dm 9 15
+# 18: of println, which has none
+ask definition main.dm 22 6
+# 19: references of total: its four, none in the comment or the string
+ask references main.dm 16 14
+# 20: of Rect, in both files
+ask references main.dm 15 16
+# 21: of paint_needed without its declaration
+{"jsonrpc":"2.0","id":"without","method":"textDocument/references","params":{"textDocument":{"uri":"file://$DIR/main.dm"},"position":{"line":19,"character":26},"context":{"includeDeclaration":false}}}
+# 21: in a document that is not open
+ask hover shapes.dm 8 8
+{"jsonrpc":"2.0","id":99,"method":"shutdown"}
+{"jsonrpc":"2.0","method":"exit"}

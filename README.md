@@ -20,7 +20,7 @@ bash bootstrap.sh          # builds build/daimond
 build/daimond examples/hello.dm -o hello && ./hello
 ```
 
-To run the test suite (409 cases, about a minute):
+To run the test suite (417 cases, about a minute):
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
@@ -31,7 +31,7 @@ build/harness build/daimond
 
 ### Stage 0 (the Zig bootstrap compiler)
 
-Stage 0 is the older compiler, which emits C. `pkg` and the LSP still live there; `run`, `check`, `fmt` and `test` are also in the Stage 5 compiler (`build/daimond run file.dm -- args`, `build/daimond check file.dm`, `build/daimond fmt file.dm`, `build/daimond test file.dm`).
+Stage 0 is the older compiler, which emits C. `pkg` still lives there, and an older language server. The language server in dAImond is `lsp/` (`build/daimond lsp/main.dm -o build/daimond-lsp`; it runs the `daimond` next to it). `run`, `check`, `fmt` and `test` are also in the Stage 5 compiler (`build/daimond run file.dm -- args`, `build/daimond check file.dm`, `build/daimond fmt file.dm`, `build/daimond test file.dm`).
 
 #### Prerequisites
 
@@ -211,6 +211,7 @@ dAImond-lang/
 ├── docs/                      # Design documents
 │   ├── ir-spec.md             # dAImond IR specification (SSA-based, typed)
 │   └── llvm-backend.md        # Stage 3 LLVM backend architecture
+├── lsp/                       # The language server, written in dAImond (it runs the compiler for errors and declarations)
 └── tests/                     # Integration tests
     ├── harness.dm             # The test harness, written in dAImond
     └── cases/                 # The Stage 5 suite: one directory per suite, one program and its expected output per case
@@ -458,7 +459,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 409/409 cases pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code). `bootstrap.sh` builds it from a committed seed with LLVM's tools alone; Stage 0 (Zig) is no longer needed to build or test the compiler, only for the tools that have not been ported. Programs it builds contain no C and are linked by `ld.lld`
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 417/417 cases pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code). `bootstrap.sh` builds it from a committed seed with LLVM's tools alone; Stage 0 (Zig) is no longer needed to build or test the compiler, only for the tools that have not been ported. Programs it builds contain no C and are linked by `ld.lld`
 
 ## Current Status
 
@@ -518,7 +519,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] `daimond fmt` -- Code formatter (indent normalization)
 - [x] `daimond test` -- Testing framework (test_* discovery, panic catching, assert/assert_eq)
 - [x] `daimond pkg` -- Package manager (TOML manifest, version/path/git dependencies)
-- [x] `daimond-lsp` -- Language Server Protocol (diagnostics, completion, hover)
+- [x] `daimond-lsp` -- Stage 0's Language Server Protocol server (diagnostics, completion, hover); the current one is `lsp/`, in dAImond
 
 ### Stage 3 LLVM Backend -- Complete
 - [x] LLVM backend with full test parity (254/254 integration tests match Stage 0 output)
@@ -531,7 +532,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 
 ### Stage 5 LLVM Backend in dAImond -- In Progress
 - [x] Entire LLVM backend written in dAImond (~22K lines monolithic, ~15 split modules)
-- [x] Passes the integration suite (409/409, the 19 memory-safety probes among them)
+- [x] Passes the integration suite (417/417, the 19 memory-safety probes among them)
 - [x] Test harness written in dAImond (`tests/harness.dm`), with the cases as plain files in `tests/cases/`
 - [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
 - [x] LLVM bridge written in dAImond over LLVM's C API (`llvm_bridge.dm`); `llvm_bridge.c` remains only for the compiler Stage 0 builds
@@ -559,7 +560,9 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Syntax errors are reported in Stage 5 (they were recorded and never printed), `symbols` and `--stdin` for editors
 - [ ] A full type checker in Stage 5
 - [x] `run`, `check`, `fmt` and `test` in the Stage 5 compiler, and `assert`/`assert_eq` that panic there (they did nothing before)
-- [ ] The LSP in dAImond, so that Stage 0, `llvm_bridge.c` and `daimond_runtime.c` can be deleted
+- [x] The language server in dAImond (`lsp/`): errors as you type, hover, go to definition, references, outline, completion, signature help, formatting
+- [x] A file imported by several files is compiled once; a name declared twice and a missing import are errors
+- [ ] Errors in an imported file name that file (today they give its line number alone), and debug info, after which Stage 0, `llvm_bridge.c` and `daimond_runtime.c` can be deleted
 
 ## Design Principles
 

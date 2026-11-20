@@ -1,0 +1,18 @@
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}
+# A syntax error in an imported file is shown where the file is imported
+open main.dm
+open helper.dm
+# The editor's text of helper.dm is fixed, but the file is not: main.dm reads the file
+change helper.dm helper_fixed.dm
+save helper.dm
+# An error with no line that names a function is shown at the function
+open effects.dm
+# An error with no line and no function is shown on the first line
+change effects.dm duplicate.dm
+# A document that is no file
+{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"untitled:Untitled-1","languageId":"daimond","version":1,"text":"module scratch\nfn main() -> int {\n    return nothing\n}\n"}}}
+{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":{"textDocument":{"uri":"untitled:Untitled-1"},"position":{"line":1,"character":4}}}
+# The same file by another spelling of its URI is the same document
+{"jsonrpc":"2.0","id":2,"method":"textDocument/hover","params":{"textDocument":{"uri":"file://$DIR/%6dain.dm"},"position":{"line":5,"character":14}}}
+{"jsonrpc":"2.0","id":99,"method":"shutdown"}
+{"jsonrpc":"2.0","method":"exit"}

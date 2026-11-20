@@ -1,0 +1,9 @@
+{"jsonrpc":"2.0","id":"start","method":"initialize","params":{"capabilities":{}}}
+{"jsonrpc":"2.0","method":"initialized","params":{}}
+open main.dm
+change main.dm missing_paren.dm
+change main.dm fixed.dm
+close main.dm
+{"jsonrpc":"2.0","id":100,"method":"workspace/symbol","params":{"query":"x"}}
+{"jsonrpc":"2.0","id":101,"method":"shutdown"}
+{"jsonrpc":"2.0","method":"exit"}

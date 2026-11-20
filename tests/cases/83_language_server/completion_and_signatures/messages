@@ -1,0 +1,19 @@
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}
+open main.dm
+# 1: in transfer, before `moved` is declared: its parameters and fee (once), then the rest
+ask completion main.dm 16 4
+# 2: after `acct.`: fields, methods and the builtin types' methods
+ask completion main.dm 22 21
+# 3: signature of transfer, in its second argument
+ask signatureHelp main.dm 23 41
+# 4: of deposit, a method, from inside its second argument, a string:
+# no self, and the comma and the bracket in the string do not count
+ask signatureHelp main.dm 22 47
+# 5: of substr, a builtin, in its third argument
+ask signatureHelp main.dm 24 31
+# 6: of int_to_string, in which the call of transfer is one argument
+ask signatureHelp main.dm 23 50
+# 7: where no call is open
+ask signatureHelp main.dm 25 12
+{"jsonrpc":"2.0","id":99,"method":"shutdown"}
+{"jsonrpc":"2.0","method":"exit"}
