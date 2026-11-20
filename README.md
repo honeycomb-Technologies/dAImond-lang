@@ -20,7 +20,7 @@ bash bootstrap.sh          # builds build/daimond
 build/daimond examples/hello.dm -o hello && ./hello
 ```
 
-To run the test suite (423 cases, about a minute):
+To run the test suite (429 cases, about a minute):
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
@@ -459,7 +459,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 423/423 cases pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code). `bootstrap.sh` builds it from a committed seed with LLVM's tools alone; Stage 0 (Zig) is no longer needed to build or test the compiler, only for the tools that have not been ported. Programs it builds contain no C and are linked by `ld.lld`
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 429/429 cases pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), and a self-build runs no C compiler (the LLVM bridge is dAImond code). `bootstrap.sh` builds it from a committed seed with LLVM's tools alone; Stage 0 (Zig) is no longer needed to build or test the compiler, only for the tools that have not been ported. Programs it builds contain no C and are linked by `ld.lld`
 
 ## Current Status
 
@@ -532,7 +532,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 
 ### Stage 5 LLVM Backend in dAImond -- In Progress
 - [x] Entire LLVM backend written in dAImond (~22K lines monolithic, ~15 split modules)
-- [x] Passes the integration suite (423/423, the 19 memory-safety probes among them)
+- [x] Passes the integration suite (429/429, the 19 memory-safety probes among them)
 - [x] Test harness written in dAImond (`tests/harness.dm`), with the cases as plain files in `tests/cases/`
 - [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
 - [x] LLVM bridge written in dAImond over LLVM's C API (`llvm_bridge.dm`); `llvm_bridge.c` remains only for the compiler Stage 0 builds

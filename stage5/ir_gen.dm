@@ -30,14 +30,60 @@ struct EnumInfo {
     variant_names: List[string],
     variant_tags: List[int],
     variant_payload_types: List[string],
-    variant_has_payload: List[bool]
+    variant_has_payload: List[bool],
+    -- The source types of the values each variant carries, joined with
+    -- "|"; "" for a variant that carries none
+    variant_payloads: List[string]
 }
 
 fn enum_info_new(name: string) -> EnumInfo {
     return EnumInfo {
         name: name, variant_names: [], variant_tags: [],
-        variant_payload_types: [], variant_has_payload: []
+        variant_payload_types: [], variant_has_payload: [],
+        variant_payloads: []
     }
+}
+
+-- "1 value" or "N values"
+fn values_text(n: int) -> string {
+    if n == 1 { return "1 value" }
+    return int_to_string(n) + " values"
+}
+
+-- The number of a variant by its name, or -1
+fn enum_variant_index(info: EnumInfo, name: string) -> int {
+    let mut i = 0
+    while i < info.variant_names.len() {
+        if info.variant_names[i] == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+-- The number of values a variant carries
+fn enum_payload_count(info: EnumInfo, variant: int) -> int {
+    let joined = info.variant_payloads[variant]
+    if joined == "" { return 0 }
+    return string_split(joined, "|").len()
+}
+
+-- The source type of value number `k` of a variant
+fn enum_payload_type(info: EnumInfo, variant: int, k: int) -> string {
+    let types = string_split(info.variant_payloads[variant], "|")
+    if k < types.len() { return types[k] }
+    return ""
+}
+
+-- The field of the enum's struct that holds a variant's first value.
+-- The struct is the tag, then the values of each variant in turn.
+fn enum_payload_field(info: EnumInfo, variant: int) -> int {
+    let mut field = 1
+    let mut i = 0
+    while i < variant {
+        field = field + enum_payload_count(info, i)
+        i = i + 1
+    }
+    return field
 }
 
 -- List element kind for typed list operations

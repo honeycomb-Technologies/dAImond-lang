@@ -288,6 +288,10 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
         if type_name == "i16" { return dm_llvm_int16_type(ctx) }
         if type_name == "i32" { return dm_llvm_int32_type(ctx) }
         if type_name == "i64" { return dm_llvm_int64_type(ctx) }
+        -- The source names of i64 and f64, which reach here inside
+        -- Option[...] and Result[...] taken from a function's signature
+        if type_name == "int" { return dm_llvm_int64_type(ctx) }
+        if type_name == "float" { return dm_llvm_double_type(ctx) }
         -- Unsigned types map to same LLVM int types (signedness is in instructions, not types)
         if type_name == "u8" { return dm_llvm_int8_type(ctx) }
         if type_name == "u16" { return dm_llvm_int16_type(ctx) }
@@ -1427,12 +1431,12 @@ fn resolve_value_with_counter(gen: LLVMGenerator, val: IRValue) -> LLVMGenerator
     return g
 }
 
--- A string or list value is a pointer to its storage. Where the
--- value itself is wanted (a by-value parameter or a return value of
--- that struct type), load it.
+-- A string or list value is a pointer to its storage, and so is a
+-- list literal that no variable holds. Where the value itself is
+-- wanted (a by-value parameter or a return value of that struct
+-- type), load it.
 fn load_handle_as(gen: LLVMGenerator, val: IRValue, v: int, want_ty: int) -> int {
     unsafe {
-        if is_string_ptr(gen, val) == false { return v }
         if dm_llvm_get_type_kind(want_ty) != 10 { return v }
         if dm_llvm_get_type_kind(dm_llvm_type_of(v)) != 12 { return v }
         return dm_llvm_build_load2(gen.builder, want_ty, v, "handle.val")
@@ -1973,6 +1977,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             -- If inserting a string value (pointer to dm_string), load the actual struct
             if is_string_ptr(g, inst.field_value) {
                 val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
+            } else if exp_ir_ty != "" and dm_llvm_get_type_kind(map_ir_type_to_llvm(g, exp_ir_ty)) == 10 and dm_llvm_get_type_kind(dm_llvm_type_of(val)) == 12 {
+                -- A list or struct that is held by its address
+                val = dm_llvm_build_load2(b, map_ir_type_to_llvm(g, exp_ir_ty), val, "field.load")
             }
             let result = dm_llvm_build_insert_value(b, base_val, val, inst.field_index, "insert")
             if inst.has_result { g.value_map.insert(id_key, result) }

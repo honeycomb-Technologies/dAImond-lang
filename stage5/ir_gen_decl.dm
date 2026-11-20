@@ -147,16 +147,27 @@ fn register_enum(gen: IRGenerator, ed: EnumDecl) -> IRGenerator {
 
         -- Check for payload types
         if v.has_payload and v.payload_types.len() > 0 {
-            let pt = v.payload_types[0]
-            info.variant_payload_types.push(pt)
+            -- A field of the struct for each value the variant carries
+            let mut joined = ""
+            let mut pi = 0
+            while pi < v.payload_types.len() {
+                g = ensure_type_instances(g, v.payload_types[pi], ed.line)
+                let pt = canon_type(g, v.payload_types[pi])
+                if pi == 0 {
+                    info.variant_payload_types.push(pt)
+                } else {
+                    joined = joined + "|"
+                }
+                joined = joined + pt
+                ir_fields.push(ir_field_new(v.name + "_" + int_to_string(pi), map_type_name(pt)))
+                pi = pi + 1
+            }
             info.variant_has_payload.push(true)
-            -- Add payload field to struct
-            let field_name = v.name + "_0"
-            let field_type = map_type_name(pt)
-            ir_fields.push(ir_field_new(field_name, field_type))
+            info.variant_payloads.push(joined)
         } else {
             info.variant_payload_types.push("")
             info.variant_has_payload.push(false)
+            info.variant_payloads.push("")
         }
 
         i = i + 1

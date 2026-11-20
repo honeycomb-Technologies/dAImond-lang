@@ -1,0 +1,4 @@
+Error: variant 'Shape.Rect' carries 2 values, not 1 at line 8
+Error: type mismatch in value 1 of 'Shape.Circle': expected int, found string at line 9
+Error: variant 'Shape.Circle' carries 1 value, but the pattern binds 2 at line 11
+Error: enum 'Shape' has no variant 'Square' at line 11

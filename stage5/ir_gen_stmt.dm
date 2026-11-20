@@ -366,6 +366,14 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
                 let elem_result = generate_expr(g, b, init_expr.elements[ei])
                 g = elem_result.gen
                 b = elem_result.block
+                if elem_kind == LIST_ELEM_OTHER() {
+                    -- A struct or another value stored whole
+                    let pushed = push_whole_value(g, b, alloca_id, elem_result.val_id, map_type_name(canon_type(g, inner)))
+                    g = pushed.gen
+                    b = pushed.block
+                    ei = ei + 1
+                    continue
+                }
                 let mut push_call_inst = ir_inst_new(g.builder.next_id, OP_CALL())
                 push_call_inst.callee = push_fn_name
                 let mut push_call_args: List[IRValue] = []
@@ -499,6 +507,9 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         g = result.gen
         b = result.block
         g.list_elem_kinds.insert(var_name, arr_elem_kind)
+        if arr_elem_kind == LIST_ELEM_OTHER() and (g.struct_defs.contains(arr_elem_type) or g.enum_defs.contains(arr_elem_type)) {
+            g.list_elem_types.insert(var_name, arr_elem_type)
+        }
         g.variable_map.insert(var_name, result.val_id)
         g.variable_types.insert(var_name, "list")
         return gen_result(g, b)

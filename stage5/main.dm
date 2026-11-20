@@ -4883,14 +4883,60 @@ struct EnumInfo {
     variant_names: List[string],
     variant_tags: List[int],
     variant_payload_types: List[string],
-    variant_has_payload: List[bool]
+    variant_has_payload: List[bool],
+    -- The source types of the values each variant carries, joined with
+    -- "|"; "" for a variant that carries none
+    variant_payloads: List[string]
 }
 
 fn enum_info_new(name: string) -> EnumInfo {
     return EnumInfo {
         name: name, variant_names: [], variant_tags: [],
-        variant_payload_types: [], variant_has_payload: []
+        variant_payload_types: [], variant_has_payload: [],
+        variant_payloads: []
     }
+}
+
+-- "1 value" or "N values"
+fn values_text(n: int) -> string {
+    if n == 1 { return "1 value" }
+    return int_to_string(n) + " values"
+}
+
+-- The number of a variant by its name, or -1
+fn enum_variant_index(info: EnumInfo, name: string) -> int {
+    let mut i = 0
+    while i < info.variant_names.len() {
+        if info.variant_names[i] == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+-- The number of values a variant carries
+fn enum_payload_count(info: EnumInfo, variant: int) -> int {
+    let joined = info.variant_payloads[variant]
+    if joined == "" { return 0 }
+    return string_split(joined, "|").len()
+}
+
+-- The source type of value number `k` of a variant
+fn enum_payload_type(info: EnumInfo, variant: int, k: int) -> string {
+    let types = string_split(info.variant_payloads[variant], "|")
+    if k < types.len() { return types[k] }
+    return ""
+}
+
+-- The field of the enum's struct that holds a variant's first value.
+-- The struct is the tag, then the values of each variant in turn.
+fn enum_payload_field(info: EnumInfo, variant: int) -> int {
+    let mut field = 1
+    let mut i = 0
+    while i < variant {
+        field = field + enum_payload_count(info, i)
+        i = i + 1
+    }
+    return field
 }
 
 -- List element kind for typed list operations
@@ -6159,16 +6205,27 @@ fn register_enum(gen: IRGenerator, ed: EnumDecl) -> IRGenerator {
 
         -- Check for payload types
         if v.has_payload and v.payload_types.len() > 0 {
-            let pt = v.payload_types[0]
-            info.variant_payload_types.push(pt)
+            -- A field of the struct for each value the variant carries
+            let mut joined = ""
+            let mut pi = 0
+            while pi < v.payload_types.len() {
+                g = ensure_type_instances(g, v.payload_types[pi], ed.line)
+                let pt = canon_type(g, v.payload_types[pi])
+                if pi == 0 {
+                    info.variant_payload_types.push(pt)
+                } else {
+                    joined = joined + "|"
+                }
+                joined = joined + pt
+                ir_fields.push(ir_field_new(v.name + "_" + int_to_string(pi), map_type_name(pt)))
+                pi = pi + 1
+            }
             info.variant_has_payload.push(true)
-            -- Add payload field to struct
-            let field_name = v.name + "_0"
-            let field_type = map_type_name(pt)
-            ir_fields.push(ir_field_new(field_name, field_type))
+            info.variant_payloads.push(joined)
         } else {
             info.variant_payload_types.push("")
             info.variant_has_payload.push(false)
+            info.variant_payloads.push("")
         }
 
         i = i + 1
@@ -7394,6 +7451,14 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
                 let elem_result = generate_expr(g, b, init_expr.elements[ei])
                 g = elem_result.gen
                 b = elem_result.block
+                if elem_kind == LIST_ELEM_OTHER() {
+                    -- A struct or another value stored whole
+                    let pushed = push_whole_value(g, b, alloca_id, elem_result.val_id, map_type_name(canon_type(g, inner)))
+                    g = pushed.gen
+                    b = pushed.block
+                    ei = ei + 1
+                    continue
+                }
                 let mut push_call_inst = ir_inst_new(g.builder.next_id, OP_CALL())
                 push_call_inst.callee = push_fn_name
                 let mut push_call_args: List[IRValue] = []
@@ -7527,6 +7592,9 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         g = result.gen
         b = result.block
         g.list_elem_kinds.insert(var_name, arr_elem_kind)
+        if arr_elem_kind == LIST_ELEM_OTHER() and (g.struct_defs.contains(arr_elem_type) or g.enum_defs.contains(arr_elem_type)) {
+            g.list_elem_types.insert(var_name, arr_elem_type)
+        }
         g.variable_map.insert(var_name, result.val_id)
         g.variable_types.insert(var_name, "list")
         return gen_result(g, b)
@@ -9476,6 +9544,42 @@ fn check_basic_type(gen: IRGenerator, expected: string, value: Expr, what: strin
     return ir_type_error(gen, "type mismatch in " + what + ": expected " + expected + ", found " + found, value.line)
 }
 
+-- Record the source type of a variable that a pattern binds, as a
+-- parameter's is recorded, so that its fields, elements and methods
+-- resolve. What an earlier variable of the name left is replaced.
+fn track_bound_variable(gen: IRGenerator, name: string, src_type: string) -> IRGenerator {
+    let mut g = gen
+    let t = canon_type(g, src_type)
+    g.variable_types.insert(name, map_type_name(t))
+    g.var_src_types.insert(name, t)
+    if g.struct_defs.contains(t) {
+        g.var_struct_types.insert(name, t)
+    } else if g.var_struct_types.contains(name) {
+        g.var_struct_types.remove(name)
+    }
+    if g.enum_defs.contains(t) {
+        g.var_enum_types.insert(name, t)
+    } else if g.var_enum_types.contains(name) {
+        g.var_enum_types.remove(name)
+    }
+    if starts_with(t, "List[") {
+        let inner = extract_inner_type(t, "List[")
+        let elem_kind = classify_list_elem(inner)
+        g.list_elem_kinds.insert(name, elem_kind)
+        if elem_kind == LIST_ELEM_OTHER() {
+            g.list_elem_types.insert(name, inner)
+        }
+    } else if g.list_elem_kinds.contains(name) {
+        g.list_elem_kinds.remove(name)
+    }
+    if starts_with(t, "Box[") {
+        g.box_inner_types.insert(name, extract_inner_type(t, "Box["))
+    } else if g.box_inner_types.contains(name) {
+        g.box_inner_types.remove(name)
+    }
+    return g
+}
+
 -- The function that a call written Type.name(args) calls, or "" when
 -- the call is a method call on a value. Box.new and Box.null are the
 -- builtins Box_new and Box_null; a function of an impl block that
@@ -9871,6 +9975,14 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
     if k == EXPR_LITERAL_BOOL() { return "bool" }
     if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
+    if k == EXPR_ENUM_LITERAL() { return expr.enum_name }
+    if k == EXPR_ARRAY_LITERAL() {
+        -- A list of its first element's type
+        if expr.elements.len() == 0 { return "" }
+        let elem_t = static_type(gen, expr.elements[0])
+        if elem_t == "" { return "" }
+        return "List[" + elem_t + "]"
+    }
     if k == EXPR_GROUPED() { return static_type(gen, *expr.operand) }
     if k == EXPR_BINARY() {
         -- Two strings joined are a string; other operators may be
@@ -9923,6 +10035,13 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
         let static_target = static_call_target(gen, expr)
         if static_target != "" {
             return static_type(gen, static_call_expr(expr, static_target))
+        }
+        -- Enum.Variant(values) is a value of the enum
+        let call_object = *expr.object
+        if call_object.kind == EXPR_IDENTIFIER() and gen.enum_defs.contains(call_object.name) and gen.variable_map.contains(call_object.name) == false {
+            if enum_variant_index(gen.enum_defs.get(call_object.name), expr.method) >= 0 {
+                return call_object.name
+            }
         }
         let recv_t = strip_box_type(static_type(gen, *expr.object))
         let m = expr.method
@@ -12649,19 +12768,15 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
     let info = g.enum_defs.get(enum_name)
 
     -- Find the variant
-    let mut tag = -1
-    let mut has_payload = false
-    let mut vi = 0
-    while vi < info.variant_names.len() {
-        if info.variant_names[vi] == variant_name {
-            tag = info.variant_tags[vi]
-            has_payload = info.variant_has_payload[vi]
-        }
-        vi = vi + 1
-    }
-
-    if tag < 0 {
+    let variant_index = enum_variant_index(info, variant_name)
+    if variant_index < 0 {
         g = ir_type_error(g, "enum '" + enum_name + "' has no variant or function '" + variant_name + "'", line)
+        return expr_result(g, b, 0)
+    }
+    let tag = info.variant_tags[variant_index]
+    let payload_count = enum_payload_count(info, variant_index)
+    if args.len() != payload_count {
+        g = ir_type_error(g, "variant '" + enum_name + "." + variant_name + "' carries " + values_text(payload_count) + ", not " + int_to_string(args.len()), line)
         return expr_result(g, b, 0)
     }
 
@@ -12687,28 +12802,14 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
 
     let mut last_id = tag_insert_id
 
-    -- If has payload, insert payload fields
-    if has_payload and args.len() > 0 {
-        -- Determine the field index for this variant's payload
-        -- The payload field is named "VariantName_0" and its index is
-        -- computed by counting prior payload fields + 1 (for the tag)
-        let mut field_idx = 1
-        let mut pi = 0
-        while pi < info.variant_names.len() {
-            if info.variant_names[pi] == variant_name {
-                -- Found our variant; field_idx is now correct
-                pi = info.variant_names.len()  -- break
-            } else {
-                if info.variant_has_payload[pi] {
-                    field_idx = field_idx + 1
-                }
-                pi = pi + 1
-            }
-        }
+    -- The values the variant carries go in its fields
+    if payload_count > 0 {
+        let field_idx = enum_payload_field(info, variant_index)
 
         -- Insert each payload argument
         let mut ai = 0
         while ai < args.len() {
+            g = check_basic_type(g, enum_payload_type(info, variant_index, ai), args[ai], "value " + int_to_string(ai + 1) + " of '" + enum_name + "." + variant_name + "'")
             let arg_result = generate_expr(g, b, args[ai])
             g = arg_result.gen
             b = arg_result.block
@@ -14564,30 +14665,22 @@ fn generate_enum_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     -- and insert them starting at field index 1.
     -- The field offset must skip past prior variant payload fields in the
     -- tagged union layout.
-    if has_payload {
+    if has_payload and variant_idx >= 0 {
         let payload = expr.payload
-        let num_payload = payload.len()
-
-        -- Compute the field offset: skip tag (1) + sum of prior variant payloads
-        let mut field_offset = 1
-        let mut pvi = 0
-        while pvi < num_variants {
-            if info.variant_names[pvi] == variant_name {
-                -- Found our variant; stop counting
-                pvi = num_variants
-            } else {
-                if info.variant_has_payload[pvi] {
-                    -- Each prior payload variant contributes its payload count
-                    -- For simplicity, assume one payload field per variant
-                    field_offset = field_offset + 1
-                }
-                pvi = pvi + 1
-            }
+        let mut num_payload = payload.len()
+        let payload_count = enum_payload_count(info, variant_idx)
+        if num_payload != payload_count {
+            g = ir_type_error(g, "variant '" + enum_name + "." + variant_name + "' carries " + values_text(payload_count) + ", not " + int_to_string(num_payload), expr.line)
+            num_payload = 0
         }
+
+        -- The variant's values go in its fields
+        let field_offset = enum_payload_field(info, variant_idx)
 
         let mut pi = 0
         while pi < num_payload {
             let payload_expr = payload[pi]
+            g = check_basic_type(g, enum_payload_type(info, variant_idx, pi), payload_expr, "value " + int_to_string(pi + 1) + " of '" + enum_name + "." + variant_name + "'")
 
             -- Generate the payload value
             let pval_result = generate_expr(g, b, payload_expr)
@@ -14617,6 +14710,41 @@ fn generate_enum_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
 -- ============================================================
 -- Array Literal: [elem1, elem2, ...]
 -- ============================================================
+
+-- Push a value that a list stores whole, such as a struct or an enum
+-- value, onto the list at `list_ptr`: the runtime copies the bytes of
+-- `elem_type` from a temporary that holds the value
+fn push_whole_value(gen: IRGenerator, block: IRBasicBlock, list_ptr: int, val_id: int, elem_type: string) -> GenResult {
+    let mut g = gen
+    let mut b = block
+    let temp_id = g.builder.next_id
+    let mut temp_inst = ir_inst_new(temp_id, OP_ALLOCA())
+    temp_inst.alloc_type = elem_type
+    temp_inst.result_type = "ptr(" + elem_type + ")"
+    temp_inst.has_result = true
+    b.instructions.push(temp_inst)
+    g.builder.next_id = g.builder.next_id + 1
+
+    let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
+    store_inst.store_ptr = ir_val_inst(temp_id)
+    store_inst.store_val = ir_val_inst(val_id)
+    store_inst.has_result = false
+    b.instructions.push(store_inst)
+    g.builder.next_id = g.builder.next_id + 1
+
+    let mut push_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+    push_inst.callee = "dm_list_generic_push"
+    let mut push_args: List[IRValue] = []
+    push_args.push(ir_val_inst(list_ptr))
+    push_args.push(ir_val_inst(temp_id))
+    push_args.push(ir_val_sizeof(elem_type))
+    push_inst.call_args = push_args
+    push_inst.result_type = "void"
+    push_inst.has_result = false
+    b.instructions.push(push_inst)
+    g.builder.next_id = g.builder.next_id + 1
+    return gen_result(g, b)
+}
 
 fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
@@ -14659,6 +14787,10 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     } else if elem_ir_type == "string" {
         new_fn = "dm_list_string_new"
         push_fn = "dm_list_string_push"
+    } else if g.struct_defs.contains(elem_ir_type) or g.enum_defs.contains(elem_ir_type) {
+        -- Structs and enum values are stored whole
+        new_fn = "dm_list_generic_new"
+        push_fn = "dm_list_generic_push"
     }
 
     -- Create list alloca and call new function (sret pattern)
@@ -14682,6 +14814,14 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Push each element into the list
     let mut pi = 0
+    if push_fn == "dm_list_generic_push" {
+        while pi < num_elements {
+            let pushed = push_whole_value(g, b, alloca_id, elem_ids[pi], elem_ir_type)
+            g = pushed.gen
+            b = pushed.block
+            pi = pi + 1
+        }
+    }
     while pi < num_elements {
         let mut push_call = ir_inst_new(g.builder.next_id, OP_CALL())
         push_call.callee = push_fn
@@ -14865,6 +15005,13 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
                         result_type_name = g.variable_types.get(scrut_expr.name)
                     }
                 }
+                if starts_with(result_type_name, "Result[") == false {
+                    -- A call, a field or a variable with no annotation
+                    let scrut_src = canon_type(g, static_type(g, scrut_expr))
+                    if starts_with(scrut_src, "Result[") {
+                        result_type_name = scrut_src
+                    }
+                }
                 return generate_result_match(g, b, expr, scrut_id, result_type_name)
             }
             if variant == "Some" or variant == "None" {
@@ -14872,6 +15019,12 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
                 if scrut_expr.kind == EXPR_IDENTIFIER() {
                     if g.variable_types.contains(scrut_expr.name) {
                         option_type_name = g.variable_types.get(scrut_expr.name)
+                    }
+                }
+                if starts_with(option_type_name, "Option[") == false {
+                    let scrut_src = canon_type(g, static_type(g, scrut_expr))
+                    if starts_with(scrut_src, "Option[") {
+                        option_type_name = scrut_src
                     }
                 }
                 return generate_option_match(g, b, expr, scrut_id, option_type_name)
@@ -14894,6 +15047,9 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int) -> ExprResult {
     let mut g = gen
     let mut b = block
+
+    -- The type of the matched value, for an arm that binds it to a name
+    let scrut_bind_type = static_type(g, *expr.scrutinee)
 
     -- Infer the match result type from arm bodies
     let match_type = infer_match_result_type(g, expr.match_arms)
@@ -14926,10 +15082,15 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
             -- Bind identifier if needed
             if pat.kind == PAT_IDENTIFIER() {
                 -- Bind the scrutinee value to the pattern name
+                -- The name is a variable of the matched value's type
+                let mut bind_type = "i64"
+                if scrut_bind_type != "" {
+                    bind_type = map_type_name(canon_type(g, scrut_bind_type))
+                }
                 let bind_alloca_id = g.builder.next_id
                 let mut bind_alloca = ir_inst_new(bind_alloca_id, OP_ALLOCA())
-                bind_alloca.alloc_type = "i64"
-                bind_alloca.result_type = "ptr(i64)"
+                bind_alloca.alloc_type = bind_type
+                bind_alloca.result_type = "ptr(" + bind_type + ")"
                 bind_alloca.has_result = true
                 b.instructions.push(bind_alloca)
                 g.builder.next_id = g.builder.next_id + 1
@@ -14942,7 +15103,10 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 g.builder.next_id = g.builder.next_id + 1
 
                 g.variable_map.insert(pat.name, bind_alloca_id)
-                g.variable_types.insert(pat.name, "i64")
+                g.variable_types.insert(pat.name, bind_type)
+                if scrut_bind_type != "" {
+                    g = track_bound_variable(g, pat.name, scrut_bind_type)
+                }
             }
 
             -- If there is a guard condition, evaluate it and branch
@@ -15021,9 +15185,13 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
             g = lit_result.gen
             b = lit_result.block
 
-            -- Compare scrutinee with literal value
+            -- Compare scrutinee with literal value: strings by their text
             let cmp_id = g.builder.next_id
-            let mut cmp_inst = ir_inst_new(cmp_id, OP_EQ())
+            let mut cmp_op = OP_EQ()
+            if lit_expr.kind == EXPR_LITERAL_STRING() {
+                cmp_op = OP_STRING_EQ()
+            }
+            let mut cmp_inst = ir_inst_new(cmp_id, cmp_op)
             cmp_inst.lhs = ir_val_inst(scrut_id)
             cmp_inst.rhs = ir_val_inst(lit_result.val_id)
             cmp_inst.result_type = "bool"
@@ -15123,6 +15291,8 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
         return generate_literal_match(g, b, expr, scrut_id)
     }
     let enum_info = g.enum_defs.get(enum_type)
+    -- The type of the matched value, for an arm that binds it to a name
+    let scrut_bind_type = enum_type
 
     -- Infer match result type from arm bodies
     let ematch_type = infer_match_result_type(g, expr.match_arms)
@@ -15165,10 +15335,15 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
         if pat.kind == PAT_WILDCARD() or pat.kind == PAT_IDENTIFIER() {
             -- Catch-all: bind if identifier
             if pat.kind == PAT_IDENTIFIER() {
+                -- The name is a variable of the matched value's type
+                let mut bind_type = "i64"
+                if scrut_bind_type != "" {
+                    bind_type = map_type_name(canon_type(g, scrut_bind_type))
+                }
                 let bind_alloca_id = g.builder.next_id
                 let mut bind_alloca = ir_inst_new(bind_alloca_id, OP_ALLOCA())
-                bind_alloca.alloc_type = "i64"
-                bind_alloca.result_type = "ptr(i64)"
+                bind_alloca.alloc_type = bind_type
+                bind_alloca.result_type = "ptr(" + bind_type + ")"
                 bind_alloca.has_result = true
                 b.instructions.push(bind_alloca)
                 g.builder.next_id = g.builder.next_id + 1
@@ -15181,7 +15356,10 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 g.builder.next_id = g.builder.next_id + 1
 
                 g.variable_map.insert(pat.name, bind_alloca_id)
-                g.variable_types.insert(pat.name, "i64")
+                g.variable_types.insert(pat.name, bind_type)
+                if scrut_bind_type != "" {
+                    g = track_bound_variable(g, pat.name, scrut_bind_type)
+                }
             }
 
             -- Generate arm body in current block
@@ -15212,13 +15390,17 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
         } else if pat.kind == PAT_ENUM_VARIANT() {
             -- Find variant tag value from enum definition
             let variant_name = pat.variant
+            let variant_index = enum_variant_index(enum_info, variant_name)
             let mut variant_tag = -1
-            let mut vi = 0
-            while vi < enum_info.variant_names.len() {
-                if enum_info.variant_names[vi] == variant_name {
-                    variant_tag = enum_info.variant_tags[vi]
-                }
-                vi = vi + 1
+            let mut payload_count = 0
+            if variant_index >= 0 {
+                variant_tag = enum_info.variant_tags[variant_index]
+                payload_count = enum_payload_count(enum_info, variant_index)
+            } else {
+                g = ir_type_error(g, "enum '" + enum_type + "' has no variant '" + variant_name + "'", expr.line)
+            }
+            if pat.bindings.len() > payload_count and variant_index >= 0 {
+                g = ir_type_error(g, "variant '" + enum_type + "." + variant_name + "' carries " + values_text(payload_count) + ", but the pattern binds " + int_to_string(pat.bindings.len()), expr.line)
             }
 
             -- Compare tag with variant tag
@@ -15238,39 +15420,27 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
             -- Generate arm body in arm_block
             let mut arm_block = ir_block_new(arm_label)
 
-            -- Bind payload variables if present
-            if pat.bindings.len() > 0 {
-                -- Compute field offset: skip tag (1) + count prior payload variants
-                let mut payload_field_offset = 1
-                let mut pvi2 = 0
-                while pvi2 < enum_info.variant_names.len() {
-                    if enum_info.variant_names[pvi2] == variant_name {
-                        pvi2 = enum_info.variant_names.len()
-                    } else {
-                        if enum_info.variant_has_payload[pvi2] {
-                            payload_field_offset = payload_field_offset + 1
-                        }
-                        pvi2 = pvi2 + 1
-                    }
-                }
+            -- Bind the variant's values: each is a variable of its type
+            let mut bi = 0
+            while bi < pat.bindings.len() and bi < payload_count {
+                let bind_name = pat.bindings[bi]
+                let payload_src = enum_payload_type(enum_info, variant_index, bi)
+                let payload_type = map_type_name(payload_src)
 
-                -- Extract payload from scrutinee at computed field offset
                 let payload_id = g.builder.next_id
                 let mut payload_inst = ir_inst_new(payload_id, OP_EXTRACT_FIELD())
                 payload_inst.field_base = ir_val_inst(scrut_id)
-                payload_inst.field_index = payload_field_offset
-                payload_inst.field_type = "i64"
-                payload_inst.result_type = "i64"
+                payload_inst.field_index = enum_payload_field(enum_info, variant_index) + bi
+                payload_inst.field_type = payload_type
+                payload_inst.result_type = payload_type
                 payload_inst.has_result = true
                 arm_block.instructions.push(payload_inst)
                 g.builder.next_id = g.builder.next_id + 1
 
-                -- Bind first payload to the first binding name
-                let bind_name = pat.bindings[0]
                 let bind_alloca_id = g.builder.next_id
                 let mut bind_alloca = ir_inst_new(bind_alloca_id, OP_ALLOCA())
-                bind_alloca.alloc_type = "i64"
-                bind_alloca.result_type = "ptr(i64)"
+                bind_alloca.alloc_type = payload_type
+                bind_alloca.result_type = "ptr(" + payload_type + ")"
                 bind_alloca.has_result = true
                 arm_block.instructions.push(bind_alloca)
                 g.builder.next_id = g.builder.next_id + 1
@@ -15283,7 +15453,8 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 g.builder.next_id = g.builder.next_id + 1
 
                 g.variable_map.insert(bind_name, bind_alloca_id)
-                g.variable_types.insert(bind_name, "i64")
+                g = track_bound_variable(g, bind_name, payload_src)
+                bi = bi + 1
             }
 
             if arm.is_expr_body {
@@ -15471,6 +15642,9 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 
             g.variable_map.insert(bind_name, ok_bind_id)
             g.variable_types.insert(bind_name, ok_field_type)
+            if starts_with(result_type_name, "Result[") {
+                g = track_bound_variable(g, bind_name, ok_field_type)
+            }
         }
 
         if ok_arm.is_expr_body {
@@ -15532,6 +15706,9 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 
             g.variable_map.insert(bind_name, err_bind_id)
             g.variable_types.insert(bind_name, err_field_type)
+            if starts_with(result_type_name, "Result[") {
+                g = track_bound_variable(g, bind_name, err_field_type)
+            }
         }
 
         if err_arm.is_expr_body {
@@ -15702,6 +15879,9 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 
             g.variable_map.insert(bind_name, some_bind_id)
             g.variable_types.insert(bind_name, some_field_type)
+            if starts_with(option_type_name, "Option[") {
+                g = track_bound_variable(g, bind_name, some_field_type)
+            }
         }
 
         if some_arm.is_expr_body {
@@ -18802,6 +18982,10 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
         if type_name == "i16" { return dm_llvm_int16_type(ctx) }
         if type_name == "i32" { return dm_llvm_int32_type(ctx) }
         if type_name == "i64" { return dm_llvm_int64_type(ctx) }
+        -- The source names of i64 and f64, which reach here inside
+        -- Option[...] and Result[...] taken from a function's signature
+        if type_name == "int" { return dm_llvm_int64_type(ctx) }
+        if type_name == "float" { return dm_llvm_double_type(ctx) }
         -- Unsigned types map to same LLVM int types (signedness is in instructions, not types)
         if type_name == "u8" { return dm_llvm_int8_type(ctx) }
         if type_name == "u16" { return dm_llvm_int16_type(ctx) }
@@ -19941,12 +20125,12 @@ fn resolve_value_with_counter(gen: LLVMGenerator, val: IRValue) -> LLVMGenerator
     return g
 }
 
--- A string or list value is a pointer to its storage. Where the
--- value itself is wanted (a by-value parameter or a return value of
--- that struct type), load it.
+-- A string or list value is a pointer to its storage, and so is a
+-- list literal that no variable holds. Where the value itself is
+-- wanted (a by-value parameter or a return value of that struct
+-- type), load it.
 fn load_handle_as(gen: LLVMGenerator, val: IRValue, v: int, want_ty: int) -> int {
     unsafe {
-        if is_string_ptr(gen, val) == false { return v }
         if dm_llvm_get_type_kind(want_ty) != 10 { return v }
         if dm_llvm_get_type_kind(dm_llvm_type_of(v)) != 12 { return v }
         return dm_llvm_build_load2(gen.builder, want_ty, v, "handle.val")
@@ -20487,6 +20671,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             -- If inserting a string value (pointer to dm_string), load the actual struct
             if is_string_ptr(g, inst.field_value) {
                 val = dm_llvm_build_load2(b, g.dm_string_type, val, "str.load")
+            } else if exp_ir_ty != "" and dm_llvm_get_type_kind(map_ir_type_to_llvm(g, exp_ir_ty)) == 10 and dm_llvm_get_type_kind(dm_llvm_type_of(val)) == 12 {
+                -- A list or struct that is held by its address
+                val = dm_llvm_build_load2(b, map_ir_type_to_llvm(g, exp_ir_ty), val, "field.load")
             }
             let result = dm_llvm_build_insert_value(b, base_val, val, inst.field_index, "insert")
             if inst.has_result { g.value_map.insert(id_key, result) }
@@ -22163,7 +22350,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "73b12c6364345b7d"
+    return "b2a2c9a1ab8aac8a"
 }
 
 
