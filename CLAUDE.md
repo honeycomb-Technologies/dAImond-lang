@@ -107,7 +107,8 @@ dAImond-lang/
 │   │   ├── convert.dm         # int/float/bool to string, parse_int, parse_float, written in dAImond
 │   │   ├── list.dm            # List[T]: push, pop, contains and the for-in read, written in dAImond
 │   │   ├── map.dm             # Map[K, V], written in dAImond, compiled into every program
-│   │   ├── os.dm              # Files, command-line arguments and system(), written in dAImond
+│   │   ├── os.dm              # Files, directories, environment, arguments and system(), written in dAImond
+│   │   ├── path.dm            # path_dirname, path_basename, path_extension, path_stem, path_join, written in dAImond
 │   │   └── llvm_wrappers.c    # C wrappers for the runtime functions not yet ported to dAImond
 │   ├── build.zig          # Builds the integration test harness
 │   ├── tests/
@@ -226,7 +227,7 @@ cd stage5 && bash gen_bootstrap.sh
 # Compile Stage 5 with itself (--link-llvm links the LLVM bridge)
 cd stage5 && /tmp/stage5_bin main.dm -o /tmp/stage5_self --link-llvm
 
-# Run the integration suite against the Stage 5 binary (309 tests)
+# Run the integration suite against the Stage 5 binary (311 tests)
 bash stage5/run_parity.sh
 ```
 
@@ -236,7 +237,7 @@ There are two tiers of tests:
 
 1. **Unit tests** (`zig build test`): Each Zig source module contains inline `test` blocks. Nine modules have tests registered in `build.zig`: lexer, errors, ast, types, parser, codegen, checker, package, lsp.
 
-2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results (stdout, the exit code and, where a case sets `expected_stderr`, stderr). It handles temporary file creation and cleanup. Currently 316 tests pass, 0 fail, 0 skipped.
+2. **Integration tests** (`zig build test-integration`): The test runner (`stage0/tests/runner.zig`) compiles `.dm` files from the `tests/` directory, executes them, and compares output against expected results (stdout, the exit code and, where a case sets `expected_stderr`, stderr). It handles temporary file creation and cleanup. Currently 318 tests pass, 0 fail, 0 skipped.
 
 3. **dAImond test framework** (`daimond test <file.dm>`): Discovers `test_*` functions in source, compiles, and runs them with panic-catching (setjmp/longjmp). Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -298,7 +299,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 309/309 integration tests and compiles itself, but Stage 0 is still required for its first build.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 311/311 integration tests and compiles itself, but Stage 0 is still required for its first build.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -372,10 +373,10 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 **Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test
 
 **Compiler stages** (all complete):
-- Stage 0 (Zig → C): Bootstrap compiler, 316/316 integration tests
+- Stage 0 (Zig → C): Bootstrap compiler, 318/318 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): first built by Stage 0, 309/309 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 309/309. Its link step still compiles the C runtime, wrappers and LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+- Stage 5 (dAImond + LLVM): first built by Stage 0, 311/311 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 311/311. Its link step still compiles the C runtime, wrappers and LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
@@ -521,11 +522,12 @@ The C runtime is being replaced one function at a time by dAImond code in `stage
 
 - A dAImond function `rt_X` replaces the C runtime function `dm_X`: the compiler binds every call to `dm_X` to `rt_X` (see RUNTIME FUNCTIONS in `llvm_gen.dm`). `rt_X` must keep the signature `dm_X` is declared with in `ir_gen_decl.dm`, except that it takes an `int`, the address, where `dm_X` takes a pointer; a mismatch is a compile error.
 - To port a function: write `rt_X` in a runtime file, delete `llvm_dm_X` from `runtime/llvm_wrappers.c`, and run `gen_bootstrap.sh`. A new runtime file also needs a line in `gen_bootstrap.sh`.
-- Ported so far: `string_concat`, `string_eq`, `string_cmp`, `char_at`, `substr`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_trim`, `string_replace`, `string_to_upper`, `string_to_lower`, `string_split`, `is_alpha`, `is_digit`, `is_whitespace`, `is_alnum`, `char_to_string` (`runtime/string.dm`); `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float` (`runtime/convert.dm`); the list operations push, pop and contains for int, float, string and other elements, and the element read `for x in xs` makes (`runtime/list.dm`); `file_read`, `file_write`, `file_append`, `file_exists`, `args_len`, `args_get`, `system` (`runtime/os.dm`). Floats go through libc's `snprintf("%g")` and `strtod`; integers are formatted and parsed in dAImond.
+- Ported so far: `string_concat`, `string_eq`, `string_cmp`, `char_at`, `substr`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_trim`, `string_replace`, `string_to_upper`, `string_to_lower`, `string_split`, `is_alpha`, `is_digit`, `is_whitespace`, `is_alnum`, `char_to_string` (`runtime/string.dm`); `int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float` (`runtime/convert.dm`); the list operations push, pop and contains for int, float, string and other elements, and the element read `for x in xs` makes (`runtime/list.dm`); `file_read`, `file_write`, `file_append`, `file_exists`, `fs_mkdir`, `fs_readdir`, `fs_remove`, `fs_rename`, `fs_getcwd`, `env_get`, `args_len`, `args_get`, `system` (`runtime/os.dm`); `path_dirname`, `path_basename`, `path_extension`, `path_stem`, `path_join` (`runtime/path.dm`). Floats go through libc's `snprintf("%g")` and `strtod`; integers are formatted and parsed in dAImond.
 - A list is `{ data, len, capacity }` and is passed to the runtime as the address of that header.
 - Inline, with no function behind them: `len(s)`, string literals, `xs.len()`, the creation of an empty list, `xs[i]` and `xs[i] = v` (one bounds check, then a load or store at the element's address), and the overflow and range checks on signed arithmetic and narrowing casts (`dm_checked_*`, `dm_cast_check_*`), which lower to LLVM's overflow intrinsics and a branch to a panic block.
 - **Panics**: `dm_panic` writes `PANIC: <message>` to stderr and exits with code 1, as Stage 0 does. Messages passed to it, by the compiler's checks or by runtime code, do not include the prefix.
 - **Command-line arguments**: `main` stores its argument count and vector in the symbols `dm_argc` (a C `int`) and `dm_argv`, which the compiler defines in the module that has `main`. The runtime reads them through `symbol_addr`. `args_get(i)` gives a string that points at the argument's own bytes.
+- **OS struct layouts**: `fs_readdir` reads the name in libc's `struct dirent` at byte 19 (`rt_dirent_name_offset` in `runtime/os.dm`), which is its place on x86-64 Linux. Another target needs its own offset.
 - **Precompiled runtime object**: a `-O0` build does not compile the runtime's non-generic functions into the program. It links `runtime-<build ID>.o`, which the compiler builds once with full optimization and keeps in `$DAIMOND_CACHE_DIR`, else `$XDG_CACHE_HOME/daimond`, else `~/.cache/daimond` (see PRECOMPILED RUNTIME in `main_split.dm`). When the object can't be built or stored, the runtime is compiled into the program instead. `--emit-llvm`, `--emit-ir` and `-O1` and above always compile it into the program, where the optimizer can inline it.
 - The build ID is a hash of the compiler's source, the runtime sources and `llvm_bridge.c`, written into `prelude.dm` by `gen_bootstrap.sh`. Rerun `gen_bootstrap.sh` after changing any of them, `llvm_bridge.c` included, or the compiler keeps linking the old object.
 - Generic runtime code (the methods of `Map`) is always compiled into the program. At `-O0` the program's own functions are marked `optnone` and stay as written, while that generic code is optimized.
@@ -602,7 +604,8 @@ runtime/string.dm  — Strings: rt_string_concat, rt_string_eq, rt_string_cmp, r
 runtime/convert.dm — Conversions: rt_int_to_string, rt_float_to_string, rt_bool_to_string, rt_parse_int, rt_parse_float
 runtime/list.dm    — Lists: rt_list_int64_*, rt_list_double_*, rt_list_string_*, rt_list_generic_*
 runtime/map.dm     — Map[K, V] as a generic struct (hash table over List fields)
-runtime/os.dm      — Files, arguments, processes: rt_file_read, rt_file_write, rt_file_append, rt_file_exists, rt_args_len, rt_args_get, rt_system
+runtime/os.dm      — Files, directories, environment, arguments, processes: rt_file_*, rt_fs_*, rt_os_getenv, rt_args_len, rt_args_get, rt_system
+runtime/path.dm    — Paths: rt_path_dirname, rt_path_basename, rt_path_extension, rt_path_stem, rt_path_join
 main_split.dm      — Entry point with imports (for modular development)
 main.dm            — Monolithic bootstrap file (~22K lines, generated)
 ```
@@ -639,7 +642,7 @@ cd stage5 && bash gen_bootstrap.sh
 Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
 stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
 Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
-stage5_bin compiles test programs                 → native binaries (309/309 tests pass)
+stage5_bin compiles test programs                 → native binaries (311/311 tests pass)
 stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓)
 ```
 

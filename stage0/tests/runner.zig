@@ -5174,6 +5174,109 @@ pub const fs_builtin_tests = [_]TestCase{
         ,
         .expected_output = "0\ntrue\n",
     },
+    // fs_mkdir with missing parents, fs_readdir of empty, missing and large
+    // directories, fs_rename, fs_remove, env_get and fs_getcwd.
+    .{
+        .name = "fs_directory_tree_and_environment",
+        .source =
+            \\module test
+            \\
+            \\fn sorted(text: string) -> string {
+            \\    if len(text) == 0 { return "(none)" }
+            \\    let mut names = string_split(text, "\n")
+            \\    let n = names.len()
+            \\    let mut i = 1
+            \\    while i < n {
+            \\        let mut j = i
+            \\        while j > 0 and names[j - 1] > names[j] {
+            \\            let t = names[j]
+            \\            names[j] = names[j - 1]
+            \\            names[j - 1] = t
+            \\            j = j - 1
+            \\        }
+            \\        i = i + 1
+            \\    }
+            \\    let mut out = int_to_string(n) + ":"
+            \\    i = 0
+            \\    while i < n {
+            \\        if i < 5 or i > n - 3 { out = out + names[i] + "," }
+            \\        i = i + 1
+            \\    }
+            \\    return out
+            \\}
+            \\
+            \\fn main() {
+            \\    -- The program's own path names a place no other test writes to
+            \\    let d = args_get(0) + ".d"
+            \\    let m1 = fs_mkdir(d + "/a/b/c")
+            \\    let m2 = fs_mkdir(d + "/a/b/c")
+            \\    let m3 = fs_mkdir(d + "/one/")
+            \\    println("mkdir " + int_to_string(m1) + " " + int_to_string(m2) + " " + int_to_string(m3))
+            \\    file_write(d + "/a/file.txt", "x")
+            \\    let m4 = fs_mkdir(d + "/a/file.txt/sub")
+            \\    let m5 = fs_mkdir("")
+            \\    println("mkdir under a file " + int_to_string(m4) + ", of no name " + int_to_string(m5))
+            \\    println("readdir " + sorted(fs_readdir(d)) + " " + sorted(fs_readdir(d + "/a")) + " " + sorted(fs_readdir(d + "/a/b/c")) + " " + sorted(fs_readdir(d + "/missing")) + " " + sorted(fs_readdir(d + "/a/file.txt")) + " " + sorted(fs_readdir("")))
+            \\    -- More names than the first buffer holds
+            \\    let mut i = 0
+            \\    while i < 300 {
+            \\        file_write(d + "/one/entry_with_a_long_name_" + int_to_string(i) + ".txt", "")
+            \\        i = i + 1
+            \\    }
+            \\    let many = fs_readdir(d + "/one")
+            \\    println("many " + sorted(many) + " " + int_to_string(len(many)))
+            \\    let r1 = fs_rename(d + "/a/file.txt", d + "/a/moved.txt")
+            \\    let r2 = fs_rename(d + "/a/file.txt", d + "/a/again.txt")
+            \\    println("rename " + int_to_string(r1) + " " + int_to_string(r2) + " " + bool_to_string(file_exists(d + "/a/moved.txt")) + " " + bool_to_string(file_exists(d + "/a/file.txt")))
+            \\    let d1 = fs_remove(d + "/a/moved.txt")
+            \\    let d2 = fs_remove(d + "/a/moved.txt")
+            \\    let d3 = fs_remove(d + "/a")
+            \\    let d4 = fs_remove(d + "/a/b/c")
+            \\    let d5 = fs_remove("")
+            \\    println("remove " + int_to_string(d1) + " " + int_to_string(d2) + " " + int_to_string(d3) + " " + int_to_string(d4) + " " + int_to_string(d5))
+            \\    println("env [" + env_get("DM_TEST_SURELY_NOT_SET") + "][" + env_get("") + "] " + bool_to_string(len(env_get("PATH")) > 0))
+            \\    println(bool_to_string(len(fs_getcwd()) > 0) + " " + bool_to_string(starts_with(fs_getcwd(), "/")))
+            \\}
+        ,
+        .expected_output = "mkdir 0 0 0\nmkdir under a file -1, of no name -1\nreaddir 2:a,one, 2:b,file.txt, (none) (none) (none) (none)\nmany 300:entry_with_a_long_name_0.txt,entry_with_a_long_name_1.txt,entry_with_a_long_name_10.txt,entry_with_a_long_name_100.txt,entry_with_a_long_name_101.txt,entry_with_a_long_name_98.txt,entry_with_a_long_name_99.txt, 9189\nrename 0 -1 true false\nremove 0 -1 -1 0 -1\nenv [][] true\ntrue true\n",
+    },
+    // The path functions on empty paths, roots, trailing and doubled
+    // slashes, dotfiles and names with several dots.
+    .{
+        .name = "path_function_edges",
+        .source =
+            \\module test
+            \\
+            \\fn p(path: string) {
+            \\    println("[" + path + "] dir=[" + path_dirname(path) + "] base=[" + path_basename(path) + "] ext=[" + path_extension(path) + "] stem=[" + path_stem(path) + "]")
+            \\}
+            \\
+            \\fn main() {
+            \\    p("")
+            \\    p("/")
+            \\    p("a")
+            \\    p("/a")
+            \\    p("a/")
+            \\    p("a/b")
+            \\    p("/foo/bar/baz.dm")
+            \\    p("a//b")
+            \\    p("/foo/")
+            \\    p(".bashrc")
+            \\    p("a.tar.gz")
+            \\    p("dir.d/file")
+            \\    p("dir.d/")
+            \\    p("a.")
+            \\    p("..")
+            \\    p(".")
+            \\    p("a/.b")
+            \\    p("noext")
+            \\    p("/x.y/z")
+            \\    p("//")
+            \\    println("join [" + path_join("", "") + "][" + path_join("a", "") + "][" + path_join("", "b") + "][" + path_join("a", "b") + "][" + path_join("a/", "b") + "][" + path_join("a", "/b") + "][" + path_join("/", "b") + "][" + path_join("src", "main.zig") + "]")
+            \\}
+        ,
+        .expected_output = "[] dir=[.] base=[] ext=[] stem=[]\n[/] dir=[/] base=[] ext=[] stem=[]\n[a] dir=[.] base=[a] ext=[] stem=[a]\n[/a] dir=[/] base=[a] ext=[] stem=[a]\n[a/] dir=[a] base=[] ext=[] stem=[]\n[a/b] dir=[a] base=[b] ext=[] stem=[b]\n[/foo/bar/baz.dm] dir=[/foo/bar] base=[baz.dm] ext=[.dm] stem=[baz]\n[a//b] dir=[a/] base=[b] ext=[] stem=[b]\n[/foo/] dir=[/foo] base=[] ext=[] stem=[]\n[.bashrc] dir=[.] base=[.bashrc] ext=[.bashrc] stem=[.bashrc]\n[a.tar.gz] dir=[.] base=[a.tar.gz] ext=[.gz] stem=[a.tar]\n[dir.d/file] dir=[dir.d] base=[file] ext=[] stem=[file]\n[dir.d/] dir=[dir.d] base=[] ext=[] stem=[]\n[a.] dir=[.] base=[a.] ext=[.] stem=[a]\n[..] dir=[.] base=[..] ext=[.] stem=[.]\n[.] dir=[.] base=[.] ext=[.] stem=[.]\n[a/.b] dir=[a] base=[.b] ext=[.b] stem=[.b]\n[noext] dir=[.] base=[noext] ext=[] stem=[noext]\n[/x.y/z] dir=[/x.y] base=[z] ext=[] stem=[z]\n[//] dir=[/] base=[] ext=[] stem=[]\njoin [][a][b][a/b][a/b][a//b][/b][src/main.zig]\n",
+    },
 };
 
 pub const div_safety_tests = [_]TestCase{
