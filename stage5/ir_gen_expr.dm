@@ -783,7 +783,7 @@ fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
         g = ir_type_error(g, fn_name + "() works on raw memory and requires an unsafe block", expr.line)
         return expr_result(g, b, 0)
     }
-    let want = if fn_name == "string_from_raw" { 3 } else if starts_with(fn_name, "store_") { 2 } else if fn_name == "size_of" { 0 } else { 1 }
+    let want = if fn_name == "string_from_raw" { 3 } else if starts_with(fn_name, "store_") or fn_name == "static_addr" { 2 } else if fn_name == "size_of" { 0 } else { 1 }
     if args.len() != want {
         g = ir_type_error(g, fn_name + "() takes " + int_to_string(want) + " arguments, not " + int_to_string(args.len()), expr.line)
         return expr_result(g, b, 0)
@@ -823,6 +823,30 @@ fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
         b.instructions.push(sym_inst)
         g.builder.next_id = sym + 1
         return expr_result(g, b, sym)
+    }
+
+    -- static_addr("name", size): lowered where the call is, see generate_call
+    if fn_name == "static_addr" {
+        if args[0].kind != EXPR_LITERAL_STRING() or args[0].str_val == "" {
+            g = ir_type_error(g, "static_addr() takes the name of the storage as a string literal", expr.line)
+            return expr_result(g, b, 0)
+        }
+        if args[1].kind != EXPR_LITERAL_INT() or args[1].int_val <= 0 {
+            g = ir_type_error(g, "static_addr() takes the size in bytes as an integer literal above 0", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let st = g.builder.next_id
+        let mut st_inst = ir_inst_new(st, OP_CALL())
+        st_inst.callee = "dm_static_addr"
+        let mut st_args: List[IRValue] = []
+        st_args.push(ir_val_string(args[0].str_val))
+        st_args.push(ir_val_int(args[1].int_val))
+        st_inst.call_args = st_args
+        st_inst.result_type = "i64"
+        st_inst.has_result = true
+        b.instructions.push(st_inst)
+        g.builder.next_id = st + 1
+        return expr_result(g, b, st)
     }
 
     -- load_T(addr)

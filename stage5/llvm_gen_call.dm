@@ -241,6 +241,16 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, symbol_addr) }
             return g
         }
+        -- static_addr("name", size): the address of the program's own
+        -- storage of that name
+        if callee_name == "dm_static_addr" and inst.call_args.len() == 2 {
+            let storage = inst.call_args[0].str_val
+            let size = inst.call_args[1].int_val
+            g = define_static_storage(g, storage, size)
+            let storage_addr = dm_llvm_build_ptr_to_int(b, g.data_symbols.get(static_symbol(storage)), dm_llvm_int64_type(g.context), "static.addr")
+            if inst.has_result { g.value_map.insert(id_key, storage_addr) }
+            return g
+        }
         -- len(s) reads the string's length field
         if callee_name == "dm_string_len" and inst.call_args.len() == 1 {
             let s_arg = inst.call_args[0]

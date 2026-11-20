@@ -164,6 +164,7 @@ extern fn dm_llvm_real_ole() -> int
 extern fn dm_llvm_real_ogt() -> int
 extern fn dm_llvm_real_oge() -> int
 extern fn dm_llvm_external_linkage() -> int
+extern fn dm_llvm_weak_linkage() -> int
 extern fn dm_llvm_object_file() -> int
 extern fn dm_llvm_assembly_file() -> int
 

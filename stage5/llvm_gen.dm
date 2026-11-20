@@ -55,6 +55,8 @@ struct LLVMGenerator {
     -- The LLVM global of each data symbol declared so far: main's
     -- argument count and vector, and the symbols symbol_addr names
     data_symbols: Map[string, int],
+    -- The size in bytes of each block of storage static_addr names
+    static_sizes: Map[string, int],
     -- Runtime functions written in dAImond: "dm_X" is here when the
     -- program defines rt_X, which then stands in for the C function
     rt_ports: Map[string, bool],
@@ -102,6 +104,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             c_symbols: Map_new(),
             c_symbol_names: Map_new(),
             data_symbols: Map_new(),
+            static_sizes: Map_new(),
             rt_ports: Map_new(),
             panic_blocks: Map_new(),
             ir_module: ir_mod,
@@ -548,6 +551,37 @@ fn declare_data_symbol(gen: LLVMGenerator, symbol: string, ty: int) -> LLVMGener
             dm_llvm_set_linkage(global, dm_llvm_external_linkage())
             g.data_symbols.insert(symbol, global)
         }
+        return g
+    }
+}
+
+-- The symbol of the storage static_addr("name", ...) names. No C
+-- symbol has a "." in its name.
+fn static_symbol(name: string) -> string {
+    return "dm_static." + name
+}
+
+-- Define the storage static_addr(name, size) names, unless it is
+-- defined already; afterwards gen.data_symbols.get(static_symbol(name))
+-- is its LLVM global. It is an array of 8-byte words, so that it is
+-- aligned for any load or store, and it starts as zeros. Its linkage
+-- is weak: the program and the precompiled runtime object may each
+-- define a name, and the linker keeps one.
+fn define_static_storage(gen: LLVMGenerator, name: string, size: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.static_sizes.contains(name) {
+            if g.static_sizes.get(name) != size {
+                g.type_errors.push("Error: static_addr(\"" + name + "\") has the size " + int_to_string(size) + " here and " + int_to_string(g.static_sizes.get(name)) + " elsewhere" + type_error_location(g))
+            }
+            return g
+        }
+        let words = dm_llvm_array_type(dm_llvm_int64_type(g.context), (size + 7) / 8)
+        let global = dm_llvm_module_add_global(g.llvm_module, words, static_symbol(name))
+        dm_llvm_set_initializer(global, dm_llvm_const_null(words))
+        dm_llvm_set_linkage(global, dm_llvm_weak_linkage())
+        g.data_symbols.insert(static_symbol(name), global)
+        g.static_sizes.insert(name, size)
         return g
     }
 }

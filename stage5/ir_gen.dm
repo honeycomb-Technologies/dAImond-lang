@@ -846,6 +846,9 @@ fn map_builtin_name(name: string) -> string {
 --     memory the string does not own
 --   symbol_addr("name"): the address of the data symbol `name`, such
 --     as a C library's global variable
+--   static_addr("name", size): the address of `size` bytes that belong
+--     to the program, are zero when it starts and last until it ends.
+--     Every use of one name gives the same address.
 -- ============================================================
 
 -- The memory type a load_T or store_T builtin accesses, or ""
@@ -865,7 +868,7 @@ fn raw_mem_type(name: string) -> string {
 
 fn is_raw_builtin(name: string) -> bool {
     if raw_mem_type(name) != "" { return true }
-    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw" or name == "symbol_addr"
+    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw" or name == "symbol_addr" or name == "static_addr"
 }
 
 fn raw_builtin_return_type(name: string) -> string {

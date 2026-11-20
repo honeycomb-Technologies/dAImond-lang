@@ -226,7 +226,7 @@ cd stage5 && bash gen_bootstrap.sh
 # Compile Stage 5 with itself (--link-llvm links the LLVM bridge)
 cd stage5 && /tmp/stage5_bin main.dm -o /tmp/stage5_self --link-llvm
 
-# Run the integration suite against the Stage 5 binary (324 tests)
+# Run the integration suite against the Stage 5 binary (327 tests)
 bash stage5/run_parity.sh
 ```
 
@@ -298,7 +298,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 
 ## Key Architecture Decisions
 
-1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 324/324 integration tests and compiles itself, but Stage 0 is still required for its first build.
+1. **Bootstrap strategy**: Stage 0 (Zig) -> Stage 1 (dAImond compiled by Stage 0) -> Stage 2 (self-compiled) -> Stage 3 (LLVM backend in Zig) -> Stage 4 (LLVM backend in dAImond, since deleted) -> Stage 5 (Stage 4 plus memory-safety checks). Stage 5 passes 327/327 integration tests and compiles itself, but Stage 0 is still required for its first build.
 
 2. **C as intermediate target**: Rather than emitting native code, the compiler generates portable C11 and delegates optimization to mature C compilers.
 
@@ -375,7 +375,7 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Stage 0 (Zig → C): Bootstrap compiler, 328/328 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): first built by Stage 0, 324/324 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 324/324. Programs it builds contain no C and are linked by `ld.lld`, with no C compiler. When it builds itself (`--link-llvm`) it still compiles the LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+- Stage 5 (dAImond + LLVM): first built by Stage 0, 327/327 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 327/327. Programs it builds contain no C and are linked by `ld.lld`, with no C compiler. When it builds itself (`--link-llvm`) it still compiles the LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
@@ -522,6 +522,7 @@ Stage 5 alone has the low-level features the runtime is being rewritten with (St
 | `string_data(s)` | Address of a string's bytes. A NUL byte follows them, except in a string that `string_from_raw` made from memory without one |
 | `string_from_raw(ptr, len, cap)` | The string at `ptr`; `cap` 0 means the string does not own the memory |
 | `symbol_addr("name")` | Address of the data symbol `name`, such as the C library's `stdout`. The name is a string literal; naming a function is a compile error |
+| `static_addr("name", size)` | Address of `size` bytes of the program's own storage, zeros when the program starts. Both arguments are literals. One name is one block of storage wherever it is used; two sizes for one name is a compile error |
 
 - **C-width integers**: integers of different types in one expression meet at one type. A literal takes the other operand's type (`fd < 0` with `fd: i32`), otherwise the narrower operand widens. `u8`/`u16`/`u32`/`u64` compare, divide and take remainders unsigned. Returning or assigning a wider integer to a narrower one is a compile error that asks for `as`, and a literal that doesn't fit its type is an error.
 - **Variadic externs**: `extern fn printf(fmt: string, ...) -> i32`. The C function is called directly: string arguments pass as `char*`, and extra arguments get C's default promotions (`f32` to double; `bool`, `i8` and `i16` to `i32`). A variadic extern can't return `string`.
@@ -660,7 +661,7 @@ cd stage5 && bash gen_bootstrap.sh
 Stage 0 (Zig) compiles Stage 1 (dAImond→C)     → stage1_compiler
 stage1_compiler self-compiles                     → stage1_v2 (fixed point ✓)
 Stage 0 (Zig) compiles Stage 5 (dAImond→LLVM)   → stage5_bin
-stage5_bin compiles test programs                 → native binaries (324/324 tests pass)
+stage5_bin compiles test programs                 → native binaries (327/327 tests pass)
 stage5_bin compiles Stage 5                       → stage5_self (same LLVM IR ✓)
 ```
 

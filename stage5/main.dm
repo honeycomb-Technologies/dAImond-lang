@@ -2473,6 +2473,7 @@ extern fn dm_llvm_real_ole() -> int
 extern fn dm_llvm_real_ogt() -> int
 extern fn dm_llvm_real_oge() -> int
 extern fn dm_llvm_external_linkage() -> int
+extern fn dm_llvm_weak_linkage() -> int
 extern fn dm_llvm_object_file() -> int
 extern fn dm_llvm_assembly_file() -> int
 
@@ -5275,6 +5276,9 @@ fn map_builtin_name(name: string) -> string {
 --     memory the string does not own
 --   symbol_addr("name"): the address of the data symbol `name`, such
 --     as a C library's global variable
+--   static_addr("name", size): the address of `size` bytes that belong
+--     to the program, are zero when it starts and last until it ends.
+--     Every use of one name gives the same address.
 -- ============================================================
 
 -- The memory type a load_T or store_T builtin accesses, or ""
@@ -5294,7 +5298,7 @@ fn raw_mem_type(name: string) -> string {
 
 fn is_raw_builtin(name: string) -> bool {
     if raw_mem_type(name) != "" { return true }
-    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw" or name == "symbol_addr"
+    return name == "addr_of" or name == "size_of" or name == "string_data" or name == "string_from_raw" or name == "symbol_addr" or name == "static_addr"
 }
 
 fn raw_builtin_return_type(name: string) -> string {
@@ -9079,7 +9083,7 @@ fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
         g = ir_type_error(g, fn_name + "() works on raw memory and requires an unsafe block", expr.line)
         return expr_result(g, b, 0)
     }
-    let want = if fn_name == "string_from_raw" { 3 } else if starts_with(fn_name, "store_") { 2 } else if fn_name == "size_of" { 0 } else { 1 }
+    let want = if fn_name == "string_from_raw" { 3 } else if starts_with(fn_name, "store_") or fn_name == "static_addr" { 2 } else if fn_name == "size_of" { 0 } else { 1 }
     if args.len() != want {
         g = ir_type_error(g, fn_name + "() takes " + int_to_string(want) + " arguments, not " + int_to_string(args.len()), expr.line)
         return expr_result(g, b, 0)
@@ -9119,6 +9123,30 @@ fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
         b.instructions.push(sym_inst)
         g.builder.next_id = sym + 1
         return expr_result(g, b, sym)
+    }
+
+    -- static_addr("name", size): lowered where the call is, see generate_call
+    if fn_name == "static_addr" {
+        if args[0].kind != EXPR_LITERAL_STRING() or args[0].str_val == "" {
+            g = ir_type_error(g, "static_addr() takes the name of the storage as a string literal", expr.line)
+            return expr_result(g, b, 0)
+        }
+        if args[1].kind != EXPR_LITERAL_INT() or args[1].int_val <= 0 {
+            g = ir_type_error(g, "static_addr() takes the size in bytes as an integer literal above 0", expr.line)
+            return expr_result(g, b, 0)
+        }
+        let st = g.builder.next_id
+        let mut st_inst = ir_inst_new(st, OP_CALL())
+        st_inst.callee = "dm_static_addr"
+        let mut st_args: List[IRValue] = []
+        st_args.push(ir_val_string(args[0].str_val))
+        st_args.push(ir_val_int(args[1].int_val))
+        st_inst.call_args = st_args
+        st_inst.result_type = "i64"
+        st_inst.has_result = true
+        b.instructions.push(st_inst)
+        g.builder.next_id = st + 1
+        return expr_result(g, b, st)
     }
 
     -- load_T(addr)
@@ -17879,6 +17907,8 @@ struct LLVMGenerator {
     -- The LLVM global of each data symbol declared so far: main's
     -- argument count and vector, and the symbols symbol_addr names
     data_symbols: Map[string, int],
+    -- The size in bytes of each block of storage static_addr names
+    static_sizes: Map[string, int],
     -- Runtime functions written in dAImond: "dm_X" is here when the
     -- program defines rt_X, which then stands in for the C function
     rt_ports: Map[string, bool],
@@ -17926,6 +17956,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             c_symbols: Map_new(),
             c_symbol_names: Map_new(),
             data_symbols: Map_new(),
+            static_sizes: Map_new(),
             rt_ports: Map_new(),
             panic_blocks: Map_new(),
             ir_module: ir_mod,
@@ -18372,6 +18403,37 @@ fn declare_data_symbol(gen: LLVMGenerator, symbol: string, ty: int) -> LLVMGener
             dm_llvm_set_linkage(global, dm_llvm_external_linkage())
             g.data_symbols.insert(symbol, global)
         }
+        return g
+    }
+}
+
+-- The symbol of the storage static_addr("name", ...) names. No C
+-- symbol has a "." in its name.
+fn static_symbol(name: string) -> string {
+    return "dm_static." + name
+}
+
+-- Define the storage static_addr(name, size) names, unless it is
+-- defined already; afterwards gen.data_symbols.get(static_symbol(name))
+-- is its LLVM global. It is an array of 8-byte words, so that it is
+-- aligned for any load or store, and it starts as zeros. Its linkage
+-- is weak: the program and the precompiled runtime object may each
+-- define a name, and the linker keeps one.
+fn define_static_storage(gen: LLVMGenerator, name: string, size: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        if g.static_sizes.contains(name) {
+            if g.static_sizes.get(name) != size {
+                g.type_errors.push("Error: static_addr(\"" + name + "\") has the size " + int_to_string(size) + " here and " + int_to_string(g.static_sizes.get(name)) + " elsewhere" + type_error_location(g))
+            }
+            return g
+        }
+        let words = dm_llvm_array_type(dm_llvm_int64_type(g.context), (size + 7) / 8)
+        let global = dm_llvm_module_add_global(g.llvm_module, words, static_symbol(name))
+        dm_llvm_set_initializer(global, dm_llvm_const_null(words))
+        dm_llvm_set_linkage(global, dm_llvm_weak_linkage())
+        g.data_symbols.insert(static_symbol(name), global)
+        g.static_sizes.insert(name, size)
         return g
     }
 }
@@ -20323,6 +20385,16 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, symbol_addr) }
             return g
         }
+        -- static_addr("name", size): the address of the program's own
+        -- storage of that name
+        if callee_name == "dm_static_addr" and inst.call_args.len() == 2 {
+            let storage = inst.call_args[0].str_val
+            let size = inst.call_args[1].int_val
+            g = define_static_storage(g, storage, size)
+            let storage_addr = dm_llvm_build_ptr_to_int(b, g.data_symbols.get(static_symbol(storage)), dm_llvm_int64_type(g.context), "static.addr")
+            if inst.has_result { g.value_map.insert(id_key, storage_addr) }
+            return g
+        }
         -- len(s) reads the string's length field
         if callee_name == "dm_string_len" and inst.call_args.len() == 1 {
             let s_arg = inst.call_args[0]
@@ -21090,7 +21162,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "95ca4be3a9136e6f"
+    return "18f6222736ab7839"
 }
 
 

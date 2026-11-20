@@ -662,6 +662,7 @@ int64_t dm_llvm_real_oge(void) { return (int64_t)LLVMRealOGE; }
 
 /* Linkage */
 int64_t dm_llvm_external_linkage(void) { return (int64_t)LLVMExternalLinkage; }
+int64_t dm_llvm_weak_linkage(void) { return (int64_t)LLVMWeakAnyLinkage; }
 
 /* File types */
 int64_t dm_llvm_object_file(void) { return 0; }

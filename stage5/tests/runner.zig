@@ -710,6 +710,89 @@ const stage5_primitive_tests = [_]TestCase{
         .expect_compile_error = true,
         .expected_error_contains = &.{"symbol_addr(\"puts\") names a function, not a data symbol", "symbol_addr(\"helper\") names a function, not a data symbol"},
     },
+    .{
+        .name = "static_addr_primitive",
+        .source =
+            \\module test
+            \\
+            \\fn counter() -> int {
+            \\    unsafe {
+            \\        return static_addr("counter", 8)
+            \\    }
+            \\}
+            \\
+            \\fn next() -> int {
+            \\    unsafe {
+            \\        let n = load_i64(counter()) + 1
+            \\        store_i64(counter(), n)
+            \\        return n
+            \\    }
+            \\}
+            \\
+            \\fn main() {
+            \\    unsafe {
+            \\        -- Storage starts as zeros and keeps what is stored in it
+            \\        println(int_to_string(load_i64(counter())))
+            \\        let a = next()
+            \\        let b = next()
+            \\        let c = next()
+            \\        println(int_to_string(a) + " " + int_to_string(b) + " " + int_to_string(c))
+            \\        -- One name is one address; another name is other storage
+            \\        let table = static_addr("table", 100)
+            \\        println(bool_to_string(table == static_addr("table", 100)) + " " + bool_to_string(table != counter()))
+            \\        -- All 100 bytes are there, and the address suits any load
+            \\        let mut i = 0
+            \\        let mut zeros = 0
+            \\        while i < 100 {
+            \\            if load_u8(table + i) == 0 { zeros = zeros + 1 }
+            \\            store_u8(table + i, i + 1)
+            \\            i = i + 1
+            \\        }
+            \\        println(int_to_string(zeros) + " " + int_to_string(load_u8(table + 99)) + " " + int_to_string(table % 8))
+            \\        println(int_to_string(load_i64(counter())))
+            \\    }
+            \\}
+        ,
+        .expected_output = "0\n1 2 3\ntrue true\n100 100 0\n3\n",
+    },
+    .{
+        .name = "static_addr_misuse",
+        .source =
+            \\module test
+            \\fn size() -> int { return 8 }
+            \\fn main() {
+            \\    let a = static_addr("a", 8)
+            \\    unsafe {
+            \\        let b = static_addr(int_to_string(1), 8)
+            \\        let c = static_addr("c", size())
+            \\        let d = static_addr("d", 0)
+            \\        let e = static_addr("e")
+            \\    }
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"static_addr() works on raw memory and requires an unsafe block at line 4", "static_addr() takes the name of the storage as a string literal at line 6", "static_addr() takes the size in bytes as an integer literal above 0 at line 7", "static_addr() takes the size in bytes as an integer literal above 0 at line 8", "static_addr() takes 2 arguments, not 1 at line 9"},
+    },
+    .{
+        .name = "static_addr_size_mismatch",
+        .source =
+            \\module test
+            \\fn first() -> int {
+            \\    unsafe {
+            \\        return static_addr("shared", 8)
+            \\    }
+            \\}
+            \\fn main() {
+            \\    unsafe {
+            \\        println(int_to_string(first() - static_addr("shared", 16)))
+            \\    }
+            \\}
+        ,
+        .expected_output = "",
+        .expect_compile_error = true,
+        .expected_error_contains = &.{"static_addr(\"shared\") has the size 16 here and 8 elsewhere"},
+    },
 };
 
 pub fn main() !void {

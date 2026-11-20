@@ -9,5 +9,5 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "95ca4be3a9136e6f"
+    return "18f6222736ab7839"
 }

@@ -429,7 +429,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 324/324 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig), and building itself still compiles the LLVM bridge with `cc`. Programs it builds contain no C and are linked by `ld.lld`
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 327/327 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig), and building itself still compiles the LLVM bridge with `cc`. Programs it builds contain no C and are linked by `ld.lld`
 
 ## Current Status
 
@@ -502,14 +502,14 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 
 ### Stage 5 LLVM Backend in dAImond -- In Progress
 - [x] Entire LLVM backend written in dAImond (~22K lines monolithic, ~15 split modules)
-- [x] Passes the integration suite (324/324) and 19/19 memory-safety probes
+- [x] Passes the integration suite (327/327) and 19/19 memory-safety probes
 - [x] Complete compiler pipeline: lexer, parser, AST, IR gen, LLVM gen -- all in dAImond
 - [x] LLVM-C bridge via extern FFI (llvm_bridge.c)
 - [x] Error detection: unterminated strings, syntax errors, undefined functions and variables, effect enforcement, untyped expressions reported at their source line
-- [x] Self-hosting: Stage 5 compiles itself; the self-built compiler emits byte-identical LLVM IR for its own source and passes 324/324
+- [x] Self-hosting: Stage 5 compiles itself; the self-built compiler emits byte-identical LLVM IR for its own source and passes 327/327
 - [ ] Bootstrap without Stage 0 (Zig) or C
 - [x] Modular source with gen_bootstrap.sh for monolithic generation (same pattern as Stage 1)
-- [x] Runtime primitives: raw memory loads and stores, `addr_of`, `size_of`, string internals, `symbol_addr`, C-width integer types and variadic `extern fn`
+- [x] Runtime primitives: raw memory loads and stores, `addr_of`, `size_of`, string internals, `symbol_addr`, `static_addr` (program-owned static storage), C-width integer types and variadic `extern fn`
 - [x] Runtime port started: the string functions (concat, compare, `char_at`, `substr`, search, trim, replace, case, `string_split`, the character classes), console I/O and `panic`, files, directories, paths, the environment, command-line arguments, `system` and the number conversions (`int_to_string`, `float_to_string`, `bool_to_string`, `parse_int`, `parse_float`) are dAImond code in `stage5/runtime/`, replacing their C versions
 - [x] Lists are dAImond code too (`stage5/runtime/list.dm`); `pop` works on lists of any element type and `contains` on float lists. `xs[i]` and `xs[i] = v` are inline: one bounds check, then a load or store
 - [x] Panics print `PANIC: <message>` to stderr and exit with code 1, the same text as Stage 0
