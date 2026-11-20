@@ -15,8 +15,10 @@ module list
 -- the rt_list_generic functions, which are told the element size
 -- and copy elements to and from addresses the caller provides.
 --
--- len(xs) and the creation of an empty list are inline and call
--- nothing.
+-- len(xs), xs[i], xs[i] = v and the creation of an empty list are
+-- inline and call nothing: the compiler checks the index and reads or
+-- writes the element itself. The get functions here serve for-in,
+-- which reads each element with a checked call.
 --
 -- A list that outgrows its allocation moves to a new one and leaves
 -- the old one as it is. A copy of a list is a copy of its header, so
@@ -106,12 +108,6 @@ fn rt_list_int64_get(list: int, index: int) -> int {
     }
 }
 
-fn rt_list_int64_set(list: int, index: int, value: int) {
-    unsafe {
-        store_i64(rt_list_slot(list, index, 8), value)
-    }
-}
-
 fn rt_list_int64_pop(list: int) -> int {
     unsafe {
         return load_i64(rt_list_remove_last(list, 8))
@@ -144,12 +140,6 @@ fn rt_list_double_push(list: int, value: float) {
 fn rt_list_double_get(list: int, index: int) -> float {
     unsafe {
         return load_f64(rt_list_slot(list, index, 8))
-    }
-}
-
-fn rt_list_double_set(list: int, index: int, value: float) {
-    unsafe {
-        store_f64(rt_list_slot(list, index, 8), value)
     }
 }
 
@@ -186,12 +176,6 @@ fn rt_list_string_get(list: int, index: int) -> string {
     return rt_string_at(rt_list_slot(list, index, 24))
 }
 
-fn rt_list_string_set(list: int, index: int, value: string) {
-    unsafe {
-        libc_memcpy(rt_list_slot(list, index, 24), addr_of(value), 24)
-    }
-}
-
 fn rt_list_string_pop(list: int) -> string {
     return rt_string_at(rt_list_remove_last(list, 24))
 }
@@ -224,13 +208,6 @@ fn rt_list_generic_push(list: int, value: int, elem_size: int) {
 fn rt_list_generic_get(out: int, list: int, index: int, elem_size: int) {
     unsafe {
         libc_memcpy(out, rt_list_slot(list, index, elem_size), elem_size)
-    }
-}
-
--- Replace element index with the elem_size bytes at address value
-fn rt_list_generic_set(list: int, value: int, index: int, elem_size: int) {
-    unsafe {
-        libc_memcpy(rt_list_slot(list, index, elem_size), value, elem_size)
     }
 }
 

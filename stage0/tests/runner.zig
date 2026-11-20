@@ -16,6 +16,8 @@ pub const TestCase = struct {
     source: []const u8,
     expected_output: []const u8,
     expected_exit_code: u8 = 0,
+    /// When set, the exact text the program must write to stderr.
+    expected_stderr: ?[]const u8 = null,
     expect_compile_error: bool = false,
     /// For expect_compile_error cases: every substring must appear in
     /// the compiler's stdout or stderr (Stage 0 prints diagnostics to
@@ -165,6 +167,14 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
         try stdout.reader().readAllArrayList(&stdout_list, 1024 * 1024);
     }
 
+    // Read stderr
+    var stderr_list = std.ArrayList(u8).init(allocator);
+    defer stderr_list.deinit();
+
+    if (run_proc.stderr) |stderr| {
+        try stderr.reader().readAllArrayList(&stderr_list, 1024 * 1024);
+    }
+
     const run_result = try run_proc.wait();
 
     // Check exit code
@@ -190,6 +200,18 @@ pub fn runTest(allocator: Allocator, case: TestCase, compiler_path: []const u8) 
             .passed = false,
             .message = msg,
         };
+    }
+
+    // Check stderr
+    if (case.expected_stderr) |expected_stderr| {
+        if (!std.mem.eql(u8, stderr_list.items, expected_stderr)) {
+            const msg = try std.fmt.allocPrint(allocator, "Stderr mismatch.\nExpected: '{s}'\nGot: '{s}'", .{ expected_stderr, stderr_list.items });
+            return .{
+                .name = case.name,
+                .passed = false,
+                .message = msg,
+            };
+        }
     }
 
     return .{
@@ -2067,6 +2089,29 @@ pub const process_tests = [_]TestCase{
         ,
         .expected_output = "0\n",
     },
+    // panic(msg) writes "PANIC: <msg>" to stderr and exits with code 1.
+    .{
+        .name = "panic_prints_message",
+        .source =
+            \\module test
+            \\
+            \\fn check(n: int) {
+            \\    if n > 2 {
+            \\        panic("value too big: " + int_to_string(n))
+            \\    }
+            \\    println("ok " + int_to_string(n))
+            \\}
+            \\
+            \\fn main() {
+            \\    check(1)
+            \\    check(7)
+            \\    println("not reached")
+            \\}
+        ,
+        .expected_output = "ok 1\n",
+        .expected_exit_code = 1,
+        .expected_stderr = "PANIC: value too big: 7\n",
+    },
 };
 
 // Phase E: Remaining Utilities
@@ -3308,6 +3353,7 @@ pub const list_method_tests = [_]TestCase{
         ,
         .expected_output = "a\n4\n0\n",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: list pop: empty list\n",
     },
 };
 
@@ -5100,6 +5146,7 @@ pub const div_safety_tests = [_]TestCase{
         ,
         .expected_output = "",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: division by zero\n",
     },
     .{
         .name = "int_modulo_by_zero_panics",
@@ -5111,6 +5158,7 @@ pub const div_safety_tests = [_]TestCase{
         ,
         .expected_output = "",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: modulo by zero\n",
     },
     .{
         .name = "float_division_by_zero_panics",
@@ -5122,6 +5170,7 @@ pub const div_safety_tests = [_]TestCase{
         ,
         .expected_output = "",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: division by zero\n",
     },
     .{
         .name = "division_by_variable_zero_panics",
@@ -5134,6 +5183,7 @@ pub const div_safety_tests = [_]TestCase{
         ,
         .expected_output = "",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: division by zero\n",
     },
     .{
         .name = "division_in_expression",
@@ -5176,6 +5226,7 @@ pub const bounds_check_tests = [_]TestCase{
         ,
         .expected_output = "",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: index out of bounds: index 5, length 1 (list)\n",
     },
     .{
         .name = "list_negative_index_panics",
@@ -5189,6 +5240,33 @@ pub const bounds_check_tests = [_]TestCase{
         ,
         .expected_output = "",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: index out of bounds: index -1, length 1 (list)\n",
+    },
+    .{
+        .name = "list_assignment_out_of_bounds_panics",
+        .source =
+            \\module test
+            \\
+            \\struct P {
+            \\    x: int
+            \\}
+            \\
+            \\fn main() {
+            \\    let mut ss: List[string] = []
+            \\    ss.push("a")
+            \\    ss[0] = "b"
+            \\    println(ss[0])
+            \\    let mut ps: List[P] = []
+            \\    ps.push(P { x: 1 })
+            \\    ps[0] = P { x: 2 }
+            \\    println(int_to_string(ps[0].x))
+            \\    ps[1] = P { x: 3 }
+            \\    println("not reached")
+            \\}
+        ,
+        .expected_output = "b\n2\n",
+        .expected_exit_code = 1,
+        .expected_stderr = "PANIC: index out of bounds: index 1, length 1 (list)\n",
     },
 };
 
@@ -5260,6 +5338,7 @@ pub const numeric_cast_tests = [_]TestCase{
         ,
         .expected_output = "308836698141973\n",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: integer overflow\n",
     },
     .{
         .name = "narrow_integer_overflow_panics",
@@ -5277,6 +5356,7 @@ pub const numeric_cast_tests = [_]TestCase{
         ,
         .expected_output = "2000000005\n250\n",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: integer overflow\n",
     },
 };
 
@@ -5906,6 +5986,7 @@ pub const audit_fix_tests = [_]TestCase{
         ,
         .expected_output = "before\n",
         .expected_exit_code = 1,
+        .expected_stderr = "PANIC: boom\n",
     },
     .{
         .name = "struct_field_shorthand",

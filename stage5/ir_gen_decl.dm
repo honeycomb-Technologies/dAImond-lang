@@ -319,14 +319,12 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_list_int64_push", "ptr", "i64", "void")
     g = declare_extern2(g, "dm_list_int64_get", "ptr", "i64", "i64")
     g = declare_extern(g, "dm_list_int64_len", "ptr", "i64")
-    g = declare_extern3(g, "dm_list_int64_set", "ptr", "i64", "i64", "void")
     g = declare_extern(g, "dm_list_int64_pop", "ptr", "i64")
 
     -- List operations (string)
     g = declare_extern(g, "dm_list_string_new", "ptr", "void")
     g = declare_extern2(g, "dm_list_string_push", "ptr", "string", "void")
     g = declare_extern2(g, "dm_list_string_get", "ptr", "i64", "string")
-    g = declare_extern3(g, "dm_list_string_set", "ptr", "i64", "string", "void")
     g = declare_extern(g, "dm_list_string_len", "ptr", "i64")
     g = declare_extern(g, "dm_list_string_pop", "ptr", "string")
 
@@ -334,7 +332,6 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_list_double_new", "ptr", "void")
     g = declare_extern2(g, "dm_list_double_push", "ptr", "f64", "void")
     g = declare_extern2(g, "dm_list_double_get", "ptr", "i64", "f64")
-    g = declare_extern3(g, "dm_list_double_set", "ptr", "i64", "f64", "void")
     g = declare_extern(g, "dm_list_double_len", "ptr", "i64")
     g = declare_extern(g, "dm_list_double_pop", "ptr", "f64")
 
@@ -342,7 +339,6 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern(g, "dm_list_generic_new", "ptr", "void")
     g = declare_extern3(g, "dm_list_generic_push", "ptr", "ptr", "i64", "void")
     g = declare_extern4(g, "dm_list_generic_get", "ptr", "ptr", "i64", "i64", "void")
-    g = declare_extern4(g, "dm_list_generic_set", "ptr", "ptr", "i64", "i64", "void")
     g = declare_extern(g, "dm_list_generic_len", "ptr", "i64")
     g = declare_extern3(g, "dm_list_generic_pop", "ptr", "ptr", "i64", "void")
 

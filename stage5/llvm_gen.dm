@@ -1517,7 +1517,12 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 -- data is an array of the element type
                 g = get_dm_string_type(g)
                 let ptr_ty = dm_llvm_pointer_type(g.context)
-                let data_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, base, 0, "list.data.addr")
+                let mut header = base
+                if dm_llvm_get_type_kind(dm_llvm_type_of(base)) != 12 {
+                    g.type_errors.push("Error: element taken from a value of type " + llvm_type_name(dm_llvm_type_of(base)) + ", which is not the address of a list" + type_error_location(g))
+                    header = dm_llvm_const_null(ptr_ty)
+                }
+                let data_slot = dm_llvm_build_struct_gep2(b, g.dm_string_type, header, 0, "list.data.addr")
                 let data = dm_llvm_build_load2(b, ptr_ty, data_slot, "list.data")
                 let idx = resolve_value(g, inst.gep_indices[0])
                 addr = dm_llvm_build_gep2_one(b, map_ir_type_to_llvm(g, inst.field_type), data, idx, "elem.addr")
@@ -1819,8 +1824,9 @@ fn generate_list_new(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     }
 }
 
--- xs[i], after its bounds check: a call to the runtime function for
--- the list's element type
+-- A read of a list whose element type the compiler could not
+-- determine, which it has reported as an error: a call to the runtime
+-- function, which checks the index
 fn generate_list_get(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     let mut get_call = ir_inst_new(inst.id, OP_CALL())
     get_call.callee = "dm_list_int64_get"

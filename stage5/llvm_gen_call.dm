@@ -186,7 +186,7 @@ fn generate_checked_arith(gen: LLVMGenerator, inst: IRInst, intrinsic: string) -
         let pair = dm_llvm_build_call2_buf(b, g.fn_type_map.get(intrinsic), g.function_map.get(intrinsic), "checked")
         let result = dm_llvm_build_extract_value(b, pair, 0, "arith")
         let overflowed = dm_llvm_build_extract_value(b, pair, 1, "overflowed")
-        g = branch_on_failed_check(g, overflowed, "PANIC: integer overflow")
+        g = branch_on_failed_check(g, overflowed, "integer overflow")
         if inst.has_result { g.value_map.insert(int_to_string(inst.id), result) }
         return g
     }
@@ -209,8 +209,8 @@ fn generate_range_check(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let above = dm_llvm_build_icmp(b, dm_llvm_int_sgt(), v, check_operand(g, inst, 2), "above")
             failed = dm_llvm_build_or(b, below, above, "out_of_range")
         }
-        let mut message = "PANIC: integer cast out of range"
-        if inst.callee == "dm_checked_range_i64" { message = "PANIC: integer overflow" }
+        let mut message = "integer cast out of range"
+        if inst.callee == "dm_checked_range_i64" { message = "integer overflow" }
         g = branch_on_failed_check(g, failed, message)
         if inst.has_result { g.value_map.insert(int_to_string(inst.id), v) }
         return g

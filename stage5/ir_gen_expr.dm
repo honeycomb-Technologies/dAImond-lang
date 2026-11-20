@@ -1096,19 +1096,8 @@ fn generate_addr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResul
         let chk = check_index_bounds(g, b, idx_result.val_id, ir_val_inst(len_id), "(list)")
         g = chk.gen
         b = chk.block
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_GEP())
-        inst.gep_base = h.ptr
-        let mut gep_idx: List[IRValue] = []
-        gep_idx.push(ir_val_inst(idx_result.val_id))
-        inst.gep_indices = gep_idx
-        inst.alloc_type = elem_ir
-        inst.field_type = elem_ir
-        inst.result_type = "ptr(" + elem_ir + ")"
-        inst.has_result = true
-        b.instructions.push(inst)
-        g.builder.next_id = id + 1
-        return addr_result(g, b, ir_val_inst(id), elem_src)
+        let elem_addr = emit_list_elem_addr(g, b, h.ptr, idx_result.val_id, elem_ir)
+        return addr_result(elem_addr.gen, elem_addr.block, ir_val_inst(elem_addr.val_id), elem_src)
     }
     if expr.kind == EXPR_FIELD_ACCESS() {
         let obj = *expr.object
@@ -1194,6 +1183,42 @@ fn generate_list_handle(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ad
     let mut copy = addr_result(g, b, ir_val_inst(tmp_id), list_t)
     copy.ok = false
     return copy
+}
+
+-- The address of element idx_id of the list whose header is at
+-- list_ptr and whose elements have IR type elem_ir. The caller has
+-- checked the index, and nothing may run between that check and the
+-- use of the address.
+fn emit_list_elem_addr(gen: IRGenerator, block: IRBasicBlock, list_ptr: IRValue, idx_id: int, elem_ir: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let id = g.builder.next_id
+    let mut inst = ir_inst_new(id, OP_GEP())
+    inst.gep_base = list_ptr
+    let mut gep_idx: List[IRValue] = []
+    gep_idx.push(ir_val_inst(idx_id))
+    inst.gep_indices = gep_idx
+    inst.alloc_type = elem_ir
+    inst.field_type = elem_ir
+    inst.result_type = "ptr(" + elem_ir + ")"
+    inst.has_result = true
+    b.instructions.push(inst)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
+-- IR type of the elements a list of this kind stores
+fn list_slot_ir_type(elem_kind: int, elem_type: string) -> string {
+    if elem_kind == LIST_ELEM_INT() { return "i64" }
+    if elem_kind == LIST_ELEM_FLOAT() { return "f64" }
+    if elem_kind == LIST_ELEM_STRING() { return "string" }
+    return elem_type
+}
+
+-- Whether loading a value of IR type t gives the address it was
+-- loaded from instead of a copy (strings and lists)
+fn ir_load_gives_address(t: string) -> bool {
+    return t == "string" or t == "list" or starts_with(t, "List[") or starts_with(t, "dm_list_")
 }
 
 -- IR element type of a list whose elements have source type elem_src
@@ -2130,7 +2155,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
         panic_inst.callee = "dm_panic"
         let mut panic_args: List[IRValue] = []
-        panic_args.push(ir_val_string("PANIC: division by zero"))
+        panic_args.push(ir_val_string("division by zero"))
         panic_inst.call_args = panic_args
         panic_inst.result_type = "void"
         panic_inst.has_result = false
@@ -2185,7 +2210,7 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
         let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
         panic_inst.callee = "dm_panic"
         let mut panic_args: List[IRValue] = []
-        panic_args.push(ir_val_string("PANIC: modulo by zero"))
+        panic_args.push(ir_val_string("modulo by zero"))
         panic_inst.call_args = panic_args
         panic_inst.result_type = "void"
         panic_inst.has_result = false
@@ -4359,8 +4384,8 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
 -- generate_binary: terminate the current block with a conditional branch
 -- to a panic block (dm_panic + unreachable) and an OK block, push both
 -- finished blocks to completed_blocks, and continue in the OK block.
--- Panic messages mirror Stage 0 codegen shapes, including the PANIC:
--- prefix, which the stage5 dm_panic wrapper does not add itself.
+-- Panic messages mirror Stage 0 codegen shapes. dm_panic prints
+-- "PANIC: " before the message.
 -- ============================================================
 
 -- Panic if a Box pointer value is null. Branches directly on the pointer
@@ -4383,7 +4408,7 @@ fn check_box_not_null(gen: IRGenerator, block: IRBasicBlock, ptr_id: int) -> Exp
     let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
     panic_inst.callee = "dm_panic"
     let mut panic_args: List[IRValue] = []
-    panic_args.push(ir_val_string("PANIC: null Box dereference"))
+    panic_args.push(ir_val_string("null Box dereference"))
     panic_inst.call_args = panic_args
     panic_inst.result_type = "void"
     panic_inst.has_result = false
@@ -4466,7 +4491,7 @@ fn check_index_bounds(gen: IRGenerator, block: IRBasicBlock, idx_id: int, len_va
 
     let c1_id = g.builder.next_id
     let mut c1 = ir_inst_new(c1_id, OP_STRING_CONCAT())
-    c1.lhs = ir_val_string("PANIC: index out of bounds: index ")
+    c1.lhs = ir_val_string("index out of bounds: index ")
     c1.rhs = ir_val_inst(idx_str_id)
     c1.result_type = "string"
     c1.has_result = true
@@ -4569,7 +4594,7 @@ fn check_div_overflow(gen: IRGenerator, block: IRBasicBlock, lhs_id: int, rhs_id
     let mut panic_inst = ir_inst_new(g.builder.next_id, OP_CALL())
     panic_inst.callee = "dm_panic"
     let mut panic_args: List[IRValue] = []
-    panic_args.push(ir_val_string("PANIC: integer overflow"))
+    panic_args.push(ir_val_string("integer overflow"))
     panic_inst.call_args = panic_args
     panic_inst.result_type = "void"
     panic_inst.has_result = false
@@ -5222,57 +5247,48 @@ fn generate_list_index_get(gen: IRGenerator, block: IRBasicBlock, elem_kind: int
     g = bounds_chk.gen
     b = bounds_chk.block
 
-    if elem_kind == LIST_ELEM_OTHER() {
-        -- Generic list get: alloca temp, call dm_list_generic_get(out_ptr, list_ptr, idx, elem_size)
-        let temp_alloca_id = g.builder.next_id
-        let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
-        temp_inst.alloc_type = elem_type
-        temp_inst.result_type = "ptr(" + elem_type + ")"
-        temp_inst.has_result = true
-        b.instructions.push(temp_inst)
-        g.builder.next_id = g.builder.next_id + 1
+    -- The index is in range: read the element where it lies
+    let slot_type = list_slot_ir_type(elem_kind, elem_type)
+    let elem_addr = emit_list_elem_addr(g, b, ir_val_inst(obj_id), idx_id, slot_type)
+    g = elem_addr.gen
+    b = elem_addr.block
+    let mut load_id = g.builder.next_id
+    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+    load_inst.load_ptr = ir_val_inst(elem_addr.val_id)
+    load_inst.load_type = slot_type
+    load_inst.result_type = slot_type
+    load_inst.has_result = true
+    b.instructions.push(load_inst)
+    g.builder.next_id = load_id + 1
 
-        let id = g.builder.next_id
-        let mut inst = ir_inst_new(id, OP_CALL())
-        inst.callee = "dm_list_generic_get"
-        let mut call_args: List[IRValue] = []
-        call_args.push(ir_val_inst(temp_alloca_id))
-        call_args.push(ir_val_inst(obj_id))
-        call_args.push(ir_val_inst(idx_id))
-        call_args.push(ir_val_sizeof(elem_type))
-        inst.call_args = call_args
-        inst.result_type = "void"
-        inst.has_result = false
-        b.instructions.push(inst)
-        g.builder.next_id = id + 1
-
-        -- Load the struct from temp alloca
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(temp_alloca_id)
-        load_inst.load_type = elem_type
-        load_inst.result_type = elem_type
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
+    if ir_load_gives_address(slot_type) {
+        -- A string or list element: copy it out, so the value read
+        -- does not change when the element is assigned later
+        let copy_id = g.builder.next_id
+        let mut copy_inst = ir_inst_new(copy_id, OP_ALLOCA())
+        copy_inst.alloc_type = slot_type
+        copy_inst.result_type = "ptr(" + slot_type + ")"
+        copy_inst.has_result = true
+        b.instructions.push(copy_inst)
+        g.builder.next_id = copy_id + 1
+        let copied = emit_ir_store(g, b, ir_val_inst(copy_id), ir_val_inst(load_id))
+        g = copied.gen
+        b = copied.block
+        load_id = g.builder.next_id
+        let mut reload_inst = ir_inst_new(load_id, OP_LOAD())
+        reload_inst.load_ptr = ir_val_inst(copy_id)
+        reload_inst.load_type = slot_type
+        reload_inst.result_type = slot_type
+        reload_inst.has_result = true
+        b.instructions.push(reload_inst)
         g.builder.next_id = load_id + 1
-
-        -- Track struct type for subsequent field access
-        if g.struct_defs.contains(elem_type) {
-            g.var_struct_types.insert("_listget_" + int_to_string(load_id), elem_type)
-        }
-
-        return expr_result(g, b, load_id)
     }
 
-    let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_LIST_GET())
-    inst.lhs = ir_val_inst(obj_id)
-    inst.rhs = ir_val_inst(idx_id)
-    inst.result_type = map_type_name(elem_type)
-    inst.has_result = true
-    b.instructions.push(inst)
-    g.builder.next_id = id + 1
-    return expr_result(g, b, id)
+    -- Track struct type for subsequent field access
+    if elem_kind == LIST_ELEM_OTHER() and g.struct_defs.contains(elem_type) {
+        g.var_struct_types.insert("_listget_" + int_to_string(load_id), elem_type)
+    }
+    return expr_result(g, b, load_id)
 }
 
 fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {

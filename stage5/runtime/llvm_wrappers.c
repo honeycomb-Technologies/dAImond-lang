@@ -64,9 +64,17 @@ void llvm_dm_eprintln(const dm_string* s) {
     fputc('\n', stderr);
 }
 
+// A panic writes "PANIC: <message>" to stderr and exits with code 1, as
+// in Stage 0. Callers pass the message without the prefix.
 void llvm_dm_panic(const dm_string* s) {
+    fputs("PANIC: ", stderr);
     fwrite(s->data, 1, s->len, stderr);
     fputc('\n', stderr);
+    exit(1);
+}
+
+static void panic_cstr(const char* message) {
+    fprintf(stderr, "PANIC: %s\n", message);
     exit(1);
 }
 
@@ -228,8 +236,7 @@ void llvm_dm_file_read(dm_string* out, const dm_string* path) {
     FILE* f = fopen(cpath, "rb");
     free(cpath);
     if (!f) {
-        fprintf(stderr, "file_read: cannot open file\n");
-        exit(1);
+        panic_cstr("file_read: cannot open file");
     }
     fseek(f, 0, SEEK_END);
     long file_size = ftell(f);
@@ -248,8 +255,7 @@ void llvm_dm_file_write(const dm_string* path, const dm_string* content) {
     FILE* f = fopen(cpath, "wb");
     free(cpath);
     if (!f) {
-        fprintf(stderr, "file_write: cannot open file\n");
-        exit(1);
+        panic_cstr("file_write: cannot open file");
     }
     fwrite(content->data, 1, content->len, f);
     fclose(f);
@@ -262,8 +268,7 @@ void llvm_dm_file_append(const dm_string* path, const dm_string* content) {
     FILE* f = fopen(cpath, "ab");
     free(cpath);
     if (!f) {
-        fprintf(stderr, "file_append: cannot open file\n");
-        exit(1);
+        panic_cstr("file_append: cannot open file");
     }
     fwrite(content->data, 1, content->len, f);
     fclose(f);
@@ -331,7 +336,7 @@ static void dm_list_string_push(dm_list_dm_string* list, const dm_string* value)
     if (list->len >= list->capacity) {
         int64_t new_cap = list->capacity == 0 ? 8 : list->capacity * 2;
         dm_string* new_data = (dm_string*)malloc((size_t)new_cap * sizeof(dm_string));
-        if (!new_data) { fprintf(stderr, "list push: out of memory\n"); exit(1); }
+        if (!new_data) panic_cstr("list push: out of memory");
         if (list->data) memcpy(new_data, list->data, (size_t)list->len * sizeof(dm_string));
         list->data = new_data;
         list->capacity = new_cap;

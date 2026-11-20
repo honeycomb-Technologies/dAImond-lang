@@ -1473,7 +1473,7 @@ fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRVal
 }
 
 -- list[index] = value for the list at list_ptr, with a bounds check
-fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_type: string, list_ptr: IRValue, index_expr: Expr, val_id: int, set_ctx: string) -> GenResult {
+fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_type: string, list_ptr: IRValue, index_expr: Expr, val_id: int, value_expr: Expr, set_ctx: string) -> GenResult {
     let mut g = gen
     let mut b = block
     -- Generate the index expression
@@ -1501,53 +1501,14 @@ fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_
     g = set_chk.gen
     b = set_chk.block
 
-    if ek == LIST_ELEM_OTHER() {
-        -- Generic set: alloca temp, store value, pass pointer + elem_size
-        let set_elem_type = elem_type
-        let set_temp_id = g.builder.next_id
-        let mut set_temp_inst = ir_inst_new(set_temp_id, OP_ALLOCA())
-        set_temp_inst.alloc_type = set_elem_type
-        set_temp_inst.result_type = "ptr(" + set_elem_type + ")"
-        set_temp_inst.has_result = true
-        b.instructions.push(set_temp_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut set_store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-        set_store_inst.store_ptr = ir_val_inst(set_temp_id)
-        set_store_inst.store_val = ir_val_inst(val_id)
-        set_store_inst.has_result = false
-        b.instructions.push(set_store_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-        set_inst.callee = "dm_list_generic_set"
-        let mut set_args: List[IRValue] = []
-        set_args.push(list_ptr)
-        set_args.push(ir_val_inst(set_temp_id))
-        set_args.push(ir_val_inst(idx_result.val_id))
-        set_args.push(ir_val_sizeof(set_elem_type))
-        set_inst.call_args = set_args
-        set_inst.result_type = "void"
-        set_inst.has_result = false
-        b.instructions.push(set_inst)
-        g.builder.next_id = g.builder.next_id + 1
-    } else {
-        let set_fn = if ek == LIST_ELEM_INT() { "dm_list_int64_set" }
-        else if ek == LIST_ELEM_FLOAT() { "dm_list_double_set" }
-        else { "dm_list_string_set" }
-        let mut set_inst = ir_inst_new(g.builder.next_id, OP_CALL())
-        set_inst.callee = set_fn
-        let mut set_args: List[IRValue] = []
-        set_args.push(list_ptr)
-        set_args.push(ir_val_inst(idx_result.val_id))
-        set_args.push(ir_val_inst(val_id))
-        set_inst.call_args = set_args
-        set_inst.result_type = "void"
-        set_inst.has_result = false
-        b.instructions.push(set_inst)
-        g.builder.next_id = g.builder.next_id + 1
-    }
-    return gen_result(g, b)
+    -- The index is in range: write the element where it lies. An
+    -- integer value takes the element's type first.
+    let slot_type = list_slot_ir_type(ek, elem_type)
+    let conv = convert_int_value(g, b, val_id, value_expr, infer_expr_type(g, value_expr), map_type_name(slot_type), "the assigned value")
+    g = conv.gen
+    b = conv.block
+    let elem_addr = emit_list_elem_addr(g, b, list_ptr, idx_result.val_id, slot_type)
+    return emit_ir_store(elem_addr.gen, elem_addr.block, ir_val_inst(elem_addr.val_id), ir_val_inst(conv.val_id))
 }
 
 fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
@@ -1752,7 +1713,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 g = ir_type_error(g, "element assignment would change a temporary copy of this list; store the list in a variable or field first", stmt.line)
             }
             let elem_src = extract_inner_type(obj_static, "List[")
-            let set_res = generate_list_index_set(g, b, classify_list_elem(elem_src), list_elem_ir_type(elem_src), h.ptr, *target.index, val_result.val_id, "(list)")
+            let set_res = generate_list_index_set(g, b, classify_list_elem(elem_src), list_elem_ir_type(elem_src), h.ptr, *target.index, val_result.val_id, *stmt.assign_value, "(list)")
             g = set_res.gen
             b = set_res.block
         }
@@ -1764,7 +1725,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 let list_ptr = g.variable_map.get(obj_name)
                 let set_elem_type = if g.list_elem_types.contains(obj_name) { g.list_elem_types.get(obj_name) } else { "i64" }
                 let set_ctx = if g.array_var_names.contains(obj_name) { "(array)" } else { "(list)" }
-                let set_res = generate_list_index_set(g, b, ek, set_elem_type, ir_val_inst(list_ptr), *target.index, val_result.val_id, set_ctx)
+                let set_res = generate_list_index_set(g, b, ek, set_elem_type, ir_val_inst(list_ptr), *target.index, val_result.val_id, *stmt.assign_value, set_ctx)
                 g = set_res.gen
                 b = set_res.block
             }
