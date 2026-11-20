@@ -767,7 +767,7 @@ fn map_builtin_name(name: string) -> string {
     if name == "eprint" { return "dm_eprint" }
     if name == "eprintln" { return "dm_eprintln" }
     if name == "panic" { return "dm_panic" }
-    if name == "exit" { return "exit" }
+    if name == "exit" { return "dm_libc_exit" }
     if name == "len" { return "dm_string_len" }
     if name == "char_at" { return "dm_char_at" }
     if name == "substr" { return "dm_substr" }

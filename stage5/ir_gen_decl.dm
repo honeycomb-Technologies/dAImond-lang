@@ -285,7 +285,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern3(g, "dm_checked_range_i64", "i64", "i64", "i64", "i64")
     g = declare_extern3(g, "dm_cast_check_i64", "i64", "i64", "i64", "i64")
     g = declare_extern2(g, "dm_cast_check_u64", "u64", "u64", "u64")
-    g = declare_extern(g, "exit", "i64", "void")
+    g = declare_libc(g, "exit", "i64", "void")
 
     -- Stdin
     g = declare_extern0(g, "dm_read_line", "string")
@@ -311,8 +311,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_path_join", "string", "string", "string")
 
     -- Memory allocation
-    g = declare_extern(g, "malloc", "i64", "ptr")
-    g = declare_extern(g, "free", "ptr", "void")
+    g = declare_libc(g, "malloc", "i64", "ptr")
 
     -- List operations (int64)
     g = declare_extern(g, "dm_list_int64_new", "ptr", "void")
@@ -372,6 +371,19 @@ fn declare_extern(gen: IRGenerator, name: string, p1: string, ret: string) -> IR
     let mut g = gen
     let mut func = ir_function_new(name, ret)
     func.is_extern = true
+    func.params.push(ir_param_new("p0", p1))
+    g.ir_mod.functions.push(func)
+    return g
+}
+
+-- Declare libc function `symbol`, which the compiler itself calls, as
+-- dm_libc_<symbol>. A program's own function or extern named `symbol`
+-- is then a different function, with its own signature.
+fn declare_libc(gen: IRGenerator, symbol: string, p1: string, ret: string) -> IRGenerator {
+    let mut g = gen
+    let mut func = ir_function_new("dm_libc_" + symbol, ret)
+    func.is_extern = true
+    func.link_name = symbol
     func.params.push(ir_param_new("p0", p1))
     g.ir_mod.functions.push(func)
     return g
@@ -532,9 +544,9 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
         g.mut_param_fns.insert(name, mut_flags)
     }
 
-    -- A source extern fn replaces an earlier declaration of the same C
-    -- function, such as the compiler's own malloc; calls convert pointers
-    -- and ints between the two signatures
+    -- A source extern fn replaces the compiler's own declaration of the
+    -- same runtime function; calls convert pointers and ints between the
+    -- two signatures
     if fd.is_extern {
         let mut fi = 0
         while fi < g.ir_mod.functions.len() {

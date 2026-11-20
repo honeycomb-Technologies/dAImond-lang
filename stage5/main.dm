@@ -5198,7 +5198,7 @@ fn map_builtin_name(name: string) -> string {
     if name == "eprint" { return "dm_eprint" }
     if name == "eprintln" { return "dm_eprintln" }
     if name == "panic" { return "dm_panic" }
-    if name == "exit" { return "exit" }
+    if name == "exit" { return "dm_libc_exit" }
     if name == "len" { return "dm_string_len" }
     if name == "char_at" { return "dm_char_at" }
     if name == "substr" { return "dm_substr" }
@@ -5829,7 +5829,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern3(g, "dm_checked_range_i64", "i64", "i64", "i64", "i64")
     g = declare_extern3(g, "dm_cast_check_i64", "i64", "i64", "i64", "i64")
     g = declare_extern2(g, "dm_cast_check_u64", "u64", "u64", "u64")
-    g = declare_extern(g, "exit", "i64", "void")
+    g = declare_libc(g, "exit", "i64", "void")
 
     -- Stdin
     g = declare_extern0(g, "dm_read_line", "string")
@@ -5855,8 +5855,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
     g = declare_extern2(g, "dm_path_join", "string", "string", "string")
 
     -- Memory allocation
-    g = declare_extern(g, "malloc", "i64", "ptr")
-    g = declare_extern(g, "free", "ptr", "void")
+    g = declare_libc(g, "malloc", "i64", "ptr")
 
     -- List operations (int64)
     g = declare_extern(g, "dm_list_int64_new", "ptr", "void")
@@ -5916,6 +5915,19 @@ fn declare_extern(gen: IRGenerator, name: string, p1: string, ret: string) -> IR
     let mut g = gen
     let mut func = ir_function_new(name, ret)
     func.is_extern = true
+    func.params.push(ir_param_new("p0", p1))
+    g.ir_mod.functions.push(func)
+    return g
+}
+
+-- Declare libc function `symbol`, which the compiler itself calls, as
+-- dm_libc_<symbol>. A program's own function or extern named `symbol`
+-- is then a different function, with its own signature.
+fn declare_libc(gen: IRGenerator, symbol: string, p1: string, ret: string) -> IRGenerator {
+    let mut g = gen
+    let mut func = ir_function_new("dm_libc_" + symbol, ret)
+    func.is_extern = true
+    func.link_name = symbol
     func.params.push(ir_param_new("p0", p1))
     g.ir_mod.functions.push(func)
     return g
@@ -6076,9 +6088,9 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
         g.mut_param_fns.insert(name, mut_flags)
     }
 
-    -- A source extern fn replaces an earlier declaration of the same C
-    -- function, such as the compiler's own malloc; calls convert pointers
-    -- and ints between the two signatures
+    -- A source extern fn replaces the compiler's own declaration of the
+    -- same runtime function; calls convert pointers and ints between the
+    -- two signatures
     if fd.is_extern {
         let mut fi = 0
         while fi < g.ir_mod.functions.len() {
@@ -16490,7 +16502,7 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     -- Allocate as many bytes as the boxed value's LLVM type needs
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
-    malloc_inst.callee = "malloc"
+    malloc_inst.callee = "dm_libc_malloc"
     let mut margs: List[IRValue] = []
     margs.push(ir_val_sizeof_value(val_result.val_id))
     malloc_inst.call_args = margs
@@ -17831,6 +17843,9 @@ struct LLVMGenerator {
     -- functions bound to the same symbol share it; each keeps its own
     -- function type in fn_type_map.
     c_symbols: Map[string, int],
+    -- Every C symbol the module's extern declarations name. A dAImond
+    -- function of the same name gets another symbol (see dm_symbol_of).
+    c_symbol_names: Map[string, bool],
     -- The LLVM global of each data symbol declared so far: main's
     -- argument count and vector, and the symbols symbol_addr names
     data_symbols: Map[string, int],
@@ -17879,6 +17894,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
             c_symbols: Map_new(),
+            c_symbol_names: Map_new(),
             data_symbols: Map_new(),
             rt_ports: Map_new(),
             panic_blocks: Map_new(),
@@ -18422,6 +18438,33 @@ fn c_symbol_of(func: IRFunction) -> string {
     return func.name
 }
 
+-- Record the C symbols the module's extern declarations name, and
+-- strlen, which the compiler declares for itself
+fn find_c_symbol_names(gen: LLVMGenerator) -> LLVMGenerator {
+    let mut g = gen
+    g.c_symbol_names.insert("strlen", true)
+    let mut i = 0
+    while i < g.ir_module.functions.len() {
+        let f = g.ir_module.functions[i]
+        if f.is_extern {
+            g.c_symbol_names.insert(c_symbol_of(f), true)
+        }
+        i = i + 1
+    }
+    return g
+}
+
+-- The symbol of dAImond function `func`: its name, unless the module
+-- also declares a C function of that name. A program may define a
+-- function named `rename` or `free`; the runtime's calls of the C
+-- functions must still reach C. No C symbol has a "." in its name.
+fn dm_symbol_of(gen: LLVMGenerator, func: IRFunction) -> string {
+    if func.name != "main" and gen.c_symbol_names.contains(func.name) {
+        return func.name + ".dm"
+    }
+    return func.name
+}
+
 -- Declare C symbol `symbol` with type `fn_ty` unless it already is;
 -- afterwards gen.c_symbols.get(symbol) is its LLVM function. A later
 -- declaration with another type calls the same function with its own type.
@@ -18589,7 +18632,7 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             }
             return g
         }
-        let llvm_fn = dm_llvm_module_add_function(g.llvm_module, func.name, fn_ty)
+        let llvm_fn = dm_llvm_module_add_function(g.llvm_module, dm_symbol_of(g, func), fn_ty)
         g.function_map.insert(func.name, llvm_fn)
         g.fn_type_map.insert(func.name, fn_ty)
         -- Track sret functions
@@ -19784,6 +19827,7 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = declare_main_args(g)
     -- Phase 3: Declare all functions
     g = find_runtime_ports(g)
+    g = find_c_symbol_names(g)
     let mut i = 0
     while i < g.ir_module.functions.len() {
         g = lg_declare_function(g, g.ir_module.functions[i])
@@ -21027,7 +21071,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "868494aaaea3501a"
+    return "0ce3ec6a8a8c4503"
 }
 
 

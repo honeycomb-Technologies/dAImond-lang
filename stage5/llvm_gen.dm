@@ -56,6 +56,9 @@ struct LLVMGenerator {
     -- functions bound to the same symbol share it; each keeps its own
     -- function type in fn_type_map.
     c_symbols: Map[string, int],
+    -- Every C symbol the module's extern declarations name. A dAImond
+    -- function of the same name gets another symbol (see dm_symbol_of).
+    c_symbol_names: Map[string, bool],
     -- The LLVM global of each data symbol declared so far: main's
     -- argument count and vector, and the symbols symbol_addr names
     data_symbols: Map[string, int],
@@ -104,6 +107,7 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
             c_symbols: Map_new(),
+            c_symbol_names: Map_new(),
             data_symbols: Map_new(),
             rt_ports: Map_new(),
             panic_blocks: Map_new(),
@@ -647,6 +651,33 @@ fn c_symbol_of(func: IRFunction) -> string {
     return func.name
 }
 
+-- Record the C symbols the module's extern declarations name, and
+-- strlen, which the compiler declares for itself
+fn find_c_symbol_names(gen: LLVMGenerator) -> LLVMGenerator {
+    let mut g = gen
+    g.c_symbol_names.insert("strlen", true)
+    let mut i = 0
+    while i < g.ir_module.functions.len() {
+        let f = g.ir_module.functions[i]
+        if f.is_extern {
+            g.c_symbol_names.insert(c_symbol_of(f), true)
+        }
+        i = i + 1
+    }
+    return g
+}
+
+-- The symbol of dAImond function `func`: its name, unless the module
+-- also declares a C function of that name. A program may define a
+-- function named `rename` or `free`; the runtime's calls of the C
+-- functions must still reach C. No C symbol has a "." in its name.
+fn dm_symbol_of(gen: LLVMGenerator, func: IRFunction) -> string {
+    if func.name != "main" and gen.c_symbol_names.contains(func.name) {
+        return func.name + ".dm"
+    }
+    return func.name
+}
+
 -- Declare C symbol `symbol` with type `fn_ty` unless it already is;
 -- afterwards gen.c_symbols.get(symbol) is its LLVM function. A later
 -- declaration with another type calls the same function with its own type.
@@ -814,7 +845,7 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             }
             return g
         }
-        let llvm_fn = dm_llvm_module_add_function(g.llvm_module, func.name, fn_ty)
+        let llvm_fn = dm_llvm_module_add_function(g.llvm_module, dm_symbol_of(g, func), fn_ty)
         g.function_map.insert(func.name, llvm_fn)
         g.fn_type_map.insert(func.name, fn_ty)
         -- Track sret functions
@@ -2009,6 +2040,7 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = declare_main_args(g)
     -- Phase 3: Declare all functions
     g = find_runtime_ports(g)
+    g = find_c_symbol_names(g)
     let mut i = 0
     while i < g.ir_module.functions.len() {
         g = lg_declare_function(g, g.ir_module.functions[i])

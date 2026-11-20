@@ -538,7 +538,7 @@ fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     -- Allocate as many bytes as the boxed value's LLVM type needs
     let malloc_id = g.builder.next_id
     let mut malloc_inst = ir_inst_new(malloc_id, OP_CALL())
-    malloc_inst.callee = "malloc"
+    malloc_inst.callee = "dm_libc_malloc"
     let mut margs: List[IRValue] = []
     margs.push(ir_val_sizeof_value(val_result.val_id))
     malloc_inst.call_args = margs

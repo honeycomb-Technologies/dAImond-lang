@@ -308,6 +308,68 @@ const stage5_file_tests = [_]TestCase{
     },
 };
 
+/// A program's function may have the name of a C function the runtime
+/// or the compiler calls. Each call reaches its own function. Stage 0
+/// fails to link such a program.
+const stage5_symbol_tests = [_]TestCase{
+    .{
+        .name = "functions_named_like_c_functions",
+        .source =
+            \\module test
+            \\
+            \\-- Functions that have the names of C functions the runtime calls
+            \\
+            \\fn rename(from: string, to: string) -> int {
+            \\    return 7
+            \\}
+            \\
+            \\fn remove(path: string) -> int {
+            \\    return 8
+            \\}
+            \\
+            \\fn strlen(s: string) -> int {
+            \\    return 100
+            \\}
+            \\
+            \\fn getenv(name: string) -> string {
+            \\    return "mine"
+            \\}
+            \\
+            \\fn memcmp(a: string, b: string) -> int {
+            \\    return 5
+            \\}
+            \\
+            \\-- Box_new allocates with C's malloc, not with this one
+            \\fn malloc(n: int) -> int {
+            \\    return 0
+            \\}
+            \\
+            \\fn free(p: int) -> int {
+            \\    return p + 1
+            \\}
+            \\
+            \\struct Node {
+            \\    v: int
+            \\}
+            \\
+            \\fn main() {
+            \\    let p = args_get(0) + ".data"
+            \\    file_write(p, "x")
+            \\    let r = fs_rename(p, p + "2")
+            \\    println(int_to_string(rename("a", "b")) + " " + int_to_string(r) + " " + bool_to_string(file_exists(p + "2")))
+            \\    let d = fs_remove(p + "2")
+            \\    println(int_to_string(remove("a")) + " " + int_to_string(d) + " " + bool_to_string(file_exists(p + "2")))
+            \\    println(int_to_string(strlen("abc")) + " " + bool_to_string(len(args_get(0)) < 100))
+            \\    println(getenv("PATH") + " " + bool_to_string(env_get("PATH") != "mine"))
+            \\    let b = Box_new(Node { v: 41 })
+            \\    println(int_to_string(b.v + malloc(8)) + " " + int_to_string(free(4)))
+            \\    println(int_to_string(memcmp("a", "b")) + " " + bool_to_string("abc" == "abd") + " " + bool_to_string("abc" == "abc"))
+            \\}
+        ,
+        .expected_output = "7 0 true\n8 0 false\n100 true\nmine true\n41 5\n5 false true\n",
+    },
+};
+
 /// Raw memory, C-width integers and variadic externs: the primitives
 /// the runtime is written with. Stage 0 has none of them.
 const stage5_primitive_tests = [_]TestCase{
@@ -672,6 +734,7 @@ pub fn main() !void {
         .{ .name = "Lists (Stage 5)", .tests = &stage5_list_tests },
         .{ .name = "Strings (Stage 5)", .tests = &stage5_string_tests },
         .{ .name = "Files (Stage 5)", .tests = &stage5_file_tests },
+        .{ .name = "C Symbol Names (Stage 5)", .tests = &stage5_symbol_tests },
         .{ .name = "Runtime Primitives", .tests = &stage5_primitive_tests },
     };
 
