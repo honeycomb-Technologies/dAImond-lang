@@ -4,7 +4,7 @@
 
 dAImond is a systems programming language designed to be the fastest compiled language, the most AI-generatable language, self-compiling, memory-safe without garbage collection (region-based with full inference), and fully Turing-complete at compile time.
 
-The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, but its first build still comes from Stage 0 (Zig), and when it builds itself it still compiles the LLVM bridge (`llvm_bridge.c`) with `cc`. Programs it builds contain no C: their runtime is dAImond code, and `cc` only links them.
+The repository contains the **Stage 0 bootstrap compiler** (Zig → C), the **Stage 1 self-hosting compiler** (dAImond → C), the **Stage 3 LLVM backend** (Zig + LLVM), and the **Stage 5 LLVM backend** (dAImond + LLVM, with memory-safety checks). Stage 5 compiles itself, but its first build still comes from Stage 0 (Zig), and when it builds itself it still compiles the LLVM bridge (`llvm_bridge.c`) with `cc`. Programs it builds contain no C: their runtime is dAImond code, and the compiler links them with `ld.lld`.
 
 ## Repository Structure
 
@@ -198,7 +198,7 @@ Stage 3 is frozen. See `docs/stage-history.md` for build commands.
 
 ### Stage 5 (LLVM Backend in dAImond)
 
-Stage 5 is compiled by Stage 0. Building it requires **LLVM 17+** development libraries and Stage 0's C runtime. Running it requires `cc`, which links the programs it builds.
+Stage 5 is compiled by Stage 0. Building it requires **LLVM 17+** development libraries and Stage 0's C runtime. Running it requires LLVM's linker `ld.lld` and the C library's development files (`Scrt1.o`, `crti.o`, `crtn.o`, `libc.so`); it needs no C compiler, except to build itself.
 
 ```bash
 # Build Stage 5 compiler (Stage 0 compiles main.dm to C, then gcc produces binary)
@@ -375,12 +375,12 @@ The runtime targets **C11** for portability. Networking requires POSIX sockets. 
 - Stage 0 (Zig → C): Bootstrap compiler, 328/328 integration tests
 - Stage 1 (dAImond → C): Self-hosting with fixed-point bootstrap
 - Stage 3 (Zig + LLVM): Native binary output, full test parity
-- Stage 5 (dAImond + LLVM): first built by Stage 0, 324/324 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 324/324. Programs it builds contain no C; `cc` only links them. When it builds itself (`--link-llvm`) it still compiles the LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
+- Stage 5 (dAImond + LLVM): first built by Stage 0, 324/324 tests, 19/19 memory-safety probes. It compiles itself: the Stage 0-built and the self-built compilers emit byte-identical LLVM IR for Stage 5's source, and the self-built compiler also passes 324/324. Programs it builds contain no C and are linked by `ld.lld`, with no C compiler. When it builds itself (`--link-llvm`) it still compiles the LLVM bridge with `cc`. Stage 5 alone supports generic structs (`struct Table[K, V]` with `impl Table[K, V]`), written with explicit type arguments such as `Table[string, int] { ... }`
 
 ### Not Yet Implemented
 - Dynamic trait dispatch (`dyn Trait`) in Stage 1 (implemented in Stage 0, Stage 3, and Stage 5)
 - Debug info (DWARF) in Stage 3/4
-- Bootstrapping Stage 5 without Stage 0 (Zig) or C (the LLVM bridge in dAImond, and linking with `ld.lld` instead of `cc`)
+- Bootstrapping Stage 5 without Stage 0 (Zig) or C (the LLVM bridge in dAImond)
 
 ## Documentation Maintenance
 
@@ -540,6 +540,7 @@ The C runtime has been replaced, one function at a time, by dAImond code in `sta
 - Inline, with no function behind them: `len(s)`, string literals, `xs.len()`, the creation of an empty list, `xs[i]` and `xs[i] = v` (one bounds check, then a load or store at the element's address), and the overflow and range checks on signed arithmetic and narrowing casts (`dm_checked_*`, `dm_cast_check_*`), which lower to LLVM's overflow intrinsics and a branch to a panic block.
 - **Console**: output and `read_line` go through libc's `stdout`, `stderr` and `stdin` streams, reached with `symbol_addr`, so they keep their order with C code that uses the same streams. `read_line` gives a whole line however long it is (Stage 0 cuts a line at 4095 bytes).
 - **Program start**: `main` begins with a call of `dm_start` (`rt_start` in `runtime/os.dm`), which raises the limit on the stack's size to 64 MB where it is lower, or to the highest value allowed when that is below 64 MB. A C constructor did this before `main`. The stack of a running program grows up to the limit in force, so the raise takes effect at once.
+- **Linking**: the compiler runs `ld.lld -pie` on the program's object, the precompiled runtime object at `-O0`, the C library's start-up objects (`Scrt1.o`, `crti.o`, `crtn.o`) and `-lm -lpthread -lc` (see LINKING in `main_split.dm`). It takes `ld.lld` from `$DAIMOND_LD`, else `PATH`, else the newest `/usr/lib/llvm-<version>/bin`; and the C library's directory from `$DAIMOND_LIBC_DIR`, else `/usr/lib/x86_64-linux-gnu`, `/usr/lib64` or `/usr/lib`. The dynamic loader is glibc's on x86-64 Linux, `/lib64/ld-linux-x86-64.so.2`. With `--link-llvm` it also compiles `llvm_bridge.c` with `cc` and adds `llvm-config`'s libraries.
 - **Terminal and time**: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms` and `sleep_ms` are builtins in Stage 5 as in Stage 0, so `examples/snake.dm` and `examples/breakout` build. `read_key` and `read_key_nb` read libc's `stdin` stream, so they see what `read_line` left in its buffer. `read_key_nb` asks `poll` about file descriptor 0, as the C did: bytes already in the stream's buffer are not seen until the descriptor has more. `sleep_ms` with a negative time does not wait. `mem_mark()` is 0 and `mem_sweep` does nothing, as in Stage 0.
 - **OS constants**: `TIOCGWINSZ` (21523), `CLOCK_MONOTONIC` (1), `POLLIN` (1) and the layouts of `struct winsize`, `struct pollfd` and `struct timespec` are those of x86-64 Linux.
 - **Panics**: `dm_panic` (`rt_panic` in `runtime/io.dm`) writes `PANIC: <message>` to stderr and exits with code 1, as Stage 0 does. Messages passed to it, by the compiler's checks or by runtime code, do not include the prefix.

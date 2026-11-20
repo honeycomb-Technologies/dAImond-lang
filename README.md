@@ -429,7 +429,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 3. **Stage 2** (Complete): Stage 1 compiles itself -- fixed-point bootstrap verified (Stage 1 output = Stage 2 output)
 4. **Stage 3** (Complete): LLVM backend in Zig for optimized native code -- full test parity with Stage 0 (254/254 tests pass), compiles Stage 1 with verified fixed-point bootstrap
 5. **Stage 4** (Deleted): LLVM backend rewritten entirely in dAImond, superseded by Stage 5
-6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 324/324 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig), and building itself still compiles the LLVM bridge with `cc`. Programs it builds contain no C; `cc` only links them
+6. **Stage 5** (In progress): Stage 4 plus memory-safety checks -- 324/324 tests pass and it compiles itself (same LLVM IR as the Stage 0-built compiler), but its first build still needs Stage 0 (Zig), and building itself still compiles the LLVM bridge with `cc`. Programs it builds contain no C and are linked by `ld.lld`
 
 ## Current Status
 
@@ -519,7 +519,7 @@ Stage 0 (Zig) -> Stage 1 (dAImond) -> Stage 2 (Self-compiled) -> Stage 3 (LLVM/Z
 - [x] Terminal and time builtins in dAImond: `chr`, `flush`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `time_ms`, `sleep_ms`; `examples/snake.dm` and `examples/breakout` build with Stage 5
 - [x] Programs no longer link `stage0/runtime/daimond_runtime.c`
 - [x] No C in the runtime: the start-up stack-size increase is dAImond code that `main` calls, and `llvm_wrappers.c` is deleted
-- [ ] Linking with `ld.lld` instead of `cc`
+- [x] Programs are linked by `ld.lld`, with no C compiler (needs lld and the C library's development files; `DAIMOND_LD` and `DAIMOND_LIBC_DIR` override where they are looked for)
 
 ### Upcoming
 - [ ] Debug info (DWARF) in Stage 5

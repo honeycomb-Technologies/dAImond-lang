@@ -21096,7 +21096,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "a0f59e6114323205"
+    return "4b7c1bbc0778052f"
 }
 
 
@@ -21275,6 +21275,65 @@ fn dirname(path: string) -> string {
         return "."
     }
     return substr(path, 0, last_slash)
+}
+
+-- ============================================================
+-- LINKING
+-- The compiler links a program itself, with LLVM's linker ld.lld. A
+-- program is its own object, the runtime's object when that is
+-- precompiled, the C library's start-up objects (Scrt1.o, crti.o and
+-- crtn.o) and the C library. No C compiler takes part, except to
+-- compile llvm_bridge.c when the compiler builds itself (--link-llvm).
+-- ============================================================
+
+-- The dynamic loader of a glibc program on x86-64 Linux
+fn dynamic_loader() -> string {
+    return "/lib64/ld-linux-x86-64.so.2"
+}
+
+-- The path of ld.lld, or "" when none is found: $DAIMOND_LD when set,
+-- else the first ld.lld on PATH, else that of the newest LLVM in
+-- /usr/lib/llvm-<version>/bin, where Debian and Ubuntu keep it
+fn find_linker() -> string {
+    let chosen = env_get("DAIMOND_LD")
+    if chosen != "" { return chosen }
+    let dirs = string_split(env_get("PATH"), ":")
+    let mut i = 0
+    while i < dirs.len() {
+        if dirs[i] != "" and file_exists(dirs[i] + "/ld.lld") {
+            return dirs[i] + "/ld.lld"
+        }
+        i = i + 1
+    }
+    let mut newest = ""
+    let mut newest_version = -1
+    let names = string_split(fs_readdir("/usr/lib"), "\n")
+    i = 0
+    while i < names.len() {
+        let name = names[i]
+        if starts_with(name, "llvm-") {
+            let version = parse_int(substr(name, 5, len(name) - 5))
+            let candidate = "/usr/lib/" + name + "/bin/ld.lld"
+            if version > newest_version and file_exists(candidate) {
+                newest = candidate
+                newest_version = version
+            }
+        }
+        i = i + 1
+    }
+    return newest
+}
+
+-- The directory that holds the C library's start-up objects and
+-- libc.so, or "" when none is found: $DAIMOND_LIBC_DIR when set, else
+-- where Debian and Ubuntu, then Fedora, then Arch keep them
+fn find_libc_dir() -> string {
+    let chosen = env_get("DAIMOND_LIBC_DIR")
+    if chosen != "" { return chosen }
+    if file_exists("/usr/lib/x86_64-linux-gnu/Scrt1.o") { return "/usr/lib/x86_64-linux-gnu" }
+    if file_exists("/usr/lib64/Scrt1.o") { return "/usr/lib64" }
+    if file_exists("/usr/lib/Scrt1.o") { return "/usr/lib" }
+    return ""
 }
 
 -- Find llvm_bridge.c for self-compilation (--link-llvm)
@@ -21721,25 +21780,35 @@ fn compile(cli: CLIArgs) -> int {
     -- Dispose LLVM resources before linking
     llvm_gen_dispose(lg)
 
-    -- Build the link command
-    -- cc -o <output> <obj> [<runtime.o>] -lm -lpthread
-    let input_dir = dirname(input_file)
-    let mut link_cmd = "cc"
+    -- Link: ld.lld puts the program's object between the C library's
+    -- start-up objects and resolves the rest against the C library
+    let linker = find_linker()
+    if linker == "" {
+        eprintln("Error: the linker ld.lld was not found on PATH or in /usr/lib/llvm-*/bin; install lld, or set DAIMOND_LD to its path")
+        fs_remove(obj_file)
+        return 1
+    }
+    let libc_dir = find_libc_dir()
+    if libc_dir == "" {
+        eprintln("Error: the C library's start-up object Scrt1.o was not found; install the C library's development files (libc6-dev or glibc-devel), or set DAIMOND_LIBC_DIR to their directory")
+        fs_remove(obj_file)
+        return 1
+    }
+    let mut link_cmd = linker + " -pie --eh-frame-hdr -dynamic-linker " + dynamic_loader()
     link_cmd = link_cmd + " -o " + output_file
+    link_cmd = link_cmd + " " + libc_dir + "/Scrt1.o " + libc_dir + "/crti.o"
     link_cmd = link_cmd + " " + obj_file
     if runtime_obj != "" {
         link_cmd = link_cmd + " " + runtime_obj
     }
-
-    -- Link system libraries
-    link_cmd = link_cmd + " -lm -lpthread"
+    link_cmd = link_cmd + " -L" + libc_dir
 
     -- If --link-llvm, add llvm_bridge.c and LLVM libraries
+    let bridge_obj = output_file + "_bridge.o"
     if cli.link_llvm {
-        let bridge_file = find_bridge_file(input_dir)
+        let bridge_file = find_bridge_file(dirname(input_file))
         if bridge_file != "" {
-            -- Compile bridge with LLVM cflags via a temp object
-            let bridge_obj = output_file + "_bridge.o"
+            -- The bridge is the one C file left, compiled by the C compiler
             let bridge_cmd = "cc -c " + bridge_file + " -o " + bridge_obj + " $(llvm-config --cflags)"
             if verbose {
                 println("  Bridge: " + bridge_cmd)
@@ -21747,6 +21816,7 @@ fn compile(cli: CLIArgs) -> int {
             let bridge_result = system(bridge_cmd)
             if bridge_result != 0 {
                 eprintln("Error: failed to compile llvm_bridge.c")
+                fs_remove(obj_file)
                 return 1
             }
             link_cmd = link_cmd + " " + bridge_obj
@@ -21757,22 +21827,24 @@ fn compile(cli: CLIArgs) -> int {
         link_cmd = link_cmd + " $(llvm-config --libs --ldflags --system-libs)"
     }
 
+    -- The C library, and its last start-up object
+    link_cmd = link_cmd + " -lm -lpthread -lc " + libc_dir + "/crtn.o"
+
     if verbose {
         println("  Link: " + link_cmd)
     }
 
     let link_result = system(link_cmd)
-    if link_result != 0 {
-        eprintln("Error: linking failed (exit code " + int_to_string(link_result) + ")")
-        -- Clean up object file on failure
-        system("rm -f " + obj_file)
-        return 1
+
+    -- Remove the temporary object file(s)
+    fs_remove(obj_file)
+    if cli.link_llvm {
+        fs_remove(bridge_obj)
     }
 
-    -- Clean up temporary object file(s)
-    system("rm -f " + obj_file)
-    if cli.link_llvm {
-        system("rm -f " + output_file + "_bridge.o")
+    if link_result != 0 {
+        eprintln("Error: linking failed (exit code " + int_to_string(link_result) + ")")
+        return 1
     }
 
     if verbose {
