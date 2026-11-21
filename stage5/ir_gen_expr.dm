@@ -1933,7 +1933,7 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return infer_expr_type(gen, *expr.operand)
     }
     if expr.kind == EXPR_ARRAY_LITERAL() {
-        return "i64"
+        return "list"
     }
     if expr.kind == EXPR_AWAIT() {
         -- Await returns the type of the inner expression
@@ -5975,6 +5975,31 @@ fn push_whole_value(gen: IRGenerator, block: IRBasicBlock, list_ptr: int, val_id
     return gen_result(g, b)
 }
 
+-- The type of the elements of a list literal whose elements are
+-- lists, as [[1, 2], [3]] and [xs, ys] are: "List[int]". "" for any
+-- other literal. Such a list stores each element's header whole.
+fn nested_list_elem_type(gen: IRGenerator, lit: Expr) -> string {
+    let t = static_type(gen, lit)
+    if starts_with(t, "List[") == false { return "" }
+    let inner = extract_inner_type(t, "List[")
+    if starts_with(inner, "List[") { return inner }
+    return ""
+}
+
+-- List_new() and List.new(): the empty list
+fn is_list_ctor(e: Expr) -> bool {
+    if e.args.len() != 0 { return false }
+    if e.kind == EXPR_FUNCTION_CALL() {
+        let c = *e.callee
+        return c.kind == EXPR_IDENTIFIER() and c.name == "List_new"
+    }
+    if e.kind == EXPR_METHOD_CALL() and e.method == "new" {
+        let o = *e.object
+        return o.kind == EXPR_IDENTIFIER() and o.name == "List"
+    }
+    return false
+}
+
 fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -6005,7 +6030,9 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     }
 
     -- Infer element type from the first element
-    let elem_ir_type = infer_expr_type(g, elements[0])
+    let mut elem_ir_type = infer_expr_type(g, elements[0])
+    let nested = nested_list_elem_type(g, expr)
+    if nested != "" { elem_ir_type = nested }
 
     -- Determine which list new/push functions to use
     let mut new_fn = "dm_list_int64_new"
@@ -6016,8 +6043,8 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     } else if elem_ir_type == "string" {
         new_fn = "dm_list_string_new"
         push_fn = "dm_list_string_push"
-    } else if g.struct_defs.contains(elem_ir_type) or g.enum_defs.contains(elem_ir_type) {
-        -- Structs and enum values are stored whole
+    } else if g.struct_defs.contains(elem_ir_type) or g.enum_defs.contains(elem_ir_type) or nested != "" {
+        -- Structs, enum values and lists are stored whole
         new_fn = "dm_list_generic_new"
         push_fn = "dm_list_generic_push"
     }

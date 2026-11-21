@@ -1817,8 +1817,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.alloc_type == "string" {
                 g.string_ptrs.insert(id_key, true)
             }
-            -- List and map types are also aggregate pointers (pass by pointer, not value)
-            if starts_with(inst.alloc_type, "dm_list_") or starts_with(inst.alloc_type, "List[") {
+            -- A list is held by the address of its header too, and so is
+            -- a list literal ("list"): a store of it copies the header
+            if starts_with(inst.alloc_type, "dm_list_") or starts_with(inst.alloc_type, "List[") or inst.alloc_type == "list" {
                 g.string_ptrs.insert(id_key, true)
             }
             if inst.has_result { g.value_map.insert(id_key, result) }

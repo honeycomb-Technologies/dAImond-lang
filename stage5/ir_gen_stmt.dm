@@ -393,6 +393,18 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
                 g.builder.next_id = g.builder.next_id + 1
                 ei = ei + 1
             }
+        } else if init_expr.kind != EXPR_ARRAY_LITERAL() and init_expr.kind != EXPR_LITERAL_NULL() and is_list_ctor(init_expr) == false {
+            -- Any other value, such as another list or a call's result:
+            -- the variable holds a copy of its header
+            let init_result = generate_expr(g, b, init_expr)
+            g = init_result.gen
+            b = init_result.block
+            let mut init_store = ir_inst_new(g.builder.next_id, OP_STORE())
+            init_store.store_ptr = ir_val_inst(alloca_id)
+            init_store.store_val = ir_val_inst(init_result.val_id)
+            init_store.has_result = false
+            b.instructions.push(init_store)
+            g.builder.next_id = g.builder.next_id + 1
         }
 
         g.variable_map.insert(var_name, alloca_id)
@@ -516,6 +528,12 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         g.list_elem_kinds.insert(var_name, arr_elem_kind)
         if arr_elem_kind == LIST_ELEM_OTHER() and (g.struct_defs.contains(arr_elem_type) or g.enum_defs.contains(arr_elem_type)) {
             g.list_elem_types.insert(var_name, arr_elem_type)
+        }
+        -- A list of lists
+        let arr_nested = nested_list_elem_type(g, infer_val)
+        if arr_nested != "" {
+            g.list_elem_kinds.insert(var_name, LIST_ELEM_OTHER())
+            g.list_elem_types.insert(var_name, arr_nested)
         }
         g.variable_map.insert(var_name, result.val_id)
         g.variable_types.insert(var_name, "list")
