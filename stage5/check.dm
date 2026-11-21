@@ -931,12 +931,21 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
     let first = ck_expr(c, cur)
     c = first.c
     let mut t = first.t
+    let mut t_literal = is_int_literal_expr(cur)
     let mut i = ops.len() - 1
     while i >= 0 {
         let right = ck_expr(c, rights[i])
         let result = ck_operator(right.c, ops[i], t, right.t, lines[i])
-        c = ck_note(result.c, ids[i], result.t)
-        t = result.t
+        let mut result_t = result.t
+        -- Two integers give the type code generation computes with
+        let right_literal = is_int_literal_expr(rights[i])
+        if ty_is_int(result_t) and ty_is_int(t) and ty_is_int(right.t) {
+            result_t = int_meet_type(t, t_literal, right.t, right_literal)
+        }
+        c = ck_note(result.c, ids[i], result_t)
+        t = result_t
+        -- is_int_literal_expr of the operator's expression
+        t_literal = t_literal and right_literal and (ops[i] == BINOP_ADD() or ops[i] == BINOP_SUB() or ops[i] == BINOP_MUL())
         i = i - 1
     }
     return ck_typed(c, t)
@@ -1461,6 +1470,9 @@ fn ck_if_expr(c0: Checker, e: Expr) -> Typed {
         if t == "" and ty_known(else_value.t) and else_value.t != "void" { t = else_value.t }
         if t != "" and else_value.t != "void" and ck_fits(c, t, else_value.t) == false and ck_fits(c, else_value.t, t) == false {
             c = ck_error(c, "the branches of this 'if' give " + t + " and " + else_value.t, e.line)
+        } else if ty_is_int(t) and ty_is_int(else_value.t) and ty_is_int(then_value.t) {
+            -- Integers of two widths give one value
+            t = int_meet_type(t, is_int_literal_expr(branch_value_expr(*e.then_branch)), else_value.t, is_int_literal_expr(branch_value_expr(*e.else_branch)))
         } else if t != "" and else_value.t != "void" {
             -- Each branch may know what the other does not: Some(n) and None
             t = ty_merge(t, else_value.t)
@@ -1636,6 +1648,8 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
     let scrutinee = ck_expr(c0, *e.scrutinee)
     let mut c = scrutinee.c
     let mut t = ""
+    -- Whether every arm so far gives an integer literal
+    let mut t_literal = false
     let scrutinee_kind = ty_kind(scrutinee.t)
     let mut i = 0
     while i < e.match_arms.len() {
@@ -1661,19 +1675,29 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
             }
         }
         let mut arm_type = ""
+        let mut arm_literal = false
         if arm.is_expr_body {
             let value = ck_expr(c, *arm.body_expr)
             c = value.c
             arm_type = value.t
+            arm_literal = is_int_literal_expr(branch_value_expr(*arm.body_expr))
         } else {
             let value = ck_body_value(c, arm.body)
             c = value.c
             arm_type = value.t
+            arm_literal = stmts_value_is_int_literal(arm.body)
         }
         c = ck_unbind(c, mark)
-        if t == "" and ty_known(arm_type) and arm_type != "void" { t = arm_type }
+        if t == "" and ty_known(arm_type) and arm_type != "void" {
+            t = arm_type
+            t_literal = arm_literal
+        }
         if used and t != "" and arm_type != "void" and ck_fits(c, t, arm_type) == false and ck_fits(c, arm_type, t) == false {
             c = ck_error(c, "the arms of this match give " + t + " and " + arm_type, e.line)
+        } else if ty_is_int(t) and ty_is_int(arm_type) {
+            -- Integers of two widths give one value
+            t = int_meet_type(t, t_literal, arm_type, arm_literal)
+            t_literal = t_literal and arm_literal
         } else if t != "" and ty_known(arm_type) and arm_type != "void" {
             t = ty_merge(t, arm_type)
         }

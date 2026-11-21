@@ -871,6 +871,32 @@ fn names_in_stmts(stmts: List[Stmt], found: List[string], calls_only: bool) -> L
     return names
 }
 
+-- The expression the value of a branch comes from: the last one of a
+-- block, without its parentheses
+fn branch_value_expr(e: Expr) -> Expr {
+    let mut cur = e
+    let mut going = true
+    while going {
+        going = false
+        if cur.kind == EXPR_GROUPED() {
+            cur = *cur.operand
+            going = true
+        } else if cur.kind == EXPR_BLOCK() {
+            if cur.has_result {
+                cur = *cur.result
+                going = true
+            } else if cur.stmts.len() > 0 {
+                let last = cur.stmts[cur.stmts.len() - 1]
+                if last.kind == STMT_EXPRESSION() {
+                    cur = *last.expr
+                    going = true
+                }
+            }
+        }
+    }
+    return cur
+}
+
 -- Every name the expression mentions (see names_in_expr)
 fn expr_names(e: Expr) -> List[string] {
     let none: List[string] = []

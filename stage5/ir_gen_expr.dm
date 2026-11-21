@@ -1108,7 +1108,9 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return struct_field_src_type(gen, obj_t, expr.field)
     }
     if k == EXPR_INDEX_ACCESS() {
-        let obj_t = static_type(gen, *expr.object)
+        -- What is in a box is indexed as itself (unboxed_container)
+        let mut obj_t = static_type(gen, *expr.object)
+        if starts_with(obj_t, "Box[") { obj_t = extract_inner_type(obj_t, "Box[") }
         if is_map_type(gen, obj_t) { return map_instance_arg(gen, obj_t, 1) }
         if starts_with(obj_t, "List[") { return extract_inner_type(obj_t, "List[") }
         if obj_t == "string" { return "string" }
@@ -1247,11 +1249,12 @@ fn generate_addr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResul
         return addr_result(g, b, ir_val_inst(box_result.val_id), extract_inner_type(box_t, "Box["))
     }
     if expr.kind == EXPR_INDEX_ACCESS() {
-        let list_t = static_type(g, *expr.object)
+        let indexed = unboxed_container(g, *expr.object)
+        let list_t = static_type(g, indexed)
         if starts_with(list_t, "List[") == false {
             return addr_fail(g, b)
         }
-        let h = generate_list_handle(g, b, *expr.object)
+        let h = generate_list_handle(g, b, indexed)
         g = h.gen
         b = h.block
         if h.ok == false {
@@ -1714,10 +1717,14 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         -- Type of the then branch's trailing expression, else the else branch's
         -- (a branch may end in `return` instead)
         let then_t = infer_expr_type(gen, *expr.then_branch)
-        if then_t != "void" or expr.has_else == false {
-            return then_t
+        if expr.has_else == false { return then_t }
+        let else_t = infer_expr_type(gen, *expr.else_branch)
+        if then_t == "void" { return else_t }
+        -- Integers of different widths meet at one type
+        if is_integer_type(then_t) and is_integer_type(else_t) {
+            return int_meet_type(then_t, is_int_literal_expr(branch_value_expr(*expr.then_branch)), else_t, is_int_literal_expr(branch_value_expr(*expr.else_branch)))
         }
-        return infer_expr_type(gen, *expr.else_branch)
+        return then_t
     }
     if expr.kind == EXPR_BLOCK() {
         -- Type of the block's trailing expression statement
@@ -1730,11 +1737,12 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return "void"
     }
     if expr.kind == EXPR_MATCH() {
-        -- Return type of first arm
+        -- The type of the first arm, and for integers the type the
+        -- arms meet at
         if expr.match_arms.len() > 0 {
             let arm = expr.match_arms[0]
             if arm.is_expr_body {
-                return infer_expr_type(gen, *arm.body_expr)
+                return arms_meet_type(gen, expr.match_arms, infer_expr_type(gen, *arm.body_expr))
             }
         }
         return "void"
@@ -3853,10 +3861,17 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     -- List methods on any other list-typed receiver: a field
     -- (p.tokens.push(x)), a boxed value, a call result, ...
     -- --------------------------------------------------------
-    let recv_list_type = if g.list_elem_kinds.contains(obj_var_name) { "" } else { static_type(g, obj_expr) }
+    let mut list_recv = obj_expr
+    let mut recv_list_type = if g.list_elem_kinds.contains(obj_var_name) { "" } else { static_type(g, obj_expr) }
+    if starts_with(recv_list_type, "Box[List[") {
+        -- A list in a box: the method is the list's, as b.len() is
+        -- (*b).len(), and it changes the list in the box
+        list_recv = unboxed_container(g, obj_expr)
+        recv_list_type = extract_inner_type(recv_list_type, "Box[")
+    }
     if starts_with(recv_list_type, "List[") {
         let recv_elem = extract_inner_type(recv_list_type, "List[")
-        let h = generate_list_handle(g, b, obj_expr)
+        let h = generate_list_handle(g, b, list_recv)
         g = h.gen
         b = h.block
         if h.ok == false and (method_name == "push" or method_name == "pop") {
@@ -3909,9 +3924,20 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     -- --------------------------------------------------------
     -- Methods of a generic struct instance
     -- --------------------------------------------------------
-    let instance_recv = strip_box_type(static_type(g, obj_expr))
+    -- A method called on a box is called on what is in the box:
+    -- b.inc() is (*b).inc(), and a `mut self` method changes the value
+    -- in the box
+    let recv_src = static_type(g, obj_expr)
+    let unboxed_recv = if starts_with(recv_src, "Box[") { expr_unary(UNOP_DEREF(), obj_expr, expr.line, expr.col) } else { obj_expr }
+    let instance_recv = strip_box_type(recv_src)
     if g.generic_instances.contains(instance_recv) {
-        return generate_struct_method_call(g, b, instance_recv, obj_expr, method_name, args)
+        return generate_struct_method_call(g, b, instance_recv, unboxed_recv, method_name, args)
+    }
+    if starts_with(recv_src, "Box[") and g.struct_defs.contains(instance_recv) {
+        let boxed_method = instance_recv + "_" + method_name
+        if g.fn_return_types.contains(boxed_method) or g.generic_fn_decls.contains(boxed_method) {
+            return generate_struct_method_call(g, b, instance_recv, unboxed_recv, method_name, args)
+        }
     }
 
     -- --------------------------------------------------------
@@ -4947,6 +4973,48 @@ fn is_int_literal_expr(e: Expr) -> bool {
     return false
 }
 
+-- Whether the statements of a branch give an integer constant as
+-- their value
+fn stmts_value_is_int_literal(stmts: List[Stmt]) -> bool {
+    if stmts.len() == 0 { return false }
+    let last = stmts[stmts.len() - 1]
+    if last.kind != STMT_EXPRESSION() { return false }
+    return is_int_literal_expr(branch_value_expr(*last.expr))
+}
+
+fn arm_value_is_int_literal(arm: MatchArm) -> bool {
+    if arm.is_expr_body { return is_int_literal_expr(branch_value_expr(*arm.body_expr)) }
+    return stmts_value_is_int_literal(arm.body)
+}
+
+-- The type the arms of a match give together, as far as it can be
+-- told before the arms' own variables are declared, where the first
+-- arm gives `first`: integers of different widths meet at one type
+-- (int_meet_type); for any other type it is the first arm's
+fn arms_meet_type(gen: IRGenerator, arms: List[MatchArm], first: string) -> string {
+    if is_integer_type(first) == false or arms.len() == 0 { return first }
+    let mut t = first
+    let mut t_literal = arm_value_is_int_literal(arms[0])
+    let mut i = 1
+    while i < arms.len() {
+        let arm = arms[i]
+        let mut arm_type = ""
+        if arm.is_expr_body {
+            arm_type = infer_expr_type(gen, *arm.body_expr)
+        } else if arm.body.len() > 0 {
+            let last = arm.body[arm.body.len() - 1]
+            if last.kind == STMT_EXPRESSION() { arm_type = infer_expr_type(gen, *last.expr) }
+        }
+        if is_integer_type(arm_type) {
+            let arm_literal = arm_value_is_int_literal(arm)
+            t = int_meet_type(t, t_literal, arm_type, arm_literal)
+            t_literal = t_literal and arm_literal
+        }
+        i = i + 1
+    }
+    return t
+}
+
 fn int_literal_value(e: Expr) -> int {
     if e.kind == EXPR_GROUPED() { return int_literal_value(*e.operand) }
     if e.kind == EXPR_UNARY() { return 0 - int_literal_value(*e.operand) }
@@ -4994,12 +5062,7 @@ fn is_bool_binop(op: int) -> bool {
 -- binary_int_type for operands whose types, lt and rt, are known
 fn common_int_type(expr: Expr, lt: string, rt: string) -> string {
     if is_integer_type(lt) == false or is_integer_type(rt) == false or lt == rt { return "" }
-    let l_lit = is_int_literal_expr(*expr.left)
-    let r_lit = is_int_literal_expr(*expr.right)
-    if r_lit and l_lit == false { return lt }
-    if l_lit and r_lit == false { return rt }
-    if type_bit_width(rt) > type_bit_width(lt) { return rt }
-    return lt
+    return int_meet_type(lt, is_int_literal_expr(*expr.left), rt, is_int_literal_expr(*expr.right))
 }
 
 -- Report an integer literal that does not fit the type it converts to
@@ -5619,7 +5682,8 @@ fn generate_index_access(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     let mut g = gen
     let mut b = block
 
-    let object = *expr.object
+    -- A list, a map or a string in a box is indexed as itself
+    let object = unboxed_container(g, *expr.object)
     let index = *expr.index
 
     -- m[k] is m.get(k)
@@ -5986,6 +6050,22 @@ fn nested_list_elem_type(gen: IRGenerator, lit: Expr) -> string {
     return ""
 }
 
+-- Whether the expression is a box of a list, a map or a string
+fn is_boxed_container(gen: IRGenerator, e: Expr) -> bool {
+    let t = static_type(gen, e)
+    if starts_with(t, "Box[") == false { return false }
+    let inner = extract_inner_type(t, "Box[")
+    return starts_with(inner, "List[") or inner == "string" or is_map_type(gen, inner)
+}
+
+-- What is indexed or has a list's method called on it: a list, a map
+-- or a string in a box stands for what is in the box, so b[i] is
+-- (*b)[i] and b.len() is (*b).len(). Any other expression is itself.
+fn unboxed_container(gen: IRGenerator, e: Expr) -> Expr {
+    if is_boxed_container(gen, e) { return expr_unary(UNOP_DEREF(), e, e.line, e.col) }
+    return e
+}
+
 -- List_new() and List.new(): the empty list
 fn is_list_ctor(e: Expr) -> bool {
     if e.args.len() != 0 { return false }
@@ -6157,12 +6237,9 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
     then_block = then_result.block
 
     -- Store then result into the result slot
-    let mut then_store = ir_inst_new(g.builder.next_id, OP_STORE())
-    then_store.store_ptr = ir_val_inst(result_alloca_id)
-    then_store.store_val = ir_val_inst(then_result.val_id)
-    then_store.has_result = false
-    then_block.instructions.push(then_store)
-    g.builder.next_id = g.builder.next_id + 1
+    let stored_then = store_branch_value(g, then_block, result_alloca_id, if_result_type, then_result.val_id, *expr.then_branch)
+    g = stored_then.gen
+    then_block = stored_then.block
 
     -- Terminate then block with branch to join
     if then_block.has_terminator == false {
@@ -6178,12 +6255,9 @@ fn generate_if_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
         else_block = else_result.block
 
         -- Store else result into the result slot
-        let mut else_store = ir_inst_new(g.builder.next_id, OP_STORE())
-        else_store.store_ptr = ir_val_inst(result_alloca_id)
-        else_store.store_val = ir_val_inst(else_result.val_id)
-        else_store.has_result = false
-        else_block.instructions.push(else_store)
-        g.builder.next_id = g.builder.next_id + 1
+        let stored_else = store_branch_value(g, else_block, result_alloca_id, if_result_type, else_result.val_id, *expr.else_branch)
+        g = stored_else.gen
+        else_block = stored_else.block
 
         if else_block.has_terminator == false {
             else_block.terminator = Box_new(term_br(join_label))
@@ -6382,12 +6456,9 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                     g = body_result.gen
                     arm_block = body_result.block
 
-                    let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                    store_result.store_ptr = ir_val_inst(result_alloca_id)
-                    store_result.store_val = ir_val_inst(body_result.val_id)
-                    store_result.has_result = false
-                    arm_block.instructions.push(store_result)
-                    g.builder.next_id = g.builder.next_id + 1
+                    let stored_body = store_branch_value(g, arm_block, result_alloca_id, match_type, body_result.val_id, *arm.body_expr)
+                    g = stored_body.gen
+                    arm_block = stored_body.block
                 } else {
                     let body_gen = generate_arm_block(g, arm_block, arm.body, result_alloca_id, match_type)
                     g = body_gen.gen
@@ -6411,12 +6482,9 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                     g = body_result.gen
                     b = body_result.block
 
-                    let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                    store_result.store_ptr = ir_val_inst(result_alloca_id)
-                    store_result.store_val = ir_val_inst(body_result.val_id)
-                    store_result.has_result = false
-                    b.instructions.push(store_result)
-                    g.builder.next_id = g.builder.next_id + 1
+                    let stored_body = store_branch_value(g, b, result_alloca_id, match_type, body_result.val_id, *arm.body_expr)
+                    g = stored_body.gen
+                    b = stored_body.block
                 } else {
                     let body_gen = generate_arm_block(g, b, arm.body, result_alloca_id, match_type)
                     g = body_gen.gen
@@ -6485,12 +6553,9 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 g = body_result.gen
                 arm_block = body_result.block
 
-                let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                store_result.store_ptr = ir_val_inst(result_alloca_id)
-                store_result.store_val = ir_val_inst(body_result.val_id)
-                store_result.has_result = false
-                arm_block.instructions.push(store_result)
-                g.builder.next_id = g.builder.next_id + 1
+                let stored_body = store_branch_value(g, arm_block, result_alloca_id, match_type, body_result.val_id, *arm.body_expr)
+                g = stored_body.gen
+                arm_block = stored_body.block
             } else {
                 let body_gen = generate_arm_block(g, arm_block, arm.body, result_alloca_id, match_type)
                 g = body_gen.gen
@@ -6623,12 +6688,9 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 g = body_result.gen
                 b = body_result.block
 
-                let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                store_result.store_ptr = ir_val_inst(result_alloca_id)
-                store_result.store_val = ir_val_inst(body_result.val_id)
-                store_result.has_result = false
-                b.instructions.push(store_result)
-                g.builder.next_id = g.builder.next_id + 1
+                let stored_body = store_branch_value(g, b, result_alloca_id, ematch_type, body_result.val_id, *arm.body_expr)
+                g = stored_body.gen
+                b = stored_body.block
             } else {
                 let body_gen = generate_arm_block(g, b, arm.body, result_alloca_id, ematch_type)
                 g = body_gen.gen
@@ -6717,12 +6779,9 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 g = body_result.gen
                 arm_block = body_result.block
 
-                let mut store_result = ir_inst_new(g.builder.next_id, OP_STORE())
-                store_result.store_ptr = ir_val_inst(result_alloca_id)
-                store_result.store_val = ir_val_inst(body_result.val_id)
-                store_result.has_result = false
-                arm_block.instructions.push(store_result)
-                g.builder.next_id = g.builder.next_id + 1
+                let stored_body = store_branch_value(g, arm_block, result_alloca_id, ematch_type, body_result.val_id, *arm.body_expr)
+                g = stored_body.gen
+                arm_block = stored_body.block
             } else {
                 let body_gen = generate_arm_block(g, arm_block, arm.body, result_alloca_id, ematch_type)
                 g = body_gen.gen
@@ -6909,12 +6968,9 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             g = body_result.gen
             ok_block = body_result.block
 
-            let mut store_r = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_r.store_ptr = ir_val_inst(result_alloca_id)
-            store_r.store_val = ir_val_inst(body_result.val_id)
-            store_r.has_result = false
-            ok_block.instructions.push(store_r)
-            g.builder.next_id = g.builder.next_id + 1
+            let stored_body = store_branch_value(g, ok_block, result_alloca_id, slot_type, body_result.val_id, *ok_arm.body_expr)
+            g = stored_body.gen
+            ok_block = stored_body.block
         } else {
             let body_gen = generate_arm_block(g, ok_block, ok_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
@@ -6973,12 +7029,9 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             g = body_result.gen
             err_block = body_result.block
 
-            let mut store_r = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_r.store_ptr = ir_val_inst(result_alloca_id)
-            store_r.store_val = ir_val_inst(body_result.val_id)
-            store_r.has_result = false
-            err_block.instructions.push(store_r)
-            g.builder.next_id = g.builder.next_id + 1
+            let stored_body = store_branch_value(g, err_block, result_alloca_id, slot_type, body_result.val_id, *err_arm.body_expr)
+            g = stored_body.gen
+            err_block = stored_body.block
         } else {
             let body_gen = generate_arm_block(g, err_block, err_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
@@ -6992,12 +7045,9 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             g = body_result.gen
             err_block = body_result.block
 
-            let mut store_r = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_r.store_ptr = ir_val_inst(result_alloca_id)
-            store_r.store_val = ir_val_inst(body_result.val_id)
-            store_r.has_result = false
-            err_block.instructions.push(store_r)
-            g.builder.next_id = g.builder.next_id + 1
+            let stored_body = store_branch_value(g, err_block, result_alloca_id, slot_type, body_result.val_id, *wild_arm.body_expr)
+            g = stored_body.gen
+            err_block = stored_body.block
         } else {
             let body_gen = generate_arm_block(g, err_block, wild_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
@@ -7148,12 +7198,9 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             g = body_result.gen
             some_block = body_result.block
 
-            let mut store_r = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_r.store_ptr = ir_val_inst(result_alloca_id)
-            store_r.store_val = ir_val_inst(body_result.val_id)
-            store_r.has_result = false
-            some_block.instructions.push(store_r)
-            g.builder.next_id = g.builder.next_id + 1
+            let stored_body = store_branch_value(g, some_block, result_alloca_id, slot_type, body_result.val_id, *some_arm.body_expr)
+            g = stored_body.gen
+            some_block = stored_body.block
         } else {
             let body_gen = generate_arm_block(g, some_block, some_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
@@ -7176,12 +7223,9 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             g = body_result.gen
             none_block = body_result.block
 
-            let mut store_r = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_r.store_ptr = ir_val_inst(result_alloca_id)
-            store_r.store_val = ir_val_inst(body_result.val_id)
-            store_r.has_result = false
-            none_block.instructions.push(store_r)
-            g.builder.next_id = g.builder.next_id + 1
+            let stored_body = store_branch_value(g, none_block, result_alloca_id, slot_type, body_result.val_id, *none_arm.body_expr)
+            g = stored_body.gen
+            none_block = stored_body.block
         } else {
             let body_gen = generate_arm_block(g, none_block, none_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
@@ -7194,12 +7238,9 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             g = body_result.gen
             none_block = body_result.block
 
-            let mut store_r = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_r.store_ptr = ir_val_inst(result_alloca_id)
-            store_r.store_val = ir_val_inst(body_result.val_id)
-            store_r.has_result = false
-            none_block.instructions.push(store_r)
-            g.builder.next_id = g.builder.next_id + 1
+            let stored_body = store_branch_value(g, none_block, result_alloca_id, slot_type, body_result.val_id, *wild_arm.body_expr)
+            g = stored_body.gen
+            none_block = stored_body.block
         } else {
             let body_gen = generate_arm_block(g, none_block, wild_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
@@ -8141,8 +8182,36 @@ fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: s
 -- Some(value) -> Option { has_value: 1, value: payload }
 -- ============================================================
 
+-- Store the value that a branch of an `if` or an arm of a `match`
+-- gives into the slot of the whole. The branches may give numbers of
+-- different widths, which meet at the slot's type (checked_slot_type
+-- in ir_gen.dm): a narrower integer widens to it, and a literal takes
+-- it. `value` is the branch's expression, generated as `val_id`.
+fn store_branch_value(gen: IRGenerator, block: IRBasicBlock, slot_id: int, slot_type: string, val_id: int, value: Expr) -> GenResult {
+    let mut g = gen
+    let mut b = block
+    let mut store_id = val_id
+    -- The type is asked for here, where the branch's variables are known
+    let from = infer_expr_type(g, value)
+    if b.has_terminator == false and from != slot_type {
+        if is_integer_type(from) and is_integer_type(slot_type) {
+            let conv = convert_int_value(g, b, val_id, branch_value_expr(value), from, slot_type, "the value of this branch")
+            g = conv.gen
+            b = conv.block
+            store_id = conv.val_id
+        } else if is_float_type(from) and is_float_type(slot_type) {
+            let conv = emit_ir_cast(g, b, ir_val_inst(val_id), from, slot_type)
+            g = conv.gen
+            b = conv.block
+            store_id = conv.val_id
+        }
+    }
+    return emit_ir_store(g, b, ir_val_inst(slot_id), ir_val_inst(store_id))
+}
+
 -- The block of a match arm. When it ends in an expression of the type
--- of the match's slot, that value is the arm's and goes into the slot.
+-- of the match's slot, or in a number where the slot holds a number
+-- of another width, that value is the arm's and goes into the slot.
 fn generate_arm_block(gen: IRGenerator, block: IRBasicBlock, stmts: List[Stmt], slot_id: int, slot_type: string) -> GenResult {
     let n = stmts.len()
     if n == 0 { return gen_result(gen, block) }
@@ -8160,22 +8229,19 @@ fn generate_arm_block(gen: IRGenerator, block: IRBasicBlock, stmts: List[Stmt], 
     if b.has_terminator { return gen_result(g, b) }
     -- The type is asked for here, where the block's variables are known
     let value = *last.expr
-    if infer_expr_type(g, value) != slot_type { return generate_statement(g, b, last) }
+    let value_type = infer_expr_type(g, value)
+    let both_integers = is_integer_type(value_type) and is_integer_type(slot_type)
+    let both_floats = is_float_type(value_type) and is_float_type(slot_type)
+    if value_type != slot_type and both_integers == false and both_floats == false { return generate_statement(g, b, last) }
     let value_result = generate_expr(g, b, value)
     g = value_result.gen
     b = value_result.block
     if b.has_terminator { return gen_result(g, b) }
-    let mut store = ir_inst_new(g.builder.next_id, OP_STORE())
-    store.store_ptr = ir_val_inst(slot_id)
-    store.store_val = ir_val_inst(value_result.val_id)
-    store.has_result = false
-    b.instructions.push(store)
-    g.builder.next_id = g.builder.next_id + 1
-    return gen_result(g, b)
+    return store_branch_value(g, b, slot_id, slot_type, value_result.val_id, value)
 }
 
 fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
-    -- Check the first arm's body to infer result type
+    -- The first arm's type, and for integers the type the arms meet at
     if arms.len() == 0 {
         return "i64"
     }
@@ -8187,7 +8253,7 @@ fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
         if arm_type == "void" {
             return "i64"
         }
-        return arm_type
+        return arms_meet_type(gen, arms, arm_type)
     }
     return "i64"
 }

@@ -1640,7 +1640,20 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     let mut g = gen
     let mut b = block
 
-    let track_target = *stmt.assign_target
+    let first_target = *stmt.assign_target
+
+    -- b[i] = v for a list or a map in a box sets it in what is in the box
+    if first_target.kind == EXPR_INDEX_ACCESS() {
+        let indexed = *first_target.object
+        if is_boxed_container(gen, indexed) {
+            let mut target2 = first_target
+            target2.object = Box_new(unboxed_container(gen, indexed))
+            let mut s2 = stmt
+            s2.assign_target = Box_new(target2)
+            return generate_assignment(gen, block, s2)
+        }
+    }
+    let track_target = first_target
 
     -- x = Map_new() creates an empty map of x's type
     if stmt.assign_op == ASSIGN_EQ() and is_map_ctor(*stmt.assign_value) {

@@ -539,19 +539,21 @@ fn checked_ir_type(gen: IRGenerator, e: Expr) -> string {
 }
 
 -- The type of the value of an `if`, a `match` or a block: the
--- checker's, and `inferred` where it gives none. `inferred` is what
--- is found here from the first branch, before the branch's own
--- variables are declared: a name the branch binds may still have the
--- type an earlier binding of that name left (`Some(v)` in one match
--- after `Some(v)` in another), and the type is "i64" where nothing is
--- known. So for a number, whose width the checker does not keep, its
--- type is taken where `inferred` is no number of that kind at all.
+-- checker's, and `inferred` where it gives none, as in the body of a
+-- generic function. `inferred` is what is found here from the first
+-- branch, before the branch's own variables are declared: a name the
+-- branch binds may still have the type an earlier binding of that
+-- name left (`Some(v)` in one match after `Some(v)` in another), and
+-- the type is "i64" where nothing is known. For a number the
+-- checker's type is the one the branches meet at (int_meet_type):
+-- `match o { Some(x) => x, None => 0 }` with o: Option[i32] is an
+-- i32. Each branch's value is converted to it where it is stored
+-- (store_branch_value in ir_gen_expr.dm).
 fn checked_slot_type(gen: IRGenerator, e: Expr, inferred: string) -> string {
     let checked = checked_ir_type(gen, e)
     if checked != "" { return checked }
     let number = map_type_name(checked_type(gen, e))
-    if is_float_type(number) and is_float_type(inferred) == false { return number }
-    if is_integer_type(number) and is_integer_type(inferred) == false { return number }
+    if is_integer_type(number) or is_float_type(number) { return number }
     return inferred
 }
 
@@ -581,6 +583,21 @@ fn type_bit_width(name: string) -> int {
     if name == "f32" { return 32 }
     if name == "f64" { return 64 }
     return 64
+}
+
+-- The one type two integers of types a and b meet at, as the two
+-- operands of an operator or as two branches that give one value: an
+-- integer literal takes the other's type, as in `fd + 1` with fd: i32
+-- and in `match o { Some(x) => x, None => 0 }`; otherwise the narrower
+-- one widens, and of two types of one width it is the first. The
+-- types are in source or IR form. The checker types an expression by
+-- this and code generation converts the values by it.
+fn int_meet_type(a: string, a_literal: bool, b: string, b_literal: bool) -> string {
+    if a == b { return a }
+    if b_literal and a_literal == false { return a }
+    if a_literal and b_literal == false { return b }
+    if type_bit_width(b) > type_bit_width(a) { return b }
+    return a
 }
 
 fn is_simd_type(name: string) -> bool {
