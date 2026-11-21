@@ -127,9 +127,32 @@ fn PAT_STRUCT() -> int { return 5 }
 -- AST NODE STRUCTS
 -- ============================================================
 
+-- EXPRESSION IDS: every expression has a number of its own, in the
+-- order the expressions are made, whichever file they come from. The
+-- checker records the type it finds for an expression at its number,
+-- and code generation reads it there (checked_type in ir_gen.dm). A
+-- copy of an expression has the number of the original.
+fn expr_next_id() -> int {
+    unsafe {
+        let counter = static_addr("dm_expr_ids", 8)
+        let id = load_i64(counter)
+        store_i64(counter, id + 1)
+        return id
+    }
+}
+
+-- How many expressions have been made
+fn expr_id_count() -> int {
+    unsafe {
+        return load_i64(static_addr("dm_expr_ids", 8))
+    }
+}
+
 -- Expression node
 struct Expr {
     kind: int,
+    -- See EXPRESSION IDS
+    id: int,
     line: int,
     col: int,
     -- Literal values
@@ -196,7 +219,7 @@ struct Expr {
 
 fn expr_new(kind: int, line: int, col: int) -> Expr {
     return Expr {
-        kind: kind, line: line, col: col,
+        kind: kind, id: expr_next_id(), line: line, col: col,
         int_val: 0, float_val: 0.0, str_val: "", bool_val: false,
         name: "", op: 0,
         left: Box_null(), right: Box_null(), operand: Box_null(),

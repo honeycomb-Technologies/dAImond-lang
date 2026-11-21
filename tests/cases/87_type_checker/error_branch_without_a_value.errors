@@ -1,0 +1,8 @@
+Error: this 'if' is used as a value, and has no 'else' to give one at line 8
+Error: this block is used as a value, and it ends in an 'if' statement, which gives none: put it in parentheses to use its value at line 14
+Error: this block is used as a value, and it ends in a statement that gives none at line 16
+Error: this block is used as a value, and it is empty at line 13
+Error: this is used as a value, and it is a call that returns none at line 19
+Error: this block is used as a value, and it ends in a 'match' statement, which gives none: put it in parentheses to use its value at line 31
+Error: this 'if' is used as a value, and has no 'else' to give one at line 51
+Error: 7 type errors

@@ -349,8 +349,13 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 
     -- Check for "None" (Option None)
     if name == "None" {
-        -- Build Option { has_value: 0, value: undef } as an aggregate value
-        let mut opt_type = g.current_return_type
+        -- Build Option { has_value: 0, value: undef } as an aggregate value.
+        -- Its type is that of the place it goes to, which the checker
+        -- found; without it, the function's return type
+        let mut opt_type = checked_ir_type(g, expr)
+        if starts_with(opt_type, "Option[") == false {
+            opt_type = g.current_return_type
+        }
         if starts_with(opt_type, "Option[") == false {
             opt_type = "Option[i64]"
         }
@@ -1062,6 +1067,14 @@ fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
 }
 
 fn static_type(gen: IRGenerator, expr: Expr) -> string {
+    let found = static_type_from_parts(gen, expr)
+    if found != "" { return found }
+    -- What cannot be told from the expression's parts, the checker
+    -- found from the whole program (see CHECKED TYPES in ir_gen.dm)
+    return checked_type(gen, expr)
+}
+
+fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     let k = expr.kind
     if k == EXPR_LITERAL_INT() { return "int" }
     if k == EXPR_LITERAL_FLOAT() { return "float" }
@@ -1408,7 +1421,39 @@ fn list_elem_ir_type(elem_src: string) -> string {
 -- family (integer, float, string) for binary operations.
 -- ============================================================
 
+-- Whether the checker's type for the expression is used before any
+-- found here (see CHECKED TYPES in ir_gen.dm): for an `if`, a `match`
+-- or a block, whose type here is that of their first branch; for
+-- None, Some(x), Ok(x) and Err(x), whose type depends on where the
+-- value goes; and for a call of a generic function
+fn checked_type_first(gen: IRGenerator, expr: Expr) -> bool {
+    let k = expr.kind
+    if k == EXPR_IF() or k == EXPR_MATCH() or k == EXPR_BLOCK() { return true }
+    if k == EXPR_IDENTIFIER() { return expr.name == "None" and gen.variable_map.contains("None") == false }
+    if k == EXPR_FUNCTION_CALL() {
+        let callee = *expr.callee
+        if callee.kind != EXPR_IDENTIFIER() { return false }
+        let name = callee.name
+        return name == "Some" or name == "Ok" or name == "Err" or gen.generic_fn_decls.contains(name)
+    }
+    return false
+}
+
 fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
+    if checked_type_first(gen, expr) {
+        let checked = checked_ir_type(gen, expr)
+        if checked != "" { return checked }
+        let k = expr.kind
+        if k == EXPR_IF() or k == EXPR_MATCH() or k == EXPR_BLOCK() {
+            return checked_slot_type(gen, expr, infer_expr_type_from_parts(gen, expr))
+        }
+    }
+    return infer_expr_type_from_parts(gen, expr)
+}
+
+-- The type of the expression as its parts and the variables declared
+-- so far give it
+fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     if expr.kind == EXPR_LITERAL_INT() {
         return "i64"
     }
@@ -1546,6 +1591,19 @@ fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
                     if decl.kind == DECL_FUNCTION() {
                         let fd = *decl.func_decl
                         let ret_type = fd.return_type
+                        -- The return type with the type arguments the
+                        -- checker found for this call
+                        let call_type_args = checked_type_args(gen, expr)
+                        if expr.generic_args.len() == 0 and call_type_args.len() == fd.generic_params.len() and call_type_args.len() > 0 {
+                            let mut with_args = gen
+                            with_args.type_substitutions = Map_new()
+                            let mut ta = 0
+                            while ta < call_type_args.len() {
+                                with_args.type_substitutions.insert(fd.generic_params[ta], call_type_args[ta])
+                                ta = ta + 1
+                            }
+                            return map_type_name(canon_type(with_args, ret_type))
+                        }
                         -- If return type is a generic param, resolve from args
                         if fd.generic_params.len() > 0 {
                             let mut pi = 0
@@ -2901,17 +2959,17 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Some(value) -> Option with has_value=1
     if fn_name == "Some" {
-        return generate_some_call(g, b, expr.args)
+        return generate_some_call(g, b, expr)
     }
 
     -- Ok(value) -> Result with tag=0
     if fn_name == "Ok" {
-        return generate_ok_call(g, b, expr.args)
+        return generate_ok_call(g, b, expr)
     }
 
     -- Err(value) -> Result with tag=1
     if fn_name == "Err" {
-        return generate_err_call(g, b, expr.args)
+        return generate_err_call(g, b, expr)
     }
 
     -- Map_new() takes its type from where the map goes (a typed let,
@@ -3254,9 +3312,10 @@ fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name
 --   fn apply(f: fn(int) -> int, x: int) -> int { return f(x) }
 -- ============================================================
 
-fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
+fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+    let args = expr.args
 
     if args.len() < 1 {
         return expr_result(g, b, 0)
@@ -3267,8 +3326,12 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -
     g = val_result.gen
     b = val_result.block
 
-    -- Use full Option[T] type from current function return type, or infer from arg type
-    let mut opt_type = g.current_return_type
+    -- The Option[T] the checker found for the place the value goes to;
+    -- without it, the function's return type, or Option of the argument's type
+    let mut opt_type = checked_ir_type(g, expr)
+    if starts_with(opt_type, "Option[") == false {
+        opt_type = g.current_return_type
+    }
     if starts_with(opt_type, "Option[") == false {
         -- current_return_type isn't an Option (e.g., we're in main/void function).
         -- Infer Option type from the argument expression type.
@@ -3309,9 +3372,10 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -
 -- Ok(value) -> Result { tag: 0, ok_val: payload, err_val: undef }
 -- ============================================================
 
-fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
+fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+    let args = expr.args
 
     if args.len() < 1 {
         return expr_result(g, b, 0)
@@ -3322,8 +3386,12 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
     g = val_result.gen
     b = val_result.block
 
-    -- Use full Result[T, E] type from current function return type for correct LLVM struct layout
-    let res_type = g.current_return_type
+    -- The Result[T, E] the checker found for the place the value goes
+    -- to; without it, the function's return type
+    let mut res_type = checked_ir_type(g, expr)
+    if starts_with(res_type, "Result[") == false {
+        res_type = g.current_return_type
+    }
 
     -- Build the Result struct: { tag: 0, ok_val: payload, err_val: undef }
     -- Use undef as the base (not alloca), since insertvalue works on values not pointers
@@ -3369,9 +3437,10 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> 
 -- Err(value) -> Result { tag: 1, ok_val: undef, err_val: payload }
 -- ============================================================
 
-fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
+fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+    let args = expr.args
 
     if args.len() < 1 {
         return expr_result(g, b, 0)
@@ -3382,8 +3451,12 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) ->
     g = val_result.gen
     b = val_result.block
 
-    -- Use full Result[T, E] type from current function return type for correct LLVM struct layout
-    let res_type = g.current_return_type
+    -- The Result[T, E] the checker found for the place the value goes
+    -- to; without it, the function's return type
+    let mut res_type = checked_ir_type(g, expr)
+    if starts_with(res_type, "Result[") == false {
+        res_type = g.current_return_type
+    }
 
     -- Build the Result struct: { tag: 1, ok_val: undef, err_val: payload }
     -- Use undef as the base (not alloca), since insertvalue works on values not pointers
@@ -3441,10 +3514,16 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     let mut mangled_name = fn_name
     let mut type_args = expr.generic_args
 
+    -- Type arguments that are not written out are those the checker
+    -- found from the arguments
     if type_args.len() == 0 {
-        -- Implicit generic: infer type args from call arguments
-        -- For now, use "i64" as default for each generic param
-        -- (A more complete implementation would inspect arg expressions)
+        type_args = checked_type_args(g, expr)
+    }
+
+    if type_args.len() == 0 {
+        -- The checker found none (the call is in the body of a generic
+        -- function, or made during code generation): type parameter i
+        -- takes the type of argument i
         if g.generic_fn_decls.contains(fn_name) {
             let decl_idx: int = g.generic_fn_decls.get(fn_name)
             if decl_idx >= 0 and decl_idx < g.declarations.len() {
@@ -3472,7 +3551,7 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
     -- Build the mangled name from type arguments
     let mut ti = 0
     while ti < type_args.len() {
-        mangled_name = mangled_name + "_" + map_type_name(type_args[ti])
+        mangled_name = mangled_name + "_" + mangle_type_arg(canon_type(g, type_args[ti]))
         ti = ti + 1
     }
 
@@ -6201,7 +6280,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
     let scrut_bind_type = static_type(g, *expr.scrutinee)
 
     -- Infer the match result type from arm bodies
-    let match_type = infer_match_result_type(g, expr.match_arms)
+    let match_type = checked_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
@@ -6283,7 +6362,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                     arm_block.instructions.push(store_result)
                     g.builder.next_id = g.builder.next_id + 1
                 } else {
-                    let body_gen = generate_block_stmts(g, arm_block, arm.body)
+                    let body_gen = generate_arm_block(g, arm_block, arm.body, result_alloca_id, match_type)
                     g = body_gen.gen
                     arm_block = body_gen.block
                 }
@@ -6312,7 +6391,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                     b.instructions.push(store_result)
                     g.builder.next_id = g.builder.next_id + 1
                 } else {
-                    let body_gen = generate_block_stmts(g, b, arm.body)
+                    let body_gen = generate_arm_block(g, b, arm.body, result_alloca_id, match_type)
                     g = body_gen.gen
                     b = body_gen.block
                 }
@@ -6386,7 +6465,7 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
                 arm_block.instructions.push(store_result)
                 g.builder.next_id = g.builder.next_id + 1
             } else {
-                let body_gen = generate_block_stmts(g, arm_block, arm.body)
+                let body_gen = generate_arm_block(g, arm_block, arm.body, result_alloca_id, match_type)
                 g = body_gen.gen
                 arm_block = body_gen.block
             }
@@ -6444,7 +6523,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     let scrut_bind_type = enum_type
 
     -- Infer match result type from arm bodies
-    let ematch_type = infer_match_result_type(g, expr.match_arms)
+    let ematch_type = checked_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
@@ -6524,7 +6603,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 b.instructions.push(store_result)
                 g.builder.next_id = g.builder.next_id + 1
             } else {
-                let body_gen = generate_block_stmts(g, b, arm.body)
+                let body_gen = generate_arm_block(g, b, arm.body, result_alloca_id, ematch_type)
                 g = body_gen.gen
                 b = body_gen.block
             }
@@ -6618,7 +6697,7 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 arm_block.instructions.push(store_result)
                 g.builder.next_id = g.builder.next_id + 1
             } else {
-                let body_gen = generate_block_stmts(g, arm_block, arm.body)
+                let body_gen = generate_arm_block(g, arm_block, arm.body, result_alloca_id, ematch_type)
                 g = body_gen.gen
                 arm_block = body_gen.block
             }
@@ -6694,11 +6773,13 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
         }
     }
 
-    -- Allocate result slot
+    -- Allocate result slot. Its type is the one the checker found for
+    -- the match; without it, a match that gives a value gives an int
+    let slot_type = checked_slot_type(g, expr, "i64")
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = "i64"
-    result_alloca.result_type = "ptr(i64)"
+    result_alloca.alloc_type = slot_type
+    result_alloca.result_type = "ptr(" + slot_type + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -6808,7 +6889,7 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             ok_block.instructions.push(store_r)
             g.builder.next_id = g.builder.next_id + 1
         } else {
-            let body_gen = generate_block_stmts(g, ok_block, ok_arm.body)
+            let body_gen = generate_arm_block(g, ok_block, ok_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
             ok_block = body_gen.block
         }
@@ -6872,7 +6953,7 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             err_block.instructions.push(store_r)
             g.builder.next_id = g.builder.next_id + 1
         } else {
-            let body_gen = generate_block_stmts(g, err_block, err_arm.body)
+            let body_gen = generate_arm_block(g, err_block, err_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
             err_block = body_gen.block
         }
@@ -6891,7 +6972,7 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             err_block.instructions.push(store_r)
             g.builder.next_id = g.builder.next_id + 1
         } else {
-            let body_gen = generate_block_stmts(g, err_block, wild_arm.body)
+            let body_gen = generate_arm_block(g, err_block, wild_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
             err_block = body_gen.block
         }
@@ -6907,8 +6988,8 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = "i64"
-    load_inst.result_type = "i64"
+    load_inst.load_type = slot_type
+    load_inst.result_type = slot_type
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -6931,11 +7012,13 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
         some_field_type = map_type_name(inner)
     }
 
-    -- Allocate result slot
+    -- Allocate result slot. Its type is the one the checker found for
+    -- the match; without it, a match that gives a value gives an int
+    let slot_type = checked_slot_type(g, expr, "i64")
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = "i64"
-    result_alloca.result_type = "ptr(i64)"
+    result_alloca.alloc_type = slot_type
+    result_alloca.result_type = "ptr(" + slot_type + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -7045,7 +7128,7 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             some_block.instructions.push(store_r)
             g.builder.next_id = g.builder.next_id + 1
         } else {
-            let body_gen = generate_block_stmts(g, some_block, some_arm.body)
+            let body_gen = generate_arm_block(g, some_block, some_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
             some_block = body_gen.block
         }
@@ -7073,7 +7156,7 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             none_block.instructions.push(store_r)
             g.builder.next_id = g.builder.next_id + 1
         } else {
-            let body_gen = generate_block_stmts(g, none_block, none_arm.body)
+            let body_gen = generate_arm_block(g, none_block, none_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
             none_block = body_gen.block
         }
@@ -7091,7 +7174,7 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
             none_block.instructions.push(store_r)
             g.builder.next_id = g.builder.next_id + 1
         } else {
-            let body_gen = generate_block_stmts(g, none_block, wild_arm.body)
+            let body_gen = generate_arm_block(g, none_block, wild_arm.body, result_alloca_id, slot_type)
             g = body_gen.gen
             none_block = body_gen.block
         }
@@ -7107,8 +7190,8 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = "i64"
-    load_inst.result_type = "i64"
+    load_inst.load_type = slot_type
+    load_inst.result_type = slot_type
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -8030,6 +8113,39 @@ fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: s
 -- SOME CALL: Option constructor
 -- Some(value) -> Option { has_value: 1, value: payload }
 -- ============================================================
+
+-- The block of a match arm. When it ends in an expression of the type
+-- of the match's slot, that value is the arm's and goes into the slot.
+fn generate_arm_block(gen: IRGenerator, block: IRBasicBlock, stmts: List[Stmt], slot_id: int, slot_type: string) -> GenResult {
+    let n = stmts.len()
+    if n == 0 { return gen_result(gen, block) }
+    let last = stmts[n - 1]
+    if last.kind != STMT_EXPRESSION() { return generate_block_stmts(gen, block, stmts) }
+    let mut lead: List[Stmt] = []
+    let mut li = 0
+    while li < n - 1 {
+        lead.push(stmts[li])
+        li = li + 1
+    }
+    let lead_result = generate_block_stmts(gen, block, lead)
+    let mut g = lead_result.gen
+    let mut b = lead_result.block
+    if b.has_terminator { return gen_result(g, b) }
+    -- The type is asked for here, where the block's variables are known
+    let value = *last.expr
+    if infer_expr_type(g, value) != slot_type { return generate_statement(g, b, last) }
+    let value_result = generate_expr(g, b, value)
+    g = value_result.gen
+    b = value_result.block
+    if b.has_terminator { return gen_result(g, b) }
+    let mut store = ir_inst_new(g.builder.next_id, OP_STORE())
+    store.store_ptr = ir_val_inst(slot_id)
+    store.store_val = ir_val_inst(value_result.val_id)
+    store.has_result = false
+    b.instructions.push(store)
+    g.builder.next_id = g.builder.next_id + 1
+    return gen_result(g, b)
+}
 
 fn infer_match_result_type(gen: IRGenerator, arms: List[MatchArm]) -> string {
     -- Check the first arm's body to infer result type

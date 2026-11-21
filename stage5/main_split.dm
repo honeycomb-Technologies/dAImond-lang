@@ -483,8 +483,10 @@ fn precompiled_function_names(prelude_sf: SourceFile) -> Map[string, bool] {
 -- Returns 0 on success. It reports nothing on failure: the caller
 -- then compiles the runtime into the program, which reports whatever
 -- is wrong with it.
-fn build_runtime_object(prelude_sf: SourceFile, obj_file: string) -> int {
+fn build_runtime_object(prelude_sf: SourceFile, checked: Checked, obj_file: string) -> int {
     let mut ir_gen = ir_generator_new()
+    ir_gen.checked_types = checked.types
+    ir_gen.checked_type_args = checked.type_args
     ir_gen = generate_module(ir_gen, prelude_sf)
     if ir_gen.type_errors.len() > 0 { return 1 }
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_runtime")
@@ -500,7 +502,7 @@ fn build_runtime_object(prelude_sf: SourceFile, obj_file: string) -> int {
 -- The path of this compiler's runtime object, which is built first
 -- when the cache does not have it. "" when it cannot be built or
 -- kept in the cache directory.
-fn find_or_build_runtime_object(prelude_sf: SourceFile, verbose: bool) -> string {
+fn find_or_build_runtime_object(prelude_sf: SourceFile, checked: Checked, verbose: bool) -> string {
     let cache_dir = runtime_cache_dir()
     if cache_dir == "" { return "" }
     let obj_file = cache_dir + "/runtime-" + runtime_build_id() + ".o"
@@ -512,7 +514,7 @@ fn find_or_build_runtime_object(prelude_sf: SourceFile, verbose: bool) -> string
     unsafe { pid = getpid() as int }
     let own_file = obj_file + "." + int_to_string(pid)
     let mut built = fs_mkdir(cache_dir) == 0
-    if built { built = build_runtime_object(prelude_sf, own_file) == 0 }
+    if built { built = build_runtime_object(prelude_sf, checked, own_file) == 0 }
     if built { built = fs_rename(own_file, obj_file) == 0 }
     if built == false {
         fs_remove(own_file)
@@ -1275,8 +1277,9 @@ fn compile(cli: CLIArgs) -> int {
         exit(1)
     }
 
-    -- Names and types (check.dm)
-    let check_errors = check_program(sf)
+    -- Names and types (check.dm). The types found go to IR generation.
+    let checked = check_program(sf)
+    let check_errors = checked.errors
     if check_errors.len() > 0 {
         let mut ce = 0
         while ce < check_errors.len() {
@@ -1295,7 +1298,7 @@ fn compile(cli: CLIArgs) -> int {
     -- and --emit-bitcode give the whole program, runtime included.
     let mut runtime_obj = ""
     if opt_level == 0 and cli.emit_ir == false and cli.emit_llvm == false and cli.emit_bitcode == false and cli.command != "check" {
-        runtime_obj = find_or_build_runtime_object(prelude_sf, verbose)
+        runtime_obj = find_or_build_runtime_object(prelude_sf, checked, verbose)
     }
 
     let mut ir_gen = ir_generator_new()
@@ -1303,6 +1306,8 @@ fn compile(cli: CLIArgs) -> int {
         ir_gen.linked_fns = precompiled_function_names(prelude_sf)
     }
     ir_gen.debug_info = cli.debug_info
+    ir_gen.checked_types = checked.types
+    ir_gen.checked_type_args = checked.type_args
     ir_gen = generate_module(ir_gen, sf)
     if ir_gen.type_errors.len() > 0 {
         let mut te = 0

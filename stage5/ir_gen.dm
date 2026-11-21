@@ -205,6 +205,12 @@ struct IRGenerator {
     -- Expressions IR generation could not resolve, reported as compile
     -- errors after IR generation instead of being lowered to placeholders
     type_errors: List[string],
+    -- The type the checker found for each expression, at the
+    -- expression's id (see CHECKED TYPES). Empty when nothing was checked.
+    checked_types: List[string],
+    -- The type arguments the checker found for each call of a generic
+    -- function, at the call's id, joined with "|"
+    checked_type_args: List[string],
     -- -g: say where each variable lives (OP_DEBUG_VAR)
     debug_info: bool,
     -- Declared source return types of functions and impl methods
@@ -280,6 +286,8 @@ fn ir_generator_new() -> IRGenerator {
         all_extern_fns: Map_new(),
         linked_fns: Map_new(),
         type_errors: [],
+        checked_types: [],
+        checked_type_args: [],
         debug_info: false,
         fn_src_return_types: Map_new(),
         fn_src_param_types: Map_new(),
@@ -477,6 +485,74 @@ fn instance_subs(gen: IRGenerator, instance: string) -> Map[string, string] {
     subs.insert("Self", instance)
     subs.insert(base, instance)
     return subs
+}
+
+-- ============================================================
+-- CHECKED TYPES
+-- The checker (check.dm) finds the type of every expression
+-- before code is generated, and records it at the expression's
+-- id. It knows what the functions here cannot work out from an
+-- expression alone: the type of None or Ok(x) from the place
+-- the value goes to, the type of an `if` or a `match` from all
+-- its branches, the result of a call of a generic function.
+--
+-- It records nothing in the body of a generic function, which
+-- is compiled once for each set of type arguments, nor for an
+-- expression made here, during code generation. And it does not
+-- keep the widths of numbers apart: every integer type fits
+-- every other. So the type of a number is worked out here
+-- (infer_expr_type), and checked_ir_type gives none.
+-- ============================================================
+
+-- The type the checker found for the expression, in source form
+-- with generic structs as their instances (canon_type): "string",
+-- "Option[int]", "Pair_i64_string". "" when it found none, or one
+-- with a part it does not know.
+fn checked_type(gen: IRGenerator, e: Expr) -> string {
+    if e.id < 0 or e.id >= gen.checked_types.len() { return "" }
+    let t = gen.checked_types[e.id]
+    if t == "" or string_contains(t, "?") { return "" }
+    return canon_type(gen, t)
+}
+
+-- What the type parameters of the generic function stand for in the
+-- call, as the checker found them from the call's arguments: T is
+-- "P" in first(ps) for fn first[T](xs: List[T]) and ps: List[P].
+-- Empty when it did not find them all.
+fn checked_type_args(gen: IRGenerator, call: Expr) -> List[string] {
+    let none: List[string] = []
+    if call.id < 0 or call.id >= gen.checked_type_args.len() { return none }
+    let joined = gen.checked_type_args[call.id]
+    if joined == "" { return none }
+    return string_split(joined, "|")
+}
+
+-- The IR type of the expression's value as the checker found it. ""
+-- when it found none, for a number (see CHECKED TYPES), and for the
+-- types that have another form in the IR than their name.
+fn checked_ir_type(gen: IRGenerator, e: Expr) -> string {
+    let t = checked_type(gen, e)
+    if t == "" or t == "void" or starts_with(t, "dyn ") or starts_with(t, "[") or starts_with(t, "Future[") { return "" }
+    let ir_type = map_type_name(t)
+    if is_integer_type(ir_type) or is_float_type(ir_type) { return "" }
+    return ir_type
+}
+
+-- The type of the value of an `if`, a `match` or a block: the
+-- checker's, and `inferred` where it gives none. `inferred` is what
+-- is found here from the first branch, before the branch's own
+-- variables are declared: a name the branch binds may still have the
+-- type an earlier binding of that name left (`Some(v)` in one match
+-- after `Some(v)` in another), and the type is "i64" where nothing is
+-- known. So for a number, whose width the checker does not keep, its
+-- type is taken where `inferred` is no number of that kind at all.
+fn checked_slot_type(gen: IRGenerator, e: Expr, inferred: string) -> string {
+    let checked = checked_ir_type(gen, e)
+    if checked != "" { return checked }
+    let number = map_type_name(checked_type(gen, e))
+    if is_float_type(number) and is_float_type(inferred) == false { return number }
+    if is_integer_type(number) and is_integer_type(inferred) == false { return number }
+    return inferred
 }
 
 fn is_integer_type(name: string) -> bool {

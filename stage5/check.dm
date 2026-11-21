@@ -9,7 +9,8 @@ import ir_gen_expr
 -- THE CHECKER
 -- Finds the type of every expression of a program and reports
 -- where names and types do not fit, before any code is
--- generated: check_program gives the errors of a source file.
+-- generated: check_program gives the errors of a source file,
+-- and the type of each of its expressions.
 --
 -- A type is its name in source form: "int", "List[string]",
 -- "Map[string, int]", "fn(int) -> bool". "" is a type the
@@ -20,6 +21,12 @@ import ir_gen_expr
 --
 -- The checker is a value: a function takes it, changes its
 -- copy and returns it, alone or in a Typed with the type found.
+--
+-- The type of each expression is recorded at the expression's
+-- id (see EXPRESSION IDS in ast.dm), for code generation. Where
+-- a value goes says what type it has when the value alone does
+-- not: None is "Option[?]", and an Option[int] in
+-- `let o: Option[int] = None` (ck_settle).
 -- ============================================================
 
 -- A function's or method's signature
@@ -74,7 +81,25 @@ struct Checker {
     -- Names that stand for other types where the checker is: Self,
     -- and the type parameters in scope, which stand for "?"
     norm_names: List[string],
-    norm_repls: List[string]
+    norm_repls: List[string],
+    -- The type of each expression, at the expression's id
+    types: List[string],
+    -- For a call of a generic function, at the call's id: what the
+    -- function's type parameters stand for, joined with "|"
+    type_args: List[string],
+    -- False in the body of a generic function or method, where the
+    -- types depend on the type arguments and none is recorded
+    record: bool
+}
+
+-- What check_program finds
+struct Checked {
+    errors: List[string],
+    -- The type of each expression at its id; "" where it is not known
+    types: List[string],
+    -- The type arguments of each call of a generic function at the
+    -- call's id, joined with "|"; "" where they are not all known
+    type_args: List[string]
 }
 
 -- A checker and the type of the expression it has just checked
@@ -157,6 +182,34 @@ fn ty_rewrite(t: string, names: List[string], repls: List[string]) -> string {
 
 fn ty_known(t: string) -> bool {
     return t != "" and t != "?"
+}
+
+-- Whether every part of the type is known: "Option[int]", and not
+-- "Option[?]"
+fn ty_whole(t: string) -> bool {
+    return t != "" and string_contains(t, "?") == false
+}
+
+-- One type from two that describe the same value, taking from each
+-- the parts the other does not know: "Result[int, string]" from
+-- "Result[int, ?]" and "Result[?, string]". The first where they differ.
+fn ty_merge(a: string, b: string) -> string {
+    if ty_known(a) == false { return b }
+    if ty_known(b) == false or a == b { return a }
+    if ty_whole(a) { return a }
+    let head = ty_head(a)
+    if head == "" or head != ty_head(b) { return a }
+    let a_args = ty_args(a)
+    let b_args = ty_args(b)
+    if a_args.len() == 0 or a_args.len() != b_args.len() { return a }
+    let mut out = head + "["
+    let mut i = 0
+    while i < a_args.len() {
+        if i > 0 { out = out + ", " }
+        out = out + ty_merge(a_args[i], b_args[i])
+        i = i + 1
+    }
+    return out + "]"
 }
 
 fn ty_is_int(t: string) -> bool {
@@ -629,7 +682,110 @@ fn ck_collect(c0: Checker, sf: SourceFile) -> Checker {
 -- EXPRESSIONS
 -- ============================================================
 
+-- Record the type found for the expression with the id
+fn ck_note(c: Checker, id: int, t: string) -> Checker {
+    if c.record == false or id < 0 or id >= c.types.len() { return c }
+    let mut out = c
+    out.types[id] = t
+    return out
+}
+
+-- Whether the expression makes a new value whose type its place
+-- decides: None, Some(x), Ok(x), Err(x), a new Box or Map, a list literal
+fn ck_makes_value(e: Expr) -> bool {
+    if e.kind == EXPR_ARRAY_LITERAL() { return true }
+    if e.kind == EXPR_IDENTIFIER() { return e.name == "None" }
+    if e.kind == EXPR_FUNCTION_CALL() {
+        let callee = *e.callee
+        if callee.kind != EXPR_IDENTIFIER() { return false }
+        let name = callee.name
+        return name == "Some" or name == "Ok" or name == "Err" or name == "Box_new" or name == "Box_null" or name == "Map_new"
+    }
+    return false
+}
+
+-- A value of the expression goes where a `want` is expected. Where
+-- the checker found a type with unknown parts for it, such as
+-- "Option[?]" for None, the place says what they are: record `want`
+-- for the expression, and for the expressions its value comes from.
+fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
+    if c0.record == false or ty_whole(want) == false or want == "void" { return c0 }
+    if e.id < 0 or e.id >= c0.types.len() { return c0 }
+    let mut c = c0
+    let have = c.types[e.id]
+    -- A type the checker does not know at all stays unknown, and so
+    -- does a whole type that differs, such as an i32 that goes where an
+    -- int is expected: the value is converted there. What makes a new
+    -- value (ck_makes_value) makes it of the type of its place.
+    if ty_known(have) and have != want and ty_fits(want, have) and (ty_whole(have) == false or ck_makes_value(e)) {
+        c = ck_note(c, e.id, want)
+    }
+    let k = e.kind
+    if k == EXPR_GROUPED() { return ck_settle(c, *e.operand, want) }
+    if k == EXPR_IF() {
+        c = ck_settle(c, *e.then_branch, want)
+        if e.has_else { c = ck_settle(c, *e.else_branch, want) }
+        return c
+    }
+    if k == EXPR_BLOCK() {
+        if e.has_result { return ck_settle(c, *e.result, want) }
+        return ck_settle_last(c, e.stmts, want)
+    }
+    if k == EXPR_MATCH() {
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            if arm.is_expr_body {
+                c = ck_settle(c, *arm.body_expr, want)
+            } else {
+                c = ck_settle_last(c, arm.body, want)
+            }
+            i = i + 1
+        }
+        return c
+    }
+    if k == EXPR_ARRAY_LITERAL() {
+        if ty_head(want) == "List" {
+            let elem = ty_arg(want, 0)
+            let mut i = 0
+            while i < e.elements.len() {
+                c = ck_settle(c, e.elements[i], elem)
+                i = i + 1
+            }
+        }
+        return c
+    }
+    -- The value inside a Some, an Ok, an Err or a Box
+    if k == EXPR_FUNCTION_CALL() and e.args.len() == 1 {
+        let callee = *e.callee
+        if callee.kind == EXPR_IDENTIFIER() {
+            let head = ty_head(want)
+            if (callee.name == "Some" and head == "Option") or (callee.name == "Ok" and head == "Result") or (callee.name == "Box_new" and head == "Box") {
+                return ck_settle(c, e.args[0], ty_arg(want, 0))
+            }
+            if callee.name == "Err" and head == "Result" {
+                return ck_settle(c, e.args[0], ty_arg(want, 1))
+            }
+        }
+    }
+    return c
+}
+
+-- ck_settle for the expression that gives a block its value
+fn ck_settle_last(c: Checker, stmts: List[Stmt], want: string) -> Checker {
+    if stmts.len() == 0 { return c }
+    let last = stmts[stmts.len() - 1]
+    if last.kind != STMT_EXPRESSION() { return c }
+    return ck_settle(c, *last.expr, want)
+}
+
+-- The type of the expression, which is recorded at its id
 fn ck_expr(c: Checker, e: Expr) -> Typed {
+    let found = ck_expr_of_kind(c, e)
+    return ck_typed(ck_note(found.c, e.id, found.t), found.t)
+}
+
+fn ck_expr_of_kind(c: Checker, e: Expr) -> Typed {
     let k = e.kind
     if k == EXPR_LITERAL_INT() { return ck_typed(c, "int") }
     if k == EXPR_LITERAL_FLOAT() { return ck_typed(c, "float") }
@@ -676,7 +832,7 @@ fn ck_exprs(c0: Checker, exprs: List[Expr]) -> TypedList {
     let mut i = 0
     while i < exprs.len() {
         let r = ck_expr(c, exprs[i])
-        c = r.c
+        c = ck_needs_value(r.c, exprs[i], false)
         types.push(r.t)
         i = i + 1
     }
@@ -762,11 +918,13 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
     let mut c = c0
     let mut ops: List[int] = []
     let mut lines: List[int] = []
+    let mut ids: List[int] = []
     let mut rights: List[Expr] = []
     let mut cur = e
     while cur.kind == EXPR_BINARY() {
         ops.push(cur.op)
         lines.push(cur.line)
+        ids.push(cur.id)
         rights.push(*cur.right)
         cur = *cur.left
     }
@@ -777,7 +935,7 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
     while i >= 0 {
         let right = ck_expr(c, rights[i])
         let result = ck_operator(right.c, ops[i], t, right.t, lines[i])
-        c = result.c
+        c = ck_note(result.c, ids[i], result.t)
         t = result.t
         i = i - 1
     }
@@ -879,22 +1037,48 @@ fn ck_arity(c: Checker, sig: FnSig, shown: string, first: int, count: int, line:
     return ck_error(c, "call to '" + shown + "' passes " + int_to_string(count) + " arguments, expected " + int_to_string(sig.params.len() - first), line)
 }
 
--- Check the arguments of a call against the signature, starting at
--- its parameter `first`, and give what the call returns. `binds` is
--- what the signature's type parameters are known to stand for.
-fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[string], arg_types: List[string], args: List[Expr]) -> Typed {
-    let mut c = c0
+-- What the signature's type parameters stand for in a call with
+-- arguments of the types, from its parameter `first` on. `binds0` is
+-- what is known before the arguments are looked at.
+fn ck_binds(sig: FnSig, first: int, binds0: List[string], arg_types: List[string]) -> List[string] {
     let mut binds = binds0
     let mut i = 0
     while i < arg_types.len() and first + i < sig.params.len() {
         binds = ty_bind(sig.params[first + i], arg_types[i], sig.generics, binds)
         i = i + 1
     }
-    i = 0
+    return binds
+}
+
+-- Record the type arguments of the call with the id, when all are known
+fn ck_note_type_args(c: Checker, id: int, binds: List[string]) -> Checker {
+    if c.record == false or id < 0 or id >= c.type_args.len() or binds.len() == 0 { return c }
+    let mut joined = ""
+    let mut i = 0
+    while i < binds.len() {
+        if ty_whole(binds[i]) == false or binds[i] == "void" { return c }
+        if i > 0 { joined = joined + "|" }
+        joined = joined + binds[i]
+        i = i + 1
+    }
+    let mut out = c
+    out.type_args[id] = joined
+    return out
+}
+
+-- Check the arguments of a call against the signature, starting at
+-- its parameter `first`, and give what the call returns. `binds` is
+-- what the signature's type parameters are known to stand for.
+fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[string], arg_types: List[string], args: List[Expr]) -> Typed {
+    let mut c = c0
+    let binds = ck_binds(sig, first, binds0, arg_types)
+    let mut i = 0
     while i < arg_types.len() and first + i < sig.params.len() {
         let want = ty_apply(sig.params[first + i], sig.generics, binds)
         if ck_fits(c, want, arg_types[i]) == false {
             c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + shown + "': expected " + want + ", found " + arg_types[i], args[i].line)
+        } else {
+            c = ck_settle(c, args[i], want)
         }
         i = i + 1
     }
@@ -916,6 +1100,8 @@ fn ck_call_value(c0: Checker, held: string, shown: string, arg_types: List[strin
     while i < params.len() {
         if ck_fits(c, params[i], arg_types[i]) == false {
             c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + shown + "': expected " + params[i] + ", found " + arg_types[i], args[i].line)
+        } else {
+            c = ck_settle(c, args[i], params[i])
         }
         i = i + 1
     }
@@ -932,7 +1118,9 @@ fn ck_builtin_type(name: string) -> string {
 
 -- A call of `name` with arguments of the types. `generic_args` are
 -- the type arguments written at the call, as in name[int](x).
-fn ck_call_named(c0: Checker, name: string, generic_args: List[string], arg_types: List[string], args: List[Expr], line: int) -> Typed {
+-- `call_id` is the id of the call's expression, -1 when it has none
+-- of its own (a pipeline).
+fn ck_call_named(c0: Checker, name: string, generic_args: List[string], arg_types: List[string], args: List[Expr], line: int, call_id: int) -> Typed {
     let c = c0
     let mut first_type = "?"
     if arg_types.len() > 0 {
@@ -963,7 +1151,9 @@ fn ck_call_named(c0: Checker, name: string, generic_args: List[string], arg_type
             binds[gi] = ty_rewrite(generic_args[gi], none, none)
             gi = gi + 1
         }
-        return ck_apply(c, sig, name, 0, binds, arg_types, args)
+        let applied = ck_apply(c, sig, name, 0, binds, arg_types, args)
+        if sig.generics.len() == 0 { return applied }
+        return ck_typed(ck_note_type_args(applied.c, call_id, ck_binds(sig, 0, binds, arg_types)), applied.t)
     }
     if builtin { return ck_typed(c, ck_builtin_type(name)) }
     return ck_typed(c, "")
@@ -977,7 +1167,7 @@ fn ck_call(c0: Checker, e: Expr) -> Typed {
         return ck_call_value(rest.c, called.t, "a function value", rest.types, e.args, e.line)
     }
     let found = ck_exprs(c0, e.args)
-    return ck_call_named(found.c, callee.name, callee.generic_args, found.types, e.args, e.line)
+    return ck_call_named(found.c, callee.name, callee.generic_args, found.types, e.args, e.line, e.id)
 }
 
 -- Whether a trait the type implements has the method
@@ -1017,6 +1207,8 @@ fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: Lis
         let want = ty_apply(payloads[i], sig.generics, ty_unbound(0))
         if ck_fits(c, want, types[i]) == false {
             c = ck_error(c, "type mismatch in value " + int_to_string(i + 1) + " of '" + enum_name + "." + variant + "': expected " + want + ", found " + types[i], values[i].line)
+        } else {
+            c = ck_settle(c, values[i], want)
         }
         i = i + 1
     }
@@ -1110,6 +1302,8 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             if arg_types.len() == 1 {
                 if ck_fits(c, elem, arg_types[0]) == false {
                     c = ck_error(c, "type mismatch in the value pushed to a " + recv + ": expected " + elem + ", found " + arg_types[0], e.line)
+                } else {
+                    c = ck_settle(c, e.args[0], elem)
                 }
             }
             return ck_typed(c, "void")
@@ -1157,6 +1351,8 @@ fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
             let want = ck_field_type(c, t, field)
             if ck_fits(c, want, values.types[i]) == false {
                 c = ck_error(c, "type mismatch in field '" + field + "' of '" + head + "': expected " + want + ", found " + values.types[i], e.field_values[i].line)
+            } else {
+                c = ck_settle(c, e.field_values[i], want)
             }
         }
         i = i + 1
@@ -1197,13 +1393,26 @@ fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
 
 fn ck_array_literal(c0: Checker, e: Expr) -> Typed {
     let values = ck_exprs(c0, e.elements)
+    let mut c = values.c
+    -- The first element's type, with what the later ones know of its parts
     let mut elem = "?"
     let mut i = 0
-    while i < values.types.len() and elem == "?" {
-        if ty_known(values.types[i]) and values.types[i] != "void" { elem = values.types[i] }
+    while i < values.types.len() {
+        if ty_known(values.types[i]) and values.types[i] != "void" {
+            if elem == "?" {
+                elem = values.types[i]
+            } else if ty_fits(elem, values.types[i]) {
+                elem = ty_merge(elem, values.types[i])
+            }
+        }
         i = i + 1
     }
-    return ck_typed(values.c, "List[" + elem + "]")
+    i = 0
+    while i < e.elements.len() {
+        c = ck_settle(c, e.elements[i], elem)
+        i = i + 1
+    }
+    return ck_typed(c, "List[" + elem + "]")
 }
 
 fn ck_condition(c: Checker, t: string, what: string, line: int) -> Checker {
@@ -1252,7 +1461,12 @@ fn ck_if_expr(c0: Checker, e: Expr) -> Typed {
         if t == "" and ty_known(else_value.t) and else_value.t != "void" { t = else_value.t }
         if t != "" and else_value.t != "void" and ck_fits(c, t, else_value.t) == false and ck_fits(c, else_value.t, t) == false {
             c = ck_error(c, "the branches of this 'if' give " + t + " and " + else_value.t, e.line)
+        } else if t != "" and else_value.t != "void" {
+            -- Each branch may know what the other does not: Some(n) and None
+            t = ty_merge(t, else_value.t)
         }
+        c = ck_settle(c, *e.then_branch, t)
+        c = ck_settle(c, *e.else_branch, t)
     }
     return ck_typed(c, t)
 }
@@ -1460,6 +1674,19 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
         if t == "" and ty_known(arm_type) and arm_type != "void" { t = arm_type }
         if used and t != "" and arm_type != "void" and ck_fits(c, t, arm_type) == false and ck_fits(c, arm_type, t) == false {
             c = ck_error(c, "the arms of this match give " + t + " and " + arm_type, e.line)
+        } else if t != "" and ty_known(arm_type) and arm_type != "void" {
+            t = ty_merge(t, arm_type)
+        }
+        i = i + 1
+    }
+    -- Each arm gives a value of the type the arms give together
+    i = 0
+    while i < e.match_arms.len() {
+        let arm = e.match_arms[i]
+        if arm.is_expr_body {
+            c = ck_settle(c, *arm.body_expr, t)
+        } else {
+            c = ck_settle_last(c, arm.body, t)
         }
         i = i + 1
     }
@@ -1502,6 +1729,8 @@ fn ck_lambda(c0: Checker, e: Expr) -> Typed {
             if ty_known(value.t) and value.t != "void" { ret = value.t }
         } else if value.t != "void" and ck_fits(c, ret, value.t) == false {
             c = ck_error(c, "type mismatch in the lambda's value: expected " + ret + ", found " + value.t, body.line)
+        } else {
+            c = ck_settle(c, body, ret)
         }
     }
     c.ret_type = outer_ret
@@ -1521,7 +1750,7 @@ fn ck_pipeline(c0: Checker, e: Expr) -> Typed {
     args.push(left_expr)
     let no_generics: List[string] = []
     if right.kind == EXPR_IDENTIFIER() {
-        return ck_call_named(left.c, right.name, no_generics, types, args, e.line)
+        return ck_call_named(left.c, right.name, no_generics, types, args, e.line, -1)
     }
     if right.kind == EXPR_FUNCTION_CALL() {
         let callee = *right.callee
@@ -1533,7 +1762,7 @@ fn ck_pipeline(c0: Checker, e: Expr) -> Typed {
                 args.push(right.args[i])
                 i = i + 1
             }
-            return ck_call_named(rest.c, callee.name, callee.generic_args, types, args, e.line)
+            return ck_call_named(rest.c, callee.name, callee.generic_args, types, args, e.line, -1)
         }
     }
     let other = ck_expr(left.c, right)
@@ -1571,7 +1800,7 @@ fn ck_scope(c0: Checker, stmts: List[Stmt]) -> Checker {
 fn ck_let(c0: Checker, s: Stmt) -> Checker {
     let value = *s.let_value
     let found = ck_expr(c0, value)
-    let mut c = found.c
+    let mut c = ck_needs_value(found.c, value, false)
     let mut t = found.t
     if t == "void" {
         c = ck_error(c, "a variable holds the result of a call that returns no value", value.line)
@@ -1582,6 +1811,8 @@ fn ck_let(c0: Checker, s: Stmt) -> Checker {
         let want = ck_norm(c, s.let_type)
         if ck_fits(c, want, t) == false {
             c = ck_error(c, "type mismatch in the value of '" + s.let_name + "': expected " + want + ", found " + t, value.line)
+        } else {
+            c = ck_settle(c, value, want)
         }
         t = want
     }
@@ -1600,7 +1831,8 @@ fn ck_return(c0: Checker, s: Stmt) -> Checker {
     }
     let value = *s.ret_value
     let found = ck_expr(c0, value)
-    let c = found.c
+    let mut c = found.c
+    if want != "void" { c = ck_needs_value(c, value, false) }
     if want == "void" {
         if ty_known(found.t) and found.t != "void" {
             return ck_error(c, "this return has a value, but the function returns none", s.line)
@@ -1616,7 +1848,7 @@ fn ck_return(c0: Checker, s: Stmt) -> Checker {
     if ck_fits(c, want, found.t) == false {
         return ck_error(c, "type mismatch in the return value: expected " + want + ", found " + found.t, value.line)
     }
-    return c
+    return ck_settle(c, value, want)
 }
 
 fn ck_assign_op(op: int) -> int {
@@ -1669,13 +1901,15 @@ fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
     }
     let to = ck_expr(c, target)
     let value = ck_expr(to.c, *s.assign_value)
-    c = value.c
+    c = ck_needs_value(value.c, *s.assign_value, false)
     if value.t == "void" {
         return ck_error(c, "the assignment" + shown + " takes the result of a call that returns no value", s.line)
     }
     if s.assign_op == ASSIGN_EQ() {
         if ck_fits(c, to.t, value.t) == false {
             c = ck_error(c, "type mismatch in the assignment" + shown + ": expected " + to.t + ", found " + value.t, s.line)
+        } else {
+            c = ck_settle(c, *s.assign_value, to.t)
         }
         return c
     }
@@ -1774,6 +2008,76 @@ fn ck_diverges(e: Expr) -> bool {
     return false
 }
 
+-- Whether the statements end by leaving the code around them: what
+-- ck_always_returns finds, a break or a continue
+fn ck_leaves(stmts: List[Stmt]) -> bool {
+    if stmts.len() == 0 { return false }
+    let s = stmts[stmts.len() - 1]
+    if s.kind == STMT_BREAK() or s.kind == STMT_CONTINUE() { return true }
+    if s.kind == STMT_IF() {
+        return s.has_else_branch and ck_leaves(s.if_then) and ck_leaves(s.if_else)
+    }
+    return ck_always_returns(stmts)
+}
+
+-- The value of the expression is used, so each of its branches must
+-- give one: report an `if` without an `else`, and a branch or an arm
+-- that ends in a statement or in a call that returns nothing. A
+-- branch that leaves (return, break, continue, panic) needs no value.
+-- `inner` says that the expression is a branch of the one in use.
+fn ck_needs_value(c: Checker, e: Expr, inner: bool) -> Checker {
+    let k = e.kind
+    if k == EXPR_GROUPED() { return ck_needs_value(c, *e.operand, inner) }
+    if k == EXPR_IF() {
+        if e.has_else == false {
+            return ck_error(c, "this 'if' is used as a value, and has no 'else' to give one", e.line)
+        }
+        return ck_needs_value(ck_needs_value(c, *e.then_branch, true), *e.else_branch, true)
+    }
+    if k == EXPR_BLOCK() {
+        if e.has_result { return ck_needs_value(c, *e.result, true) }
+        return ck_block_needs_value(c, e.stmts, e.line)
+    }
+    if k == EXPR_MATCH() {
+        let mut out = c
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            if arm.is_expr_body {
+                out = ck_needs_value(out, *arm.body_expr, true)
+            } else {
+                out = ck_block_needs_value(out, arm.body, e.line)
+            }
+            i = i + 1
+        }
+        return out
+    }
+    -- A call that returns nothing. (One that is the whole value is
+    -- reported where the value goes.)
+    if inner and c.record and e.id >= 0 and e.id < c.types.len() {
+        if c.types[e.id] == "void" and ck_diverges(e) == false {
+            return ck_error(c, "this is used as a value, and it is a call that returns none", e.line)
+        }
+    }
+    return c
+}
+
+-- ck_needs_value for the statements of a block
+fn ck_block_needs_value(c: Checker, stmts: List[Stmt], line: int) -> Checker {
+    if stmts.len() == 0 {
+        return ck_error(c, "this block is used as a value, and it is empty", line)
+    }
+    let last = stmts[stmts.len() - 1]
+    if last.kind == STMT_EXPRESSION() { return ck_needs_value(c, *last.expr, true) }
+    if ck_leaves(stmts) { return c }
+    if last.kind == STMT_IF() or last.kind == STMT_MATCH() {
+        let mut word = "an 'if'"
+        if last.kind == STMT_MATCH() { word = "a 'match'" }
+        return ck_error(c, "this block is used as a value, and it ends in " + word + " statement, which gives none: put it in parentheses to use its value", last.line)
+    }
+    return ck_error(c, "this block is used as a value, and it ends in a statement that gives none", last.line)
+}
+
 -- Whether the statements cannot reach their end: the last one
 -- returns, or never ends, on every path
 fn ck_always_returns(stmts: List[Stmt]) -> bool {
@@ -1818,6 +2122,10 @@ fn ck_function(c0: Checker, fd: FunctionDecl, self_type: string, outer_generics:
     }
     c.norm_names = names
     c.norm_repls = repls
+    -- A generic function is compiled once for each set of type
+    -- arguments, and a trait's own method once for each type that
+    -- takes it: its expressions have no one type
+    c.record = outer_generics.len() == 0 and fd.generic_params.len() == 0 and self_type != "?"
     let no_names: List[string] = []
     let no_types: List[string] = []
     let no_flags: List[int] = []
@@ -1886,6 +2194,7 @@ fn ck_const_decl(c0: Checker, cd: ConstDecl) -> Checker {
     c.var_types = no_types
     let no_flags: List[int] = []
     c.var_flags = no_flags
+    c.record = true
     let value = *cd.value
     let found = ck_expr(c, value)
     c = found.c
@@ -1897,6 +2206,8 @@ fn ck_const_decl(c0: Checker, cd: ConstDecl) -> Checker {
     let want = c.consts.get(cd.name)
     if ck_fits(c, want, found.t) == false {
         c = ck_error(c, "type mismatch in the value of '" + cd.name + "': expected " + want + ", found " + found.t, value.line)
+    } else {
+        c = ck_settle(c, value, want)
     }
     return c
 }
@@ -1926,9 +2237,20 @@ fn ck_trait(c0: Checker, td: TraitDecl) -> Checker {
     return c
 }
 
--- The errors of the names and types of a program: the file being
--- compiled with the files it imports and the runtime
-fn check_program(sf: SourceFile) -> List[string] {
+-- The errors of the names and types of a program, which is the file
+-- being compiled with the files it imports and the runtime; and the
+-- type of each of its expressions
+fn check_program(sf: SourceFile) -> Checked {
+    -- Two lists: a copy of a list shares its storage
+    let mut types: List[string] = []
+    let mut type_args: List[string] = []
+    let count = expr_id_count()
+    let mut ti = 0
+    while ti < count {
+        types.push("")
+        type_args.push("")
+        ti = ti + 1
+    }
     let mut c = Checker {
         files: sf.files,
         errors: [],
@@ -1943,7 +2265,10 @@ fn check_program(sf: SourceFile) -> List[string] {
         var_flags: [],
         ret_type: "",
         norm_names: [],
-        norm_repls: []
+        norm_repls: [],
+        types: types,
+        type_args: type_args,
+        record: true
     }
     c = ck_collect(c, sf)
     -- Constants first: a function may use one declared after it
@@ -1972,5 +2297,5 @@ fn check_program(sf: SourceFile) -> List[string] {
         }
         i = i + 1
     }
-    return c.errors
+    return Checked { errors: c.errors, types: c.types, type_args: c.type_args }
 }

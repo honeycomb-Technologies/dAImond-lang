@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (481 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (486 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 481 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 486 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
@@ -364,7 +364,8 @@ The compiler passes its suite of 481 cases, builds itself to a fixed point, and 
 
 ### Known gaps
 
-- The type checker reports a mismatch only where it knows both types. It does not check the arguments of a function held in a struct field, whether two function types agree, or the type of an `await`, and code generation does not use its types yet: `Ok`, `Err`, `Some` and `None` take their type from the function's return type.
+- The type checker reports a mismatch only where it knows both types. It does not check the arguments of a function held in a struct field, whether two function types agree, or the type of an `await`. Code generation takes the checker's types for `None`, `Some`, `Ok` and `Err`, for the value of an `if` or a `match` and for calls of generic functions, but not inside the body of a generic function.
+- Lists of lists written as literals (`[[1, 2], [3]]`, `lists.push([7, 8])`) are compiled wrongly.
 - `dyn Trait` is not dynamic dispatch: a `dyn` variable is the struct it is declared with, and a `dyn Trait` parameter takes one implementing type.
 - A guard on the arm of a variant (`Color.Blue(n) if n > 5 =>`) is a compile error; generic enums do not compile.
 - There are no closure values. A lambda that uses a variable of the function around it can be bound with `let` and called by that name; passing, returning or storing it is a compile error. A lambda that uses none is a plain function and can go anywhere.
