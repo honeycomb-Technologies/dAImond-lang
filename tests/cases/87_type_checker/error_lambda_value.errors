@@ -1,0 +1,4 @@
+Error: type mismatch in the lambda's value: expected int, found string at line 5
+Error: undefined type 'Missing' at line 7
+Error: operator '+' does not take int and string at line 9
+Error: 3 type errors

@@ -10,7 +10,7 @@ OUTPUT="main.dm"
 # Order matters: dependencies before dependents
 MODULES="token.dm lexer.dm ast.dm ir.dm ir_builder.dm llvm.dm parser.dm \
     ir_gen.dm ir_gen_decl.dm ir_gen_stmt.dm ir_gen_expr.dm ir_gen_builtins.dm \
-    ir_gen_comptime.dm llvm_gen.dm llvm_gen_call.dm llvm_gen_simd.dm"
+    ir_gen_comptime.dm check.dm llvm_gen.dm llvm_gen_call.dm llvm_gen_simd.dm"
 
 # The dAImond runtime sources (runtime/*.dm), which the compiler embeds
 # as one string, so compiled programs need no runtime files on disk

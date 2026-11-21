@@ -1,0 +1,11 @@
+Error: struct 'Point' has no field 'z' at line 7
+Error: struct 'Point' has no field 'z' at line 21
+Error: the struct literal of 'Point' leaves out the field 'y' at line 22
+Error: struct 'Point' has no field 'z' at line 23
+Error: type mismatch in field 'x' of 'Point': expected int, found string at line 24
+Error: type mismatch in field 'y' of 'Point': expected int, found float at line 24
+Error: type 'Point' has no method 'total' at line 25
+Error: enum 'Color' has no variant or function 'Blue' at line 27
+Error: enum 'Color' has no variant or function 'Blue' at line 28
+Error: type 'Color' has no method 'name' at line 29
+Error: 10 type errors

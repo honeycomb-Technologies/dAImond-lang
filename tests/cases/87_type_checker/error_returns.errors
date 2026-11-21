@@ -1,0 +1,11 @@
+Error: type mismatch in the return value: expected int, found string at line 8
+Error: type mismatch in the return value: expected bool, found int at line 12
+Error: type mismatch in the return value: expected Result[int, string], found Result[string, ?] at line 16
+Error: type mismatch in the return value: expected Option[string], found Option[int] at line 20
+Error: this return has no value, but the function returns int at line 24
+Error: this return has a value, but the function returns none at line 28
+Error: the return value is a call that returns no value at line 32
+Error: function 'some_paths' can reach its end without returning a value of type int at line 35
+Error: function 'last_expression' can reach its end without returning a value of type int at line 39
+Error: function 'loop_with_break' can reach its end without returning a value of type int at line 41
+Error: 10 type errors

@@ -1,0 +1,16 @@
+Error: operator '+' does not take string and int at line 8
+Error: operator '-' does not take int and string at line 9
+Error: operator '*' does not take string and string at line 10
+Error: operator '+' does not take bool and bool at line 11
+Error: cannot compare string with int ('==') at line 12
+Error: cannot compare int with bool ('<') at line 13
+Error: the left side of 'and' is int, not bool at line 14
+Error: the right side of 'or' is string, not bool at line 15
+Error: the condition of 'if' is int, not bool at line 16
+Error: the condition of 'while' is string, not bool at line 17
+Error: '-' takes a number, not string at line 18
+Error: 'not' takes a bool, not int at line 19
+Error: an index is an integer, not string at line 20
+Error: an index is an integer, not bool at line 21
+Error: the condition of a match guard is int, not bool at line 23
+Error: 15 type errors

@@ -1,0 +1,15 @@
+Error: type mismatch in the value of 'LIMIT': expected int, found string at line 6
+Error: type mismatch in the value of 'a': expected A, found B at line 17
+Error: type mismatch in the value of 'half': expected float, found int at line 18
+Error: type mismatch in the value of 'whole': expected int, found float at line 19
+Error: type mismatch in the value of 'truth': expected int, found bool at line 20
+Error: type mismatch in the value of 'maybe': expected Option[int], found Option[string] at line 21
+Error: type mismatch in the value of 'names': expected List[int], found List[string] at line 22
+Error: type mismatch in the value of 'same': expected string, found int at line 23
+Error: type mismatch in the value of 'length': expected string, found int at line 24
+Error: a variable holds the result of a call that returns no value at line 25
+Error: type mismatch in the assignment to 'n': expected int, found string at line 27
+Error: the assignment to 'n' takes the result of a call that returns no value at line 28
+Error: type mismatch in the assignment: expected int, found string at line 30
+Error: operator '+' does not take string and int at line 32
+Error: 14 type errors

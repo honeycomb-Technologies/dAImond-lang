@@ -12,6 +12,7 @@ import ir_gen_stmt
 import ir_gen_expr
 import ir_gen_builtins
 import ir_gen_comptime
+import check
 import llvm
 import llvm_gen
 import llvm_gen_call
@@ -1272,6 +1273,18 @@ fn compile(cli: CLIArgs) -> int {
             ei2 = ei2 + 1
         }
         exit(1)
+    }
+
+    -- Names and types (check.dm)
+    let check_errors = check_program(sf)
+    if check_errors.len() > 0 {
+        let mut ce = 0
+        while ce < check_errors.len() {
+            eprintln(check_errors[ce])
+            ce = ce + 1
+        }
+        eprintln("Error: " + int_to_string(check_errors.len()) + " type errors")
+        return 1
     }
 
     -- Phase 4: Generate IR

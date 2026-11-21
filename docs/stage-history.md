@@ -15,7 +15,7 @@ Stage 5 was first built by Stage 0, which compiled it to C. It then got its own 
 
 ## What Stage 0 had that the compiler does not
 
-- A type checker (Hindley-Milner inference with unification), with error codes such as `Error[E0100]`
+- Type inference by unification (Hindley-Milner), and error codes such as `Error[E0100]`. The compiler's checker (`stage5/check.dm`) finds each expression's type from its parts and leaves alone what it cannot type
 - A package manager (`daimond pkg init`, `add`, `list`, with a TOML manifest)
 - A compilation cache, and the `lex` and `parse` commands that printed tokens and the AST
 - Effect checking of every call in a function's body
@@ -34,6 +34,8 @@ Stage 5 was first built by Stage 0, which compiled it to C. It then got its own 
 - `tcp_listen` and `tcp_connect` give -1 for a host that is not an address and for a port above 65535; Stage 0 listened on every address for a host it could not read, and cut the port to 16 bits.
 - `daimond test` runs each test in its own process and goes on after a panic; Stage 0 stopped at the first panic that was not an assertion.
 - Error messages have the form `Error: ... at line N`.
+- A function that returns a value must end in a `return`: `fn f() -> int { 42 }` is an error. Stage 0 took the last expression as the value.
+- A `match` on an enum, an `Option`, a `Result` or a `bool` must have an arm for every variant or a `_` arm, and assigning to a field or an element of a variable needs the variable to be `mut`.
 - A program's function may be named like a C function (`rename`, `strlen`); Stage 0 could not link such a program.
 
 The rest of this file describes Stage 1 and Stage 3 as they were. The commands in it work in a checkout of `2ddc25f`, not in the current tree.

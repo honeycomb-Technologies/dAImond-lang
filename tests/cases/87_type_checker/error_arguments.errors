@@ -1,0 +1,17 @@
+Error: type mismatch in argument 1 of 'f': expected int, found string at line 34
+Error: call to 'f' passes 2 arguments, expected 1 at line 34
+Error: type mismatch in the value pushed to a List[string]: expected string, found int at line 40
+Error: type mismatch in argument 1 of 'total': expected List[int], found List[string] at line 41
+Error: type mismatch in argument 1 of 'total': expected List[int], found Point at line 42
+Error: type mismatch in argument 2 of 'first': expected string, found int at line 43
+Error: type mismatch in argument 1 of 'Point.moved': expected int, found string at line 44
+Error: call to 'Point.moved' passes 0 arguments, expected 1 at line 45
+Error: type mismatch in argument 2 of 'Point.new': expected int, found string at line 46
+Error: call to 'Point.new' passes 1 arguments, expected 2 at line 47
+Error: type mismatch in argument 1 of 'Pair.with_first': expected int, found string at line 49
+Error: type mismatch in argument 2 of 'Map.insert': expected int, found string at line 51
+Error: type mismatch in argument 1 of 'Map.get': expected string, found int at line 52
+Error: type mismatch in value 2 of 'Shape.Rect': expected int, found string at line 53
+Error: type mismatch in argument 1 of 'double': expected int, found string at line 55
+Error: call to 'double' passes 2 arguments, expected 1 at line 56
+Error: 16 type errors

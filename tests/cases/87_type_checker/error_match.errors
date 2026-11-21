@@ -1,0 +1,13 @@
+Error: this match has no arm for Color.Blue at line 6
+Error: this match has no arm for None at line 14
+Error: a guard on the arm of the variant 'Ok' is not supported: test the condition inside the arm at line 20
+Error: this match has no arm for Ok at line 19
+Error: this match has no arm for false at line 27
+Error: this match has no arm for every other int at line 31
+Error: the arms of this match give string and int at line 35
+Error: the branches of this 'if' give string and int at line 36
+Error: a guard on the arm of the variant 'Blue' is not supported: test the condition inside the arm at line 42
+Error: a pattern is a string, but the matched value is int at line 51
+Error: a pattern is a number, but the matched value is string at line 55
+Error: a pattern is a bool, but the matched value is string at line 56
+Error: 12 type errors

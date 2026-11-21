@@ -1,0 +1,7 @@
+Error: undefined type 'Pont' at line 3
+Error: undefined type 'Pointt' at line 5
+Error: undefined variable 'inner' at line 14
+Error: undefined type 'Intt' at line 15
+Error: undefined type 'Pint' at line 16
+Error: undefined variable 'missing' at line 17
+Error: 6 type errors

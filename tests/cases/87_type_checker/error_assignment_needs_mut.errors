@@ -1,0 +1,7 @@
+Error: cannot assign to 'n', which is not declared 'mut' at line 9
+Error: cannot assign to 'n', which is not declared 'mut' at line 15
+Error: cannot assign to the constant 'LIMIT' at line 16
+Error: cannot assign to a part of 'p', which is not declared 'mut' at line 18
+Error: cannot assign to a part of 'line', which is not declared 'mut' at line 20
+Error: cannot assign to a part of 'xs', which is not declared 'mut' at line 22
+Error: 6 type errors

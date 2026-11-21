@@ -42,7 +42,7 @@ dAImond-lang/
 │   ├── ir-spec.md         # dAImond IR specification (SSA-based, typed)
 │   └── stage-history.md   # The deleted compilers (Stage 0, 1, 3 and 4) and how this one differs from them
 ├── stage5/                # The compiler, written in dAImond
-│   ├── main.dm            # Generated: the modules as one file (~24K lines), which bootstrap.sh compiles
+│   ├── main.dm            # Generated: the modules as one file (~26K lines), which bootstrap.sh compiles
 │   ├── main_split.dm      # Entry point with imports (for modular development)
 │   ├── token.dm           # Token kinds, Token struct, keyword lookup
 │   ├── lexer.dm           # Lexer struct, tokenize, character helpers
@@ -56,6 +56,7 @@ dAImond-lang/
 │   ├── ir_gen_decl.dm     # Declaration IR generation (functions, impls)
 │   ├── ir_gen_builtins.dm # Builtin function IR generation
 │   ├── ir_gen_comptime.dm # Comptime evaluation
+│   ├── check.dm           # The type checker: names, types, `mut` and match coverage, before IR generation
 │   ├── llvm.dm            # LLVM type definitions and helpers
 │   ├── llvm_gen.dm        # LLVM IR generation from dAImond IR
 │   ├── llvm_gen_call.dm   # LLVM call instruction generation
@@ -93,7 +94,7 @@ dAImond-lang/
 ## Compiler Pipeline
 
 ```
-Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Validation -> Effect Check -> IR Gen -> dAImond IR -> LLVM Gen (via the LLVM bridge) -> LLVM IR -> LLVM -> Object -> ld.lld -> Native Binary
+Source (.dm) -> Lexer -> Tokens -> Parser -> AST -> Validation -> Effect Check -> Type Check -> IR Gen -> dAImond IR -> LLVM Gen (via the LLVM bridge) -> LLVM IR -> LLVM -> Object -> ld.lld -> Native Binary
 ```
 
 ## Build Commands
@@ -155,7 +156,7 @@ cd stage5 && bash gen_bootstrap.sh
 # Compile the compiler with a compiler you already have (--link-llvm adds llvm_bridge.dm and links libLLVM)
 cd stage5 && ../build/daimond main.dm -o /tmp/daimond_new --link-llvm
 
-# Run the integration suite against a compiler (467 cases, about a minute)
+# Run the integration suite against a compiler (481 cases, about a minute)
 build/daimond tests/harness.dm -o build/harness
 build/harness build/daimond                              # every case in tests/cases
 build/harness build/daimond tests/cases 17_lists/        # only the cases whose "suite/name" contains the text
@@ -163,7 +164,7 @@ build/harness build/daimond tests/cases 17_lists/        # only the cases whose 
 
 ## Testing Strategy
 
-1. **The suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. A case with `X.cmd` runs that shell command instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 467 pass, 0 fail. The suite began as the cases of the Zig compiler's test runner. It also holds the 19 memory-safety probes (`74_memory_safety_probes`), and programs that were once loose files in `tests/`, with the README's examples (`86_programs`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory.
+1. **The suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. A case with `X.cmd` runs that shell command instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 481 pass, 0 fail. The suite began as the cases of the Zig compiler's test runner. It also holds the 19 memory-safety probes (`74_memory_safety_probes`), and programs that were once loose files in `tests/`, with the README's examples (`86_programs`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory.
 
 2. **dAImond test framework** (`daimond test <file.dm>`): runs each `test_*` function of the file in its own process, so a panic ends only that test. Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -188,7 +189,7 @@ build/harness build/daimond tests/cases 17_lists/        # only the cases whose 
 
 - **Integer kind tags**: an AST or IR node is one struct with a `kind` and the fields of every kind (`fn EXPR_FUNCTION_CALL() -> int { return 40 }`). Check the kind before reading a `Box` field: dereferencing a null `Box` panics.
 - **State is passed and returned**: the generator structs (`IRGenerator`, `LLVMGenerator`, `Parser`) are values. A function takes one, changes its copy and returns it: `g = ir_type_error(g, ...)`, `let result = generate_expr(g, b, e)` then `g = result.gen`. A change to a copy that is not returned is lost.
-- **Errors**: a syntax error is `p_error(pp, "expected ... but got ...")`; an error found during IR generation is `g = ir_type_error(g, message, line)`, and the compilation fails after the function is generated.
+- **Errors**: a syntax error is `p_error(pp, "expected ... but got ...")`; a type error is `c = ck_error(c, message, line)` in the checker; an error found during IR generation is `g = ir_type_error(g, message, line)`, and the compilation fails after the function is generated.
 - **Section headers**: `-- ====...` comment bars separate the sections of a file.
 - **Types as strings**: a type is its name, in source form (`List[int]`) or IR form (`i64`, `string`, `ptr`); `map_type_name` goes from the first to the second.
 
@@ -242,9 +243,10 @@ Environment: `DAIMOND_CACHE_DIR` (where the precompiled runtime object is kept),
 
 1. Add token kinds in `token.dm` and `lexer.dm` if new syntax is needed
 2. Add the AST fields in `ast.dm` (and to `names_in_expr`/`names_in_stmts` there, if the node has child expressions: lambda captures and the effect check walk the tree with them) and the parsing in `parser.dm`
-3. Generate IR for it in `ir_gen_expr.dm`, `ir_gen_stmt.dm` or `ir_gen_decl.dm`; a new IR instruction also needs `ir.dm` and `llvm_gen.dm`
-4. Report misuse with `ir_type_error`, and add an `X.errors` case for each message
-5. Add cases to `tests/cases/`, and the keyword or builtin to `lsp/tables.dm`
+3. Give it a type in `check.dm`: a new expression in `ck_expr`, a new statement in `ck_stmt`. What the checker does not know has the type `""` and is not checked
+4. Generate IR for it in `ir_gen_expr.dm`, `ir_gen_stmt.dm` or `ir_gen_decl.dm`; a new IR instruction also needs `ir.dm` and `llvm_gen.dm`
+5. Report misuse with `ck_error` or `ir_type_error`, and add an `X.errors` case for each message
+6. Add cases to `tests/cases/`, and the keyword or builtin to `lsp/tables.dm`
 
 ### Adding a builtin function
 
@@ -257,7 +259,7 @@ Environment: `DAIMOND_CACHE_DIR` (where the precompiled runtime object is kept),
 
 ### Adding a compiler diagnostic
 
-1. Report it where it is found: `p_error` in the parser, `ir_type_error(g, message, line)` in IR generation, `lg_error` in LLVM generation
+1. Report it where it is found: `p_error` in the parser, `ck_error(c, message, line)` in the checker (what is wrong with names and types belongs there), `ir_type_error(g, message, line)` in IR generation, `lg_error` in LLVM generation
 2. Add a case `X.dm` with `X.errors`, which holds each line the compiler must print
 
 ## Current Status
@@ -268,16 +270,22 @@ Environment: `DAIMOND_CACHE_DIR` (where the precompiled runtime object is kept),
 
 **Data structures**: List[T], Map[K,V], Box[T], for-in iteration
 
+**Type checking** (`check.dm`): undefined variables and types; the types of `let` values, assignments, arguments, return values, struct fields, list elements and variant values; operators and conditions; assignment to what is not `mut`; unknown fields and methods; functions that can end without returning; matches that leave a variant out
+
 **Tooling**: the CLI (compile, `run`, `check`, `fmt`, `test`, `symbols`), debug info (`-g`), and the language server in dAImond (`lsp/`)
 
 **Runtime safety**: integer overflow, division by zero, list bounds, narrowing casts, null `Box` dereference
 
 **Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test. `import std.X` with no `std/X.dm` next to the importing file is `X.dm` in the library: the directory `$DAIMOND_STDLIB`, else `stdlib/` beside the compiler's directory, else `stdlib/` in the compiler's directory, else `stdlib/` in the current directory (`stdlib_file` in `main_split.dm`)
 
-**The compiler**: 467/467 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. `bootstrap.sh` builds it from the seed and checks that it reproduces itself; with LLVM 19 and with LLVM 23.
+**The compiler**: 481/481 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. `bootstrap.sh` builds it from the seed and checks that it reproduces itself; with LLVM 19 and with LLVM 23.
 
 ### Not Yet Implemented
-- A type checker. IR generation reports what it cannot type, undefined names, calls whose arguments do not fit, and a string, a bool or a number given where another of the three is expected (`check_basic_type`). Other type errors are found by LLVM's verifier, or not at all
+- In the type checker: an unknown method of a `List` or a `string`, the arguments of a function held in a struct field, whether two function types agree, the type of an `await`, and a method that changes a variable that is not `mut` (`xs.push(1)`). It reports a mismatch only when it knows both types. The number of arguments of a call by name and undefined functions are still reported by IR generation
+- IR generation does not use the checker's types. `Ok`, `Err`, `Some` and `None` take their type from the function's return type, so `let r: Result[int, string] = Ok(3)` in a function that returns something else fails in LLVM's verifier, and `let o = if c { Some(n) } else { None }` holds garbage
+- Dynamic dispatch. A `dyn Trait` variable is the struct it is declared with, and its methods are called directly; assigning to it again is a compile error. A `dyn Trait` parameter is compiled for the last type that implements the trait, and a call that passes another fails to compile
+- Guards on the arm of a variant (`Color.Blue(n) if n > 5 =>`, `Ok(v) if ... =>`): a compile error, because code generation tests such an arm by the variant alone. Guards on other arms work
+- Generic enums (`enum Opt[T]`): parsed, but a function that takes one does not compile
 - Closure values. A lambda that captures variables can only be bound with `let` and called by that name, because its captures are extra parameters that such a call passes; using it as a value is a compile error (`captured_lambda_error` in `ir_gen_expr.dm`)
 - Effect checks of method calls and of calls through a function value. Calls by name are checked at any depth of a function's or method's body (`validate_effects` in `main_split.dm`)
 - Freeing memory: strings are never freed, and `mem_mark`/`mem_sweep` (regions) free nothing
@@ -489,7 +497,7 @@ The compiler produces native binaries by calling LLVM's C API through the LLVM b
 ### Design Decisions
 - **Pipeline**: Lexer → Parser → AST → dAImond IR (SSA) → LLVM IR → native binary.
 - **Integer kind tags**: `fn EXPR_FUNCTION_CALL() -> int { return 40 }` constants; a node is one struct with the fields of every kind.
-- **No type checker**: there is no checking pass. IR generation reports what it cannot type, calls whose arguments do not fit, and a string, a bool or a number given where another of the three is expected (`check_basic_type` in `ir_gen_expr.dm`: annotated `let`s, arguments of functions, `len`). Nothing type-checks the compiler's own source either: a mistake in it shows as an error from IR generation or LLVM's verifier, or as a failing case.
+- **Type checker** (`check.dm`): `check_program` runs after the effect check and before IR generation, on the program with its imports and the runtime, and the compilation stops when it reports anything (`Error: N type errors`). It finds the type of every expression as a string in source form (`List[string]`, `fn(int) -> bool`); `""` is a type it does not know and `?` stands for any type (`Option[?]` is `None`), and it reports a mismatch only when both sides are known. Every integer type fits every other (IR generation checks narrowing) and so do `f32` and `float`; an `int` given where a `float` is expected is an error. Function, array and `dyn` types are not compared, except that a struct given as a `dyn Trait` must implement the trait. Inside a generic function its type parameters are `?`; a call binds them from its arguments (`ty_bind`). A `match` on an enum, an `Option`, a `Result` or a `bool` must have an arm for every variant or a `_` arm, and so must any `match` whose value is used. A function that returns a value must end in a `return`, a `panic`, a `loop` or branches that all do (`ck_always_returns`); `main` is exempt. The checker only reports: IR generation still finds types itself (`infer_expr_type`, `static_type`) and keeps its own checks (`check_basic_type`, argument counts, undefined functions). The compiler's own source passes the checker; checking it adds under half a second and 40 MB to a self-build.
 - **Calls on a type**: `Type.name(args)` calls the function `name` of `impl Type` that takes no `self` (`static_call_target` in `ir_gen_expr.dm`); `Box.new(x)` and `Box.null()` are `Box_new(x)` and `Box_null()`. A variable in scope with the type's name is a value, and the call is a method call on it. `s.len()` on a string is `len(s)`.
 - **LLVM bridge**: the compiler calls LLVM through 125 `dm_llvm_*` functions, which `llvm.dm` declares as `extern fn`. `llvm_bridge.dm` defines them in dAImond over LLVM's C API (`extern fn LLVMBuildAdd(...)`); `--link-llvm` adds that file to the program and each of its functions takes the place of the extern declaration of the same name (`add_llvm_bridge` in `main_split.dm`). The list of types or values LLVM takes as an array is built in `static_addr` storage (`dm_llvm_buf_*`); LLVM's enum numbers are written out in `llvm_bridge.dm`.
 - **Modular source, one generated file**: the modules are separate `.dm` files; `gen_bootstrap.sh` concatenates them into `main.dm`, which is what `bootstrap.sh` and a self-build compile. Edit the modules, never `main.dm`.
@@ -508,6 +516,7 @@ ir_gen_stmt.dm     — Statement IR generation (let, if, for, while, match, regi
 ir_gen_decl.dm     — Declaration IR generation (functions, impl blocks)
 ir_gen_builtins.dm — Builtin function IR generation (println, file_read, etc.)
 ir_gen_comptime.dm — Comptime evaluation (arithmetic, variables, functions)
+check.dm           — The type checker: check_program gives a program's type errors
 llvm.dm            — LLVM type definitions and helpers
 llvm_gen.dm        — LLVM IR generation from dAImond IR (main module)
 llvm_gen_call.dm   — LLVM call instruction generation
@@ -524,13 +533,14 @@ runtime/io.dm      — Console: rt_print, rt_println, rt_eprint, rt_eprintln, rt
 runtime/net.dm     — TCP sockets: rt_tcp_listen, rt_tcp_accept, rt_tcp_connect, rt_tcp_read, rt_tcp_write, rt_tcp_close
 runtime/thread.dm  — Threads and mutexes: rt_thread_spawn, rt_thread_join, rt_mutex_new, rt_mutex_lock, rt_mutex_unlock, rt_mutex_destroy
 main_split.dm      — Entry point: the command line, imports, the commands, linking
-main.dm            — Generated: the modules as one file (~24K lines)
+main.dm            — Generated: the modules as one file (~26K lines)
 ```
 
 ### Error Detection
 The compiler detects at compile time:
 - **Unterminated strings**: Lexer detects EOF inside string literals and exits with error
 - **Syntax errors**: the parser reports `Error at LINE:COL: expected ... but got ...`, the first error of each top-level declaration (what follows an error in a declaration is parsed out of step). An error in an imported file is prefixed with that file's path. The parser is passed by value, so its errors leave in `SourceFile.errors`; until 2026-11-20 they were read from the caller's copy, which was always empty, so no syntax error was ever printed. Loops that parse a list until a closing token skip a token they cannot use (`p_skip_stuck`), so no input makes the parser loop forever. Post-parse validation still catches parameters without types
+- **Type errors**: the checker (`check.dm`) reports mismatched types, undefined variables and types, assignment to what is not `mut`, unknown fields and methods, missing returns and matches that leave a variant out, all of a program's at once, as `Error: ... at line N`
 - **Undefined functions**: IR generation checks a `known_functions` map before generating calls
 - **Effect violations**: Builtin-to-effect mapping (e.g., `file_read` → `FileSystem`) with callee effect subset checking: a function or method that declares effects may only call, by name and at any depth of its body, what its `with [...]` list allows
 
@@ -540,14 +550,14 @@ llc + ld.lld turn seed/daimond.bc into            → seed compiler
 seed compiler compiles stage5/main.dm             → gen1
 gen1 compiles stage5/main.dm                      → gen2 (same file as gen1 when the seed is current ✓)
 gen2 compiles stage5/main.dm                      → gen3 (same file as gen2 ✓, when the seed is older)
-the compiler compiles tests/harness.dm            → the harness, which runs tests/cases (467/467 cases pass)
+the compiler compiles tests/harness.dm            → the harness, which runs tests/cases (481/481 cases pass)
 ```
 
 ## Important Notes
 
 - `seed/daimond.bc` is a build product (2.8 MB of LLVM bitcode, written by LLVM 19). `bootstrap.sh --update-seed` writes it; each new version adds its size to the repository's history, so write it again only when the compiler needs a newer compiler to build it. A seed from the same source is byte-identical, so an unneeded update changes nothing.
 - `bootstrap.sh` gives each generation its own runtime-object cache (`DAIMOND_CACHE_DIR`), so that the comparison of generations covers the runtime object too.
-- `stage5/main.dm` (~24K lines) and `stage5/prelude.dm` are generated by `gen_bootstrap.sh`. Edit the modules and the `runtime/*.dm` files.
+- `stage5/main.dm` (~26K lines) and `stage5/prelude.dm` are generated by `gen_bootstrap.sh`. Edit the modules and the `runtime/*.dm` files.
 - The largest module is `ir_gen_expr.dm` (~8K lines). A function there returns its generator; see The Compiler's Source.
 - A self-build takes about 90 seconds and 2 GB of memory at `-O0`. `-O2` of the whole compiler needs more than 4 GB.
 - The test harness and the compiler write files next to nothing they read: programs are built in `/tmp`. Do not run another compiler's output into the source tree either.
