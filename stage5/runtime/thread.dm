@@ -17,19 +17,21 @@ extern fn libc_pthread_mutex_lock(mutex: int) -> i32 = "pthread_mutex_lock"
 extern fn libc_pthread_mutex_unlock(mutex: int) -> i32 = "pthread_mutex_unlock"
 extern fn libc_pthread_mutex_destroy(mutex: int) -> i32 = "pthread_mutex_destroy"
 
--- thread_spawn(f): run the function f, which takes nothing and gives
--- nothing, on a new thread, and give the thread. Panics when the
+-- thread_spawn(f): run the function value f, which takes nothing and
+-- gives nothing, on a new thread, and give the thread. Panics when the
 -- thread cannot be started.
 --
--- f itself is the thread's start routine. pthreads calls it with one
--- argument and reads a result, and on x86-64 a function that takes
--- nothing ignores the argument's register and leaves the result's
--- register as it is. thread_join asks for no result, so that value is
--- never read.
+-- f is the address of a closure, whose first word is the address of
+-- its function, and the function takes the closure (see FUNCTION
+-- VALUES in ir_gen_expr.dm). That function is the thread's start
+-- routine and the closure is its argument, which is the call
+-- pthreads makes. pthreads also reads a result: on x86-64 a function
+-- that gives nothing leaves the result's register as it is, and
+-- thread_join asks for no result, so that value is never read.
 fn rt_thread_spawn(f: int) -> int {
     unsafe {
         let mut thread = 0
-        if libc_pthread_create(addr_of(thread), 0, f, 0) != 0 {
+        if libc_pthread_create(addr_of(thread), 0, load_i64(f), f) != 0 {
             panic("thread_spawn: cannot start a thread")
         }
         return thread

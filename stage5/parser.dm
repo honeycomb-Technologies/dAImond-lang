@@ -330,6 +330,28 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
                 pp = p_error(pp, "expected a field or method name after '.' but got " + token_kind_name(field_tok.kind))
                 cont = false
             }
+        } else if kind == TK_LPAREN() and p_starts_line(pp) == false {
+            -- A call of the value before it: make_adder(1)(2), fs[0](x).
+            -- (A call of a name is parsed with the name.) At the start
+            -- of a line a parenthesis begins a statement of its own.
+            let line = p_cur(pp).line
+            let col = p_cur(pp).col
+            pp = p_advance(pp)
+            let mut args: List[Expr] = []
+            if p_peek(p_skip_newlines(pp)) != TK_RPAREN() {
+                let arg = parse_expr(pp)
+                pp = arg.p
+                args.push(arg.expr)
+                while p_peek(p_skip_newlines(pp)) == TK_COMMA() {
+                    pp = p_expect(pp, TK_COMMA())
+                    let next_arg = parse_expr(pp)
+                    pp = next_arg.p
+                    args.push(next_arg.expr)
+                }
+            }
+            pp = p_skip_newlines(pp)
+            pp = p_expect(pp, TK_RPAREN())
+            left = expr_call(left, args, line, col)
         } else if kind == TK_LBRACKET() and p_starts_line(pp) == false {
             -- Index access: obj[idx]
             let line = p_cur(pp).line
@@ -384,10 +406,29 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
                 pp = p_advance(pp)
                 let right_result = parse_expr_pratt(pp, prec + 1)
                 pp = right_result.p
-                let mut e = expr_new(EXPR_PIPELINE(), op_tok.line, op_tok.col)
-                e.left = Box_new(left)
-                e.pipe_right = Box_new(right_result.expr)
-                left = e
+                -- left |> f(args) is the call f(left, args), and
+                -- left |> f is f(left)
+                let piped_to = right_result.expr
+                let mut piped_args: List[Expr] = []
+                piped_args.push(left)
+                if piped_to.kind == EXPR_FUNCTION_CALL() {
+                    let mut pai = 0
+                    while pai < piped_to.args.len() {
+                        piped_args.push(piped_to.args[pai])
+                        pai = pai + 1
+                    }
+                    left = expr_call(*piped_to.callee, piped_args, op_tok.line, op_tok.col)
+                } else if piped_to.kind == EXPR_METHOD_CALL() {
+                    -- left |> x.f(args) is x.f(left, args)
+                    let mut pai = 0
+                    while pai < piped_to.args.len() {
+                        piped_args.push(piped_to.args[pai])
+                        pai = pai + 1
+                    }
+                    left = expr_method_call(*piped_to.object, piped_to.method, piped_args, op_tok.line, op_tok.col)
+                } else {
+                    left = expr_call(piped_to, piped_args, op_tok.line, op_tok.col)
+                }
             } else {
                 let binop = token_to_binop(op_kind)
                 if binop >= 0 {

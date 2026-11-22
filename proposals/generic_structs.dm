@@ -1,18 +1,14 @@
 -- PROPOSAL -- NOT IMPLEMENTED, NOT A TEST
 --
--- Generic struct definitions (Pair[A, B]) with a generic impl block.
--- Moved from tests/generics.dm in Stage 5 Phase 3: this file does not
--- compile and is not run by any test suite.
+-- Type arguments of a generic struct found from its values.
+-- Generic structs work when the type arguments are written out:
+-- `Pair[int, string] { first: 1, second: "one" }`, with a generic impl
+-- block (tests/cases/65_generic_structs). What this file proposes is
+-- leaving them out: `Pair.new(1, "one")` and `Pair { first, second }`
+-- (which also uses the field shorthand, a proposal of its own).
 --
--- Stage 5 compiles generic structs when the type arguments are written
--- out (Pair[int, string] { ... }); see the Generic Structs suite in
--- stage5/tests/runner.zig. Inferring them, as Pair.new(1, "one") and
--- Pair { first, second } below need, is not implemented.
---
--- What breaks today (Stage 0): the checker does not register a struct's
--- generic parameters, so A/B in field types, the impl target, and the
--- return type all report "Error[E0202]: undefined type", and codegen
--- has no monomorphization for generic struct layouts.
+-- What the compiler says today: "cannot determine the type of the
+-- value '.new()' is called on" and "undefined variable 'Pair'".
 
 module proposals.generic_structs
 

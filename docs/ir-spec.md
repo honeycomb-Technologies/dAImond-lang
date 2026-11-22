@@ -46,7 +46,8 @@ string        -- dm_string struct: { data: ptr(u8), len: i64, cap: i64 }
 
 ```
 fn(T0, T1, ...) -> R            -- Direct function
-fn_ptr(T0, T1, ...) -> R        -- Function pointer (closures, dyn dispatch)
+ptr                             -- A function value: the address of a closure, whose first word
+                                -- is the function's address; called with OP_CALL_PTR
 ```
 
 ### Enum/Variant Types
@@ -105,7 +106,7 @@ result(T, E) = tagged_union { tag: i32, payload: union { ok: T, err: E } }
 %v = extractfield %struct, N             -- Extract field N from struct value
 
 %v = call @fn(%a, %b, ...)              -- Direct function call
-%v = callptr %fptr(%a, %b, ...)         -- Indirect call (closures, dyn dispatch)
+%v = callptr %closure(%closure, %a, ...) -- Call of a function value: the function at the closure's first word
 
 %v = phi [%a, bb0], [%b, bb1]           -- SSA phi node
 
@@ -208,18 +209,26 @@ let f = |x: int| -> int { return x + offset }
 
 Lowers to:
 ```
-%env = alloca { i64 }                   -- Closure environment struct
-%env_field0 = gep %env, 0
-store %offset, %env_field0              -- Capture offset
+%closure = call @dm_libc_malloc(sizeof closure$__lambda_0)   -- { ptr function, i64 offset }
+%f0 = gep %closure, 0
+store @__lambda_0, %f0                  -- The function's address is the first word
+%f1 = gep %closure, 1
+store %offset, %f1                      -- The value of offset, as it is now
 
--- Lifted closure function:
-fn @closure_0(%env_ptr: ptr, %x: i64) -> i64 {
-    %env = load %env_ptr as ptr({ i64 })
-    %offset = extractfield %env, 0
+-- The lambda's function takes the closure first:
+fn @__lambda_0(%closure: ptr, %x: i64) -> i64 {
+    %f1 = gep %closure, 1
+    %offset = load %f1
     %result = add %x, %offset
     ret %result
 }
 ```
+
+The value of the lambda is `%closure`. A call of any function value loads
+the function's address from the closure and passes the closure first:
+`%v = callptr %closure(%closure, %a)`. A function used by its name, and a
+lambda that uses no variable of the function around it, have a closure of
+one word in the program's own storage.
 
 ### Regions
 

@@ -22,8 +22,9 @@ module thread
 --       mutex_destroy(m)
 --   }
 --
--- Note: thread_spawn takes a function reference. The function must take
--- no arguments and return void. It is spawned in a new OS thread.
+-- Note: thread_spawn takes a function value that takes no arguments and
+-- returns nothing: a function's name, or a lambda, which may use
+-- variables of the function around it. It runs on a new OS thread.
 
 -- Create a new mutex
 -- Returns a mutex handle (integer)

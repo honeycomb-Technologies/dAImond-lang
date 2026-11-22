@@ -168,6 +168,12 @@ fn error_at(files: List[string], msg: string, line: int) -> string {
 -- no source can write (see TRAITS in main_split.dm)
 fn DYN_PREFIX() -> string { return "Dyn$" }
 
+-- A type as source text, for source the compiler writes: `dyn Shape`
+-- for Dyn$Shape
+fn type_source_text(t: string) -> string {
+    return string_replace(t, DYN_PREFIX(), "dyn ")
+}
+
 -- The text with each variable's name as it is in the source: without
 -- the `$N` that a variable which shadows another has by the time IR
 -- is generated (see SHADOWED NAMES in ast.dm)

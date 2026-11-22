@@ -435,11 +435,6 @@ fn has_method_named(methods: List[FunctionDecl], name: string) -> bool {
     return false
 }
 
--- A type as source text: `dyn Shape` for Dyn$Shape
-fn type_source_text(t: string) -> string {
-    return string_replace(t, DYN_PREFIX(), "dyn ")
-}
-
 -- Whether a `dyn Trait` has the method: it takes `self`, has no type
 -- parameters of its own and names `Self` nowhere else
 fn dyn_takes_method(m: FunctionDecl) -> bool {

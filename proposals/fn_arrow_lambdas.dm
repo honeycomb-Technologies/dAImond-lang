@@ -1,14 +1,12 @@
 -- PROPOSAL -- NOT IMPLEMENTED, NOT A TEST
 --
 -- The `fn(x) => expr` lambda spelling.
--- Moved from tests/generics.dm in Stage 5 Phase 3: this file does not
--- compile and is not run by any test suite. The implemented lambda
--- spelling is `|x: int| -> int expr` (typed parameters and return),
--- used in tests/generics.dm. One obvious spelling should win; this
--- file only records the alternative that used to appear in tests.
+-- The lambda spelling the compiler has is `|x: int| -> int expr`. One
+-- spelling should do; this file records the other one, which early
+-- test files used.
 --
--- What breaks today (Stage 0): `fn(x) => x * 2` is a parse error
--- ("Expected identifier for function name, found: (").
+-- What the compiler says today: `let f = fn(x) => x * 2` is a syntax
+-- error ("expected an expression but got 'fn'").
 
 module proposals.fn_arrow_lambdas
 

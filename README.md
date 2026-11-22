@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (568 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (572 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 568 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 572 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
@@ -351,7 +351,7 @@ The compiler passes its suite of 568 cases, builds itself to a fixed point, and 
 - Generic functions (monomorphized, with type arguments inferred at the call, and trait bounds: `fn f[T: Show + Named]`) generic structs (`struct Table[K, V]`, with type arguments written out) and generic enums (`enum Opt[T]`, with type arguments found from the values or the place)
 - `List[T]`, `Map[K, V]` and `Box[T]`, `for`-in over lists, maps and ranges
 - Traits: methods with bodies that every implementing type gets, impls checked against the trait, and `dyn Trait` values that hold any implementing type and dispatch at run time
-- Lambdas, the pipeline operator `|>`, bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `~`)
+- Lambdas and function values that are closures: a lambda keeps the values of the variables it uses and can be passed, returned and stored. The pipeline operator `|>`, bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `~`)
 - String interpolation (`f"..."`), all numeric types (`i8` to `u64`, `f32`, `f64`) with `as` casts
 - Compile-time evaluation (`comptime`, and every `const`): numbers, strings, lists, loops and calls of the program's functions; what cannot be evaluated is a compile error. Compile-time array sizes
 - Regions, `async`/`await`, SIMD vectors
@@ -366,7 +366,7 @@ The compiler passes its suite of 568 cases, builds itself to a fixed point, and 
 ### Known gaps
 
 - The type checker reports a mismatch only where it knows both types. A generic function is checked for each set of type arguments the program uses it with, so an error that depends on them is reported for that use, and not for a generic function that is never called.
-- There are no closure values. A lambda that uses a variable of the function around it can be bound with `let` and called by that name; passing, returning or storing it is a compile error. A lambda that uses none is a plain function and can go anywhere.
+- A lambda has copies of the variables it uses: it cannot change the originals, and does not see later changes to them.
 - `async fn` and `await` are synchronous: `await f()` runs `f` to its end.
 - Strings are never freed, and neither is what a region allocates.
 - Only x86-64 Linux with glibc is supported.

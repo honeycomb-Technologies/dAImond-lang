@@ -1,0 +1,7 @@
+Error: cannot assign to 'total', a variable of the function around this lambda: the lambda has its own copy of it at line 21
+Error: 'push' changes 'items', a variable of the function around this lambda: the lambda has its own copy of it at line 25
+Error: the generic function 'first' cannot be used as a value: call it in a lambda at line 28
+Error: the function 'grow' has a 'mut' parameter, so it cannot be used as a value: call it in a lambda at line 29
+Error: 'n' is a value of type int, which cannot be called at line 31
+Error: call to 'apply' passes 3 arguments, expected 2 at line 32
+Error: type mismatch in argument 1 of 'apply': expected fn(int) -> int, found fn(string) -> int at line 33

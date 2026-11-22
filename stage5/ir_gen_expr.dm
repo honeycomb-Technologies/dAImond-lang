@@ -165,9 +165,6 @@ fn generate_expr_plain(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
     if expr.kind == EXPR_LAMBDA() {
         return generate_lambda_expr(gen, block, expr)
     }
-    if expr.kind == EXPR_PIPELINE() {
-        return generate_pipeline(gen, block, expr)
-    }
     if expr.kind == EXPR_ERROR_PROPAGATE() {
         return generate_error_propagate(gen, block, expr)
     }
@@ -358,17 +355,6 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         return generate_literal_bool(g, b, expr_bool(false, 0, 0))
     }
 
-    -- A name bound to a lambda that captures variables is only called
-    -- (see generate_lambda_expr); here it is used as a value
-    if g.fn_ptr_vars.contains(name) {
-        let bound_lambda = g.fn_ptr_vars.get(name)
-        if g.lambda_captures.contains(bound_lambda) {
-            let captured = string_split(g.lambda_captures.get(bound_lambda), "|")
-            eprintln(error_at(g.ir_mod.files, captured_lambda_error(captured[0], "the lambda '" + name + "'"), expr.line))
-            exit(1)
-        }
-    }
-
     -- Check for "None" (Option None)
     if name == "None" {
         -- Build Option { has_value: 0, value: undef } as an aggregate value.
@@ -546,32 +532,14 @@ fn generate_identifier(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         fi = fi + 1
     }
     if is_function {
-        -- Return a global reference to the function
-        let ref_id = g.builder.next_id
-        let mut ref_inst = ir_inst_new(ref_id, OP_ALLOCA())
-        ref_inst.alloc_type = "ptr"
-        ref_inst.result_type = "ptr(ptr)"
-        ref_inst.has_result = true
-        b.instructions.push(ref_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_ref = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_ref.store_ptr = ir_val_inst(ref_id)
-        store_ref.store_val = ir_val_global(name)
-        store_ref.has_result = false
-        b.instructions.push(store_ref)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(ref_id)
-        load_inst.load_type = "ptr"
-        load_inst.result_type = "ptr"
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        return expr_result(g, b, load_id)
+        -- The function as a value: the closure of the function that
+        -- stands for it (see FUNCTION VALUES)
+        if g.mut_param_fns.contains(name) {
+            g = ir_type_error(g, "the function '" + name + "' has a 'mut' parameter, so it cannot be used as a value: call it in a lambda", expr.line)
+            return expr_result(g, b, 0)
+        }
+        g = value_function(g, name)
+        return emit_static_closure(g, b, value_function_name(name))
     }
 
     -- Unknown identifier: report it, then emit a placeholder to continue
@@ -1103,6 +1071,7 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
     if k == EXPR_LITERAL_BOOL() { return "bool" }
     if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
+    if k == EXPR_LAMBDA() { return lambda_value_type(gen, expr) }
     if k == EXPR_ENUM_LITERAL() {
         if is_generic_enum(gen, expr.enum_name) {
             return canon_type(gen, generic_enum_type(gen, expr, expr.enum_name, expr.variant_name, expr.payload))
@@ -1434,6 +1403,8 @@ fn list_slot_ir_type(elem_kind: int, elem_type: string) -> string {
     if elem_kind == LIST_ELEM_INT() { return "i64" }
     if elem_kind == LIST_ELEM_FLOAT() { return "f64" }
     if elem_kind == LIST_ELEM_STRING() { return "string" }
+    -- A function value is the address of its closure
+    if starts_with(elem_type, "fn(") { return "ptr" }
     return elem_type
 }
 
@@ -1449,6 +1420,8 @@ fn list_elem_ir_type(elem_src: string) -> string {
     if kind == LIST_ELEM_INT() { return "i64" }
     if kind == LIST_ELEM_FLOAT() { return "f64" }
     if kind == LIST_ELEM_STRING() { return "string" }
+    -- A function value is the address of its closure
+    if starts_with(elem_src, "fn(") { return "ptr" }
     return elem_src
 }
 
@@ -1545,9 +1518,13 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
             }
             gi_ty = gi_ty + 1
         }
+        -- A function's name is the address of its closure
+        if gen.fn_src_param_types.contains(name) and gen.generic_fn_decls.contains(name) == false {
+            return "ptr"
+        }
         return "i64"
     }
-    -- A lambda is the address of its function
+    -- A lambda is the address of its closure
     if expr.kind == EXPR_LAMBDA() {
         return "ptr"
     }
@@ -1598,6 +1575,11 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     if expr.kind == EXPR_FUNCTION_CALL() {
         -- Check if callee is an identifier with a known builtin return type
         let callee = *expr.callee
+        -- A call of a function value gives what the value's type says
+        let called_type = called_value_type(gen, callee)
+        if called_type != "" {
+            return value_call_result_type(gen, called_type)
+        }
         if callee.kind == EXPR_IDENTIFIER() {
             let fn_name = callee.name
             if is_builtin_fn(fn_name) {
@@ -1688,28 +1670,6 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
             if gen.fn_return_types.contains(fn_name) {
                 return gen.fn_return_types.get(fn_name)
             }
-            -- Check if callee is a lambda/fn-ptr variable: look up actual function
-            if gen.fn_ptr_vars.contains(fn_name) {
-                let lambda_fn_name = gen.fn_ptr_vars.get(fn_name)
-                let mut lfi = 0
-                while lfi < gen.ir_mod.functions.len() {
-                    if gen.ir_mod.functions[lfi].name == lambda_fn_name {
-                        return gen.ir_mod.functions[lfi].return_type
-                    }
-                    lfi = lfi + 1
-                }
-            }
-            -- Check if callee is a function-pointer-typed variable: parse return type
-            if gen.variable_types.contains(fn_name) {
-                let vtype = gen.variable_types.get(fn_name)
-                if starts_with(vtype, "fn(") {
-                    let arrow_pos = string_find(vtype, " -> ")
-                    if arrow_pos >= 0 {
-                        let ret_str = substr(vtype, arrow_pos + 4, len(vtype) - arrow_pos - 4)
-                        return map_type_name(ret_str)
-                    }
-                }
-            }
         }
         return "i64"
     }
@@ -1718,44 +1678,6 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     }
     if expr.kind == EXPR_GROUPED() {
         return infer_expr_type(gen, *expr.operand)
-    }
-    if expr.kind == EXPR_PIPELINE() {
-        -- Pipeline: a |> f — return type of function f
-        let rhs = *expr.pipe_right
-        if rhs.kind == EXPR_FUNCTION_CALL() {
-            let callee = *rhs.callee
-            if callee.kind == EXPR_IDENTIFIER() {
-                let fn_name = callee.name
-                if is_builtin_fn(fn_name) {
-                    return builtin_return_type(fn_name)
-                }
-                let mut fi = 0
-                while fi < gen.ir_mod.functions.len() {
-                    let func = gen.ir_mod.functions[fi]
-                    if func.name == fn_name {
-                        return func.return_type
-                    }
-                    fi = fi + 1
-                }
-                if gen.fn_return_types.contains(fn_name) and gen.generic_fn_decls.contains(fn_name) == false {
-                    return gen.fn_return_types.get(fn_name)
-                }
-            }
-        } else if rhs.kind == EXPR_IDENTIFIER() {
-            let fn_name = rhs.name
-            if is_builtin_fn(fn_name) {
-                return builtin_return_type(fn_name)
-            }
-            let mut fi = 0
-            while fi < gen.ir_mod.functions.len() {
-                let func = gen.ir_mod.functions[fi]
-                if func.name == fn_name {
-                    return func.return_type
-                }
-                fi = fi + 1
-            }
-        }
-        return "i64"
     }
     if expr.kind == EXPR_STRUCT_LITERAL() {
         return canon_type(gen, expr.type_name)
@@ -2068,7 +1990,6 @@ fn made_function(gen: IRGenerator, mangled: string, source: string) -> IRGenerat
     g.list_elem_types = Map_new()
     g.var_enum_types = Map_new()
     g.box_inner_types = Map_new()
-    g.fn_ptr_vars = Map_new()
     g.array_var_names = Map_new()
     g = declare_function(g, fd, mangled)
     g = generate_function_body(g, fd, mangled)
@@ -3361,8 +3282,17 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     let mut g = gen
     let mut b = block
 
-    -- Get the callee name from the callee expression (should be an identifier)
+    -- A call of a value: a variable that holds a function, or any
+    -- expression that is not a name
     let callee_expr = *expr.callee
+    let called_type = called_value_type(g, callee_expr)
+    if called_type != "" {
+        return generate_value_call(g, b, callee_expr, called_type, expr.args, expr.line)
+    }
+    if callee_expr.kind != EXPR_IDENTIFIER() {
+        g = ir_type_error(g, "this expression is not a function, so it cannot be called", expr.line)
+        return expr_result(g, b, 0)
+    }
     let fn_name = callee_expr.name
 
     -- Unsafe fence: calling an `extern fn` requires an unsafe block
@@ -3479,18 +3409,6 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return generate_generic_call(g, b, expr)
     }
 
-    -- Indirect call via function pointer (lambda variable)
-    if g.fn_ptr_vars.contains(fn_name) {
-        return generate_lambda_indirect_call(g, b, fn_name, expr.args)
-    }
-
-    -- Indirect call via function-pointer-typed parameter: f: fn(int) -> int
-    if g.variable_types.contains(fn_name) {
-        let vtype = g.variable_types.get(fn_name)
-        if starts_with(vtype, "fn(") {
-            return generate_fn_ptr_param_call(g, b, fn_name, vtype, expr.args)
-        }
-    }
 
     -- len() on a list variable: dispatch to typed list_len runtime function
     if fn_name == "len" and expr.args.len() > 0 {
@@ -3523,15 +3441,15 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Builtin function (println, len, int_to_string, etc.)
     if is_builtin_fn(fn_name) {
-        -- A thread runs a function that is named and takes nothing: the
-        -- runtime gets the function's address and nothing to call it with
+        -- A thread runs a function value that takes nothing: the
+        -- runtime calls it with its closure (rt_thread_spawn)
         if fn_name == "thread_spawn" {
             if expr.args.len() != 1 {
                 g = ir_type_error(g, "thread_spawn() takes 1 argument, not " + int_to_string(expr.args.len()), expr.line)
                 return expr_result(g, b, 0)
             }
-            if is_thread_function(g, expr.args[0]) == false {
-                g = ir_type_error(g, "thread_spawn() takes a function that takes no arguments, by its name", expr.line)
+            if starts_with(static_type(g, expr.args[0]), "fn()") == false {
+                g = ir_type_error(g, "thread_spawn() takes a function that takes no arguments", expr.line)
                 return expr_result(g, b, 0)
             }
         }
@@ -3627,6 +3545,12 @@ fn generate_normal_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
             b.instructions.push(st_inst)
             g.builder.next_id = g.builder.next_id + 1
             call_args.push(ir_val_inst(tmp_id))
+        } else if i < param_types.len() and starts_with(param_types[i], "fn(") and g.all_extern_fns.contains(fn_name) {
+            -- A C function takes a function as its address
+            let c_function = generate_c_function_arg(g, b, args[i], fn_name)
+            g = c_function.gen
+            b = c_function.block
+            call_args.push(ir_val_inst(c_function.val_id))
         } else {
             let mut arg_result = generate_expr(g, b, args[i])
             if i < param_types.len() {
@@ -3692,95 +3616,6 @@ fn infer_call_return_type(gen: IRGenerator, fn_name: string) -> string {
     -- Unknown function: assume i64 return
     return "i64"
 }
-
--- ============================================================
--- LAMBDA / FUNCTION POINTER INDIRECT CALL
--- Calls a lambda stored in fn_ptr_vars.
--- Passes captured variables as additional arguments.
--- ============================================================
-
-fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, args: List[Expr]) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Get the actual lambda function name
-    let lambda_name = g.fn_ptr_vars.get(var_name)
-
-    -- Generate explicit arguments; an integer becomes the parameter's
-    -- integer type
-    let mut param_types: List[string] = []
-    if g.fn_src_param_types.contains(lambda_name) {
-        param_types = string_split(g.fn_src_param_types.get(lambda_name), "|")
-    }
-    let mut call_args: List[IRValue] = []
-    let mut i = 0
-    while i < args.len() {
-        let mut arg_result = generate_expr(g, b, args[i])
-        if i < param_types.len() {
-            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], param_types[i], "argument " + int_to_string(i + 1) + " of '" + var_name + "'")
-        }
-        g = arg_result.gen
-        b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
-        i = i + 1
-    }
-
-    -- Add captured variable values as extra arguments
-    if g.lambda_captures.contains(lambda_name) {
-        let captures_str = g.lambda_captures.get(lambda_name)
-        let capture_names = string_split(captures_str, "|")
-        let mut ci = 0
-        while ci < capture_names.len() {
-            let cap_name = capture_names[ci]
-            if len(cap_name) > 0 and g.variable_map.contains(cap_name) {
-                let cap_alloca = g.variable_map.get(cap_name)
-                let cap_type = if g.variable_types.contains(cap_name) {
-                    g.variable_types.get(cap_name)
-                } else {
-                    "i64"
-                }
-
-                -- Load the captured variable's current value
-                let load_id = g.builder.next_id
-                let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-                load_inst.load_ptr = ir_val_inst(cap_alloca)
-                load_inst.load_type = cap_type
-                load_inst.result_type = cap_type
-                load_inst.has_result = true
-                b.instructions.push(load_inst)
-                g.builder.next_id = g.builder.next_id + 1
-
-                call_args.push(ir_val_inst(load_id))
-            } else {
-                -- Captured variable not found: pass zero
-                call_args.push(ir_val_int(0))
-            }
-            ci = ci + 1
-        }
-    }
-
-    -- Look up the return type of the lambda function
-    let ret_type = infer_call_return_type(g, lambda_name)
-    let has_result = ret_type != "void"
-
-    -- Emit a direct call to the lambda function
-    let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL())
-    inst.callee = lambda_name
-    inst.call_args = call_args
-    inst.result_type = ret_type
-    inst.has_result = has_result
-    b.instructions.push(inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, b, id)
-}
-
--- ============================================================
--- FUNCTION POINTER PARAMETER INDIRECT CALL
--- Handles calling through function-pointer-typed parameters:
---   fn apply(f: fn(int) -> int, x: int) -> int { return f(x) }
--- ============================================================
 
 fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
@@ -4305,6 +4140,16 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     -- recorded its type and its type arguments.
     if starts_with(checked_target(g, expr), "call:") {
         return generate_function_call(g, b, method_as_call(g, expr))
+    }
+
+    -- x.f(a) where f is a field of x that holds a function, and no
+    -- method, is a call of that value
+    let holder = strip_box_type(static_type(g, obj_expr))
+    if holder != "" and g.struct_defs.contains(holder) and g.enum_defs.contains(holder) == false {
+        let held = struct_field_src_type(g, holder, method_name)
+        if starts_with(held, "fn(") and struct_has_method(g, holder, method_name) == false {
+            return generate_value_call(g, b, expr_field_access(obj_expr, method_name, expr.line, expr.col), held, args, expr.line)
+        }
     }
 
     -- xs.contains(v) for a list of what `==` compares in parts looks
@@ -4834,7 +4679,6 @@ fn back_to_caller(caller: IRGenerator, g: IRGenerator) -> IRGenerator {
     out.ir_mod = g.ir_mod
     out.struct_defs = g.struct_defs
     out.mono_generated = g.mono_generated
-    out.lambda_captures = g.lambda_captures
     out.mut_param_fns = g.mut_param_fns
     out.user_extern_fns = g.user_extern_fns
     out.fn_return_types = g.fn_return_types
@@ -4905,7 +4749,6 @@ fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: strin
     g.list_elem_types = Map_new()
     g.var_enum_types = Map_new()
     g.box_inner_types = Map_new()
-    g.fn_ptr_vars = Map_new()
     g.array_var_names = Map_new()
     g = declare_function(g, mono_fd, mangled)
     let base = g.generic_instances.get(instance)
@@ -7717,68 +7560,295 @@ fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
 }
 
 -- ============================================================
--- LAMBDA EXPRESSION
--- Creates a new IR function for the lambda and returns a
--- reference to it. The lambda is lifted to a module-level
--- function with a unique name.
+-- FUNCTION VALUES
+-- A value of a type fn(A, B) -> R is the address of a closure: memory
+-- that begins with the address of a function and goes on with what
+-- that function needs besides its arguments. The function takes the
+-- closure's address and then A and B. So every function value is
+-- called the same way, whatever made it (generate_value_call): the
+-- function's address is loaded from the closure, and the function is
+-- called with the closure and the arguments.
+--
+-- A lambda's closure holds the values of the variables of the function
+-- around it that the lambda's body names, as they are when the lambda
+-- is made; the lambda's function begins by copying them into variables
+-- of its own (generate_lambda_expr). The closure is allocated and
+-- never freed, as a string is. A lambda that names none of those
+-- variables needs nothing with it, and neither does a function used by
+-- its name: such a closure is one word of the program's own storage
+-- (emit_static_closure). A function declared with `fn` takes no
+-- closure, so its value is made with a function the compiler writes,
+-- which takes one and calls it (value_function).
+--
+-- A C function cannot call a closure. An `extern fn` whose parameter
+-- has a function type takes the address of a function, which the
+-- argument must name (generate_c_function_arg).
 -- ============================================================
 
--- The error for a lambda that captures `variable` and is used as a
--- value (passed, returned or stored) instead of being called by name
-fn captured_lambda_error(variable: string, what: string) -> string {
-    return what + " uses '" + variable + "', a variable of the function around it, so it can only be bound to a name with 'let' and called by that name; pass it '" + variable + "' as a parameter to use it as a value"
+-- The function type of what a call calls, when that is a value: a
+-- variable that holds a function, or an expression that is not a
+-- name. "" for a call of a function by its name.
+fn called_value_type(gen: IRGenerator, callee: Expr) -> string {
+    if callee.kind == EXPR_IDENTIFIER() and gen.variable_map.contains(callee.name) == false {
+        return ""
+    }
+    let t = static_type(gen, callee)
+    if starts_with(t, "fn(") { return t }
+    return ""
 }
+
+-- The function type of a lambda: its parameters and its result as
+-- they are written, else as the checker found them, else int (which
+-- is what generate_lambda_expr makes of them)
+fn lambda_value_type(gen: IRGenerator, expr: Expr) -> string {
+    let checked = checked_type(gen, expr)
+    let mut checked_params: List[string] = []
+    let mut ret = expr.lambda_ret_type
+    if starts_with(checked, "fn(") {
+        checked_params = ty_fn_params(checked)
+        if ret == "" and ty_known(ty_fn_ret(checked)) { ret = ty_fn_ret(checked) }
+    }
+    if ret == "" { ret = "int" }
+    let mut text = "fn("
+    let mut i = 0
+    while i < expr.lambda_params.len() {
+        let mut t = expr.lambda_params[i].type_name
+        if t == "" and i < checked_params.len() {
+            if ty_known(checked_params[i]) { t = checked_params[i] }
+        }
+        if t == "" { t = "int" }
+        if i > 0 { text = text + ", " }
+        text = text + t
+        i = i + 1
+    }
+    return text + ") -> " + ret
+}
+
+-- The IR type of what a call of a value of the function type gives
+fn value_call_result_type(gen: IRGenerator, fn_type: string) -> string {
+    let ret = ty_fn_ret(fn_type)
+    if ret == "" or ret == "void" { return "void" }
+    if ty_known(ret) == false { return "i64" }
+    return map_type_name(canon_type(gen, ret))
+}
+
+-- The name of the function that stands for the function `name` in a
+-- function value
+fn value_function_name(name: string) -> string {
+    return "fn$" + name
+}
+
+-- Write the function that stands for the function `name` in a function
+-- value, unless it is written already: it takes a closure, which it
+-- has no use for, then what `name` takes, and calls `name`
+fn value_function(gen: IRGenerator, name: string) -> IRGenerator {
+    let made = value_function_name(name)
+    if gen.mono_generated.contains(made) { return gen }
+    let mut params: List[string] = []
+    if gen.fn_src_param_types.contains(name) {
+        let joined = gen.fn_src_param_types.get(name)
+        if joined != "" { params = string_split(joined, "|") }
+    }
+    let mut src = "module made\nfn made(closure__: Box[int]"
+    let mut call = name + "("
+    let mut i = 0
+    while i < params.len() {
+        let arg = "a" + int_to_string(i) + "__"
+        src = src + ", " + arg + ": " + type_source_text(params[i])
+        if i > 0 { call = call + ", " }
+        call = call + arg
+        i = i + 1
+    }
+    call = call + ")"
+    src = src + ")"
+    let mut ret = ""
+    if gen.fn_src_return_types.contains(name) { ret = gen.fn_src_return_types.get(name) }
+    if ret != "" and ret != "void" {
+        src = src + " -> " + type_source_text(ret)
+        call = "return " + call
+    }
+    if gen.all_extern_fns.contains(name) {
+        call = "unsafe { " + call + " }"
+    }
+    return made_function(gen, made, src + " {\n    " + call + "\n}\n")
+}
+
+-- The closure of `function`, a function that takes a closure and
+-- reads nothing from it: one word of the program's own storage, named
+-- after the function, that holds the function's address. The word is
+-- written each time the value is made, with the same address.
+fn emit_static_closure(gen: IRGenerator, block: IRBasicBlock, function: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let st = g.builder.next_id
+    let mut st_inst = ir_inst_new(st, OP_CALL())
+    st_inst.callee = "dm_static_addr"
+    let mut st_args: List[IRValue] = []
+    st_args.push(ir_val_string("closure$" + function))
+    st_args.push(ir_val_int(8))
+    st_inst.call_args = st_args
+    st_inst.result_type = "i64"
+    st_inst.has_result = true
+    b.instructions.push(st_inst)
+    g.builder.next_id = st + 1
+    let addr = emit_ir_cast(g, b, ir_val_inst(st), "i64", "ptr")
+    let stored = emit_ir_store(addr.gen, addr.block, ir_val_inst(addr.val_id), ir_val_global(function))
+    return expr_result(stored.gen, stored.block, addr.val_id)
+}
+
+-- An argument of the C function `c_name` where its parameter has a
+-- function type: the address of the function the argument names
+fn generate_c_function_arg(gen: IRGenerator, block: IRBasicBlock, arg: Expr, c_name: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let named = arg.kind == EXPR_IDENTIFIER() and g.variable_map.contains(arg.name) == false and g.fn_src_param_types.contains(arg.name) and g.generic_fn_decls.contains(arg.name) == false
+    if named == false {
+        g = ir_type_error(g, "the C function '" + c_name + "' takes a function by its name: a lambda or a function held in a variable is a closure, which C cannot call", arg.line)
+        return expr_result(g, b, 0)
+    }
+    let slot = g.builder.next_id
+    let mut slot_inst = ir_inst_new(slot, OP_ALLOCA())
+    slot_inst.alloc_type = "ptr"
+    slot_inst.result_type = "ptr(ptr)"
+    slot_inst.has_result = true
+    b.instructions.push(slot_inst)
+    g.builder.next_id = slot + 1
+    let stored = emit_ir_store(g, b, ir_val_inst(slot), ir_val_global(arg.name))
+    g = stored.gen
+    b = stored.block
+    let load_id = g.builder.next_id
+    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
+    load_inst.load_ptr = ir_val_inst(slot)
+    load_inst.load_type = "ptr"
+    load_inst.result_type = "ptr"
+    load_inst.has_result = true
+    b.instructions.push(load_inst)
+    g.builder.next_id = load_id + 1
+    return expr_result(g, b, load_id)
+}
+
+-- A call of the function value `callee`, of the type `fn_type`
+fn generate_value_call(gen: IRGenerator, block: IRBasicBlock, callee: Expr, fn_type: string, args: List[Expr], line: int) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let params = ty_fn_params(fn_type)
+    if params.len() != args.len() {
+        g = ir_type_error(g, "this call passes " + int_to_string(args.len()) + " arguments to a function of type " + fn_type, line)
+        return expr_result(g, b, 0)
+    }
+    let held = generate_expr(g, b, callee)
+    g = held.gen
+    b = held.block
+    let mut shown = "this call"
+    if callee.kind == EXPR_IDENTIFIER() { shown = "'" + callee.name + "'" }
+
+    -- The closure, then the arguments; an integer becomes the integer
+    -- type the function type names for it
+    let mut call_args: List[IRValue] = []
+    call_args.push(ir_val_inst(held.val_id))
+    let mut param_irs = "ptr"
+    let mut i = 0
+    while i < args.len() {
+        let mut arg_result = generate_expr(g, b, args[i])
+        let mut param_ir = ""
+        if ty_known(params[i]) {
+            let want = canon_type(arg_result.gen, params[i])
+            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], want, "argument " + int_to_string(i + 1) + " of " + shown)
+            param_ir = map_type_name(want)
+        } else {
+            param_ir = infer_expr_type(arg_result.gen, args[i])
+        }
+        g = arg_result.gen
+        b = arg_result.block
+        call_args.push(ir_val_inst(arg_result.val_id))
+        param_irs = param_irs + "|" + param_ir
+        i = i + 1
+    }
+
+    let ret_type = value_call_result_type(g, fn_type)
+    let id = g.builder.next_id
+    let mut inst = ir_inst_new(id, OP_CALL_PTR())
+    inst.callee_val = ir_val_inst(held.val_id)
+    inst.callee = param_irs
+    inst.call_args = call_args
+    inst.result_type = ret_type
+    inst.has_result = ret_type != "void"
+    b.instructions.push(inst)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
+-- What IR generation knows about the variable `name` of the function
+-- `from`, by its name, copied to `to`: a lambda's copy of a captured
+-- variable is all that the variable is
+fn copy_variable_facts(from: IRGenerator, to: IRGenerator, name: string) -> IRGenerator {
+    let mut g = to
+    if from.var_src_types.contains(name) { g.var_src_types.insert(name, from.var_src_types.get(name)) }
+    if from.var_struct_types.contains(name) { g.var_struct_types.insert(name, from.var_struct_types.get(name)) }
+    if from.var_enum_types.contains(name) { g.var_enum_types.insert(name, from.var_enum_types.get(name)) }
+    if from.box_inner_types.contains(name) { g.box_inner_types.insert(name, from.box_inner_types.get(name)) }
+    if from.list_elem_kinds.contains(name) { g.list_elem_kinds.insert(name, from.list_elem_kinds.get(name)) }
+    if from.list_elem_types.contains(name) { g.list_elem_types.insert(name, from.list_elem_types.get(name)) }
+    if from.array_var_names.contains(name) { g.array_var_names.insert(name, from.array_var_names.get(name)) }
+    if from.var_type_annotations.contains(name) { g.var_type_annotations.insert(name, from.var_type_annotations.get(name)) }
+    return g
+}
+
+-- ============================================================
+-- LAMBDA EXPRESSION
+-- A lambda is a function of the module, with a name of its own, and a
+-- closure that holds its address (see FUNCTION VALUES). The value of
+-- the expression is the closure's address.
+-- ============================================================
 
 fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    let bound_by_let = g.lambda_bound_by_let
-    g.lambda_bound_by_let = false
-
-    -- Generate unique lambda name
     let lambda_name = gen_next_lambda_name(g)
     g = gen_advance_lambda(g)
 
-    -- Determine return type
-    let ret_type = if len(expr.lambda_ret_type) > 0 {
-        map_type_name(expr.lambda_ret_type)
-    } else {
+    -- The types of the parameters and of the value: as they are
+    -- written, else as the checker found them for the lambda
+    let checked = checked_type(g, expr)
+    let mut checked_params: List[string] = []
+    let mut checked_ret = ""
+    if starts_with(checked, "fn(") {
+        checked_params = ty_fn_params(checked)
+        checked_ret = ty_fn_ret(checked)
+    }
+    let mut ret_src = expr.lambda_ret_type
+    if ret_src == "" and ty_known(checked_ret) { ret_src = checked_ret }
+    let ret_type = if ret_src == "" {
         "i64"
+    } else if ret_src == "void" {
+        "void"
+    } else {
+        map_type_name(canon_type(g, ret_src))
     }
 
-    -- Create a new IR function for the lambda
     let mut lambda_func = ir_function_new(lambda_name, ret_type)
     lambda_func.source_line = expr.line
 
-    -- Add lambda parameters
-    let mut lambda_param_src = ""
+    -- The closure, then the lambda's own parameters
+    lambda_func.params.push(ir_param_new("closure$", "ptr"))
+    let mut param_src: List[string] = []
     let mut pi = 0
     while pi < expr.lambda_params.len() {
         let lp = expr.lambda_params[pi]
-        let ptype = if len(lp.type_name) > 0 {
-            map_type_name(lp.type_name)
-        } else {
-            "i64"
+        let mut src = lp.type_name
+        if src == "" and pi < checked_params.len() {
+            if ty_known(checked_params[pi]) { src = checked_params[pi] }
         }
-        lambda_func.params.push(ir_param_new(lp.name, ptype))
-        if pi > 0 { lambda_param_src = lambda_param_src + "|" }
-        if len(lp.type_name) > 0 {
-            lambda_param_src = lambda_param_src + lp.type_name
-        } else {
-            lambda_param_src = lambda_param_src + "int"
-        }
+        if src == "" { src = "int" }
+        src = canon_type(g, src)
+        param_src.push(src)
+        lambda_func.params.push(ir_param_new(lp.name, map_type_name(src)))
         pi = pi + 1
     }
-    -- What a call of the lambda by its name converts its arguments to
-    g.fn_src_param_types.insert(lambda_name, lambda_param_src)
 
-    -- Collect captured variables: the variables of the current scope
-    -- that the lambda's body mentions. A lambda that captures nothing
-    -- is a plain function, which can be passed where a fn(...) is
-    -- expected.
-    -- Build a pipe-delimited list of captured variable names
-    let mut captures = ""
+    -- The captured variables: those of the function around the lambda
+    -- that the lambda's body names, and that no parameter hides
     let mut capture_names: List[string] = []
     let mut capture_types: List[string] = []
     let body_names = expr_names(*expr.lambda_body)
@@ -7788,93 +7858,115 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         mentioned.insert(body_names[ni], true)
         ni = ni + 1
     }
-    let mut keys = g.variable_map.keys()
+    let keys = g.variable_map.keys()
     let mut ki = 0
     while ki < keys.len() {
         let var_name = keys[ki]
-        -- Skip lambda parameters (they are not captures)
-        let mut is_param = mentioned.contains(var_name) == false
+        let mut captured = mentioned.contains(var_name)
         let mut pj = 0
         while pj < expr.lambda_params.len() {
-            if expr.lambda_params[pj].name == var_name {
-                is_param = true
-            }
+            if expr.lambda_params[pj].name == var_name { captured = false }
             pj = pj + 1
         }
-        if is_param == false {
+        if captured {
             capture_names.push(var_name)
-            let cap_type = if g.variable_types.contains(var_name) {
-                g.variable_types.get(var_name)
+            if g.variable_types.contains(var_name) {
+                capture_types.push(g.variable_types.get(var_name))
             } else {
-                "i64"
+                capture_types.push("i64")
             }
-            capture_types.push(cap_type)
-            lambda_func.params.push(ir_param_new(var_name, cap_type))
-
-            if len(captures) > 0 {
-                captures = captures + "|"
-            }
-            captures = captures + var_name
         }
         ki = ki + 1
     }
 
-    -- A captured variable is an extra parameter of the lambda's function,
-    -- which only a call of the lambda by its name passes. Anywhere else
-    -- the lambda would be called without it.
-    if capture_names.len() > 0 and bound_by_let == false {
-        eprintln(error_at(g.ir_mod.files, captured_lambda_error(capture_names[0], "this lambda"), expr.line))
-        exit(1)
+    -- The closure's layout: the function's address, then the captured
+    -- values
+    let closure_type = "closure$" + lambda_name
+    if capture_names.len() > 0 {
+        let mut fields: List[IRField] = []
+        fields.push(ir_field_new("function", "ptr"))
+        let mut fi = 0
+        while fi < capture_names.len() {
+            fields.push(ir_field_new(capture_names[fi], capture_types[fi]))
+            fi = fi + 1
+        }
+        let mut closure_ir = ir_type_named(IR_TYPE_STRUCT(), closure_type)
+        closure_ir.fields = fields
+        g.ir_mod.struct_defs.insert(closure_type, closure_ir)
     }
 
-    -- Save current generator state
-    let saved_variable_map = g.variable_map
-    let saved_variable_types = g.variable_types
-    let saved_return_type = g.current_return_type
-    let saved_next_id = g.builder.next_id
-    let saved_region_depth = g.region_depth
-    let saved_tainted_vars = g.tainted_vars
-    let saved_ref_vars = g.ref_vars
-    let saved_region_born_vars = g.region_born_vars
-    let saved_declared_vars = g.declared_vars
-    let saved_region_marks = g.region_marks
-    let saved_completed_blocks = g.completed_blocks
+    -- The closure is made here, in the function around the lambda,
+    -- from the variables as they are now
+    let mut closure_id = 0
+    if capture_names.len() == 0 {
+        let made = emit_static_closure(g, b, lambda_name)
+        g = made.gen
+        b = made.block
+        closure_id = made.val_id
+    } else {
+        closure_id = g.builder.next_id
+        let mut malloc_inst = ir_inst_new(closure_id, OP_CALL())
+        malloc_inst.callee = "dm_libc_malloc"
+        let mut margs: List[IRValue] = []
+        margs.push(ir_val_sizeof(closure_type))
+        malloc_inst.call_args = margs
+        malloc_inst.result_type = "ptr"
+        malloc_inst.has_result = true
+        b.instructions.push(malloc_inst)
+        g.builder.next_id = closure_id + 1
+        let function_at = emit_ir_field_addr(g, b, ir_val_inst(closure_id), closure_type, 0, "ptr")
+        let function_set = emit_ir_store(function_at.gen, function_at.block, ir_val_inst(function_at.val_id), ir_val_global(lambda_name))
+        g = function_set.gen
+        b = function_set.block
+        let mut ci = 0
+        while ci < capture_names.len() {
+            let value = generate_expr(g, b, expr_ident(capture_names[ci], expr.line, expr.col))
+            let value_at = emit_ir_field_addr(value.gen, value.block, ir_val_inst(closure_id), closure_type, ci + 1, capture_types[ci])
+            let value_set = emit_ir_store(value_at.gen, value_at.block, ir_val_inst(value_at.val_id), ir_val_inst(value.val_id))
+            g = value_set.gen
+            b = value_set.block
+            ci = ci + 1
+        }
+    }
 
-    -- The lambda's blocks are its own: a body with a branch in it (an
-    -- `if`, `and`, a division's zero check) finishes blocks as it goes
-    let empty_lambda_blocks: List[IRBasicBlock] = []
-    g.completed_blocks = empty_lambda_blocks
-
-    -- Set up new variable scope for the lambda body. Safety state is
-    -- fresh per function; unsafe_depth is lexical and carries in.
+    -- The lambda's function is generated with the state of a function
+    -- of its own; what is lexical (the impl type, type parameters, an
+    -- unsafe block) carries in
+    let outer = g
+    let empty_blocks: List[IRBasicBlock] = []
+    let empty_declared: List[string] = []
+    let empty_marks: List[int] = []
+    g.completed_blocks = empty_blocks
     g.variable_map = Map_new()
+    g.variable_types = Map_new()
+    g.mut_ptr_vars = Map_new()
+    g.param_ptr_map = Map_new()
+    g.var_src_types = Map_new()
+    g.var_struct_types = Map_new()
+    g.var_enum_types = Map_new()
+    g.box_inner_types = Map_new()
+    g.list_elem_kinds = Map_new()
+    g.list_elem_types = Map_new()
+    g.array_var_names = Map_new()
+    g.var_type_annotations = Map_new()
     g.region_depth = 0
     g.tainted_vars = Map_new()
     g.ref_vars = Map_new()
     g.region_born_vars = Map_new()
-    let empty_lambda_declared: List[string] = []
-    g.declared_vars = empty_lambda_declared
-    let empty_lambda_marks: List[int] = []
-    g.region_marks = empty_lambda_marks
-    g.variable_types = Map_new()
+    g.declared_vars = empty_declared
+    g.region_marks = empty_marks
+    g.has_break_target = false
+    g.has_continue_target = false
     g.current_return_type = ret_type
     g.builder.next_id = 0
 
-    -- Create entry block for the lambda
     let mut entry_block = ir_block_new("entry")
 
-    -- Create allocas and stores for all parameters (lambda params + captures)
-    let total_params = expr.lambda_params.len() + capture_names.len()
+    -- The lambda's parameters are variables of its function
     let mut param_idx = 0
-
-    -- Lambda parameters first
     while param_idx < expr.lambda_params.len() {
         let lp = expr.lambda_params[param_idx]
-        let ptype = if len(lp.type_name) > 0 {
-            map_type_name(lp.type_name)
-        } else {
-            "i64"
-        }
+        let ptype = map_type_name(param_src[param_idx])
 
         let alloca_id = g.builder.next_id
         let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
@@ -7882,33 +7974,39 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         alloca_inst.result_type = "ptr(" + ptype + ")"
         alloca_inst.has_result = true
         entry_block.instructions.push(alloca_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_inst.store_ptr = ir_val_inst(alloca_id)
-        store_inst.store_val = ir_val_param(param_idx)
-        store_inst.has_result = false
-        entry_block.instructions.push(store_inst)
-        g.builder.next_id = g.builder.next_id + 1
+        g.builder.next_id = alloca_id + 1
+        let param_set = emit_ir_store(g, entry_block, ir_val_inst(alloca_id), ir_val_param(param_idx + 1))
+        g = param_set.gen
+        entry_block = param_set.block
 
         g.variable_map.insert(lp.name, alloca_id)
         g.variable_types.insert(lp.name, ptype)
         g.declared_vars.push(lp.name)
-        if g.var_src_types.contains(lp.name) {
-            g.var_src_types.remove(lp.name)
-        }
-        let param_debug = debug_var(g, entry_block, lp.name, expr.line, param_idx + 1)
+        -- The type of an untyped parameter is left to the checker
+        if lp.type_name != "" { g.var_src_types.insert(lp.name, param_src[param_idx]) }
+        let param_debug = debug_var(g, entry_block, lp.name, expr.line, param_idx + 2)
         g = param_debug.gen
         entry_block = param_debug.block
         param_idx = param_idx + 1
     }
 
-    -- Captured variables next
+    -- And so are the captured variables, each with its value from the
+    -- closure
     let mut cap_idx = 0
     while cap_idx < capture_names.len() {
         let cap_name = capture_names[cap_idx]
         let cap_type = capture_types[cap_idx]
-        let full_param_idx = expr.lambda_params.len() + cap_idx
+        let from_at = emit_ir_field_addr(g, entry_block, ir_val_param(0), closure_type, cap_idx + 1, cap_type)
+        g = from_at.gen
+        entry_block = from_at.block
+        let from_id = g.builder.next_id
+        let mut from_inst = ir_inst_new(from_id, OP_LOAD())
+        from_inst.load_ptr = ir_val_inst(from_at.val_id)
+        from_inst.load_type = cap_type
+        from_inst.result_type = cap_type
+        from_inst.has_result = true
+        entry_block.instructions.push(from_inst)
+        g.builder.next_id = from_id + 1
 
         let alloca_id = g.builder.next_id
         let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
@@ -7916,27 +8014,22 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         alloca_inst.result_type = "ptr(" + cap_type + ")"
         alloca_inst.has_result = true
         entry_block.instructions.push(alloca_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_inst.store_ptr = ir_val_inst(alloca_id)
-        store_inst.store_val = ir_val_param(full_param_idx)
-        store_inst.has_result = false
-        entry_block.instructions.push(store_inst)
-        g.builder.next_id = g.builder.next_id + 1
+        g.builder.next_id = alloca_id + 1
+        let cap_set = emit_ir_store(g, entry_block, ir_val_inst(alloca_id), ir_val_inst(from_id))
+        g = cap_set.gen
+        entry_block = cap_set.block
 
         g.variable_map.insert(cap_name, alloca_id)
         g.variable_types.insert(cap_name, cap_type)
         g.declared_vars.push(cap_name)
+        g = copy_variable_facts(outer, g, cap_name)
         cap_idx = cap_idx + 1
     }
 
-    -- Generate the lambda body expression
+    -- The body's value is the lambda's
     let body_result = generate_expr(g, entry_block, *expr.lambda_body)
     g = body_result.gen
     entry_block = body_result.block
-
-    -- Add return terminator
     if entry_block.has_terminator == false {
         if ret_type == "void" {
             entry_block.terminator = Box_new(term_ret_void())
@@ -7956,177 +8049,32 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     lambda_func.blocks.push(entry_block)
     g.ir_mod.functions.push(lambda_func)
 
-    -- Restore generator state
-    g.variable_map = saved_variable_map
-    g.variable_types = saved_variable_types
-    g.current_return_type = saved_return_type
-    g.builder.next_id = saved_next_id
-    g.region_depth = saved_region_depth
-    g.tainted_vars = saved_tainted_vars
-    g.ref_vars = saved_ref_vars
-    g.region_born_vars = saved_region_born_vars
-    g.declared_vars = saved_declared_vars
-    g.region_marks = saved_region_marks
-    g.completed_blocks = saved_completed_blocks
+    -- Back to the function around the lambda
+    g.completed_blocks = outer.completed_blocks
+    g.variable_map = outer.variable_map
+    g.variable_types = outer.variable_types
+    g.mut_ptr_vars = outer.mut_ptr_vars
+    g.param_ptr_map = outer.param_ptr_map
+    g.var_src_types = outer.var_src_types
+    g.var_struct_types = outer.var_struct_types
+    g.var_enum_types = outer.var_enum_types
+    g.box_inner_types = outer.box_inner_types
+    g.list_elem_kinds = outer.list_elem_kinds
+    g.list_elem_types = outer.list_elem_types
+    g.array_var_names = outer.array_var_names
+    g.var_type_annotations = outer.var_type_annotations
+    g.region_depth = outer.region_depth
+    g.tainted_vars = outer.tainted_vars
+    g.ref_vars = outer.ref_vars
+    g.region_born_vars = outer.region_born_vars
+    g.declared_vars = outer.declared_vars
+    g.region_marks = outer.region_marks
+    g.has_break_target = outer.has_break_target
+    g.has_continue_target = outer.has_continue_target
+    g.current_return_type = outer.current_return_type
+    g.builder.next_id = outer.builder.next_id
 
-    -- Record the lambda in fn_ptr_vars and lambda_captures
-    g.fn_ptr_vars.insert(lambda_name, lambda_name)
-    if len(captures) > 0 {
-        g.lambda_captures.insert(lambda_name, captures)
-    }
-
-    -- Return a global reference to the lambda function
-    let ref_id = g.builder.next_id
-    let mut ref_inst = ir_inst_new(ref_id, OP_ALLOCA())
-    ref_inst.alloc_type = "ptr"
-    ref_inst.result_type = "ptr(ptr)"
-    ref_inst.has_result = true
-    b.instructions.push(ref_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    let mut store_ref = ir_inst_new(g.builder.next_id, OP_STORE())
-    store_ref.store_ptr = ir_val_inst(ref_id)
-    store_ref.store_val = ir_val_global(lambda_name)
-    store_ref.has_result = false
-    b.instructions.push(store_ref)
-    g.builder.next_id = g.builder.next_id + 1
-
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(ref_id)
-    load_inst.load_type = "ptr"
-    load_inst.result_type = "ptr"
-    load_inst.has_result = true
-    b.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, b, load_id)
-}
-
--- ============================================================
--- PIPELINE OPERATOR
--- x |> f desugars to f(x)
--- x |> f(y) desugars to f(x, y)
--- ============================================================
-
-fn generate_pipeline(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Generate the left side (the argument to prepend)
-    let left_result = generate_expr(g, b, *expr.left)
-    g = left_result.gen
-    b = left_result.block
-
-    let pipe_right = *expr.pipe_right
-
-    -- Case 1: Right side is a function call with args -> prepend left as first arg
-    if pipe_right.kind == EXPR_FUNCTION_CALL() {
-        let callee = *pipe_right.callee
-        let fn_name = if callee.kind == EXPR_IDENTIFIER() {
-            callee.name
-        } else {
-            ""
-        }
-
-        check_extern_fence(g, fn_name, pipe_right.line)
-
-        -- Build argument list: left value first, then original args
-        let mut call_args: List[IRValue] = []
-        call_args.push(ir_val_inst(left_result.val_id))
-
-        let mut i = 0
-        while i < pipe_right.args.len() {
-            let arg_result = generate_expr(g, b, pipe_right.args[i])
-            g = arg_result.gen
-            b = arg_result.block
-            call_args.push(ir_val_inst(arg_result.val_id))
-            i = i + 1
-        }
-
-        -- Determine return type
-        let ret_type = if is_builtin_fn(fn_name) {
-            builtin_return_type(fn_name)
-        } else {
-            "i64"
-        }
-
-        -- Map builtin name if needed
-        let c_name = if is_builtin_fn(fn_name) {
-            map_builtin_name(fn_name)
-        } else {
-            fn_name
-        }
-
-        let call_id = g.builder.next_id
-        let mut call_inst = ir_inst_new(call_id, OP_CALL())
-        call_inst.callee = c_name
-        call_inst.call_args = call_args
-        call_inst.result_type = ret_type
-        call_inst.has_result = ret_type != "void"
-        b.instructions.push(call_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        return expr_result(g, b, call_id)
-    }
-
-    -- Case 2: Right side is an identifier -> call it with left as sole arg
-    if pipe_right.kind == EXPR_IDENTIFIER() {
-        let fn_name = pipe_right.name
-
-        check_extern_fence(g, fn_name, pipe_right.line)
-
-        let mut call_args: List[IRValue] = []
-        call_args.push(ir_val_inst(left_result.val_id))
-
-        let ret_type = if is_builtin_fn(fn_name) {
-            builtin_return_type(fn_name)
-        } else {
-            "i64"
-        }
-
-        let c_name = if is_builtin_fn(fn_name) {
-            map_builtin_name(fn_name)
-        } else {
-            fn_name
-        }
-
-        let call_id = g.builder.next_id
-        let mut call_inst = ir_inst_new(call_id, OP_CALL())
-        call_inst.callee = c_name
-        call_inst.call_args = call_args
-        call_inst.result_type = ret_type
-        call_inst.has_result = ret_type != "void"
-        b.instructions.push(call_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        return expr_result(g, b, call_id)
-    }
-
-    -- Case 3: Right side is a lambda variable -> call_ptr with left as arg
-    if pipe_right.kind == EXPR_IDENTIFIER() {
-        let fn_name = pipe_right.name
-        if g.fn_ptr_vars.contains(fn_name) {
-            let lambda_fn = g.fn_ptr_vars.get(fn_name)
-
-            let mut call_args: List[IRValue] = []
-            call_args.push(ir_val_inst(left_result.val_id))
-
-            let call_id = g.builder.next_id
-            let mut call_inst = ir_inst_new(call_id, OP_CALL())
-            call_inst.callee = lambda_fn
-            call_inst.call_args = call_args
-            call_inst.result_type = "i64"
-            call_inst.has_result = true
-            b.instructions.push(call_inst)
-            g.builder.next_id = g.builder.next_id + 1
-
-            return expr_result(g, b, call_id)
-        }
-    }
-
-    g = ir_type_error(g, "unsupported pipeline target", expr.line)
-    return expr_result(g, b, left_result.val_id)
+    return expr_result(g, b, closure_id)
 }
 
 -- ============================================================
@@ -8476,60 +8424,6 @@ fn generate_comptime_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 -- ============================================================
 
 -- Returns true if the function name is a SIMD builtin intrinsic
-
-fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: string, var_type: string, args: List[Expr]) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Load the function pointer value from the parameter's alloca
-    let alloca_id = g.variable_map.get(var_name)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(alloca_id)
-    load_inst.load_type = "ptr"
-    load_inst.result_type = "ptr"
-    load_inst.has_result = true
-    b.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Generate arguments; an integer becomes the integer type the
-    -- function type names for it
-    let param_types = ty_fn_params(var_type)
-    let mut call_args: List[IRValue] = []
-    let mut i = 0
-    while i < args.len() {
-        let mut arg_result = generate_expr(g, b, args[i])
-        if i < param_types.len() {
-            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], param_types[i], "argument " + int_to_string(i + 1) + " of '" + var_name + "'")
-        }
-        g = arg_result.gen
-        b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
-        i = i + 1
-    }
-
-    -- Parse return type from "fn(int, int) -> int"
-    let arrow_pos = string_find(var_type, " -> ")
-    let ret_type_str = if arrow_pos >= 0 {
-        substr(var_type, arrow_pos + 4, len(var_type) - arrow_pos - 4)
-    } else {
-        "void"
-    }
-    let ret_type = map_type_name(ret_type_str)
-    let has_result = ret_type != "void"
-
-    -- Emit OP_CALL_PTR instruction
-    let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL_PTR())
-    inst.callee_val = ir_val_inst(load_id)
-    inst.call_args = call_args
-    inst.result_type = ret_type
-    inst.has_result = has_result
-    b.instructions.push(inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, b, id)
-}
 
 -- ============================================================
 -- SOME CALL: Option constructor

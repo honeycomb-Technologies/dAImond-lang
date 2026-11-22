@@ -117,13 +117,6 @@ struct IRGenerator {
     mono_generated: Map[string, bool],
     -- Type param name -> concrete type name
     type_substitutions: Map[string, string],
-    -- Variable name -> lambda function name
-    fn_ptr_vars: Map[string, string],
-    -- Lambda name -> pipe-delimited capture list
-    lambda_captures: Map[string, string],
-    -- True while the value of a `let` that is a lambda is generated:
-    -- the one place a lambda that captures variables may be written
-    lambda_bound_by_let: bool,
     -- The id of the `match` that is a statement, while it is
     -- generated: its arms' values go nowhere (see match_slot_type in
     -- ir_gen_expr.dm). -1 otherwise.
@@ -251,9 +244,6 @@ fn ir_generator_new() -> IRGenerator {
         generic_fn_decls: Map_new(),
         mono_generated: Map_new(),
         type_substitutions: Map_new(),
-        fn_ptr_vars: Map_new(),
-        lambda_captures: Map_new(),
-        lambda_bound_by_let: false,
         unused_match: -1,
         method_struct_map: Map_new(),
         static_fns: Map_new(),
@@ -393,7 +383,8 @@ fn map_type_name(name: string) -> string {
     if name == "i32x8" { return "i32x8" }
     if name == "i64x2" { return "i64x2" }
     if name == "i64x4" { return "i64x4" }
-    -- Function pointer type: fn(int, int) -> int becomes ptr
+    -- A function value is the address of its closure (see FUNCTION
+    -- VALUES in ir_gen_expr.dm)
     if starts_with(name, "fn(") {
         return "ptr"
     }
@@ -433,6 +424,13 @@ fn split_type_args(inner: string) -> List[string] {
 
 -- A type argument as part of an instance name: List[int] -> List_i64
 fn mangle_type_arg(t: string) -> string {
+    -- Every function type is a pointer in the IR, and each is a type
+    -- argument of its own: fn(int) -> bool is fn$int$to$bool
+    if starts_with(t, "fn(") {
+        let a = string_replace(string_replace(string_replace(t, " -> ", "$to$"), ", ", "$"), ",", "$")
+        let b = string_replace(string_replace(string_replace(string_replace(a, "(", "$"), ")", ""), "[", "$"), "]", "")
+        return string_replace(b, " ", "")
+    }
     let m = map_type_name(t)
     return string_replace(string_replace(string_replace(string_replace(m, ", ", "_"), ",", "_"), "[", "_"), "]", "")
 }

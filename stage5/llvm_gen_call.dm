@@ -481,32 +481,73 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
     unsafe {
         let mut g = gen
         let b = g.builder
+        let ctx = g.context
         let id_key = int_to_string(inst.id)
-        -- Resolve the function pointer value
-        let fn_ptr = resolve_value(g, inst.callee_val)
+        -- The address of the function is the closure's first word. A
+        -- closure that was kept as an integer (a list of functions
+        -- keeps 8-byte elements) is an address all the same.
+        let ptr_ty = dm_llvm_pointer_type(ctx)
+        let closure = coerce_ptr_int(g, resolve_value(g, inst.callee_val), ptr_ty)
         g = resolve_value_with_counter(g, inst.callee_val)
-        -- Build the LLVM function type for the indirect call
-        -- Map the return type
-        let ret_ty = map_ir_type_to_llvm(g, inst.result_type)
-        -- Build param types and args simultaneously
+        let fn_ptr = dm_llvm_build_load2(b, ptr_ty, closure, "closure.fn")
+        -- The function's type is the one declare_function gives a
+        -- function of these parameters and this result: a string, an
+        -- Option or a Result comes back through a pointer that is
+        -- passed first
+        let needs_sret = is_sret_return_type(inst.result_type)
+        let result_ty = map_ir_type_to_llvm(g, inst.result_type)
+        let declared = string_split(inst.callee, "|")
+        let mut param_tys: List[int] = []
+        if needs_sret { param_tys.push(dm_llvm_pointer_type(ctx)) }
+        let mut pi = 0
+        while pi < declared.len() {
+            param_tys.push(map_ir_type_to_llvm(g, declared[pi]))
+            pi = pi + 1
+        }
         dm_llvm_buf_clear()
+        pi = 0
+        while pi < param_tys.len() {
+            dm_llvm_buf_push(param_tys[pi])
+            pi = pi + 1
+        }
+        let mut ret_ty = result_ty
+        if needs_sret { ret_ty = dm_llvm_void_type(ctx) }
+        let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
+
         let mut args: List[int] = []
+        let mut sret = 0
+        if needs_sret {
+            sret = dm_llvm_build_alloca(b, result_ty, "sret." + int_to_string(g.sret_counter))
+            g.sret_counter = g.sret_counter + 1
+            args.push(sret)
+        }
+        let first = args.len()
         let mut ai = 0
-        while ai < inst.call_args.len() {
+        while ai < inst.call_args.len() and first + ai < param_tys.len() {
             let arg = inst.call_args[ai]
-            let val = resolve_value(g, arg)
+            let want_ty = param_tys[first + ai]
+            let mut val = resolve_value(g, arg)
             g = resolve_value_with_counter(g, arg)
-            args.push(val)
-            -- Get the LLVM type of the resolved value
+            if arg.kind == VAL_CONST_STRING() and want_ty == g.dm_string_type {
+                val = string_operand(g, arg, val, true)
+            }
+            -- A string, a list or a struct held by its address is passed
+            -- as the value
+            val = load_handle_as(g, arg, val, want_ty)
+            -- An integer takes the parameter's width
             let val_ty = dm_llvm_type_of(val)
-            dm_llvm_buf_push(val_ty)
+            if dm_llvm_get_type_kind(want_ty) == 8 and dm_llvm_get_type_kind(val_ty) == 8 {
+                let want_w = dm_llvm_get_int_type_width(want_ty)
+                let val_w = dm_llvm_get_int_type_width(val_ty)
+                if val_w < want_w { val = dm_llvm_build_sext(b, val, want_ty, "arg.sext") }
+                if val_w > want_w { val = dm_llvm_build_trunc(b, val, want_ty, "arg.trunc") }
+            }
+            val = coerce_ptr_int(g, val, want_ty)
+            args.push(val)
             ai = ai + 1
         }
-        -- Create function type
-        let fn_ty = dm_llvm_function_type_buf(ret_ty, 0)
-        -- Build the indirect call
         let mut call_name = ""
-        if inst.has_result { call_name = "callptr" }
+        if inst.has_result and needs_sret == false { call_name = "callptr" }
         dm_llvm_buf_clear()
         let mut argi4 = 0
         while argi4 < args.len() {
@@ -515,7 +556,18 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         g = check_call_args(g, fn_ty, fn_ptr)
         let result = dm_llvm_build_call2_buf(b, fn_ty, fn_ptr, call_name)
-        if inst.has_result { g.value_map.insert(id_key, result) }
+        if inst.has_result == false { return g }
+        if needs_sret {
+            if inst.result_type == "string" {
+                -- A string stays where it is, as a string's address
+                g.string_ptrs.insert(id_key, true)
+                g.value_map.insert(id_key, sret)
+            } else {
+                g.value_map.insert(id_key, dm_llvm_build_load2(b, result_ty, sret, "sret.load"))
+            }
+            return g
+        }
+        g.value_map.insert(id_key, result)
         return g
     }
 }

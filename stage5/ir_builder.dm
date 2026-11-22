@@ -324,19 +324,6 @@ fn builder_build_call_void(b: IRBuilder, callee: string, args: List[IRValue]) ->
     return builder_build_call(b, callee, args, "void")
 }
 
-fn builder_build_call_ptr(b: IRBuilder, callee: IRValue, args: List[IRValue], ret_type: string) -> IRBuilder {
-    let mut builder = b
-    let id = builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL_PTR())
-    inst.callee_val = callee
-    inst.call_args = args
-    inst.result_type = ret_type
-    inst.has_result = ret_type != "void"
-    builder = builder_add_inst(builder, inst)
-    builder.next_id = id + 1
-    return builder
-}
-
 -- ============================================================
 -- CAST BUILDER
 -- ============================================================

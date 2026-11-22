@@ -285,6 +285,13 @@ fn OP_GEP() -> int { return 33 }
 fn OP_EXTRACT_FIELD() -> int { return 34 }
 fn OP_INSERT_FIELD() -> int { return 35 }
 fn OP_CALL() -> int { return 40 }
+-- A call of the function value `callee_val`, the address of a closure:
+-- the function whose address is the closure's first word is called
+-- with `call_args`, of which the first is the closure. `callee` holds
+-- the IR types of the function's parameters, joined with "|": the
+-- call is made with the function type a function declared with those
+-- parameters and `result_type` has (generate_call_ptr in
+-- llvm_gen_call.dm).
 fn OP_CALL_PTR() -> int { return 41 }
 fn OP_CAST() -> int { return 50 }
 fn OP_PHI() -> int { return 51 }

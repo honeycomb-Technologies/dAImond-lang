@@ -1,4 +1,4 @@
-Error: thread_spawn() takes a function that takes no arguments, by its name at line 11
+Error: thread_spawn() takes a function that takes no arguments at line 11
 Error: thread_spawn() takes 1 argument, not 2 at line 12
-Error: thread_spawn() takes a function that takes no arguments, by its name at line 14
-Error: thread_spawn() takes a function that takes no arguments, by its name at line 15
+Error: thread_spawn() takes a function that takes no arguments at line 14
+Error: thread_spawn() takes a function that takes no arguments at line 15

@@ -27,7 +27,6 @@ fn EXPR_IF() -> int { return 50 }
 fn EXPR_MATCH() -> int { return 51 }
 fn EXPR_BLOCK() -> int { return 52 }
 fn EXPR_LAMBDA() -> int { return 60 }
-fn EXPR_PIPELINE() -> int { return 70 }
 fn EXPR_ERROR_PROPAGATE() -> int { return 71 }
 fn EXPR_RANGE() -> int { return 72 }
 fn EXPR_CAST() -> int { return 80 }
@@ -211,9 +210,7 @@ struct Expr {
     cast_is_ref: bool,
     -- String interpolation parts (alternating literal and expr)
     interp_parts: List[Expr],
-    interp_is_literal: List[bool],
-    -- Pipeline right side
-    pipe_right: Box[Expr]
+    interp_is_literal: List[bool]
 }
 
 fn expr_new(kind: int, line: int, col: int) -> Expr {
@@ -233,8 +230,7 @@ fn expr_new(kind: int, line: int, col: int) -> Expr {
         stmts: [], result: Box_null(), has_result: false,
         lambda_params: [], lambda_ret_type: "", lambda_body: Box_null(),
         cast_type: "", cast_is_ref: false,
-        interp_parts: [], interp_is_literal: [],
-        pipe_right: Box_null()
+        interp_parts: [], interp_is_literal: []
     }
 }
 
@@ -780,15 +776,6 @@ fn names_in_expr(e: Expr, found: List[string], calls_only: bool) -> List[string]
         names = names_in_expr(*e.left, names, calls_only)
         return names_in_expr(*e.right, names, calls_only)
     }
-    if k == EXPR_PIPELINE() {
-        -- `x |> f` calls f
-        let piped_to = *e.pipe_right
-        if calls_only and piped_to.kind == EXPR_IDENTIFIER() {
-            names.push(piped_to.name)
-        }
-        names = names_in_expr(*e.left, names, calls_only)
-        return names_in_expr(*e.pipe_right, names, calls_only)
-    }
     if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
         return names_in_expr(*e.operand, names, calls_only)
     }
@@ -1066,9 +1053,6 @@ fn sc_scan_expr(s0: Scopes, e: Expr) -> Scopes {
     if k == EXPR_BINARY() or k == EXPR_RANGE() {
         return sc_scan_expr(sc_scan_expr(s, *e.left), *e.right)
     }
-    if k == EXPR_PIPELINE() {
-        return sc_scan_expr(sc_scan_expr(s, *e.left), *e.pipe_right)
-    }
     if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
         return sc_scan_expr(s, *e.operand)
     }
@@ -1200,12 +1184,6 @@ fn sc_expr(s0: Scopes, e: Expr) -> ScopedExpr {
         s = r.s
         out.left = Box_new(l.e)
         out.right = Box_new(r.e)
-    } else if k == EXPR_PIPELINE() {
-        let l = sc_expr(s, *e.left)
-        let r = sc_expr(l.s, *e.pipe_right)
-        s = r.s
-        out.left = Box_new(l.e)
-        out.pipe_right = Box_new(r.e)
     } else if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
         let r = sc_expr(s, *e.operand)
         s = r.s
@@ -1512,9 +1490,6 @@ fn fresh_expr(e: Expr) -> Expr {
     if k == EXPR_BINARY() or k == EXPR_RANGE() {
         out.left = Box_new(fresh_expr(*e.left))
         out.right = Box_new(fresh_expr(*e.right))
-    } else if k == EXPR_PIPELINE() {
-        out.left = Box_new(fresh_expr(*e.left))
-        out.pipe_right = Box_new(fresh_expr(*e.pipe_right))
     } else if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
         out.operand = Box_new(fresh_expr(*e.operand))
     } else if k == EXPR_FIELD_ACCESS() {

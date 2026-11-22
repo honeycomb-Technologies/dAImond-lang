@@ -701,7 +701,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     let outer_box_inner_types = g.box_inner_types
     let outer_list_elem_kinds = g.list_elem_kinds
     let outer_list_elem_types = g.list_elem_types
-    let outer_fn_ptr_vars = g.fn_ptr_vars
     let outer_array_var_names = g.array_var_names
     g.var_src_types = Map_new()
     g.var_struct_types = Map_new()
@@ -709,7 +708,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     g.box_inner_types = Map_new()
     g.list_elem_kinds = Map_new()
     g.list_elem_types = Map_new()
-    g.fn_ptr_vars = Map_new()
     g.array_var_names = Map_new()
     -- Safety-check state is per-function (Stage 0 checker resets likewise)
     g.unsafe_depth = 0
@@ -783,11 +781,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             g.variable_types.insert(pname, ptype)
         }
 
-
-        -- Track function-pointer-typed parameters for indirect calls
-        if starts_with(ptype_str, "fn(") {
-            g.variable_types.insert(pname, ptype_str)
-        }
 
         g.var_src_types.insert(pname, ptype_str)
         let param_debug = debug_var(g, blk, pname, fd.line, i + 1)
@@ -878,7 +871,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
     g.box_inner_types = outer_box_inner_types
     g.list_elem_kinds = outer_list_elem_kinds
     g.list_elem_types = outer_list_elem_types
-    g.fn_ptr_vars = outer_fn_ptr_vars
     g.array_var_names = outer_array_var_names
 
     return g

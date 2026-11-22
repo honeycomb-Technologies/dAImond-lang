@@ -303,6 +303,9 @@ fn map_ir_type_to_llvm(gen: LLVMGenerator, type_name: string) -> int {
         if type_name == "void" { return dm_llvm_void_type(ctx) }
         if type_name == "string" { return gen.dm_string_type }
         if type_name == "ptr" { return dm_llvm_pointer_type(ctx) }
+        -- A function type that reached here by its source name: a
+        -- function value is the address of its closure
+        if starts_with(type_name, "fn(") { return dm_llvm_pointer_type(ctx) }
         -- Pointer types: ptr(...)
         if starts_with(type_name, "ptr(") { return dm_llvm_pointer_type(ctx) }
         -- Box types are heap pointers

@@ -86,6 +86,15 @@ struct Checker {
     var_names: List[string],
     var_types: List[string],
     var_flags: List[int],
+    -- Inside a lambda, how many variables there were where it began:
+    -- those are the variables of the function around it, of which the
+    -- lambda has copies (see FUNCTION VALUES in ir_gen_expr.dm). 0
+    -- outside a lambda.
+    lambda_floor: int,
+    -- While a lambda that does not say what it returns is checked: the
+    -- type of the value its first `return` gives ("void" for a return
+    -- without one), "" before there was one. "-" otherwise.
+    lambda_ret: string,
     -- What the function or lambda being checked returns: "void" for
     -- nothing, "" when it is not known
     ret_type: string,
@@ -418,6 +427,19 @@ fn ty_bind(pattern: string, actual: string, generics: List[string], binds: List[
             out[at] = actual
         }
         return out
+    }
+    -- A function type binds through its parameters and its result:
+    -- fn(T) -> U against fn(int) -> string
+    if starts_with(pattern, "fn(") and starts_with(actual, "fn(") {
+        let pattern_params = ty_fn_params(pattern)
+        let actual_params = ty_fn_params(actual)
+        if pattern_params.len() != actual_params.len() { return out }
+        let mut pi = 0
+        while pi < pattern_params.len() {
+            out = ty_bind(pattern_params[pi], actual_params[pi], generics, out)
+            pi = pi + 1
+        }
+        return ty_bind(ty_fn_ret(pattern), ty_fn_ret(actual), generics, out)
     }
     let head = ty_head(pattern)
     if head == "" or head == pattern or head != ty_head(actual) { return out }
@@ -1010,7 +1032,6 @@ fn ck_expr_of_kind(c: Checker, e: Expr) -> Typed {
     if k == EXPR_MATCH() { return ck_match(c, e, true) }
     if k == EXPR_BLOCK() { return ck_block(c, e) }
     if k == EXPR_LAMBDA() { return ck_lambda(c, e) }
-    if k == EXPR_PIPELINE() { return ck_pipeline(c, e) }
     if k == EXPR_ERROR_PROPAGATE() { return ck_propagate(c, e) }
     if k == EXPR_GROUPED() or k == EXPR_COMPTIME() { return ck_expr(c, *e.operand) }
     if k == EXPR_CAST() { return ck_cast(c, e) }
@@ -1103,6 +1124,18 @@ fn ck_identifier(c: Checker, e: Expr) -> Typed {
         let sig = c.fns.get(name)
         let named = ck_effects(c, name, sig.effects, " not in caller's effects", "uses", e.line)
         if is_builtin_fn(name) or sig.variadic { return ck_typed(named, "") }
+        -- The value is called with what its type says, which has
+        -- neither type parameters nor `mut` parameters
+        if sig.generics.len() > 0 {
+            return ck_typed(ck_error(named, "the generic function '" + name + "' cannot be used as a value: call it in a lambda", e.line), "")
+        }
+        let mut pi = 0
+        while pi < sig.changes.len() {
+            if sig.changes[pi] {
+                return ck_typed(ck_error(named, "the function '" + name + "' has a 'mut' parameter, so it cannot be used as a value: call it in a lambda", e.line), "")
+            }
+            pi = pi + 1
+        }
         return ck_typed(named, ty_fn_text(sig))
     }
     if is_builtin_fn(name) { return ck_typed(c, "") }
@@ -1442,8 +1475,18 @@ fn ck_fixed_root(c: Checker, e: Expr) -> string {
     if cur.kind != EXPR_IDENTIFIER() { return "" }
     let at = ck_var(c, cur.name)
     if at < 0 { return "" }
-    if c.var_flags[at] != 0 { return "" }
+    if c.var_flags[at] != 0 and at >= c.lambda_floor { return "" }
     return cur.name
+}
+
+-- Why the variable cannot be changed: it is not `mut`, or it is a
+-- variable of the function around the lambda being checked
+fn ck_fixed_why(c: Checker, name: string) -> string {
+    let at = ck_var(c, name)
+    if at >= 0 and at < c.lambda_floor {
+        return "'" + name + "', a variable of the function around this lambda: the lambda has its own copy of it"
+    }
+    return "'" + name + "', which is not declared 'mut'"
 }
 
 -- A value that a call changes must be one that may be changed. `what`
@@ -1452,9 +1495,9 @@ fn ck_changes(c: Checker, e: Expr, what: string, line: int) -> Checker {
     let root = ck_fixed_root(c, e)
     if root == "" { return c }
     if e.kind == EXPR_IDENTIFIER() {
-        return ck_error(c, what + " changes '" + root + "', which is not declared 'mut'", line)
+        return ck_error(c, what + " changes " + ck_fixed_why(c, root), line)
     }
-    return ck_error(c, what + " changes a part of '" + root + "', which is not declared 'mut'", line)
+    return ck_error(c, what + " changes a part of " + ck_fixed_why(c, root), line)
 }
 
 -- The arguments that go to `mut` parameters of the function are
@@ -2385,6 +2428,8 @@ fn ck_lambda(c0: Checker, e: Expr) -> Typed {
     let mut c = c0
     let mark = c.var_names.len()
     let outer_ret = c.ret_type
+    let outer_floor = c.lambda_floor
+    c.lambda_floor = mark
     let mut text = "fn("
     let mut i = 0
     while i < e.lambda_params.len() {
@@ -2405,12 +2450,27 @@ fn ck_lambda(c0: Checker, e: Expr) -> Typed {
         ret = ck_norm(c, e.lambda_ret_type)
     }
     c.ret_type = ret
+    let outer_lambda_ret = c.lambda_ret
+    c.lambda_ret = "-"
+    if ret == "" { c.lambda_ret = "" }
     let body = *e.lambda_body
     let value = ck_expr(c, body)
     c = value.c
-    if body.kind != EXPR_BLOCK() {
+    let returned = c.lambda_ret
+    c.lambda_ret = outer_lambda_ret
+    if body.kind == EXPR_BLOCK() {
+        -- A block's lambda returns what its first `return` gives, else
+        -- the block's value
         if ret == "" {
-            if ty_known(value.t) and value.t != "void" { ret = value.t }
+            if returned != "" and returned != "-" {
+                ret = returned
+            } else if ty_known(value.t) {
+                ret = value.t
+            }
+        }
+    } else {
+        if ret == "" {
+            if ty_known(value.t) { ret = value.t }
         } else if value.t != "void" and ck_fits_value(c, ret, value.t, body) == false {
             c = ck_error(c, "type mismatch in the lambda's value: expected " + ret + ", found " + value.t, body.line)
         } else {
@@ -2418,39 +2478,10 @@ fn ck_lambda(c0: Checker, e: Expr) -> Typed {
         }
     }
     c.ret_type = outer_ret
+    c.lambda_floor = outer_floor
     c = ck_unbind(c, mark)
     if ret == "" { ret = "?" }
     return ck_typed(c, text + ") -> " + ret)
-}
-
--- left |> f(args) is f(left, args)
-fn ck_pipeline(c0: Checker, e: Expr) -> Typed {
-    let left = ck_expr(c0, *e.left)
-    let left_expr = *e.left
-    let right = *e.pipe_right
-    let mut types: List[string] = []
-    types.push(left.t)
-    let mut args: List[Expr] = []
-    args.push(left_expr)
-    let no_generics: List[string] = []
-    if right.kind == EXPR_IDENTIFIER() {
-        return ck_call_named(left.c, right.name, no_generics, types, args, e.line, -1)
-    }
-    if right.kind == EXPR_FUNCTION_CALL() {
-        let callee = *right.callee
-        if callee.kind == EXPR_IDENTIFIER() {
-            let rest = ck_exprs(left.c, right.args)
-            let mut i = 0
-            while i < right.args.len() {
-                types.push(rest.types[i])
-                args.push(right.args[i])
-                i = i + 1
-            }
-            return ck_call_named(rest.c, callee.name, callee.generic_args, types, args, e.line, -1)
-        }
-    }
-    let other = ck_expr(left.c, right)
-    return ck_typed(other.c, "")
 }
 
 -- value? is the value of an Ok or a Some
@@ -2508,6 +2539,13 @@ fn ck_let(c0: Checker, s: Stmt) -> Checker {
 fn ck_return(c0: Checker, s: Stmt) -> Checker {
     let want = c0.ret_type
     if s.has_ret_value == false {
+        if want == "" and c0.lambda_ret == "" {
+            -- The first return of a lambda says what the lambda returns
+            let mut first = c0
+            first.lambda_ret = "void"
+            first.ret_type = "void"
+            return first
+        }
         if ty_known(want) and want != "void" {
             return ck_error(c0, "this return has no value, but the function returns " + want, s.line)
         }
@@ -2527,6 +2565,12 @@ fn ck_return(c0: Checker, s: Stmt) -> Checker {
         if ty_known(want) {
             return ck_error(c, "the return value is a call that returns no value", s.line)
         }
+        return c
+    }
+    if want == "" and c.lambda_ret == "" and ty_known(found.t) {
+        -- The first return of a lambda says what the lambda returns
+        c.lambda_ret = found.t
+        c.ret_type = found.t
         return c
     }
     if ck_fits_value(c, want, found.t, value) == false {
@@ -2558,15 +2602,15 @@ fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
     if target.kind == EXPR_FIELD_ACCESS() or target.kind == EXPR_INDEX_ACCESS() {
         let root = ck_fixed_root(c, *target.object)
         if root != "" {
-            c = ck_error(c, "cannot assign to a part of '" + root + "', which is not declared 'mut'", s.line)
+            c = ck_error(c, "cannot assign to a part of " + ck_fixed_why(c, root), s.line)
         }
     }
     if target.kind == EXPR_IDENTIFIER() {
         shown = " to '" + target.name + "'"
         let at = ck_var(c, target.name)
         if at >= 0 {
-            if c.var_flags[at] == 0 {
-                c = ck_error(c, "cannot assign to '" + target.name + "', which is not declared 'mut'", s.line)
+            if c.var_flags[at] == 0 or at < c.lambda_floor {
+                c = ck_error(c, "cannot assign to " + ck_fixed_why(c, target.name), s.line)
             }
         } else if c.consts.contains(target.name) {
             c = ck_error(c, "cannot assign to the constant '" + target.name + "'", s.line)
@@ -3036,6 +3080,8 @@ fn check_program(sf: SourceFile) -> Checked {
         var_names: [],
         var_types: [],
         var_flags: [],
+        lambda_floor: 0,
+        lambda_ret: "-",
         ret_type: "",
         awaited: -2,
         fn_name: "",

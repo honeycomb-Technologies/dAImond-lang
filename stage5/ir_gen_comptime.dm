@@ -492,7 +492,6 @@ fn ct_expr_text(e: Expr) -> string {
     if k == EXPR_STRUCT_LITERAL() { return "a struct ('" + e.type_name + "')" }
     if k == EXPR_ENUM_LITERAL() { return "an enum value" }
     if k == EXPR_LAMBDA() { return "a lambda" }
-    if k == EXPR_PIPELINE() { return "a pipeline ('|>')" }
     if k == EXPR_ERROR_PROPAGATE() { return "'?'" }
     if k == EXPR_RANGE() { return "a range outside a 'for'" }
     if k == EXPR_AWAIT() { return "'await'" }
