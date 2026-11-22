@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (517 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (530 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 517 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 530 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
@@ -350,7 +350,7 @@ The compiler passes its suite of 517 cases, builds itself to a fixed point, and 
 - Generic functions (monomorphized, with type arguments inferred at the call) and generic structs (`struct Table[K, V]`, with type arguments written out)
 - `List[T]`, `Map[K, V]` and `Box[T]`, `for`-in over lists, maps and ranges
 - Traits with static dispatch, and `dyn Trait` values
-- Lambdas, the pipeline operator `|>`
+- Lambdas, the pipeline operator `|>`, bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `~`)
 - String interpolation (`f"..."`), all numeric types (`i8` to `u64`, `f32`, `f64`) with `as` casts
 - Compile-time evaluation (`comptime`), compile-time array sizes
 - Regions, `async`/`await`, SIMD vectors
@@ -358,7 +358,7 @@ The compiler passes its suite of 517 cases, builds itself to a fixed point, and 
 - Multi-file imports, and the standard library in `stdlib/` (`import std.math`)
 - `extern fn` with C-width integer types, variadic C functions and link names; raw memory inside `unsafe`
 - Files, directories, paths, the environment, processes, time, the terminal, TCP sockets, threads and mutexes
-- Runtime checks: integer overflow, division by zero, list bounds, narrowing casts
+- Runtime checks: integer overflow, division by zero, shift amounts, list bounds, narrowing casts
 - A type checker: mismatched types, undefined names and functions, wrong arguments, changes to what is not `mut`, missing returns, matches that leave a variant out and effects that are not declared are compile errors
 - Tooling: `run`, `check`, `fmt`, `test`, debug info (`-g`), the language server (errors as you type, hover, go to definition, references, outline, completion, signature help, formatting)
 

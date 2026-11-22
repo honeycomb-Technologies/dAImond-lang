@@ -1,0 +1,3 @@
+Error: type mismatch in the assignment: expected int, found string at line 9
+Error: '*' takes a Box, not int at line 11
+Error: cannot assign to this expression: it is not a variable, a field, an element or the value of a box at line 12

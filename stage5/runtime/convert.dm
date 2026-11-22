@@ -68,6 +68,36 @@ fn rt_int_to_string(n: int) -> string {
     }
 }
 
+-- An unsigned 64-bit integer in decimal: what print and int_to_string
+-- make of a u64, whose values above the highest int have no int
+fn rt_uint_to_string(n: u64) -> string {
+    unsafe {
+        -- The longest result, "18446744073709551615", is 20 bytes
+        let size = 21
+        let buf = libc_malloc(size)
+        if buf == 0 {
+            panic("out of memory")
+        }
+        let end = buf + size - 1
+        store_u8(end, 0)
+        let mut at = end
+        let mut v = n
+        while v >= 10 {
+            let rest = v / 10
+            at = at - 1
+            store_u8(at, 48 + ((v - rest * 10) as int))
+            v = rest
+        }
+        at = at - 1
+        store_u8(at, 48 + (v as int))
+        let length = end - at
+        if at != buf {
+            libc_memmove(buf, at, length + 1)
+        }
+        return string_from_raw(buf, length, size)
+    }
+}
+
 -- float_to_string(f): f as C's "%g" prints it, with up to six
 -- significant digits ("3.14159", "1e+20", "inf", "nan")
 fn rt_float_to_string(f: float) -> string {

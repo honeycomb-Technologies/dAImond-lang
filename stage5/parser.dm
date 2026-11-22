@@ -330,7 +330,7 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
                 pp = p_error(pp, "expected a field or method name after '.' but got " + token_kind_name(field_tok.kind))
                 cont = false
             }
-        } else if kind == TK_LBRACKET() {
+        } else if kind == TK_LBRACKET() and p_starts_line(pp) == false {
             -- Index access: obj[idx]
             let line = p_cur(pp).line
             let col = p_cur(pp).col
@@ -362,7 +362,7 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
     while keep_going {
         pp = p_skip_newlines(pp)
         let prec = infix_prec(p_peek(pp))
-        if prec < min_prec {
+        if prec < min_prec or (p_starts_line(pp) and starts_expression(p_peek(pp))) {
             keep_going = false
         } else {
             let op_tok = p_cur(pp)
@@ -405,6 +405,10 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
     return ParseExprResult { p: pp, expr: left }
 }
 
+-- How tightly a binary operator binds; -1 for a token that is none.
+-- The bitwise operators bind tighter than the comparisons, so
+-- `a & mask == 0` compares `a & mask`; among them `|` binds loosest,
+-- then `^`, then `&`, then the shifts.
 fn infix_prec(kind: int) -> int {
     if kind == TK_DOTDOT() or kind == TK_DOTDOTEQ() { return 0 }
     if kind == TK_OR() { return 1 }
@@ -412,9 +416,31 @@ fn infix_prec(kind: int) -> int {
     if kind == TK_EQEQ() or kind == TK_BANGEQ() { return 3 }
     if kind == TK_LT() or kind == TK_GT() or kind == TK_LTEQ() or kind == TK_GTEQ() { return 4 }
     if kind == TK_PIPEGT() { return 5 }
-    if kind == TK_PLUS() or kind == TK_MINUS() { return 6 }
-    if kind == TK_STAR() or kind == TK_SLASH() or kind == TK_PERCENT() { return 7 }
+    if kind == TK_PIPE() { return 6 }
+    if kind == TK_CARET() { return 7 }
+    if kind == TK_AMP() { return 8 }
+    if kind == TK_SHL() or kind == TK_SHR() { return 9 }
+    if kind == TK_PLUS() or kind == TK_MINUS() { return 10 }
+    if kind == TK_STAR() or kind == TK_SLASH() or kind == TK_PERCENT() { return 11 }
     return -1
+}
+
+-- What a unary operator's operand binds with: tighter than any binary
+-- operator
+fn PREFIX_PREC() -> int { return 12 }
+
+-- Whether the token the parser is at is the first of its line
+fn p_starts_line(p: Parser) -> bool {
+    if p.pos < 1 or p.pos >= p.tokens.len() { return false }
+    return p.tokens[p.pos - 1].kind == TK_NEWLINE()
+}
+
+-- Whether the token can begin an expression as well as continue one.
+-- At the start of a line it begins one: `*b = 5`, `-x`, `[1, 2]`, a
+-- lambda and a reference are statements of their own, not the rest of
+-- the line before.
+fn starts_expression(kind: int) -> bool {
+    return kind == TK_MINUS() or kind == TK_STAR() or kind == TK_AMP() or kind == TK_PIPE() or kind == TK_LBRACKET()
 }
 
 fn token_to_binop(kind: int) -> int {
@@ -431,6 +457,11 @@ fn token_to_binop(kind: int) -> int {
     if kind == TK_GTEQ() { return BINOP_GE() }
     if kind == TK_AND() { return BINOP_AND() }
     if kind == TK_OR() { return BINOP_OR() }
+    if kind == TK_AMP() { return BINOP_BIT_AND() }
+    if kind == TK_PIPE() { return BINOP_BIT_OR() }
+    if kind == TK_CARET() { return BINOP_BIT_XOR() }
+    if kind == TK_SHL() { return BINOP_SHL() }
+    if kind == TK_SHR() { return BINOP_SHR() }
     return -1
 }
 
@@ -478,21 +509,28 @@ fn parse_prefix(p: Parser) -> ParseExprResult {
     -- Unary minus
     if tok.kind == TK_MINUS() {
         pp = p_advance(pp)
-        let operand = parse_expr_pratt(pp, 8)
+        let operand = parse_expr_pratt(pp, PREFIX_PREC())
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_NEG(), operand.expr, tok.line, tok.col) }
+    }
+
+    -- Bitwise not
+    if tok.kind == TK_TILDE() {
+        pp = p_advance(pp)
+        let operand = parse_expr_pratt(pp, PREFIX_PREC())
+        return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_BIT_NOT(), operand.expr, tok.line, tok.col) }
     }
 
     -- Unary not
     if tok.kind == TK_NOT() {
         pp = p_advance(pp)
-        let operand = parse_expr_pratt(pp, 8)
+        let operand = parse_expr_pratt(pp, PREFIX_PREC())
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_NOT(), operand.expr, tok.line, tok.col) }
     }
 
     -- Dereference *expr (Box[T] -> T)
     if tok.kind == TK_STAR() {
         pp = p_advance(pp)
-        let operand = parse_expr_pratt(pp, 8)
+        let operand = parse_expr_pratt(pp, PREFIX_PREC())
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_DEREF(), operand.expr, tok.line, tok.col) }
     }
 

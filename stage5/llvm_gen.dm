@@ -1798,6 +1798,48 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             if inst.has_result { g.value_map.insert(id_key, result) }
             return g
         }
+        -- Bitwise operators: & | ^ on integers of one type or on
+        -- bools, << and >> on integers
+        if op == OP_BIT_AND() or op == OP_BIT_OR() or op == OP_BIT_XOR() or op == OP_SHL() or op == OP_SHR() {
+            let lhs = resolve_value(g, inst.lhs)
+            let mut rhs = resolve_value(g, inst.rhs)
+            g = resolve_value_with_counter(g, inst.lhs)
+            g = resolve_value_with_counter(g, inst.rhs)
+            -- A constant, such as the -1 that ~x is x ^ -1 with, takes
+            -- the width of the other operand
+            let lhs_ty = dm_llvm_type_of(lhs)
+            let rhs_ty = dm_llvm_type_of(rhs)
+            if lhs_ty != rhs_ty and dm_llvm_get_type_kind(lhs_ty) == 8 and dm_llvm_get_type_kind(rhs_ty) == 8 {
+                let lw = dm_llvm_get_int_type_width(lhs_ty)
+                let rw = dm_llvm_get_int_type_width(rhs_ty)
+                if rw > lw { rhs = dm_llvm_build_trunc(b, rhs, lhs_ty, "trunc") }
+                if rw < lw { rhs = dm_llvm_build_sext(b, rhs, lhs_ty, "sext") }
+            }
+            let mut result = 0
+            if op == OP_BIT_AND() {
+                result = dm_llvm_build_and(b, lhs, rhs, "bit_and")
+            } else if op == OP_BIT_OR() {
+                result = dm_llvm_build_or(b, lhs, rhs, "bit_or")
+            } else if op == OP_BIT_XOR() {
+                result = dm_llvm_build_xor(b, lhs, rhs, "bit_xor")
+            } else {
+                -- A shift by the type's width or more, or by a negative
+                -- amount, has no value in LLVM: it panics. 35 is LLVM's
+                -- unsigned greater-or-equal, which a negative amount is too.
+                let width = dm_llvm_get_int_type_width(lhs_ty)
+                let failed = dm_llvm_build_icmp(b, 35, rhs, dm_llvm_const_int(lhs_ty, width, 0), "shift_range")
+                g = branch_on_failed_check(g, failed, "shift amount out of range")
+                if op == OP_SHL() {
+                    result = dm_llvm_build_shl(g.builder, lhs, rhs, "shl")
+                } else if lg_is_unsigned_type(inst.operand_type) {
+                    result = dm_llvm_build_lshr(g.builder, lhs, rhs, "lshr")
+                } else {
+                    result = dm_llvm_build_ashr(g.builder, lhs, rhs, "ashr")
+                }
+            }
+            if inst.has_result { g.value_map.insert(id_key, result) }
+            return g
+        }
         if op == OP_LOGICAL_NOT() {
             let operand = resolve_value(g, inst.operand)
             g = resolve_value_with_counter(g, inst.operand)

@@ -1866,14 +1866,19 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 g.builder.next_id = g.builder.next_id + 1
             }
         }
-    } else if target.kind == EXPR_FIELD_ACCESS() {
-        -- Field assignment: store through the field's address, so nested
-        -- fields, boxed structs and mut parameters change in place
+    } else if target.kind != EXPR_INDEX_ACCESS() {
+        -- A field, or the value of a box (`*b = v`): store through its
+        -- address, so nested fields, boxed structs and mut parameters
+        -- change in place
         let fa = generate_addr(g, b, target)
         g = fa.gen
         b = fa.block
         if fa.ok == false {
-            g = ir_type_error(g, "cannot assign to field '." + target.field + "': its struct is not a variable, field or box", stmt.line)
+            if target.kind == EXPR_FIELD_ACCESS() {
+                g = ir_type_error(g, "cannot assign to field '." + target.field + "': its struct is not a variable, field or box", stmt.line)
+            } else {
+                g = ir_type_error(g, "cannot assign to this expression: it is not a variable, a field, an element or the value of a box", stmt.line)
+            }
             return gen_result(g, b)
         }
         let mut store_val_id = val_result.val_id
@@ -1894,7 +1899,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
         store_inst.has_result = false
         b.instructions.push(store_inst)
         g.builder.next_id = g.builder.next_id + 1
-    } else if target.kind == EXPR_INDEX_ACCESS() {
+    } else {
         -- Index assignment: arr[i] = value or map[key] = value
         -- Delegate to list_push or map_insert depending on type
         let obj = *target.object

@@ -880,7 +880,16 @@ fn ck_expr_of_kind(c: Checker, e: Expr) -> Typed {
     if k == EXPR_CAST() { return ck_cast(c, e) }
     if k == EXPR_STRING_INTERP() {
         let parts = ck_exprs(c, e.interp_parts)
-        return ck_typed(parts.c, "string")
+        let mut pc = parts.c
+        let mut pi = 0
+        while pi < parts.types.len() {
+            let pt = parts.types[pi]
+            if pt == "void" or (ty_known(pt) and ty_kind(pt) == "") {
+                pc = ck_error(pc, "a value in an f-string must be a string, a number or a bool, not " + pt, e.interp_parts[pi].line)
+            }
+            pi = pi + 1
+        }
+        return ck_typed(pc, "string")
     }
     if k == EXPR_RANGE() {
         let low = ck_expr(c, *e.left)
@@ -968,6 +977,9 @@ fn ck_identifier(c: Checker, e: Expr) -> Typed {
 fn ck_cast(c0: Checker, e: Expr) -> Typed {
     let operand = ck_expr(c0, *e.operand)
     let c = ck_type_exists(operand.c, e.cast_type, e.line)
+    -- `as &T`: the checker has no reference types. IR generation
+    -- decides whether the cast is one that is allowed.
+    if e.cast_is_ref { return ck_typed(c, "") }
     return ck_typed(c, ck_norm(c, e.cast_type))
 }
 
@@ -1000,8 +1012,25 @@ fn ck_operator(c0: Checker, op: int, left: string, right: string, line: int) -> 
         }
         return ck_typed(c, "bool")
     }
+    let bits = op == BINOP_BIT_AND() or op == BINOP_BIT_OR() or op == BINOP_BIT_XOR()
+    if bits or op == BINOP_SHL() or op == BINOP_SHR() {
+        -- Integers, and for & | ^ two bools
+        if bits and left == "bool" and right == "bool" { return ck_typed(c, "bool") }
+        if bits and ((left == "bool" and ty_is_int(right)) or (ty_is_int(left) and right == "bool")) {
+            c = ck_error(c, "operator '" + text + "' does not take " + left + " and " + right, line)
+            return ck_typed(c, "")
+        }
+        let mut wrong = ""
+        if ty_known(right) and ty_is_int(right) == false { wrong = right }
+        if ty_known(left) and ty_is_int(left) == false { wrong = left }
+        if wrong != "" {
+            let mut takes = "integers"
+            if bits { takes = "integers or bools" }
+            c = ck_error(c, "operator '" + text + "' takes " + takes + ", not " + wrong, line)
+            return ck_typed(c, "")
+        }
+    }
     if lk != "" and rk != "" {
-        let bits = op == BINOP_BIT_AND() or op == BINOP_BIT_OR() or op == BINOP_BIT_XOR()
         if lk == "bool" and rk == "bool" and bits { return ck_typed(c, "bool") }
         if lk != rk or lk == "bool" or (lk == "string" and op != BINOP_ADD()) {
             c = ck_error(c, "operator '" + text + "' does not take " + left + " and " + right, line)
@@ -1075,7 +1104,16 @@ fn ck_unary(c0: Checker, e: Expr) -> Typed {
     }
     if e.op == UNOP_DEREF() {
         if ty_head(operand.t) == "Box" { return ck_typed(operand.c, ty_arg(operand.t, 0)) }
+        if ty_known(operand.t) {
+            return ck_typed(ck_error(operand.c, "'*' takes a Box, not " + operand.t, e.line), "")
+        }
         return ck_typed(operand.c, "")
+    }
+    if e.op == UNOP_BIT_NOT() {
+        if ty_known(operand.t) and ty_is_int(operand.t) == false {
+            return ck_typed(ck_error(operand.c, "'~' takes an integer, not " + operand.t, e.line), "")
+        }
+        return operand
     }
     return operand
 }
@@ -2260,6 +2298,14 @@ fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
     let mut c = c0
     let target = *s.assign_target
     let mut shown = ""
+    let mut place = target
+    while place.kind == EXPR_GROUPED() {
+        place = *place.operand
+    }
+    let is_box_value = place.kind == EXPR_UNARY() and place.op == UNOP_DEREF()
+    if place.kind != EXPR_IDENTIFIER() and place.kind != EXPR_FIELD_ACCESS() and place.kind != EXPR_INDEX_ACCESS() and is_box_value == false {
+        c = ck_error(c, "cannot assign to this expression: it is not a variable, a field, an element or the value of a box", s.line)
+    }
     if target.kind == EXPR_FIELD_ACCESS() or target.kind == EXPR_INDEX_ACCESS() {
         let root = ck_fixed_root(c, *target.object)
         if root != "" {

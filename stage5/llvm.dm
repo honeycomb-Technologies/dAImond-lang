@@ -129,6 +129,10 @@ extern fn dm_llvm_sizeof_type(ty: int) -> int
 -- Logical
 extern fn dm_llvm_build_and(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_or(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_xor(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_shl(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_ashr(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn dm_llvm_build_lshr(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn dm_llvm_build_not(b: int, val: int, name: string) -> int
 
 -- SIMD / Vector

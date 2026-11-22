@@ -263,6 +263,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- Conversion
     g = declare_extern(g, "dm_int_to_string", "i64", "string")
+    g = declare_extern(g, "dm_uint_to_string", "u64", "string")
     g = declare_extern(g, "dm_float_to_string", "f64", "string")
     g = declare_extern(g, "dm_bool_to_string", "bool", "string")
     g = declare_extern(g, "dm_parse_int", "string", "i64")
@@ -925,29 +926,23 @@ fn generate_constant(gen: IRGenerator, cd: ConstDecl) -> IRGenerator {
     -- Comptime recursion copies the generator by value, sharing the list buffer.
     -- A realloc in a callee would free the buffer the caller is still using.
     -- By pre-growing, we ensure enough capacity for comptime variable pushes.
-    if cd.is_comptime {
-        let mut prealloc_i = 0
-        while prealloc_i < 1024 {
-            let mut dummy = ir_global_new("__comptime_prealloc__", "i64")
-            dummy.has_init = false
-            dummy.is_const = false
-            g.ir_mod.globals.push(dummy)
-            prealloc_i = prealloc_i + 1
-        }
-        let mut pop_i = 0
-        while pop_i < 1024 {
-            g.ir_mod.globals.pop()
-            pop_i = pop_i + 1
-        }
+    let mut prealloc_i = 0
+    while prealloc_i < 1024 {
+        let mut dummy = ir_global_new("__comptime_prealloc__", "i64")
+        dummy.has_init = false
+        dummy.is_const = false
+        g.ir_mod.globals.push(dummy)
+        prealloc_i = prealloc_i + 1
+    }
+    let mut pop_i = 0
+    while pop_i < 1024 {
+        g.ir_mod.globals.pop()
+        pop_i = pop_i + 1
     }
 
-    -- Try to evaluate the value at compile time
-    -- Use the full comptime evaluator for comptime expressions (blocks, fn calls, etc.)
-    let val = if cd.is_comptime {
-        eval_comptime_expr(g, *cd.value)
-    } else {
-        eval_const_value(g, cd.value)
-    }
+    -- A constant's value is found at compile time, with `comptime` or
+    -- without it: every operator, and calls of functions
+    let val = eval_comptime_expr(g, *cd.value)
 
     let ty = if len(cd.type_name) > 0 {
         map_type_name(cd.type_name)
@@ -970,78 +965,6 @@ fn generate_constant(gen: IRGenerator, cd: ConstDecl) -> IRGenerator {
     g.ir_mod.globals.push(global)
 
     return g
-}
-
--- Simple constant value evaluation
-fn eval_const_value(gen: IRGenerator, expr_box: Box[Expr]) -> IRValue {
-    let e = *expr_box
-    if e.kind == EXPR_LITERAL_INT() {
-        return ir_val_int(e.int_val)
-    }
-    if e.kind == EXPR_LITERAL_FLOAT() {
-        return ir_val_float(e.float_val)
-    }
-    if e.kind == EXPR_LITERAL_BOOL() {
-        return ir_val_bool(e.bool_val)
-    }
-    if e.kind == EXPR_LITERAL_STRING() {
-        return ir_val_string(e.str_val)
-    }
-    if e.kind == EXPR_BINARY() {
-        let lhs = eval_const_value(gen, e.left)
-        let rhs = eval_const_value(gen, e.right)
-        -- Integer arithmetic
-        if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
-            if e.op == BINOP_ADD() { return ir_val_int(lhs.int_val + rhs.int_val) }
-            if e.op == BINOP_SUB() { return ir_val_int(lhs.int_val - rhs.int_val) }
-            if e.op == BINOP_MUL() { return ir_val_int(lhs.int_val * rhs.int_val) }
-            if e.op == BINOP_DIV() and rhs.int_val != 0 { return ir_val_int(lhs.int_val / rhs.int_val) }
-        }
-        -- Float arithmetic
-        if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_FLOAT() {
-            if e.op == BINOP_ADD() { return ir_val_float(lhs.float_val + rhs.float_val) }
-            if e.op == BINOP_SUB() { return ir_val_float(lhs.float_val - rhs.float_val) }
-            if e.op == BINOP_MUL() { return ir_val_float(lhs.float_val * rhs.float_val) }
-        }
-        -- String concatenation
-        if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
-            if e.op == BINOP_ADD() { return ir_val_string(lhs.str_val + rhs.str_val) }
-        }
-        -- Boolean AND/OR
-        if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
-            if e.op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
-            if e.op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
-        }
-    }
-    if e.kind == EXPR_UNARY() {
-        if e.op == UNOP_NOT() {
-            let operand_val = eval_const_value(gen, e.operand)
-            if operand_val.kind == VAL_CONST_BOOL() {
-                return ir_val_bool(operand_val.bool_val == false)
-            }
-        }
-        if e.op == UNOP_NEG() {
-            let operand_val = eval_const_value(gen, e.operand)
-            if operand_val.kind == VAL_CONST_INT() {
-                return ir_val_int(0 - operand_val.int_val)
-            }
-            if operand_val.kind == VAL_CONST_FLOAT() {
-                return ir_val_float(0.0 - operand_val.float_val)
-            }
-        }
-    }
-    if e.kind == EXPR_IDENTIFIER() {
-        -- Look up globals
-        let mut i = 0
-        while i < gen.ir_mod.globals.len() {
-            let gl = gen.ir_mod.globals[i]
-            if gl.name == e.name {
-                return gl.init_value
-            }
-            i = i + 1
-        }
-    }
-    return ir_val_int(0)
 }
 
 -- ============================================================

@@ -1,0 +1,8 @@
+Error: operator '&' takes integers or bools, not float at line 4
+Error: operator '<<' takes integers, not string at line 5
+Error: operator '>>' takes integers, not float at line 6
+Error: operator '|' does not take bool and int at line 7
+Error: '~' takes an integer, not float at line 8
+Error: '~' takes an integer, not bool at line 9
+Error: operator '<<' takes integers, not bool at line 10
+Error: 7 type errors

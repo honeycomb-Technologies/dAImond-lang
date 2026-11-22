@@ -2798,6 +2798,8 @@ fn emit_binary_op(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_val_id:
         inst.lhs = ir_val_inst(lhs_id)
         inst.rhs = ir_val_inst(rhs_id)
         inst.result_type = arith_type
+        -- An unsigned integer shifts in zeros, a signed one its sign
+        inst.operand_type = int_operand_t
         inst.has_result = true
         b.instructions.push(inst)
         g.builder.next_id = id + 1
@@ -8261,20 +8263,12 @@ fn generate_string_interp(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
             if part_type == "string" {
                 -- Already a string, use directly
                 str_val_id = part_val_id
-            } else if part_type == "i64" or part_type == "int" {
-                -- Convert int to string via int_to_string
-                let conv_id = g.builder.next_id
-                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
-                conv_inst.callee = "dm_int_to_string"
-                let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(part_val_id))
-                conv_inst.call_args = conv_args
-                conv_inst.result_type = "string"
-                conv_inst.has_result = true
-                b.instructions.push(conv_inst)
-                g.builder.next_id = g.builder.next_id + 1
-                str_val_id = conv_id
-            } else if part_type == "f64" or part_type == "float" {
+            } else if is_integer_type(part_type) or part_type == "int" {
+                let conv = emit_int_to_string(g, b, part_val_id, part_type)
+                g = conv.gen
+                b = conv.block
+                str_val_id = conv.val_id
+            } else if part_type == "f64" or part_type == "f32" or part_type == "float" {
                 -- Convert float to string via float_to_string
                 let conv_id = g.builder.next_id
                 let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
@@ -8336,34 +8330,7 @@ fn generate_string_interp(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 -- Infer the type of a string interpolation part expression.
 -- Checks identifiers against variable_types, and literals by kind.
 fn infer_part_type(gen: IRGenerator, part: Expr) -> string {
-    if part.kind == EXPR_LITERAL_STRING() {
-        return "string"
-    }
-    if part.kind == EXPR_LITERAL_INT() {
-        return "i64"
-    }
-    if part.kind == EXPR_LITERAL_FLOAT() {
-        return "f64"
-    }
-    if part.kind == EXPR_LITERAL_BOOL() {
-        return "bool"
-    }
-    if part.kind == EXPR_IDENTIFIER() {
-        if gen.variable_types.contains(part.name) {
-            return gen.variable_types.get(part.name)
-        }
-    }
-    if part.kind == EXPR_FUNCTION_CALL() {
-        let callee = *part.callee
-        if callee.kind == EXPR_IDENTIFIER() {
-            let fn_name = callee.name
-            if is_builtin_fn(fn_name) {
-                return builtin_return_type(fn_name)
-            }
-        }
-    }
-    -- Default: assume int (most common)
-    return "i64"
+    return infer_expr_type(gen, part)
 }
 
 -- ============================================================

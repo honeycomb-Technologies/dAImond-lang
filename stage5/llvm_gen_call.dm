@@ -618,6 +618,7 @@ fn is_runtime_string_fn(fn_name: string) -> bool {
     if fn_name == "dm_read_line" { return true }
     if starts_with(fn_name, "dm_file_") { return true }
     if fn_name == "dm_int_to_string" { return true }
+    if fn_name == "dm_uint_to_string" { return true }
     if fn_name == "dm_float_to_string" { return true }
     if fn_name == "dm_bool_to_string" { return true }
     if fn_name == "dm_parse_int" { return true }

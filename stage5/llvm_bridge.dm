@@ -150,6 +150,10 @@ extern fn LLVMBuildFDiv(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn LLVMBuildFRem(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn LLVMBuildAnd(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn LLVMBuildOr(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn LLVMBuildXor(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn LLVMBuildShl(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn LLVMBuildAShr(b: int, lhs: int, rhs: int, name: string) -> int
+extern fn LLVMBuildLShr(b: int, lhs: int, rhs: int, name: string) -> int
 extern fn LLVMBuildNeg(b: int, value: int, name: string) -> int
 extern fn LLVMBuildFNeg(b: int, value: int, name: string) -> int
 extern fn LLVMBuildNot(b: int, value: int, name: string) -> int
@@ -629,6 +633,30 @@ fn dm_llvm_build_and(b: int, lhs: int, rhs: int, name: string) -> int {
 fn dm_llvm_build_or(b: int, lhs: int, rhs: int, name: string) -> int {
     unsafe {
         return LLVMBuildOr(b, lhs, rhs, name)
+    }
+}
+
+fn dm_llvm_build_xor(b: int, lhs: int, rhs: int, name: string) -> int {
+    unsafe {
+        return LLVMBuildXor(b, lhs, rhs, name)
+    }
+}
+
+fn dm_llvm_build_shl(b: int, lhs: int, rhs: int, name: string) -> int {
+    unsafe {
+        return LLVMBuildShl(b, lhs, rhs, name)
+    }
+}
+
+fn dm_llvm_build_ashr(b: int, lhs: int, rhs: int, name: string) -> int {
+    unsafe {
+        return LLVMBuildAShr(b, lhs, rhs, name)
+    }
+}
+
+fn dm_llvm_build_lshr(b: int, lhs: int, rhs: int, name: string) -> int {
+    unsafe {
+        return LLVMBuildLShr(b, lhs, rhs, name)
     }
 }
 

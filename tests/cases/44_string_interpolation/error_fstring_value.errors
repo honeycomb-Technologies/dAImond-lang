@@ -1,0 +1,3 @@
+Error: a value in an f-string must be a string, a number or a bool, not P at line 12
+Error: a value in an f-string must be a string, a number or a bool, not void at line 13
+Error: a value in an f-string must be a string, a number or a bool, not List[int] at line 14

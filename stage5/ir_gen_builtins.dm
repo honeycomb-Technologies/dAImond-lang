@@ -342,6 +342,35 @@ fn is_thread_function(gen: IRGenerator, arg: Expr) -> bool {
 }
 
 -- Generate a simple builtin function call (non-SIMD).
+-- An integer as text. The value widens to 64 bits by the sign of its
+-- own type, so a u8 of 200 is "200"; a u64 goes to uint_to_string,
+-- which prints the values above the highest int.
+fn emit_int_to_string(gen: IRGenerator, block: IRBasicBlock, val_id: int, int_type: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let mut wide_id = val_id
+    let mut callee = "dm_int_to_string"
+    if int_type == "u64" {
+        callee = "dm_uint_to_string"
+    } else if is_integer_type(int_type) and type_bit_width(int_type) < 64 {
+        let wide = emit_ir_cast(g, b, ir_val_inst(val_id), int_type, "i64")
+        g = wide.gen
+        b = wide.block
+        wide_id = wide.val_id
+    }
+    let conv_id = g.builder.next_id
+    let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
+    conv_inst.callee = callee
+    let mut conv_args: List[IRValue] = []
+    conv_args.push(ir_val_inst(wide_id))
+    conv_inst.call_args = conv_args
+    conv_inst.result_type = "string"
+    conv_inst.has_result = true
+    b.instructions.push(conv_inst)
+    g.builder.next_id = conv_id + 1
+    return expr_result(g, b, conv_id)
+}
+
 -- Maps the dAImond builtin name to the C runtime name and emits
 -- an OP_CALL instruction with generated argument values.
 fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, args: List[Expr]) -> ExprResult {
@@ -350,8 +379,16 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
     let c_name = map_builtin_name(fn_name)
     let ret_type = builtin_return_type(fn_name)
 
+    -- int_to_string takes an integer of any type
+    if fn_name == "int_to_string" and args.len() == 1 {
+        let n = generate_expr(g, b, args[0])
+        return emit_int_to_string(n.gen, n.block, n.val_id, infer_expr_type(n.gen, args[0]))
+    }
+
     -- Auto-convert print/println/eprint/eprintln args to string
     let is_print_fn = fn_name == "println" or fn_name == "print" or fn_name == "eprintln" or fn_name == "eprint"
+    -- What the builtin's parameters take (see ck_builtin_params)
+    let param_kinds = string_split(ck_builtin_params(fn_name), "|")
 
     -- Generate all argument expressions
     let mut call_args: List[IRValue] = []
@@ -363,19 +400,11 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
 
         if is_print_fn {
             let arg_type = infer_expr_type(g, args[i])
-            if arg_type == "i64" or arg_type == "i32" or arg_type == "i16" or arg_type == "i8" or arg_type == "u64" or arg_type == "u32" or arg_type == "u16" or arg_type == "u8" or arg_type == "int" {
-                -- Wrap with int_to_string
-                let conv_id = g.builder.next_id
-                let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
-                conv_inst.callee = "dm_int_to_string"
-                let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(arg_result.val_id))
-                conv_inst.call_args = conv_args
-                conv_inst.result_type = "string"
-                conv_inst.has_result = true
-                b.instructions.push(conv_inst)
-                g.builder.next_id = g.builder.next_id + 1
-                call_args.push(ir_val_inst(conv_id))
+            if is_integer_type(arg_type) or arg_type == "int" {
+                let conv = emit_int_to_string(g, b, arg_result.val_id, arg_type)
+                g = conv.gen
+                b = conv.block
+                call_args.push(ir_val_inst(conv.val_id))
             } else if arg_type == "f64" or arg_type == "f32" or arg_type == "float" {
                 -- Wrap with float_to_string
                 let conv_id = g.builder.next_id
@@ -402,6 +431,18 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
                 b.instructions.push(conv_inst)
                 g.builder.next_id = g.builder.next_id + 1
                 call_args.push(ir_val_inst(conv_id))
+            } else {
+                call_args.push(ir_val_inst(arg_result.val_id))
+            }
+        } else if i < param_kinds.len() and param_kinds[i] == "int" {
+            -- An integer narrower than the int the builtin takes
+            -- widens by the sign of its own type
+            let arg_type = infer_expr_type(g, args[i])
+            if is_integer_type(arg_type) and type_bit_width(arg_type) < 64 {
+                let wide = emit_ir_cast(g, b, ir_val_inst(arg_result.val_id), arg_type, "i64")
+                g = wide.gen
+                b = wide.block
+                call_args.push(ir_val_inst(wide.val_id))
             } else {
                 call_args.push(ir_val_inst(arg_result.val_id))
             }

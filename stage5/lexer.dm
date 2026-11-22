@@ -312,6 +312,10 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                     tokens.push(token_new(TK_LTEQ(), "<=", sl, sc))
                     lex.pos = lex.pos + 2
                     lex.col = lex.col + 2
+                } else if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "<" {
+                    tokens.push(token_new(TK_SHL(), "<<", sl, sc))
+                    lex.pos = lex.pos + 2
+                    lex.col = lex.col + 2
                 } else {
                     tokens.push(token_new(TK_LT(), "<", sl, sc))
                     lex.pos = lex.pos + 1
@@ -320,6 +324,10 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
             } else if ch == ">" {
                 if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
                     tokens.push(token_new(TK_GTEQ(), ">=", sl, sc))
+                    lex.pos = lex.pos + 2
+                    lex.col = lex.col + 2
+                } else if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == ">" {
+                    tokens.push(token_new(TK_SHR(), ">>", sl, sc))
                     lex.pos = lex.pos + 2
                     lex.col = lex.col + 2
                 } else {
@@ -339,6 +347,14 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                 }
             } else if ch == "&" {
                 tokens.push(token_new(TK_AMP(), "&", sl, sc))
+                lex.pos = lex.pos + 1
+                lex.col = lex.col + 1
+            } else if ch == "^" {
+                tokens.push(token_new(TK_CARET(), "^", sl, sc))
+                lex.pos = lex.pos + 1
+                lex.col = lex.col + 1
+            } else if ch == "~" {
+                tokens.push(token_new(TK_TILDE(), "~", sl, sc))
                 lex.pos = lex.pos + 1
                 lex.col = lex.col + 1
             } else if ch == "?" {

@@ -40,104 +40,84 @@ fn eval_identifier_comptime(gen: IRGenerator, name: string) -> IRValue {
 -- BINARY EXPRESSION EVALUATION
 -- ============================================================
 
--- Evaluate a binary expression at compile time.
--- Supports integer arithmetic, float arithmetic, boolean logic,
--- comparison operators, string concatenation, and string comparison.
-fn eval_binary_comptime(gen: IRGenerator, e: Expr) -> IRValue {
-    let lhs = eval_comptime_expr(gen, *e.left)
-    let rhs = eval_comptime_expr(gen, *e.right)
-    let op = e.op
+fn is_bit_binop(op: int) -> bool {
+    return op == BINOP_BIT_AND() or op == BINOP_BIT_OR() or op == BINOP_BIT_XOR() or op == BINOP_SHL() or op == BINOP_SHR()
+}
 
-    -- Integer arithmetic
-    if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
-        let a = lhs.int_val
-        let b = rhs.int_val
+-- The 64 bits of an integer, the lowest first, each 0 or 1. The
+-- compiler's own source is compiled by the seed's compiler, which may
+-- have no bitwise operators, so the bits are found by arithmetic.
+fn comptime_bits(v: int) -> List[int] {
+    let mut bits: List[int] = []
+    let mut x = v
+    let mut i = 0
+    while i < 64 {
+        -- x halved and rounded down, also where x is negative
+        let mut half = x / 2
+        if x < 0 and x % 2 != 0 { half = (x - 1) / 2 }
+        bits.push(x - half - half)
+        x = half
+        i = i + 1
+    }
+    return bits
+}
 
-        if op == BINOP_ADD() { return ir_val_int(a + b) }
-        if op == BINOP_SUB() { return ir_val_int(a - b) }
-        if op == BINOP_MUL() { return ir_val_int(a * b) }
-        if op == BINOP_DIV() {
-            if b != 0 {
-                return ir_val_int(a / b)
+-- The integer with the 64 bits, the lowest first
+fn comptime_from_bits(bits: List[int]) -> int {
+    let mut v = 0
+    let mut weight = 1
+    let mut i = 0
+    while i < 63 {
+        if bits[i] == 1 { v = v + weight }
+        if i < 62 { weight = weight * 2 }
+        i = i + 1
+    }
+    -- The highest bit is the sign: it weighs -2^63
+    if bits[63] == 1 { v = v + (0 - 9223372036854775807 - 1) }
+    return v
+}
+
+-- a & b, a | b, a ^ b, a << b or a >> b of two 64-bit integers, as the
+-- program computes them. A shift by 64 or more, or by a negative
+-- amount, is an error here as it is a panic there.
+fn comptime_bit_op(gen: IRGenerator, op: int, a: int, b: int, line: int) -> int {
+    let x = comptime_bits(a)
+    let mut out: List[int] = []
+    let mut i = 0
+    if op == BINOP_SHL() or op == BINOP_SHR() {
+        if b < 0 or b > 63 {
+            eprintln(error_at(gen.ir_mod.files, "shift amount " + int_to_string(b) + " is out of range in a compile-time expression", line))
+            exit(1)
+        }
+        while i < 64 {
+            let mut bit = 0
+            if op == BINOP_SHL() {
+                if i >= b { bit = x[i - b] }
+            } else if i + b < 64 {
+                bit = x[i + b]
+            } else {
+                -- The sign fills the top
+                bit = x[63]
             }
-            return ir_val_int(0)
+            out.push(bit)
+            i = i + 1
         }
-        if op == BINOP_MOD() {
-            if b != 0 {
-                return ir_val_int(a % b)
-            }
-            return ir_val_int(0)
+        return comptime_from_bits(out)
+    }
+    let y = comptime_bits(b)
+    while i < 64 {
+        let mut bit = 0
+        if op == BINOP_BIT_AND() {
+            if x[i] == 1 and y[i] == 1 { bit = 1 }
+        } else if op == BINOP_BIT_OR() {
+            if x[i] == 1 or y[i] == 1 { bit = 1 }
+        } else if x[i] != y[i] {
+            bit = 1
         }
-
-        -- Integer comparisons
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-        if op == BINOP_LT() { return ir_val_bool(a < b) }
-        if op == BINOP_LE() { return ir_val_bool(a <= b) }
-        if op == BINOP_GT() { return ir_val_bool(a > b) }
-        if op == BINOP_GE() { return ir_val_bool(a >= b) }
+        out.push(bit)
+        i = i + 1
     }
-
-    -- Float arithmetic
-    if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_FLOAT() {
-        let a = lhs.float_val
-        let b = rhs.float_val
-
-        if op == BINOP_ADD() { return ir_val_float(a + b) }
-        if op == BINOP_SUB() { return ir_val_float(a - b) }
-        if op == BINOP_MUL() { return ir_val_float(a * b) }
-        if op == BINOP_DIV() {
-            return ir_val_float(a / b)
-        }
-
-        -- Float comparisons
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-        if op == BINOP_LT() { return ir_val_bool(a < b) }
-        if op == BINOP_LE() { return ir_val_bool(a <= b) }
-        if op == BINOP_GT() { return ir_val_bool(a > b) }
-        if op == BINOP_GE() { return ir_val_bool(a >= b) }
-    }
-
-    -- Mixed int/float: promote int to float
-    if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_FLOAT() {
-        let a = lhs.int_val as float
-        let b = rhs.float_val
-        if op == BINOP_ADD() { return ir_val_float(a + b) }
-        if op == BINOP_SUB() { return ir_val_float(a - b) }
-        if op == BINOP_MUL() { return ir_val_float(a * b) }
-    }
-
-    if lhs.kind == VAL_CONST_FLOAT() and rhs.kind == VAL_CONST_INT() {
-        let a = lhs.float_val
-        let b = rhs.int_val as float
-        if op == BINOP_ADD() { return ir_val_float(a + b) }
-        if op == BINOP_SUB() { return ir_val_float(a - b) }
-        if op == BINOP_MUL() { return ir_val_float(a * b) }
-    }
-
-    -- Boolean logic
-    if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
-        let a = lhs.bool_val
-        let b = rhs.bool_val
-
-        if op == BINOP_AND() { return ir_val_bool(a and b) }
-        if op == BINOP_OR() { return ir_val_bool(a or b) }
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-    }
-
-    -- String concatenation
-    if lhs.kind == VAL_CONST_STRING() and rhs.kind == VAL_CONST_STRING() {
-        let a = lhs.str_val
-        let b = rhs.str_val
-
-        if op == BINOP_ADD() { return ir_val_string(a + b) }
-        if op == BINOP_EQ() { return ir_val_bool(a == b) }
-        if op == BINOP_NE() { return ir_val_bool(a != b) }
-    }
-
-    return ir_val_int(0)
+    return comptime_from_bits(out)
 }
 
 -- Binary comptime with pre-evaluated values
@@ -150,6 +130,13 @@ fn eval_unary_comptime(gen: IRGenerator, e: Expr) -> IRValue {
         }
         if operand_val.kind == VAL_CONST_FLOAT() {
             return ir_val_float(0.0 - operand_val.float_val)
+        }
+    }
+
+    if e.op == UNOP_BIT_NOT() {
+        if operand_val.kind == VAL_CONST_INT() {
+            -- ~x is -x - 1
+            return ir_val_int(0 - 1 - operand_val.int_val)
         }
     }
 
@@ -781,15 +768,23 @@ fn comptime_value_type(val: IRValue) -> string {
 -- String values in LLVM IR are pointers to stack-allocated dm_string structs.
 -- ============================================================
 
-fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue) -> IRValue {
+fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRValue, line: int) -> IRValue {
     if lhs.kind == VAL_CONST_INT() and rhs.kind == VAL_CONST_INT() {
         let a = lhs.int_val
         let b = rhs.int_val
         if op == BINOP_ADD() { return ir_val_int(a + b) }
         if op == BINOP_SUB() { return ir_val_int(a - b) }
         if op == BINOP_MUL() { return ir_val_int(a * b) }
-        if op == BINOP_DIV() { if b != 0 { return ir_val_int(a / b) } return ir_val_int(0) }
-        if op == BINOP_MOD() { if b != 0 { return ir_val_int(a % b) } return ir_val_int(0) }
+        if op == BINOP_DIV() or op == BINOP_MOD() {
+            -- An error here as it is a panic in the program
+            if b == 0 {
+                eprintln(error_at(gen.ir_mod.files, "division by zero in a compile-time expression", line))
+                exit(1)
+            }
+            if op == BINOP_DIV() { return ir_val_int(a / b) }
+            return ir_val_int(a % b)
+        }
+        if is_bit_binop(op) { return ir_val_int(comptime_bit_op(gen, op, a, b, line)) }
         if op == BINOP_EQ() { return ir_val_bool(a == b) }
         if op == BINOP_NE() { return ir_val_bool(a != b) }
         if op == BINOP_LT() { return ir_val_bool(a < b) }
@@ -812,8 +807,9 @@ fn eval_binary_comptime_vals(gen: IRGenerator, op: int, lhs: IRValue, rhs: IRVal
         if op == BINOP_GE() { return ir_val_bool(a >= b) }
     }
     if lhs.kind == VAL_CONST_BOOL() and rhs.kind == VAL_CONST_BOOL() {
-        if op == BINOP_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
-        if op == BINOP_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
+        if op == BINOP_AND() or op == BINOP_BIT_AND() { return ir_val_bool(lhs.bool_val and rhs.bool_val) }
+        if op == BINOP_OR() or op == BINOP_BIT_OR() { return ir_val_bool(lhs.bool_val or rhs.bool_val) }
+        if op == BINOP_BIT_XOR() { return ir_val_bool(lhs.bool_val != rhs.bool_val) }
         if op == BINOP_EQ() { return ir_val_bool(lhs.bool_val == rhs.bool_val) }
         if op == BINOP_NE() { return ir_val_bool(lhs.bool_val != rhs.bool_val) }
     }
@@ -1093,7 +1089,7 @@ fn eval_comptime_expr_d(gen: IRGenerator, e: Expr, depth: int) -> IRValue {
     if e.kind == EXPR_BINARY() {
         let lv = eval_comptime_expr_d(gen, *e.left, depth)
         let rv = eval_comptime_expr_d(gen, *e.right, depth)
-        return eval_binary_comptime_vals(gen, e.op, lv, rv)
+        return eval_binary_comptime_vals(gen, e.op, lv, rv, e.line)
     }
 
     -- Unary expression
