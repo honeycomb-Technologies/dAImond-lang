@@ -1,6 +1,6 @@
 # The seed
 
-`daimond.bc` is the dAImond compiler (Stage 5) as LLVM bitcode for x86-64 Linux. It is what the compiler is built from when no dAImond compiler exists yet: `bash bootstrap.sh`, in the repository's root, turns it into a compiler with LLVM's `llc` and `ld.lld`, and that compiler then compiles the source in `stage5/`.
+`daimond.bc` is the dAImond compiler (Stage 5) as LLVM bitcode for x86-64 Linux. It is what the compiler is built from when no dAImond compiler exists yet: `sh bootstrap.sh`, in the repository's root, turns it into a compiler with LLVM's `llc` and `ld.lld`, and that compiler then compiles the source in `stage5/`.
 
 - The seed is a build product, not source. Do not edit it.
 - It was written by LLVM 19. A newer LLVM reads it; an older one does not.
@@ -11,7 +11,7 @@ To write the seed again after changing the compiler:
 
 ```bash
 build/daimond run stage5/gen_bootstrap.dm
-LLVM_BIN=/usr/lib/llvm-19/bin bash bootstrap.sh --update-seed
+LLVM_BIN=/usr/lib/llvm-19/bin sh bootstrap.sh --update-seed
 ```
 
 Write it with LLVM 19, the oldest LLVM the compiler is built with: a seed is readable by the LLVM that wrote it and by newer ones, so a seed written by LLVM 23 could not be read where only LLVM 19 is installed. `bootstrap.sh` takes the newest LLVM it finds unless `LLVM_BIN` names another.

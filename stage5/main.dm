@@ -25835,7 +25835,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "7bb16b69127088a2"
+    return "53dce90e4231e097"
 }
 
 
@@ -25905,8 +25905,8 @@ struct CLIArgs {
     output_file: string,
     -- Whether -o named the output file
     has_output: bool,
-    -- run: the program's arguments, as one piece of a shell command
-    program_args: string,
+    -- run: the program's arguments
+    program_args: List[string],
     opt_level: int,
     emit_ir: bool,
     emit_llvm: bool,
@@ -25928,7 +25928,7 @@ fn parse_cli_args() -> CLIArgs {
         input_file: "",
         output_file: "",
         has_output: false,
-        program_args: "",
+        program_args: [],
         opt_level: 0,
         emit_ir: false,
         emit_llvm: false,
@@ -25959,7 +25959,7 @@ fn parse_cli_args() -> CLIArgs {
             -- The rest goes to the program
             i = i + 1
             while i < argc {
-                args.program_args = args.program_args + " " + shell_quote(args_get(i))
+                args.program_args.push(args_get(i))
                 i = i + 1
             }
         } else if arg == "-h" or arg == "--help" {
@@ -26120,6 +26120,49 @@ fn find_libc_dir() -> string {
     if file_exists("/usr/lib/x86_64-linux-gnu/Scrt1.o") { return "/usr/lib/x86_64-linux-gnu" }
     if file_exists("/usr/lib64/Scrt1.o") { return "/usr/lib64" }
     if file_exists("/usr/lib/Scrt1.o") { return "/usr/lib" }
+    return ""
+}
+
+-- The path with every symbolic link in it followed, or "" when there is
+-- no such file
+fn real_path(path: string) -> string {
+    unsafe {
+        -- Given no buffer, realpath allocates one of the size it needs
+        let real = compiler_realpath(path, 0)
+        if real == 0 {
+            return ""
+        }
+        let n = compiler_strlen(real)
+        return string_from_raw(real, n, n + 1)
+    }
+}
+
+-- The LLVM library that --link-llvm links, or "" when none is found:
+-- $DAIMOND_LLVM_LIB when set, else libLLVM.so of the LLVM that the
+-- linker belongs to, which is in lib/ (or lib64/) next to the bin/
+-- that holds the linker once its symbolic links are followed
+-- (/usr/lib/llvm-19/lib on Debian and Ubuntu, /usr/lib on Arch,
+-- /usr/lib64 on Fedora)
+fn find_llvm_library(linker: string) -> string {
+    let chosen = env_get("DAIMOND_LLVM_LIB")
+    if chosen != "" { return chosen }
+    let mut found = linker
+    if string_contains(linker, "/") == false {
+        -- $DAIMOND_LD as a name: the program is looked for on PATH
+        let dirs = string_split(env_get("PATH"), ":")
+        let mut i = 0
+        while i < dirs.len() and found == linker {
+            if dirs[i] != "" and file_exists(dirs[i] + "/" + linker) {
+                found = dirs[i] + "/" + linker
+            }
+            i = i + 1
+        }
+    }
+    let real = real_path(found)
+    if real == "" { return "" }
+    let root = dirname(dirname(real))
+    if file_exists(root + "/lib/libLLVM.so") { return root + "/lib/libLLVM.so" }
+    if file_exists(root + "/lib64/libLLVM.so") { return root + "/lib64/libLLVM.so" }
     return ""
 }
 
@@ -26369,15 +26412,11 @@ extern fn compiler_strlen(s: int) -> int = "strlen"
 
 -- The directory the running compiler is in, or "" when it can't be found
 fn compiler_dir() -> string {
-    unsafe {
-        -- Given no buffer, realpath allocates one of the size it needs
-        let exe = compiler_realpath("/proc/self/exe", 0)
-        if exe == 0 {
-            return ""
-        }
-        let n = compiler_strlen(exe)
-        return dirname(string_from_raw(exe, n, n + 1))
+    let exe = real_path("/proc/self/exe")
+    if exe == "" {
+        return ""
     }
+    return dirname(exe)
 }
 
 -- The file of the standard library module `import std.<module>` names,
@@ -26489,26 +26528,7 @@ fn process_import(imp: ImportDecl, base_dir: string, imports: Imports, verbose: 
 -- (check is the compilation pipeline, stopped before it builds)
 -- ============================================================
 
--- A word of a shell command that stands for exactly this text
-fn shell_quote(text: string) -> string {
-    return "'" + string_replace(text, "'", "'\\''") + "'"
-}
-
--- The exit code that a result of system() stands for: the command's
--- own, 128 plus the signal's number when a signal ended it, or 127
--- when the shell could not be started
-fn exit_code_of(status: int) -> int {
-    if status < 0 {
-        return 127
-    }
-    if status % 128 != 0 {
-        return 128 + status % 128
-    }
-    return (status / 256) % 256
-}
-
--- A path in /tmp for a file of this process's own. It needs no quoting
--- in a shell command.
+-- A path in /tmp for a file of this process's own
 fn temp_path(kind: string) -> string {
     let mut pid = 0
     unsafe { pid = getpid() as int }
@@ -26532,7 +26552,13 @@ fn run_file(cli: CLIArgs) -> int {
     if string_contains(program, "/") == false {
         program = "./" + program
     }
-    let code = exit_code_of(system(shell_quote(program) + cli.program_args))
+    let mut command: List[string] = [program]
+    let mut ai = 0
+    while ai < cli.program_args.len() {
+        command.push(cli.program_args[ai])
+        ai = ai + 1
+    }
+    let code = run_command(command)
     if cli.has_output == false {
         fs_remove(build.output_file)
     }
@@ -26726,7 +26752,7 @@ fn test_file(cli: CLIArgs) -> int {
     if built != 0 {
         return built
     }
-    let code = exit_code_of(system(build.output_file))
+    let code = run_command([build.output_file])
     fs_remove(build.output_file)
     return code
 }
@@ -27292,28 +27318,44 @@ fn compile(cli: CLIArgs) -> int {
         fs_remove(obj_file)
         return 1
     }
-    let mut link_cmd = linker + " -pie --eh-frame-hdr -dynamic-linker " + dynamic_loader()
-    link_cmd = link_cmd + " -o " + output_file
-    link_cmd = link_cmd + " " + libc_dir + "/Scrt1.o " + libc_dir + "/crti.o"
-    link_cmd = link_cmd + " " + obj_file
+    let mut link: List[string] = [linker, "-pie", "--eh-frame-hdr", "-dynamic-linker", dynamic_loader(), "-o", output_file]
+    link.push(libc_dir + "/Scrt1.o")
+    link.push(libc_dir + "/crti.o")
+    link.push(obj_file)
     if runtime_obj != "" {
-        link_cmd = link_cmd + " " + runtime_obj
+        link.push(runtime_obj)
     }
-    link_cmd = link_cmd + " -L" + libc_dir
+    link.push("-L" + libc_dir)
 
-    -- --link-llvm: the LLVM libraries
+    -- --link-llvm: the LLVM library
     if cli.link_llvm {
-        link_cmd = link_cmd + " $(llvm-config --libs --ldflags --system-libs)"
+        let llvm_library = find_llvm_library(linker)
+        if llvm_library == "" {
+            eprintln("Error: the LLVM library libLLVM.so was not found next to " + linker + "; install LLVM's development files, or set DAIMOND_LLVM_LIB to the library's path")
+            fs_remove(obj_file)
+            return 1
+        }
+        link.push(llvm_library)
     }
 
     -- The C library, and its last start-up object
-    link_cmd = link_cmd + " -lm -lpthread -lc " + libc_dir + "/crtn.o"
+    link.push("-lm")
+    link.push("-lpthread")
+    link.push("-lc")
+    link.push(libc_dir + "/crtn.o")
 
     if verbose {
-        println("  Link: " + link_cmd)
+        let mut shown = "  Link:"
+        let mut li = 0
+        while li < link.len() {
+            shown = shown + " " + link[li]
+            li = li + 1
+        }
+        println(shown)
     }
 
-    let link_result = system(link_cmd)
+    -- The linker is started as a program of its own, with no shell
+    let link_result = run_command(link)
 
     -- Remove the temporary object file
     fs_remove(obj_file)

@@ -1,21 +1,24 @@
-#!/bin/bash
+#!/bin/sh
 # Build the dAImond compiler from its seed, with LLVM's tools only.
 #
 # The seed (seed/daimond.bc) is the compiler as LLVM bitcode. LLVM's llc
 # and ld.lld turn it into a compiler. That compiler compiles the
 # compiler's source (stage5/main.dm), the result compiles it again, and
 # so on until two generations in a row are the same file. No Zig and no
-# C compiler takes part.
+# C compiler takes part, and of LLVM only llc, ld.lld and libLLVM.so.
 #
-# Usage: bash bootstrap.sh [-o <compiler>] [--no-verify] [--update-seed]
+# Usage: sh bootstrap.sh [-o <compiler>] [--no-verify] [--update-seed]
 #   -o <compiler>   where to put the compiler (default: build/daimond)
 #   --no-verify     stop after the second generation without checking
 #                   that the compiler reproduces itself
 #   --update-seed   write seed/daimond.bc again from the new compiler
 #
 # Environment:
-#   LLVM_BIN          the directory of llc, ld.lld and llvm-config
+#   LLVM_BIN          the directory of llc and ld.lld
 #                     (default: PATH, else the newest /usr/lib/llvm-*/bin)
+#   DAIMOND_LLVM_LIB  the LLVM library to link the compiler with
+#                     (default: libLLVM.so in lib/ or lib64/ next to
+#                     the bin/ that holds ld.lld, symbolic links followed)
 #   DAIMOND_LIBC_DIR  the directory of the C library's Scrt1.o, crti.o,
 #                     crtn.o and libc.so
 #
@@ -37,7 +40,7 @@ while [ $# -gt 0 ]; do
             OUT="$2"; shift ;;
         --no-verify) VERIFY=0 ;;
         --update-seed) UPDATE_SEED=1 ;;
-        -h|--help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -60,19 +63,32 @@ SEED="$ROOT/seed/daimond.bc"
 # ---- LLVM's tools ----
 
 have_tools() {
-    [ -x "$1/llc" ] && [ -x "$1/ld.lld" ] && [ -x "$1/llvm-config" ]
+    [ -x "$1/llc" ] && [ -x "$1/ld.lld" ]
 }
 
 if [ -n "$LLVM_BIN" ]; then
-    have_tools "$LLVM_BIN" || { echo "error: LLVM_BIN=$LLVM_BIN does not hold llc, ld.lld and llvm-config" >&2; exit 1; }
-elif ! { command -v llc && command -v ld.lld && command -v llvm-config; } >/dev/null 2>&1; then
+    have_tools "$LLVM_BIN" || { echo "error: LLVM_BIN=$LLVM_BIN does not hold llc and ld.lld" >&2; exit 1; }
+elif ! { command -v llc && command -v ld.lld; } >/dev/null 2>&1; then
     for dir in $(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V -r); do
         if have_tools "$dir"; then LLVM_BIN="$dir"; break; fi
     done
-    [ -n "$LLVM_BIN" ] || { echo "error: llc, ld.lld and llvm-config were not found on PATH or in /usr/lib/llvm-*/bin; install LLVM and lld, or set LLVM_BIN to their directory" >&2; exit 1; }
+    [ -n "$LLVM_BIN" ] || { echo "error: llc and ld.lld were not found on PATH or in /usr/lib/llvm-*/bin; install LLVM and lld, or set LLVM_BIN to their directory" >&2; exit 1; }
 fi
-# The compiler looks on PATH for ld.lld and llvm-config too
+# The compiler looks on PATH for ld.lld too
 [ -z "$LLVM_BIN" ] || PATH="$LLVM_BIN:$PATH"
+
+# ---- The LLVM library ----
+
+# The compiler finds it the same way (find_llvm_library in
+# stage5/main_split.dm): libLLVM.so of the LLVM that ld.lld belongs to
+LLVM_LIB="$DAIMOND_LLVM_LIB"
+if [ -z "$LLVM_LIB" ]; then
+    llvm_root="$(dirname "$(dirname "$(readlink -f "$(command -v ld.lld)")")")"
+    for dir in lib lib64; do
+        if [ -e "$llvm_root/$dir/libLLVM.so" ]; then LLVM_LIB="$llvm_root/$dir/libLLVM.so"; break; fi
+    done
+fi
+[ -n "$LLVM_LIB" ] && [ -e "$LLVM_LIB" ] || { echo "error: the LLVM library libLLVM.so was not found next to $(command -v ld.lld); install LLVM's development files, or set DAIMOND_LLVM_LIB to the library's path" >&2; exit 1; }
 
 # ---- The C library's start-up objects ----
 
@@ -91,7 +107,7 @@ mkdir -p "$WORK" "$(dirname "$OUT")"
 SEED_ID="$(cat "$ROOT/seed/BUILD_ID" 2>/dev/null || true)"
 SOURCE_ID="$(grep -A1 '^fn runtime_build_id' "$ROOT/stage5/prelude.dm" | grep -o '"[0-9a-f]*"' | tr -d '"')"
 
-echo "==> LLVM $(llvm-config --version), from $(dirname "$(command -v llc)")"
+echo "==> LLVM $(llc --version | sed -n 's/.*LLVM version \([0-9.]*\).*/\1/p' | head -n 1), from $(dirname "$(command -v llc)")"
 if [ "$SEED_ID" = "$SOURCE_ID" ]; then
     echo "==> The seed was made from this source (build ID $SOURCE_ID)"
 else
@@ -102,10 +118,9 @@ fi
 
 echo "==> Compiling the seed with llc (a minute or two)"
 llc -O0 -filetype=obj -relocation-model=pic "$SEED" -o "$WORK/seed.o"
-# shellcheck disable=SC2046
 ld.lld -pie --eh-frame-hdr -dynamic-linker /lib64/ld-linux-x86-64.so.2 -o "$WORK/seed" \
     "$LIBC_DIR/Scrt1.o" "$LIBC_DIR/crti.o" "$WORK/seed.o" -L"$LIBC_DIR" \
-    $(llvm-config --libs --ldflags --system-libs) -lm -lpthread -lc "$LIBC_DIR/crtn.o"
+    "$LLVM_LIB" -lm -lpthread -lc "$LIBC_DIR/crtn.o"
 rm -f "$WORK/seed.o"
 
 # ---- Generations ----

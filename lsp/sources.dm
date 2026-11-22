@@ -23,7 +23,7 @@ extern fn lsp_c_stat(path: string, to: int) -> i32 = "stat"
 extern fn lsp_c_getpid() -> i32 = "getpid"
 
 struct Server {
-    -- The compiler to run, as the shell finds it
+    -- The compiler to run: a path, or a name that is looked for on PATH
     compiler: string,
     -- How long the editor must be quiet before changed documents are
     -- checked; 0 checks right after every change
@@ -37,7 +37,6 @@ struct Server {
     path: int,        -- that URI's path
     scratch: int,     -- what the compiler printed; names seen
     note: int,        -- a text on its way into `out`
-    command: int,     -- a shell command
     visit: int,       -- sources, as a list of ints: a file and what it imports
     file_text: int,   -- the text of a file that is not open
     stack: int,       -- open brackets, as a list of ints
@@ -51,6 +50,11 @@ struct Server {
     tmp_out: string,
     tmp_err: string,
     tmp_fmt: string,
+    -- The compiler's command lines, made once: running the compiler
+    -- writes the words that differ into them and allocates nothing
+    text_args: List[string],   -- compiler, command, name, --stdin
+    file_args: List[string],   -- compiler, command, file
+    fmt_args: List[string],    -- compiler, fmt, tmp_text, -o, tmp_fmt
     builtins: List[string],
     words: List[string],
     methods: List[string]
@@ -92,7 +96,6 @@ fn server_new(compiler: string, debounce_ms: int) -> Server {
         path: buf_new(256),
         scratch: buf_new(4096),
         note: buf_new(1024),
-        command: buf_new(1024),
         visit: buf_new(256),
         file_text: buf_new(4096),
         stack: buf_new(256),
@@ -104,6 +107,9 @@ fn server_new(compiler: string, debounce_ms: int) -> Server {
         tmp_out: stem + ".out",
         tmp_err: stem + ".err",
         tmp_fmt: stem + ".fmt",
+        text_args: [compiler, "", "", "--stdin"],
+        file_args: [compiler, "", ""],
+        fmt_args: [compiler, "fmt", stem + ".dm", "-o", stem + ".fmt"],
         builtins: builtin_functions(),
         words: known_words(),
         methods: builtin_methods()
@@ -215,49 +221,28 @@ fn source_text(server: Server, src: int) -> string {
 
 -- ---- Running the compiler ----
 
--- The exit code that a result of system() stands for
-fn exit_code_of(status: int) -> int {
-    if status < 0 {
-        return 127
-    }
-    if status % 128 != 0 {
-        return 128 + status % 128
-    }
-    return (status / 256) % 256
-}
-
 -- Run `daimond <what> <name>`, with the text in the file tmp_text on
 -- its standard input when `from_text`. Its output goes to the files
--- tmp_out and tmp_err. Gives its exit code.
+-- tmp_out and tmp_err. Gives its exit code (127 when it cannot be
+-- run). The compiler is started directly, with no shell between.
 fn run_compiler(server: Server, what: string, name: string, from_text: bool) -> int {
-    let c = server.command
-    buf_reset(c)
-    buf_shell_quote(c, server.compiler)
-    buf_add(c, " ")
-    buf_add(c, what)
-    buf_add(c, " ")
-    buf_shell_quote(c, name)
     if from_text {
-        buf_add(c, " --stdin < ")
-        buf_shell_quote(c, server.tmp_text)
-    } else {
-        -- Not the server's own input, which is the editor
-        buf_add(c, " < /dev/null")
+        -- A copy of the list's header: its words are the server's own
+        let mut text_args = server.text_args
+        text_args[1] = what
+        text_args[2] = name
+        return run_command_io(text_args, server.tmp_text, server.tmp_out, server.tmp_err)
     }
-    buf_add(c, " > ")
-    buf_shell_quote(c, server.tmp_out)
-    buf_add(c, " 2> ")
-    buf_shell_quote(c, server.tmp_err)
-    return exit_code_of(system(buf_view(c)))
+    let mut file_args = server.file_args
+    file_args[1] = what
+    file_args[2] = name
+    -- Not the server's own input, which is the editor
+    return run_command_io(file_args, "/dev/null", server.tmp_out, server.tmp_err)
 }
 
 -- Whether the compiler can be run at all
 fn compiler_runs(server: Server) -> bool {
-    let c = server.command
-    buf_reset(c)
-    buf_shell_quote(c, server.compiler)
-    buf_add(c, " --version < /dev/null > /dev/null 2>&1")
-    return exit_code_of(system(buf_view(c))) == 0
+    return run_command_io([server.compiler, "--version"], "/dev/null", "/dev/null", "/dev/null") == 0
 }
 
 -- Read the file's time of change and size into the server's two stamp

@@ -349,23 +349,6 @@ fn buf_drop_front(b: int, n: int) {
     }
 }
 
--- Add a string as one word of a shell command
-fn buf_shell_quote(b: int, s: string) {
-    buf_byte(b, 39)
-    let mut run = 0
-    let mut i = 0
-    while i < len(s) {
-        if byte_at(s, i) == 39 {
-            buf_add_part(b, s, run, i - run)
-            buf_add(b, "'\\''")
-            run = i + 1
-        }
-        i = i + 1
-    }
-    buf_add_part(b, s, run, len(s) - run)
-    buf_byte(b, 39)
-}
-
 -- A copy of a string that owns its bytes and has a NUL after them, as
 -- a path or a map's key must
 fn owned(s: string) -> string {

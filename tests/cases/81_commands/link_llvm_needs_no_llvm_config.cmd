@@ -1,0 +1,1 @@
+mkdir {work}/bin && printf '#!/bin/sh\necho "llvm-config was called" >&2\nexit 1\n' > {work}/bin/llvm-config && chmod +x {work}/bin/llvm-config && cd "$(dirname {source})/../../../stage5" && PATH={work}/bin:$PATH {compiler} {source} --link-llvm -o {work}/program && {work}/program

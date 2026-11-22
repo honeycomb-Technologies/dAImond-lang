@@ -14,7 +14,7 @@ dAImond is a systems programming language designed to be:
 The compiler is written in dAImond and builds itself. It needs x86-64 Linux with glibc, LLVM 19 or newer with `lld`, and the C library's development files (`libc6-dev` or `glibc-devel`). It needs no C compiler and no other language's toolchain.
 
 ```bash
-bash bootstrap.sh          # builds build/daimond (about six minutes, 1.4 GB of memory)
+sh bootstrap.sh          # builds build/daimond (about six minutes, 1.4 GB of memory)
 build/daimond examples/hello.dm -o hello && ./hello
 ```
 
@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (508 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (509 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -337,11 +337,11 @@ generation 2 compiles stage5/            -> generation 3, which must be the same
 
 When the seed was made from the current source, generations 1 and 2 are already the same file. The seed does not have to match the source; it only has to be able to compile it. `bootstrap.sh --update-seed` writes the seed again, which is needed before the compiler's own source may use a language feature that the seed's compiler lacks.
 
-What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld.lld` and libLLVM), and the C library, which the runtime calls and whose start-up objects every program links. No C is compiled.
+What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld.lld` and `libLLVM.so`), and the C library, which the runtime calls and whose start-up objects every program links. No C is compiled. `bootstrap.sh` is a POSIX shell script, because nothing written in dAImond can run before the seed is linked; after that the compiler starts the linker and the programs it runs itself, with no shell and without `llvm-config`, and the files it generates (`main.dm`, `prelude.dm`) are written by a dAImond program.
 
 ## Status
 
-The compiler passes its suite of 508 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 509 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 

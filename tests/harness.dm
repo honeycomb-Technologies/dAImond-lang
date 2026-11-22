@@ -18,19 +18,22 @@ module harness
 --   X.exit     the exit code the program must end with (default 0)
 --   X.stderr   what the program must write to standard error (not
 --              compared when the file is missing)
---   X.args     the arguments the program is run with, as shell words
+--   X.args     the arguments the program is run with, with spaces
+--              between them
 --   X.errors   the case must fail to compile, and each line of this
 --              file must appear in what the compiler prints
 --   X.cmd      a shell command to run in place of compiling and running
---              the program, for the compiler's own commands. In it,
+--              the program, for the compiler's own commands (`sh -c`
+--              runs it; the harness uses no shell for anything else). In it,
 --              {compiler} stands for the compiler, {source} for the
 --              case's program and {work} for an empty directory, the
 --              first two as absolute paths. X.stdout, X.exit and
 --              X.stderr are what the command must print and end with.
 -- A case has X.stdout or X.errors, not both.
 --
--- The harness runs the compiler and the programs through the shell,
--- with their output sent to files. It exits with 0 when every case
+-- The harness runs the compiler and the programs itself, with no shell
+-- between, and with their output sent to files; only a case's X.cmd
+-- goes to `sh`. It exits with 0 when every case
 -- passes and with 1 otherwise.
 -- ============================================================
 
@@ -89,18 +92,34 @@ fn shell_quote(text: string) -> string {
     return "'" + string_replace(text, "'", "'\\''") + "'"
 }
 
--- Run a shell command. Gives the exit code of what it ran, 128 plus
--- the signal's number when a signal ended it, or 254 when the shell
--- could not be started.
-fn run(command: string) -> int {
-    let status = system(command)
-    if status < 0 {
-        return 254
+-- Run a program with its arguments, no shell between: its standard
+-- output and error go to the files `out_file` and `err_file`, and its
+-- input is empty. Gives its exit code, 128 plus the signal's number
+-- when a signal ended it, or 127 when it could not be started.
+fn run(args: List[string], out_file: string, err_file: string) -> int {
+    return run_command_io(args, "/dev/null", out_file, err_file)
+}
+
+-- The words of a line: its parts between spaces, tabs and newlines
+fn words(line: string) -> List[string] {
+    let mut out: List[string] = []
+    let mut start = 0
+    let mut i = 0
+    while i <= len(line) {
+        let mut at_space = true
+        if i < len(line) {
+            let b = byte_at(line, i)
+            at_space = b == 32 or b == 9 or b == 10 or b == 13
+        }
+        if at_space {
+            if i > start {
+                out.push(substr(line, start, i - start))
+            }
+            start = i + 1
+        }
+        i = i + 1
     }
-    if status % 128 != 0 {
-        return 128 + status % 128
-    }
-    return (status / 256) % 256
+    return out
 }
 
 -- The file's contents; "" when there is no such file
@@ -187,14 +206,14 @@ fn run_case(compiler: string, source: string, base: string, work: string) -> Out
         command = string_replace(command, "{compiler}", shell_quote(absolute_path(compiler)))
         command = string_replace(command, "{source}", shell_quote(absolute_path(source)))
         command = string_replace(command, "{work}", shell_quote(command_dir))
-        let command_code = run("( " + command + " ) > " + shell_quote(run_out) + " 2> " + shell_quote(run_err) + " < /dev/null")
+        let command_code = run(["sh", "-c", command], run_out, run_err)
         return compare_run(base, command_code, run_out, run_err)
     }
 
     let binary = work + "/test_bin"
     let compile_out = work + "/compile.stdout"
     let compile_err = work + "/compile.stderr"
-    let compile_code = run(shell_quote(compiler) + " " + shell_quote(source) + " -o " + shell_quote(binary) + " > " + shell_quote(compile_out) + " 2> " + shell_quote(compile_err) + " < /dev/null")
+    let compile_code = run([compiler, source, "-o", binary], compile_out, compile_err)
     let compile_output = read_or_empty(compile_out) + read_or_empty(compile_err)
 
     if expects_error {
@@ -219,11 +238,16 @@ fn run_case(compiler: string, source: string, base: string, work: string) -> Out
         return fail("Compilation failed (exit code " + int_to_string(compile_code) + ")\n" + compile_output)
     }
 
-    let mut arguments = ""
+    let mut program: List[string] = [binary]
     if file_exists(base + ".args") {
-        arguments = " " + string_trim(file_read(base + ".args"))
+        let arguments = words(file_read(base + ".args"))
+        let mut a = 0
+        while a < arguments.len() {
+            program.push(arguments[a])
+            a = a + 1
+        }
     }
-    let code = run(binary + arguments + " > " + shell_quote(run_out) + " 2> " + shell_quote(run_err) + " < /dev/null")
+    let code = run(program, run_out, run_err)
     return compare_run(base, code, run_out, run_err)
 }
 

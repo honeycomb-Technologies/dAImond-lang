@@ -741,16 +741,7 @@ fn formatting(server: Server, id_at: int) {
     buf_reset(formatted)
     let mut ran = false
     if buf_write_file(cell(src + SRC_TEXT()), server.tmp_text) {
-        let c = server.command
-        buf_reset(c)
-        buf_shell_quote(c, server.compiler)
-        buf_add(c, " fmt ")
-        buf_shell_quote(c, server.tmp_text)
-        buf_add(c, " -o ")
-        buf_shell_quote(c, server.tmp_fmt)
-        buf_add(c, " < /dev/null > /dev/null 2> ")
-        buf_shell_quote(c, server.tmp_err)
-        if exit_code_of(system(buf_view(c))) == 0 {
+        if run_command_io(server.fmt_args, "/dev/null", "/dev/null", server.tmp_err) == 0 {
             ran = buf_read_file(formatted, server.tmp_fmt)
         }
     }

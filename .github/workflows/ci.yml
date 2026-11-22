@@ -28,7 +28,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y llvm-19-dev lld-19 libc6-dev
           fi
-          /usr/lib/llvm-19/bin/llvm-config --version
+          /usr/lib/llvm-19/bin/llc --version
 
       - name: Put failing stand-ins for zig and the C compilers on PATH
         run: |
@@ -42,7 +42,7 @@ jobs:
       - name: Build the compiler from the seed, to a fixed point
         env:
           LLVM_BIN: /usr/lib/llvm-19/bin
-        run: bash bootstrap.sh
+        run: sh bootstrap.sh
 
       - name: main.dm and prelude.dm are what the modules give
         env:
