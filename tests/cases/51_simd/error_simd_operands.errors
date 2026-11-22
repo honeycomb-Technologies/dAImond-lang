@@ -1,2 +1,11 @@
-Error: the arguments of a SIMD operation must be SIMD vectors, such as f32x4 at line 4
-Error: the first argument of simd_extract must be a SIMD vector, such as f32x4 at line 5
+Error: type mismatch in argument 1 of 'simd_add': expected a SIMD vector, such as f32x4, found int at line 4
+Error: type mismatch in argument 1 of 'simd_extract': expected a SIMD vector, such as f32x4, found float at line 5
+Error: simd_mul() takes two vectors of one type, not f32x4 and i32x4 at line 8
+Error: simd_set_f32x4() takes 4 arguments, not 2 at line 9
+Error: type mismatch in argument 1 of 'simd_splat_i32x4': expected int, found float at line 10
+Error: type mismatch in argument 1 of 'simd_splat_f64x2': expected float, found string at line 11
+Error: simd_extract() of lane 4 of a f32x4, which has lanes 0 to 3 at line 12
+Error: type mismatch in argument 2 of 'simd_extract': expected int, found float at line 13
+Error: simd_sub() takes 2 arguments, not 1 at line 14
+Error: type mismatch in the value of 'j': expected int, found float at line 15
+Error: type mismatch in the value of 'k': expected f32x4, found i32x4 at line 16

@@ -1743,8 +1743,78 @@ fn ck_call_named(c0: Checker, name: string, generic_args: List[string], arg_type
         return ck_typed(ck_note_type_args(applied.c, call_id, ck_binds(sig, 0, binds, arg_types)), applied.t)
     }
     if builtin { return ck_typed(ck_builtin_call(c, name, arg_types, args, line), ck_builtin_type(name)) }
-    if is_simd_builtin(name) { return ck_typed(c, "") }
+    if is_simd_builtin(name) { return ck_simd_call(c, name, arg_types, args, line) }
     return ck_typed(ck_error(c, "undefined function '" + name + "'", line), "")
+}
+
+-- A call of a SIMD builtin. simd_splat_T(x) and simd_set_T(a, b, ...)
+-- make a vector of the type T their name ends in, from floats for a
+-- vector of floats and integers for one of integers. simd_add,
+-- simd_sub, simd_mul and simd_div take two vectors of one type and
+-- give a third. simd_extract(v, i) gives lane i as a float or an int.
+fn ck_simd_call(c0: Checker, name: string, arg_types: List[string], args: List[Expr], line: int) -> Typed {
+    let mut c = c0
+    if starts_with(name, "simd_splat_") or starts_with(name, "simd_set_") {
+        let vec = parse_simd_type_from_name(name)
+        if is_simd_type(vec) == false {
+            return ck_typed(ck_error(c, "undefined function '" + name + "'", line), "")
+        }
+        let mut wanted = 1
+        if starts_with(name, "simd_set_") { wanted = simd_lane_count(vec) }
+        if arg_types.len() != wanted {
+            return ck_typed(ck_error(c, name + "() takes " + arguments_text(wanted) + ", not " + int_to_string(arg_types.len()), line), vec)
+        }
+        let mut lane = "int"
+        if is_simd_float_type(vec) { lane = "float" }
+        let mut i = 0
+        while i < args.len() {
+            if arg_types[i] == "void" {
+                c = ck_error(c, "argument " + int_to_string(i + 1) + " of '" + name + "' is the result of a call that returns no value", args[i].line)
+            } else if ck_fits(c, lane, arg_types[i]) == false {
+                c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + name + "': expected " + lane + ", found " + arg_types[i], args[i].line)
+            }
+            i = i + 1
+        }
+        return ck_typed(c, vec)
+    }
+    if arg_types.len() != 2 {
+        return ck_typed(ck_error(c, name + "() takes 2 arguments, not " + int_to_string(arg_types.len()), line), "")
+    }
+    let vec = arg_types[0]
+    if name == "simd_extract" {
+        if arg_types[1] == "void" or ck_fits(c, "int", arg_types[1]) == false {
+            c = ck_error(c, "type mismatch in argument 2 of 'simd_extract': expected int, found " + arg_types[1], args[1].line)
+        }
+        if ty_known(vec) == false { return ck_typed(c, "") }
+        if is_simd_type(vec) == false {
+            return ck_typed(ck_error(c, "type mismatch in argument 1 of 'simd_extract': expected a SIMD vector, such as f32x4, found " + vec, args[0].line), "")
+        }
+        -- A lane that does not exist, where the index is written out
+        let mut index = args[1]
+        while index.kind == EXPR_GROUPED() {
+            index = *index.operand
+        }
+        if index.kind == EXPR_LITERAL_INT() {
+            if index.int_val >= simd_lane_count(vec) {
+                c = ck_error(c, "simd_extract() of lane " + int_to_string(index.int_val) + " of a " + vec + ", which has lanes 0 to " + int_to_string(simd_lane_count(vec) - 1), args[1].line)
+            }
+        }
+        if is_simd_float_type(vec) { return ck_typed(c, "float") }
+        return ck_typed(c, "int")
+    }
+    let other = arg_types[1]
+    if ty_known(vec) and is_simd_type(vec) == false {
+        return ck_typed(ck_error(c, "type mismatch in argument 1 of '" + name + "': expected a SIMD vector, such as f32x4, found " + vec, args[0].line), "")
+    }
+    if ty_known(other) and is_simd_type(other) == false {
+        return ck_typed(ck_error(c, "type mismatch in argument 2 of '" + name + "': expected a SIMD vector, such as f32x4, found " + other, args[1].line), "")
+    }
+    if ty_known(vec) and ty_known(other) and vec != other {
+        return ck_typed(ck_error(c, name + "() takes two vectors of one type, not " + vec + " and " + other, line), vec)
+    }
+    if ty_known(vec) { return ck_typed(c, vec) }
+    if ty_known(other) { return ck_typed(c, other) }
+    return ck_typed(c, "")
 }
 
 fn ck_call(c0: Checker, e: Expr) -> Typed {
@@ -2485,11 +2555,40 @@ fn ck_lambda(c0: Checker, e: Expr) -> Typed {
 }
 
 -- value? is the value of an Ok or a Some
+-- `value?`: the value of an Ok or a Some. An Err or a None leaves
+-- the function, which must return a Result with that error type, or
+-- an Option.
 fn ck_propagate(c0: Checker, e: Expr) -> Typed {
     let operand = ck_expr(c0, *e.operand)
+    let mut c = operand.c
     let head = ty_head(operand.t)
-    if head == "Result" or head == "Option" { return ck_typed(operand.c, ty_arg(operand.t, 0)) }
-    return ck_typed(operand.c, "")
+    if head != "Result" and head != "Option" {
+        if ty_known(operand.t) {
+            c = ck_error(c, "'?' needs a Result or an Option, found " + operand.t, e.line)
+        }
+        return ck_typed(c, "")
+    }
+    let returns = c.ret_type
+    if ty_known(returns) {
+        if ty_head(returns) != head {
+            let mut leaves = "an Err"
+            let mut needs = "a Result"
+            if head == "Option" {
+                leaves = "a None"
+                needs = "an Option"
+            }
+            let mut found = "returns " + returns
+            if returns == "void" { found = "returns no value" }
+            c = ck_error(c, "'?' leaves the function with " + leaves + ", so the function must return " + needs + "; it " + found, e.line)
+        } else if head == "Result" {
+            let given = ty_arg(operand.t, 1)
+            let wanted = ty_arg(returns, 1)
+            if ty_known(given) and ty_known(wanted) and ty_same(given, wanted) == false {
+                c = ck_error(c, "'?' leaves the function with an error of type " + given + ", but the function returns " + returns, e.line)
+            }
+        }
+    }
+    return ck_typed(c, ty_arg(operand.t, 0))
 }
 
 -- ============================================================

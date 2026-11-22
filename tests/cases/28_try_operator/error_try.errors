@@ -1,0 +1,5 @@
+Error: '?' leaves the function with an Err, so the function must return a Result; it returns int at line 18
+Error: '?' leaves the function with a None, so the function must return an Option; it returns no value at line 23
+Error: '?' leaves the function with an Err, so the function must return a Result; it returns Option[int] at line 28
+Error: '?' leaves the function with an error of type int, but the function returns Result[int, string] at line 33
+Error: '?' needs a Result or an Option, found int at line 38

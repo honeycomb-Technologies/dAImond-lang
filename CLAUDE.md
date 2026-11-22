@@ -158,7 +158,7 @@ build/daimond run stage5/gen_bootstrap.dm -- --check    # writes nothing; exits 
 # Compile the compiler with a compiler you already have (--link-llvm adds llvm_bridge.dm and links libLLVM)
 cd stage5 && ../build/daimond main.dm -o /tmp/daimond_new --link-llvm
 
-# Run the integration suite against a compiler (576 cases, about a minute)
+# Run the integration suite against a compiler (581 cases, about a minute)
 build/daimond tests/harness.dm -o build/harness
 build/harness build/daimond                              # every case in tests/cases
 build/harness build/daimond tests/cases 17_lists/        # only the cases whose "suite/name" contains the text
@@ -166,7 +166,7 @@ build/harness build/daimond tests/cases 17_lists/        # only the cases whose 
 
 ## Testing Strategy
 
-1. **The suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. The harness starts the compiler and each program itself (`run_command_io`), with no shell. A case with `X.cmd` runs that shell command (`sh -c`, the suite's only use of a shell) instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 576 pass, 0 fail. The suite began as the cases of the Zig compiler's test runner. It also holds the 19 memory-safety probes (`74_memory_safety_probes`), and programs that were once loose files in `tests/`, with the README's examples (`86_programs`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory.
+1. **The suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. The harness starts the compiler and each program itself (`run_command_io`), with no shell. A case with `X.cmd` runs that shell command (`sh -c`, the suite's only use of a shell) instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 581 pass, 0 fail. The suite began as the cases of the Zig compiler's test runner. It also holds the 19 memory-safety probes (`74_memory_safety_probes`), and programs that were once loose files in `tests/`, with the README's examples (`86_programs`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory.
 
 2. **dAImond test framework** (`daimond test <file.dm>`): runs each `test_*` function of the file in its own process, so a panic ends only that test. Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -183,7 +183,7 @@ build/harness build/daimond tests/cases 17_lists/        # only the cases whose 
 - **Effects**: Declared with `with [Effect1, Effect2]` on function signatures
 - **Regions**: `region name { ... }` for scoped memory management
 - **Pattern matching**: `match value { Pattern => expr, ... }`
-- **Error propagation**: `?` operator on Result types
+- **Error propagation**: `?` operator on Result and Option values
 - **Pipe operator**: `|>` for function chaining
 - **File extension**: `.dm`
 
@@ -277,11 +277,11 @@ Environment: `DAIMOND_CACHE_DIR` (where the precompiled runtime object is kept),
 
 **Tooling**: the CLI (compile, `run`, `check`, `fmt`, `test`, `symbols`), debug info (`-g`), and the language server in dAImond (`lsp/`)
 
-**Runtime safety**: integer overflow, division by zero, shift amounts, list bounds, narrowing casts, null `Box` dereference
+**Runtime safety**: integer overflow, division by zero, shift amounts, list bounds, SIMD lanes, narrowing casts, null `Box` dereference
 
 **Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test. `import std.X` with no `std/X.dm` next to the importing file is `X.dm` in the library: the directory `$DAIMOND_STDLIB`, else `stdlib/` beside the compiler's directory, else `stdlib/` in the compiler's directory, else `stdlib/` in the current directory (`stdlib_file` in `main_split.dm`)
 
-**The compiler**: 576/576 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. `bootstrap.sh` builds it from the seed and checks that it reproduces itself; with LLVM 19 and with LLVM 23.
+**The compiler**: 581/581 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. `bootstrap.sh` builds it from the seed and checks that it reproduces itself; with LLVM 19 and with LLVM 23.
 
 ### Not Yet Implemented
 - In the type checker: it reports a mismatch only when it knows both types. What depends on the type arguments of a generic function is reported for each instance the program uses (see Instances below), and so not at all for a generic function that is never called
@@ -392,7 +392,7 @@ These built-in functions are available in every dAImond program. The compiler re
 | `simd_sub(a, b)` | `(TYPE, TYPE) -> TYPE` | Element-wise subtraction |
 | `simd_mul(a, b)` | `(TYPE, TYPE) -> TYPE` | Element-wise multiplication |
 | `simd_div(a, b)` | `(TYPE, TYPE) -> TYPE` | Element-wise division |
-| `simd_extract(vec, idx)` | `(TYPE, int) -> scalar` | Extract element at index |
+| `simd_extract(vec, idx)` | `(TYPE, int) -> scalar` | Lane `idx` of the vector, as a `float` for a vector of floats and an `int` for one of integers. A lane the vector does not have is a compile error where the index is written out, and a panic otherwise |
 
 Where TYPE is one of: `f32x4`, `f32x8`, `f64x2`, `f64x4`, `i32x4`, `i32x8`, `i64x2`, `i64x4`
 
@@ -475,6 +475,8 @@ The runtime of every program is dAImond code in `stage5/runtime/*.dm`, which `ge
 - **OS constants**: `TIOCGWINSZ` (21523), `CLOCK_MONOTONIC` (1), `POLLIN` (1) and the layouts of `struct winsize`, `struct pollfd` and `struct timespec` are those of x86-64 Linux.
 - **Assertions**: `assert(cond)` panics with `assertion failed`. `assert_eq(a, b)` compares with `==`, so it takes whatever `==` does, and panics with `assert_eq failed: strings not equal` or `assert_eq failed: values not equal` (`rt_assert*` in `runtime/io.dm`). A call the IR generator emits of a function that was never declared is a compile error (`internal: call of ...`); it used to be dropped, which is how both assertions did nothing.
 - **Enums and `match`**: an enum is a struct of its tag and then one field for each value of each variant (`Variant_0`, `Variant_1`, ...; `enum_payload_field` in `ir_gen.dm`), so a variant carries any number of values of any types. A pattern binds each value as a variable of its type (`track_bound_variable` records the type, as for a parameter), and so do `Ok`, `Err` and `Some`; a pattern may bind fewer values than the variant carries. An arm that is a name binds the matched value with its type. A string is matched against string literals by its text. The matched value's type comes from the expression (`static_type`), so a call can be matched directly. A wrong number of values, in a constructor or a pattern, and a variant the enum does not have are compile errors. The arms are tried in the order they are written (`generate_variant_match` in `ir_gen_expr.dm`): the arm of a variant is taken when the value is that variant and the arm's guard, if it has one, holds, and a name or `_` takes any value. A guard may read what its pattern binds (`Color.Blue(n) if n > 5 =>`, `Some(v) if v > 0 =>`); an arm with a guard does not count toward the match having an arm for every variant. An `Option` and a `Result` are matched by the same code, as the enums they are laid out as. A value of a variant's pattern is a name, `_` or a literal: an integer, a string or a bool (`Token.Number(0) =>`, `Some("x") =>`, `Err(_) =>`). The parser gives a literal a name of its own (`$lit_LINE_COL`) and adds `name == literal` to the arm's guard (`parse_variant_value` in `parser.dm`), so an arm with a literal does not count toward covering its variant either; anything else there is a syntax error (it was taken as a name). A pattern may be a negative integer (`-1 =>`). Until 2026-11-22 a guard on a variant's arm was a compile error, a guard on a `_` arm of a match on an enum was ignored, and a match on an `Option` or a `Result` took the last arm of each variant, and its `_` arm only for `None` or `Err`: `match o { None => 0, _ => 1 }` gave no value for a `Some`.
+- **`?`** (`generate_error_propagate` in `ir_gen_expr.dm`, `ck_propagate` in `check.dm`): `value?` on a `Result[T, E]` or an `Option[T]` is the `T`. An `Err` or a `None` leaves the function, which must return a `Result` with the error type `E`, or an `Option`; the function's value type may be another, so the `Err` or `None` that leaves is made of the function's return type. `?` on any other value, in a function that returns something else, or with another error type, is a compile error. Until 2026-11-22 `?` on an `Option` crashed the compiler, `?` returned its operand as it was (a `Result[Outer, E]` from a function that returns `Result[Inner, E]`, which was read as garbage), `let x = f()?` gave `x` the type `int`, and the checker checked none of it.
+- **SIMD builtins**: the checker types them (`ck_simd_call`): `simd_splat_T` and `simd_set_T` take floats for a vector of floats and integers for one of integers, the four operations take two vectors of one type, and `simd_extract` gives a `float` or an `int`. The vector type of an operation is its first argument's type (`infer_simd_arg_type`); until 2026-11-22 it was taken to be `f32x4` unless the argument was a variable or a splat, so an operation on list elements or fields of another vector type gave wrong lanes. `simd_extract` checks its index like a list's (`check_index_bounds`).
 - **Generic enums** (GENERIC ENUMS in `ir_gen_expr.dm`): `enum Opt[T] { Has(T), Empty }` is one enum for each set of type arguments it is used with, as a generic struct is one struct: `Opt[int]` is the enum `Opt_i64`, registered when a type names it (`ensure_type_instances`, `register_enum_instance` in `ir_gen_decl.dm`). A constructor names no type arguments. The checker finds them from the values (`Opt.Has(3)` is an `Opt[int]`; `ck_enum_value_type`) and, for what the values do not say, from the place the value goes to (`let e: Opt[int] = Opt.Empty`, an argument, a `return`; `ck_settle_variant`); IR generation reads them at the constructor's id (`generic_enum_type`), and in the body of a generic function, where the checker records nothing, takes them from the values' types and then from the function's return type. A constructor whose type arguments nothing says is a compile error. A match on a generic enum is on the instance that is the matched value's type. Methods (`impl Opt[T]`), generic functions over one (`fn or_else[T](o: Opt[T], d: T) -> T`), instances in fields, in lists and in each other, and recursive ones (`Node(Box[Tree[T]], Box[Tree[T]])`) work. A wrong number of type arguments, for a generic struct or enum, is a type error (`ck_type_arity`).
 - **Scopes**: a variable lasts to the end of its block, and one declared while another of its name is in scope shadows it until then: a `let` in a block, a `for` variable, a lambda's parameter, a name that a match arm binds, and a second `let` of a name in one block (whose value may read the first). IR generation keeps a function's variables by name, in maps that know no scopes, so `unshadowed_declarations` (SHADOWED NAMES in `ast.dm`) first gives each variable that shadows another a name of its own, `x$1`, in a copy of the function; a function that shadows nothing is left as it is. The scopes are the checker's. `source_name` (`token.dm`) takes the `$1` off again, in error messages (`error_at`) and debug info. Until 2026-11-22 the inner variable took the outer one's place for the rest of the function: after `if c { let x = 99 }`, `x` was 99, and `match o { Some(x) => x, None => x }` read a slot that was never written.
 - **List literals**: a literal of structs or enum values stores each whole (`push_whole_value`), with or without a type annotation on the variable, and a literal can be passed straight to a function.
@@ -581,7 +583,7 @@ llc + ld.lld turn seed/daimond.bc into            → seed compiler
 seed compiler compiles stage5/main.dm             → gen1
 gen1 compiles stage5/main.dm                      → gen2 (same file as gen1 when the seed is current ✓)
 gen2 compiles stage5/main.dm                      → gen3 (same file as gen2 ✓, when the seed is older)
-the compiler compiles tests/harness.dm            → the harness, which runs tests/cases (576/576 cases pass)
+the compiler compiles tests/harness.dm            → the harness, which runs tests/cases (581/581 cases pass)
 ```
 
 ## Important Notes

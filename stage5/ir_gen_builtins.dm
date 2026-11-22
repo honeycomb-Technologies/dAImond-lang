@@ -271,6 +271,12 @@ fn generate_simd_extract(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     -- Use dAImond-native types (f64 for float vectors, i64 for int vectors)
     let scalar_type = if is_simd_float_type(vec_type) { "f64" } else { "i64" }
 
+    -- The lane must be one the vector has: LLVM gives no defined value
+    -- for any other
+    let in_range = check_index_bounds(g, b, idx_result.val_id, ir_val_int(simd_lane_count(vec_type)), "(" + vec_type + ")")
+    g = in_range.gen
+    b = in_range.block
+
     -- Emit OP_SIMD_EXTRACT instruction
     let id = g.builder.next_id
     let mut inst = ir_inst_new(id, OP_SIMD_EXTRACT())

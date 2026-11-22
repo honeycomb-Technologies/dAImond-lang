@@ -1086,6 +1086,7 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return "List[" + elem_t + "]"
     }
     if k == EXPR_GROUPED() { return static_type(gen, *expr.operand) }
+    if k == EXPR_ERROR_PROPAGATE() { return propagated_type(static_type(gen, *expr.operand)) }
     if k == EXPR_BINARY() {
         -- Two strings joined are a string; other operators may be
         -- overloaded, so their type is not known here
@@ -1678,6 +1679,10 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     }
     if expr.kind == EXPR_GROUPED() {
         return infer_expr_type(gen, *expr.operand)
+    }
+    if expr.kind == EXPR_ERROR_PROPAGATE() {
+        let value_type = propagated_type(infer_expr_type(gen, *expr.operand))
+        if value_type != "" { return map_type_name(value_type) }
     }
     if expr.kind == EXPR_STRUCT_LITERAL() {
         return canon_type(gen, expr.type_name)
@@ -8083,40 +8088,39 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
 -- expr? on Option[T] unwraps Some or early-returns None
 -- ============================================================
 
+-- The type of the value of `operand?`: T for a Result[T, E] or an
+-- Option[T], in the form the operand's type is in. "" for any other
+-- operand.
+fn propagated_type(operand_type: string) -> string {
+    if starts_with(operand_type, "Result[") {
+        let parts = split_type_args(extract_inner_type(operand_type, "Result["))
+        if parts.len() > 0 { return string_trim(parts[0]) }
+    }
+    if starts_with(operand_type, "Option[") {
+        return string_trim(extract_inner_type(operand_type, "Option["))
+    }
+    return ""
+}
+
 fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    -- Infer operand type to get correct Ok/Err field types
+    -- The operand's type gives the types of the value and of the error
     let operand_type = infer_expr_type(g, *expr.operand)
+    let is_option = starts_with(operand_type, "Option[")
     let mut ok_field_type = "i64"
     let mut err_field_type = "i64"
     if starts_with(operand_type, "Result[") {
-        let inner = substr(operand_type, 7, len(operand_type) - 8)
-        let mut comma_pos = 0 - 1
-        let mut depth = 0
-        let mut ci = 0
-        while ci < len(inner) {
-            let ch = char_at(inner, ci)
-            if ch == "[" { depth = depth + 1 }
-            if ch == "]" { depth = depth - 1 }
-            if ch == "," and depth == 0 {
-                comma_pos = ci
-                ci = len(inner)
-            }
-            ci = ci + 1
+        let parts = split_type_args(extract_inner_type(operand_type, "Result["))
+        if parts.len() > 1 {
+            ok_field_type = map_type_name(string_trim(parts[0]))
+            err_field_type = map_type_name(string_trim(parts[1]))
         }
-        if comma_pos >= 0 {
-            ok_field_type = map_type_name(substr(inner, 0, comma_pos))
-            let mut err_start = comma_pos + 1
-            if err_start < len(inner) and char_at(inner, err_start) == " " {
-                err_start = err_start + 1
-            }
-            err_field_type = map_type_name(substr(inner, err_start, len(inner) - err_start))
-        }
-    } else if starts_with(operand_type, "Option[") {
-        let inner = substr(operand_type, 7, len(operand_type) - 8)
-        ok_field_type = map_type_name(inner)
+    } else if is_option {
+        ok_field_type = map_type_name(string_trim(extract_inner_type(operand_type, "Option[")))
+    } else {
+        g = ir_type_error(g, "'?' needs a Result or an Option", expr.line)
     }
 
     -- Generate the operand (the Result/Option expression)
@@ -8136,11 +8140,13 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     b.instructions.push(tag_inst)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Compare tag: 0 = Ok/Some (success), nonzero = Err/None (failure)
+    -- The tag of the variant that has the value: 0 for Ok, 1 for Some
+    let mut value_tag = 0
+    if is_option { value_tag = 1 }
     let is_ok_id = g.builder.next_id
     let mut is_ok_cmp = ir_inst_new(is_ok_id, OP_EQ())
     is_ok_cmp.lhs = ir_val_inst(tag_id)
-    is_ok_cmp.rhs = ir_val_int(0)
+    is_ok_cmp.rhs = ir_val_int(value_tag)
     is_ok_cmp.result_type = "bool"
     is_ok_cmp.has_result = true
     b.instructions.push(is_ok_cmp)
@@ -8163,28 +8169,65 @@ fn generate_error_propagate(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -
     b.instructions.push(ok_alloca)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Branch: if tag == 0 go to ok, else go to err
+    -- Branch to the block of the variant the operand is
     b.terminator = Box_new(term_br_cond(ir_val_inst(is_ok_id), ok_label, err_label))
     b.has_terminator = true
     g.completed_blocks.push(b)
-    -- Err path: extract error value and early-return it from the function
+
+    -- An Err or a None leaves the function with a value of the type
+    -- the function returns: the operand itself where that is its type,
+    -- and otherwise a None, or an Err with the operand's error (the
+    -- function may return a Result with another type of value)
     let mut err_block = ir_block_new(err_label)
+    let ret_type = g.current_return_type
+    let mut leaves_with = operand_id
+    if ret_type != operand_type and is_option and starts_with(ret_type, "Option[") {
+        let none_id = g.builder.next_id
+        let mut none_inst = ir_inst_new(none_id, OP_INSERT_FIELD())
+        none_inst.field_base = ir_val_undef()
+        none_inst.field_value = ir_val_int(0)
+        none_inst.field_index = 0
+        none_inst.result_type = ret_type
+        none_inst.has_result = true
+        err_block.instructions.push(none_inst)
+        g.builder.next_id = none_id + 1
+        leaves_with = none_id
+    } else if ret_type != operand_type and is_option == false and starts_with(ret_type, "Result[") {
+        let err_val_id = g.builder.next_id
+        let mut err_extract = ir_inst_new(err_val_id, OP_EXTRACT_FIELD())
+        err_extract.field_base = ir_val_inst(operand_id)
+        err_extract.field_index = 2
+        err_extract.field_type = err_field_type
+        err_extract.result_type = err_field_type
+        err_extract.has_result = true
+        err_block.instructions.push(err_extract)
+        g.builder.next_id = err_val_id + 1
 
-    -- Extract the error payload (field 2 for Result, or undef for Option)
-    let err_val_id = g.builder.next_id
-    let mut err_extract = ir_inst_new(err_val_id, OP_EXTRACT_FIELD())
-    err_extract.field_base = ir_val_inst(operand_id)
-    err_extract.field_index = 2
-    err_extract.field_type = err_field_type
-    err_extract.result_type = err_field_type
-    err_extract.has_result = true
-    err_block.instructions.push(err_extract)
-    g.builder.next_id = g.builder.next_id + 1
+        let tag_set_id = g.builder.next_id
+        let mut tag_set = ir_inst_new(tag_set_id, OP_INSERT_FIELD())
+        tag_set.field_base = ir_val_undef()
+        tag_set.field_value = ir_val_int(1)
+        tag_set.field_index = 0
+        tag_set.result_type = ret_type
+        tag_set.has_result = true
+        err_block.instructions.push(tag_set)
+        g.builder.next_id = tag_set_id + 1
 
-    -- Return the operand directly (it already has the Err tag).
-    err_block.terminator = Box_new(term_ret(ir_val_inst(operand_id)))
+        let err_set_id = g.builder.next_id
+        let mut err_set = ir_inst_new(err_set_id, OP_INSERT_FIELD())
+        err_set.field_base = ir_val_inst(tag_set_id)
+        err_set.field_value = ir_val_inst(err_val_id)
+        err_set.field_index = 2
+        err_set.result_type = ret_type
+        err_set.has_result = true
+        err_block.instructions.push(err_set)
+        g.builder.next_id = err_set_id + 1
+        leaves_with = err_set_id
+    }
+    err_block.terminator = Box_new(term_ret(ir_val_inst(leaves_with)))
     err_block.has_terminator = true
     g.completed_blocks.push(err_block)
+
     -- Ok path: extract the Ok/Some value (field 1)
     let mut ok_block = ir_block_new(ok_label)
     let ok_val_id = g.builder.next_id
