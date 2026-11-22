@@ -1359,12 +1359,29 @@ fn generate_addr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResul
 -- or field is used in place. Any other list value (a call result, a
 -- list element) is copied to a temporary and `ok` is false, because
 -- changes to that copy would be lost.
+--
+-- The pointer is the list's place, and not the list's value: the
+-- value of a list that is read from a variable is the list as it
+-- was then (generate_header_load in llvm_gen.dm), which a push would
+-- not reach and a loop over the list would not see grow.
 fn generate_list_handle(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResult {
     let mut g = gen
     let mut b = block
     let list_t = static_type(g, expr)
     if expr.kind == EXPR_IDENTIFIER() {
-        -- A list variable's value is already a pointer to its storage
+        if g.param_ptr_map.contains(expr.name) and g.variable_types.contains(expr.name) {
+            -- A mut parameter points at the caller's list
+            let place = emit_place_load(g, b, ir_val_param(g.param_ptr_map.get(expr.name)), g.variable_types.get(expr.name))
+            return addr_result(place.gen, place.block, ir_val_inst(place.val_id), list_t)
+        }
+        if g.variable_map.contains(expr.name) {
+            -- A variable's storage is the list's header
+            let slot = g.variable_map.get(expr.name)
+            if slot >= 0 {
+                return addr_result(g, b, ir_val_inst(slot), list_t)
+            }
+        }
+        -- A constant: its value, which nothing changes
         let var_result = generate_expr(g, b, expr)
         return addr_result(var_result.gen, var_result.block, ir_val_inst(var_result.val_id), list_t)
     }
@@ -1394,6 +1411,24 @@ fn generate_list_handle(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ad
     let mut copy = addr_result(g, b, ir_val_inst(tmp_id), list_t)
     copy.ok = false
     return copy
+}
+
+-- A string or a list where it is, at the address `ptr`: a load that
+-- is marked "place", which LLVM generation never turns into a copy of
+-- the header (generate_header_load). ty is the IR type.
+fn emit_place_load(gen: IRGenerator, block: IRBasicBlock, ptr: IRValue, ty: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let id = g.builder.next_id
+    let mut load = ir_inst_new(id, OP_LOAD())
+    load.load_ptr = ptr
+    load.load_type = ty
+    load.result_type = ty
+    load.callee = "place"
+    load.has_result = true
+    b.instructions.push(load)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
 }
 
 -- The address of element idx_id of the list whose header is at
@@ -4277,12 +4312,12 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     if len(obj_var_name) > 0 and g.list_elem_kinds.contains(obj_var_name) {
         let ek = g.list_elem_kinds.get(obj_var_name)
         let raw_list_ptr = g.variable_map.get(obj_var_name)
-        -- For mut params (negative sentinel), generate expr to get the actual pointer
+        -- A mut parameter (negative sentinel) points at the caller's list
         if raw_list_ptr < 0 and g.param_ptr_map.contains(obj_var_name) {
-            let obj_result = generate_expr(g, b, obj_expr)
-            g = obj_result.gen
-            b = obj_result.block
-            return generate_list_method_call(g, b, ek, obj_result.val_id, obj_var_name, method_name, args)
+            let place = generate_list_handle(g, b, obj_expr)
+            g = place.gen
+            b = place.block
+            return generate_list_method_call(g, b, ek, place.ptr.ref_id, obj_var_name, method_name, args)
         }
         return generate_list_method_call(g, b, ek, raw_list_ptr, obj_var_name, method_name, args)
     }

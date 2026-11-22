@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (590 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (601 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 590 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 601 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
@@ -352,7 +352,7 @@ The compiler passes its suite of 590 cases, builds itself to a fixed point, and 
 - `List[T]`, `Map[K, V]` and `Box[T]`, `for`-in over lists, maps and ranges
 - Traits: methods with bodies that every implementing type gets, impls checked against the trait, and `dyn Trait` values that hold any implementing type and dispatch at run time
 - Lambdas and function values that are closures: a lambda keeps the values of the variables it uses and can be passed, returned and stored. The pipeline operator `|>`, bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `~`)
-- String interpolation (`f"..."`), all numeric types (`i8` to `u64`, `f32`, `f64`) with `as` casts
+- String interpolation (`f"..."`), all numeric types (`i8` to `u64`, `f32`, `f64`) with `as` casts; integers in base 16, 2 and 8 (`0xff`, `0b1010`, `0o17`) and `_` between digits (`1_000_000`)
 - Compile-time evaluation (`comptime`, and every `const`): numbers, strings, lists, loops and calls of the program's functions; what cannot be evaluated is a compile error. Compile-time array sizes
 - Regions, `async`/`await`, SIMD vectors
 - Effects (`with [Console, FileSystem]`), also user-defined ones

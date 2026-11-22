@@ -797,6 +797,45 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     return gen_result(g, exit_block)
 }
 
+
+-- The step of a for loop that counts in the variable at idx_alloca_id:
+-- a block that adds one to it and goes back to the loop's test. The
+-- end of the loop's body goes to this block, and so does `continue`:
+-- until 2026-11-22 `continue` went to the test, the count stayed as
+-- it was, and the loop never ended.
+fn index_step_block(gen: IRGenerator, step_label: string, idx_alloca_id: int, header_label: string) -> GenResult {
+    let mut g = gen
+    let mut step = ir_block_new(step_label)
+    let mut load_idx = ir_inst_new(g.builder.next_id, OP_LOAD())
+    load_idx.load_ptr = ir_val_inst(idx_alloca_id)
+    load_idx.load_type = "i64"
+    load_idx.result_type = "i64"
+    load_idx.has_result = true
+    step.instructions.push(load_idx)
+    let idx_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+
+    let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
+    add_inst.lhs = ir_val_inst(idx_id)
+    add_inst.rhs = ir_val_int(1)
+    add_inst.result_type = "i64"
+    add_inst.has_result = true
+    step.instructions.push(add_inst)
+    let next_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+
+    let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
+    store_idx.store_ptr = ir_val_inst(idx_alloca_id)
+    store_idx.store_val = ir_val_inst(next_id)
+    store_idx.has_result = false
+    step.instructions.push(store_idx)
+    g.builder.next_id = g.builder.next_id + 1
+
+    step.terminator = Box_new(term_br(header_label))
+    step.has_terminator = true
+    return gen_result(g, step)
+}
+
 -- ============================================================
 -- FOR LOOP
 -- ============================================================
@@ -941,6 +980,8 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g = gen_advance_label(g)
     let exit_label = gen_next_label(g, "for_exit")
     g = gen_advance_label(g)
+    let step_label = gen_next_label(g, "for_step")
+    g = gen_advance_label(g)
 
     -- Save break/continue targets
     let prev_break = g.break_target
@@ -948,7 +989,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let prev_has_break = g.has_break_target
     let prev_has_continue = g.has_continue_target
     g.break_target = exit_label
-    g.continue_target = header_label
+    g.continue_target = step_label
     g.has_break_target = true
     g.has_continue_target = true
 
@@ -1065,36 +1106,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g = body_result.gen
     body_block = body_result.block
 
-    -- Increment index
+    -- The body goes on to the step, and so does `continue`
     if body_block.has_terminator == false {
-        let mut load_idx3 = ir_inst_new(g.builder.next_id, OP_LOAD())
-        load_idx3.load_ptr = ir_val_inst(idx_alloca_id)
-        load_idx3.load_type = "i64"
-        load_idx3.result_type = "i64"
-        load_idx3.has_result = true
-        body_block.instructions.push(load_idx3)
-        let idx_val3_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
-        add_inst.lhs = ir_val_inst(idx_val3_id)
-        add_inst.rhs = ir_val_int(1)
-        add_inst.result_type = "i64"
-        add_inst.has_result = true
-        body_block.instructions.push(add_inst)
-        let next_idx_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_idx.store_ptr = ir_val_inst(idx_alloca_id)
-        store_idx.store_val = ir_val_inst(next_idx_id)
-        store_idx.has_result = false
-        body_block.instructions.push(store_idx)
-        g.builder.next_id = g.builder.next_id + 1
-
-        body_block.terminator = Box_new(term_br(header_label))
+        body_block.terminator = Box_new(term_br(step_label))
         body_block.has_terminator = true
     }
+    let stepped = index_step_block(g, step_label, idx_alloca_id, header_label)
+    g = stepped.gen
 
     -- Restore break/continue
     g.break_target = prev_break
@@ -1107,6 +1125,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.completed_blocks.push(first_header)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
+    g.completed_blocks.push(stepped.block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -1162,13 +1181,15 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     g = gen_advance_label(g)
     let exit_label = gen_next_label(g, "range_exit")
     g = gen_advance_label(g)
+    let step_label = gen_next_label(g, "for_step")
+    g = gen_advance_label(g)
 
     let prev_break = g.break_target
     let prev_continue = g.continue_target
     let prev_has_break = g.has_break_target
     let prev_has_continue = g.has_continue_target
     g.break_target = exit_label
-    g.continue_target = header_label
+    g.continue_target = step_label
     g.has_break_target = true
     g.has_continue_target = true
 
@@ -1208,36 +1229,13 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     g = body_result.gen
     body_block = body_result.block
 
-    -- Increment
+    -- The body goes on to the step, and so does `continue`
     if body_block.has_terminator == false {
-        let mut load_idx2 = ir_inst_new(g.builder.next_id, OP_LOAD())
-        load_idx2.load_ptr = ir_val_inst(idx_alloca_id)
-        load_idx2.load_type = "i64"
-        load_idx2.result_type = "i64"
-        load_idx2.has_result = true
-        body_block.instructions.push(load_idx2)
-        let idx_val2_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
-        add_inst.lhs = ir_val_inst(idx_val2_id)
-        add_inst.rhs = ir_val_int(1)
-        add_inst.result_type = "i64"
-        add_inst.has_result = true
-        body_block.instructions.push(add_inst)
-        let next_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_idx.store_ptr = ir_val_inst(idx_alloca_id)
-        store_idx.store_val = ir_val_inst(next_id)
-        store_idx.has_result = false
-        body_block.instructions.push(store_idx)
-        g.builder.next_id = g.builder.next_id + 1
-
-        body_block.terminator = Box_new(term_br(header_label))
+        body_block.terminator = Box_new(term_br(step_label))
         body_block.has_terminator = true
     }
+    let stepped = index_step_block(g, step_label, idx_alloca_id, header_label)
+    g = stepped.gen
 
     g.break_target = prev_break
     g.continue_target = prev_continue
@@ -1248,6 +1246,7 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     g.completed_blocks.push(b)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
+    g.completed_blocks.push(stepped.block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -1319,13 +1318,15 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
     g = gen_advance_label(g)
     let exit_label = gen_next_label(g, "strfor_exit")
     g = gen_advance_label(g)
+    let step_label = gen_next_label(g, "for_step")
+    g = gen_advance_label(g)
 
     let prev_break = g.break_target
     let prev_continue = g.continue_target
     let prev_has_break = g.has_break_target
     let prev_has_continue = g.has_continue_target
     g.break_target = exit_label
-    g.continue_target = header_label
+    g.continue_target = step_label
     g.has_break_target = true
     g.has_continue_target = true
 
@@ -1389,35 +1390,13 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
     g = body_result.gen
     body_block = body_result.block
 
+    -- The body goes on to the step, and so does `continue`
     if body_block.has_terminator == false {
-        let mut load_idx3 = ir_inst_new(g.builder.next_id, OP_LOAD())
-        load_idx3.load_ptr = ir_val_inst(idx_alloca_id)
-        load_idx3.load_type = "i64"
-        load_idx3.result_type = "i64"
-        load_idx3.has_result = true
-        body_block.instructions.push(load_idx3)
-        let idx_val3_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
-        add_inst.lhs = ir_val_inst(idx_val3_id)
-        add_inst.rhs = ir_val_int(1)
-        add_inst.result_type = "i64"
-        add_inst.has_result = true
-        body_block.instructions.push(add_inst)
-        let next_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_idx.store_ptr = ir_val_inst(idx_alloca_id)
-        store_idx.store_val = ir_val_inst(next_id)
-        store_idx.has_result = false
-        body_block.instructions.push(store_idx)
-        g.builder.next_id = g.builder.next_id + 1
-
-        body_block.terminator = Box_new(term_br(header_label))
+        body_block.terminator = Box_new(term_br(step_label))
         body_block.has_terminator = true
     }
+    let stepped = index_step_block(g, step_label, idx_alloca_id, header_label)
+    g = stepped.gen
 
     g.break_target = prev_break
     g.continue_target = prev_continue
@@ -1428,6 +1407,7 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
     g.completed_blocks.push(b)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
+    g.completed_blocks.push(stepped.block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)

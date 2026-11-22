@@ -40,6 +40,128 @@ fn is_digit_char(ch: string) -> bool {
     return false
 }
 
+-- ============================================================
+-- NUMBERS
+-- An integer is written in base 10, or after 0x, 0b or 0o in base
+-- 16, 2 or 8. One `_` may stand between two digits: 1_000_000,
+-- 0xff_ff. A float is digits, a point and digits, with an exponent
+-- or without (see exponent_digits_at).
+--
+-- The token of an integer holds its value in base 10. An integer in
+-- base 10 must fit in an int. One in another base gives the 64 bits
+-- it writes: 0xffffffffffffffff is -1, and is the highest u64 where
+-- a u64 is expected.
+-- ============================================================
+
+-- The base of the number that begins at pos
+fn number_base_at(source: string, pos: int) -> int {
+    if pos + 1 >= len(source) or char_at(source, pos) != "0" { return 10 }
+    let mark = char_at(source, pos + 1)
+    if mark == "x" { return 16 }
+    if mark == "b" { return 2 }
+    if mark == "o" { return 8 }
+    return 10
+}
+
+-- The value of the digit at pos, or -1 when what is there is no digit
+-- of the base
+fn digit_at(source: string, pos: int, base: int) -> int {
+    if pos >= len(source) { return -1 }
+    let c = byte_at(source, pos)
+    let mut d = -1
+    if c >= 48 and c <= 57 {
+        d = c - 48
+    } else if c >= 97 and c <= 102 {
+        d = c - 87
+    } else if c >= 65 and c <= 70 {
+        d = c - 55
+    }
+    if d >= base { return -1 }
+    return d
+}
+
+-- Where the digits that begin at pos end. A `_` belongs to them when
+-- it stands between two digits.
+fn digits_end_at(source: string, pos: int, base: int) -> int {
+    let mut i = pos
+    let mut going = true
+    while going {
+        if digit_at(source, i, base) >= 0 {
+            i = i + 1
+        } else if i > pos and i < len(source) and char_at(source, i) == "_" and digit_at(source, i + 1, base) >= 0 {
+            i = i + 2
+        } else {
+            going = false
+        }
+    }
+    return i
+}
+
+-- The digits source[from..to] of the base as an integer in base 10:
+-- the int with the 64 bits they write. "" when they need more bits.
+fn based_int_text(source: string, from: int, to: int, base: int) -> string {
+    -- The value is kept as two halves of 32 bits, since an int's
+    -- arithmetic stops the program when it leaves an int's range
+    let half = 4294967296
+    let mut high = 0
+    let mut low = 0
+    let mut i = from
+    while i < to {
+        let d = digit_at(source, i, base)
+        if d >= 0 {
+            low = low * base + d
+            high = high * base + low / half
+            low = low % half
+            if high >= half { return "" }
+        }
+        i = i + 1
+    }
+    if high >= 2147483648 {
+        return int_to_string((high - half) * half + low)
+    }
+    return int_to_string(high * half + low)
+}
+
+-- The digits of a number in base 10 as they go into its token:
+-- without `_`, and an integer without the zeros it begins with
+fn plain_digits(text: string, is_float: bool) -> string {
+    let mut parts: List[string] = []
+    let mut leading = is_float == false
+    let mut i = 0
+    while i < len(text) {
+        let ch = char_at(text, i)
+        if ch != "_" {
+            if leading and ch == "0" and i + 1 < len(text) {
+                -- a zero that more digits follow
+            } else {
+                leading = false
+                parts.push(ch)
+            }
+        }
+        i = i + 1
+    }
+    return join_strings(parts)
+}
+
+-- One more than the highest int: the digits of the lowest int, which
+-- is written with a minus before them (see int_token_value in
+-- parser.dm)
+fn LOWEST_INT_DIGITS() -> string { return "9223372036854775808" }
+
+-- Whether an integer in base 10, as plain_digits gives it, is at most
+-- LOWEST_INT_DIGITS
+fn decimal_fits(digits: string) -> bool {
+    if len(digits) != 19 { return len(digits) < 19 }
+    return digits <= LOWEST_INT_DIGITS()
+}
+
+-- A number that cannot be read ends the compilation, as a string
+-- with no end does
+fn number_error(prefix: string, message: string, line: int) {
+    eprintln(prefix + "Error: " + message + " at line " + int_to_string(line_in_file(line)))
+    exit(1)
+}
+
 fn is_alnum_char(ch: string) -> bool {
     return is_alpha_char(ch) or is_digit_char(ch)
 }
@@ -142,35 +264,46 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                     tokens.push(token_new(keyword_lookup(text), text, sl, sc))
                 }
             } else if is_digit_char(ch) {
-                while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
-                    lex.pos = lex.pos + 1
-                    lex.col = lex.col + 1
-                }
+                -- See NUMBERS
+                let base = number_base_at(lex.source, lex.pos)
                 let mut is_float = false
-                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos) == "." and is_digit_char(char_at(lex.source, lex.pos + 1)) {
-                    is_float = true
-                }
-                if is_float {
-                    lex.pos = lex.pos + 1
-                    lex.col = lex.col + 1
-                    while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
-                        lex.pos = lex.pos + 1
-                        lex.col = lex.col + 1
+                let mut text = ""
+                if base != 10 {
+                    let digits_end = digits_end_at(lex.source, sp + 2, base)
+                    if digits_end == sp + 2 {
+                        number_error(prefix, "'" + substr(lex.source, sp, 2) + "' begins an integer in base " + int_to_string(base) + ", and no digit of that base follows it", sl)
+                    }
+                    lex.pos = digits_end
+                    text = based_int_text(lex.source, sp + 2, digits_end, base)
+                    if text == "" {
+                        number_error(prefix, "the integer " + substr(lex.source, sp, lex.pos - sp) + " does not fit in 64 bits", sl)
+                    }
+                } else {
+                    lex.pos = digits_end_at(lex.source, lex.pos, 10)
+                    if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos) == "." and is_digit_char(char_at(lex.source, lex.pos + 1)) {
+                        is_float = true
+                        lex.pos = digits_end_at(lex.source, lex.pos + 1, 10)
+                    }
+                    -- An exponent makes a float: 1.5e10, 2e-3, 6E+2. The
+                    -- "e" belongs to the number only when digits follow it.
+                    let exp_digits = exponent_digits_at(lex.source, lex.pos)
+                    if exp_digits > lex.pos {
+                        is_float = true
+                        lex.pos = exp_digits
+                        while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
+                            lex.pos = lex.pos + 1
+                        }
+                    }
+                    text = plain_digits(substr(lex.source, sp, lex.pos - sp), is_float)
+                    if is_float == false and decimal_fits(text) == false {
+                        number_error(prefix, "the integer " + text + " does not fit in an int: the highest is 9223372036854775807", sl)
                     }
                 }
-                -- An exponent makes a float: 1.5e10, 2e-3, 6E+2. The
-                -- "e" belongs to the number only when digits follow it.
-                let exp_digits = exponent_digits_at(lex.source, lex.pos)
-                if exp_digits > lex.pos {
-                    is_float = true
-                    lex.col = lex.col + exp_digits - lex.pos
-                    lex.pos = exp_digits
-                    while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
-                        lex.pos = lex.pos + 1
-                        lex.col = lex.col + 1
-                    }
+                lex.col = lex.col + lex.pos - sp
+                -- `12abc` was the number 12 and then the name abc
+                if lex.pos < lex.src_len and is_alnum_char(char_at(lex.source, lex.pos)) {
+                    number_error(prefix, "the number " + substr(lex.source, sp, lex.pos - sp) + " runs into '" + char_at(lex.source, lex.pos) + "': a number has no suffix, and a name does not begin with a digit", sl)
                 }
-                let text = substr(lex.source, sp, lex.pos - sp)
                 if is_float {
                     tokens.push(token_new(TK_FLOAT(), text, sl, sc))
                 } else {

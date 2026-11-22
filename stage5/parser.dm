@@ -74,6 +74,28 @@ fn nesting_error(what: string) -> string {
 -- PARSER HELPERS
 -- ============================================================
 
+-- The value of an integer token; `negative` when a minus stands
+-- before it. The lexer lets through one integer that is no int, the
+-- digits of the lowest int, which are an int only after the minus:
+-- without it the value is 0, and p_check_int reports it.
+fn int_token_value(tok: Token, negative: bool) -> int {
+    if tok.value == LOWEST_INT_DIGITS() {
+        if negative { return 0 - 9223372036854775807 - 1 }
+        return 0
+    }
+    if negative { return 0 - parse_int(tok.value) }
+    return parse_int(tok.value)
+}
+
+-- Report the integer at the parser's place when it is the one that
+-- is no int without a minus before it
+fn p_check_int(p: Parser) -> Parser {
+    if p_cur(p).kind == TK_INTEGER() and p_cur(p).value == LOWEST_INT_DIGITS() {
+        return p_error(p, "the integer " + LOWEST_INT_DIGITS() + " does not fit in an int: the highest is 9223372036854775807")
+    }
+    return p
+}
+
 fn p_cur(p: Parser) -> Token {
     if p.pos < p.tokens.len() {
         return p.tokens[p.pos]
@@ -601,8 +623,9 @@ fn parse_prefix_at(p: Parser) -> ParseExprResult {
 
     -- Integer literal
     if tok.kind == TK_INTEGER() {
+        pp = p_check_int(pp)
         pp = p_advance(pp)
-        return ParseExprResult { p: pp, expr: expr_int(parse_int(tok.value), tok.line, tok.col) }
+        return ParseExprResult { p: pp, expr: expr_int(int_token_value(tok, false), tok.line, tok.col) }
     }
 
     -- Float literal
@@ -635,6 +658,12 @@ fn parse_prefix_at(p: Parser) -> ParseExprResult {
     -- Unary minus
     if tok.kind == TK_MINUS() {
         pp = p_advance(pp)
+        if p_cur(pp).kind == TK_INTEGER() and p_cur(pp).value == LOWEST_INT_DIGITS() {
+            -- The lowest int: its digits alone are no int to negate
+            let lowest = p_cur(pp)
+            pp = p_advance(pp)
+            return ParseExprResult { p: pp, expr: expr_int(int_token_value(lowest, true), tok.line, tok.col) }
+        }
         let operand = parse_expr_pratt(pp, PREFIX_PREC())
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_NEG(), operand.expr, tok.line, tok.col) }
     }
@@ -1289,10 +1318,11 @@ fn parse_variant_value(p: Parser, into: Pattern) -> ParsePatternResult {
     }
     let mut literal = expr_int(0, tok.line, tok.col)
     if tok.kind == TK_INTEGER() {
-        literal = expr_int(parse_int(tok.value), tok.line, tok.col)
+        pp = p_check_int(pp)
+        literal = expr_int(int_token_value(tok, false), tok.line, tok.col)
     } else if tok.kind == TK_MINUS() and p_cur(p_advance(pp)).kind == TK_INTEGER() {
         pp = p_advance(pp)
-        literal = expr_int(0 - parse_int(p_cur(pp).value), tok.line, tok.col)
+        literal = expr_int(int_token_value(p_cur(pp), true), tok.line, tok.col)
     } else if tok.kind == TK_STRING() {
         literal = expr_string(tok.value, tok.line, tok.col)
     } else if tok.kind == TK_TRUE() or tok.kind == TK_FALSE() {
@@ -1323,15 +1353,16 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
 
     -- Integer literal pattern
     if tok.kind == TK_INTEGER() {
+        pp = p_check_int(pp)
         pp = p_advance(pp)
         let mut pat = pattern_new(PAT_LITERAL())
-        pat.literal_expr = Box_new(expr_int(parse_int(tok.value), tok.line, tok.col))
+        pat.literal_expr = Box_new(expr_int(int_token_value(tok, false), tok.line, tok.col))
         return ParsePatternResult { p: pp, pattern: pat }
     }
     if tok.kind == TK_MINUS() and p_cur(p_advance(pp)).kind == TK_INTEGER() {
         pp = p_advance(pp)
         let mut pat = pattern_new(PAT_LITERAL())
-        pat.literal_expr = Box_new(expr_int(0 - parse_int(p_cur(pp).value), tok.line, tok.col))
+        pat.literal_expr = Box_new(expr_int(int_token_value(p_cur(pp), true), tok.line, tok.col))
         pp = p_advance(pp)
         return ParsePatternResult { p: pp, pattern: pat }
     }

@@ -1,0 +1,19 @@
+t and t and t = true : a b c
+t and f and t = false : a b
+f and t and t = false : a
+f or f or t = true : a b c
+t or f or t = true : a
+f or t and f = false : a b c
+t or t and f = true : a
+f and t or t = true : a c
+t and f or f or t = true : a b c d
+(f or t) and (f or f) = false : a b c d
+not f and t = true : a b
+t and not t or t = true : a b c
+x > 3 and x < 9 and t = true : a
+x > 7 and t or x == 5 and t = true : b
+1 + 2 == 3 and 2 * 2 == 4 and t = true : a
+5 10
+strings
+after if = true :
+if value 1 = true : a b c

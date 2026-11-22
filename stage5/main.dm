@@ -366,6 +366,128 @@ fn is_digit_char(ch: string) -> bool {
     return false
 }
 
+-- ============================================================
+-- NUMBERS
+-- An integer is written in base 10, or after 0x, 0b or 0o in base
+-- 16, 2 or 8. One `_` may stand between two digits: 1_000_000,
+-- 0xff_ff. A float is digits, a point and digits, with an exponent
+-- or without (see exponent_digits_at).
+--
+-- The token of an integer holds its value in base 10. An integer in
+-- base 10 must fit in an int. One in another base gives the 64 bits
+-- it writes: 0xffffffffffffffff is -1, and is the highest u64 where
+-- a u64 is expected.
+-- ============================================================
+
+-- The base of the number that begins at pos
+fn number_base_at(source: string, pos: int) -> int {
+    if pos + 1 >= len(source) or char_at(source, pos) != "0" { return 10 }
+    let mark = char_at(source, pos + 1)
+    if mark == "x" { return 16 }
+    if mark == "b" { return 2 }
+    if mark == "o" { return 8 }
+    return 10
+}
+
+-- The value of the digit at pos, or -1 when what is there is no digit
+-- of the base
+fn digit_at(source: string, pos: int, base: int) -> int {
+    if pos >= len(source) { return -1 }
+    let c = byte_at(source, pos)
+    let mut d = -1
+    if c >= 48 and c <= 57 {
+        d = c - 48
+    } else if c >= 97 and c <= 102 {
+        d = c - 87
+    } else if c >= 65 and c <= 70 {
+        d = c - 55
+    }
+    if d >= base { return -1 }
+    return d
+}
+
+-- Where the digits that begin at pos end. A `_` belongs to them when
+-- it stands between two digits.
+fn digits_end_at(source: string, pos: int, base: int) -> int {
+    let mut i = pos
+    let mut going = true
+    while going {
+        if digit_at(source, i, base) >= 0 {
+            i = i + 1
+        } else if i > pos and i < len(source) and char_at(source, i) == "_" and digit_at(source, i + 1, base) >= 0 {
+            i = i + 2
+        } else {
+            going = false
+        }
+    }
+    return i
+}
+
+-- The digits source[from..to] of the base as an integer in base 10:
+-- the int with the 64 bits they write. "" when they need more bits.
+fn based_int_text(source: string, from: int, to: int, base: int) -> string {
+    -- The value is kept as two halves of 32 bits, since an int's
+    -- arithmetic stops the program when it leaves an int's range
+    let half = 4294967296
+    let mut high = 0
+    let mut low = 0
+    let mut i = from
+    while i < to {
+        let d = digit_at(source, i, base)
+        if d >= 0 {
+            low = low * base + d
+            high = high * base + low / half
+            low = low % half
+            if high >= half { return "" }
+        }
+        i = i + 1
+    }
+    if high >= 2147483648 {
+        return int_to_string((high - half) * half + low)
+    }
+    return int_to_string(high * half + low)
+}
+
+-- The digits of a number in base 10 as they go into its token:
+-- without `_`, and an integer without the zeros it begins with
+fn plain_digits(text: string, is_float: bool) -> string {
+    let mut parts: List[string] = []
+    let mut leading = is_float == false
+    let mut i = 0
+    while i < len(text) {
+        let ch = char_at(text, i)
+        if ch != "_" {
+            if leading and ch == "0" and i + 1 < len(text) {
+                -- a zero that more digits follow
+            } else {
+                leading = false
+                parts.push(ch)
+            }
+        }
+        i = i + 1
+    }
+    return join_strings(parts)
+}
+
+-- One more than the highest int: the digits of the lowest int, which
+-- is written with a minus before them (see int_token_value in
+-- parser.dm)
+fn LOWEST_INT_DIGITS() -> string { return "9223372036854775808" }
+
+-- Whether an integer in base 10, as plain_digits gives it, is at most
+-- LOWEST_INT_DIGITS
+fn decimal_fits(digits: string) -> bool {
+    if len(digits) != 19 { return len(digits) < 19 }
+    return digits <= LOWEST_INT_DIGITS()
+}
+
+-- A number that cannot be read ends the compilation, as a string
+-- with no end does
+fn number_error(prefix: string, message: string, line: int) {
+    eprintln(prefix + "Error: " + message + " at line " + int_to_string(line_in_file(line)))
+    exit(1)
+}
+
 fn is_alnum_char(ch: string) -> bool {
     return is_alpha_char(ch) or is_digit_char(ch)
 }
@@ -468,35 +590,46 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                     tokens.push(token_new(keyword_lookup(text), text, sl, sc))
                 }
             } else if is_digit_char(ch) {
-                while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
-                    lex.pos = lex.pos + 1
-                    lex.col = lex.col + 1
-                }
+                -- See NUMBERS
+                let base = number_base_at(lex.source, lex.pos)
                 let mut is_float = false
-                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos) == "." and is_digit_char(char_at(lex.source, lex.pos + 1)) {
-                    is_float = true
-                }
-                if is_float {
-                    lex.pos = lex.pos + 1
-                    lex.col = lex.col + 1
-                    while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
-                        lex.pos = lex.pos + 1
-                        lex.col = lex.col + 1
+                let mut text = ""
+                if base != 10 {
+                    let digits_end = digits_end_at(lex.source, sp + 2, base)
+                    if digits_end == sp + 2 {
+                        number_error(prefix, "'" + substr(lex.source, sp, 2) + "' begins an integer in base " + int_to_string(base) + ", and no digit of that base follows it", sl)
+                    }
+                    lex.pos = digits_end
+                    text = based_int_text(lex.source, sp + 2, digits_end, base)
+                    if text == "" {
+                        number_error(prefix, "the integer " + substr(lex.source, sp, lex.pos - sp) + " does not fit in 64 bits", sl)
+                    }
+                } else {
+                    lex.pos = digits_end_at(lex.source, lex.pos, 10)
+                    if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos) == "." and is_digit_char(char_at(lex.source, lex.pos + 1)) {
+                        is_float = true
+                        lex.pos = digits_end_at(lex.source, lex.pos + 1, 10)
+                    }
+                    -- An exponent makes a float: 1.5e10, 2e-3, 6E+2. The
+                    -- "e" belongs to the number only when digits follow it.
+                    let exp_digits = exponent_digits_at(lex.source, lex.pos)
+                    if exp_digits > lex.pos {
+                        is_float = true
+                        lex.pos = exp_digits
+                        while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
+                            lex.pos = lex.pos + 1
+                        }
+                    }
+                    text = plain_digits(substr(lex.source, sp, lex.pos - sp), is_float)
+                    if is_float == false and decimal_fits(text) == false {
+                        number_error(prefix, "the integer " + text + " does not fit in an int: the highest is 9223372036854775807", sl)
                     }
                 }
-                -- An exponent makes a float: 1.5e10, 2e-3, 6E+2. The
-                -- "e" belongs to the number only when digits follow it.
-                let exp_digits = exponent_digits_at(lex.source, lex.pos)
-                if exp_digits > lex.pos {
-                    is_float = true
-                    lex.col = lex.col + exp_digits - lex.pos
-                    lex.pos = exp_digits
-                    while lex.pos < lex.src_len and is_digit_char(char_at(lex.source, lex.pos)) {
-                        lex.pos = lex.pos + 1
-                        lex.col = lex.col + 1
-                    }
+                lex.col = lex.col + lex.pos - sp
+                -- `12abc` was the number 12 and then the name abc
+                if lex.pos < lex.src_len and is_alnum_char(char_at(lex.source, lex.pos)) {
+                    number_error(prefix, "the number " + substr(lex.source, sp, lex.pos - sp) + " runs into '" + char_at(lex.source, lex.pos) + "': a number has no suffix, and a name does not begin with a digit", sl)
                 }
-                let text = substr(lex.source, sp, lex.pos - sp)
                 if is_float {
                     tokens.push(token_new(TK_FLOAT(), text, sl, sc))
                 } else {
@@ -3790,6 +3923,28 @@ fn nesting_error(what: string) -> string {
 -- PARSER HELPERS
 -- ============================================================
 
+-- The value of an integer token; `negative` when a minus stands
+-- before it. The lexer lets through one integer that is no int, the
+-- digits of the lowest int, which are an int only after the minus:
+-- without it the value is 0, and p_check_int reports it.
+fn int_token_value(tok: Token, negative: bool) -> int {
+    if tok.value == LOWEST_INT_DIGITS() {
+        if negative { return 0 - 9223372036854775807 - 1 }
+        return 0
+    }
+    if negative { return 0 - parse_int(tok.value) }
+    return parse_int(tok.value)
+}
+
+-- Report the integer at the parser's place when it is the one that
+-- is no int without a minus before it
+fn p_check_int(p: Parser) -> Parser {
+    if p_cur(p).kind == TK_INTEGER() and p_cur(p).value == LOWEST_INT_DIGITS() {
+        return p_error(p, "the integer " + LOWEST_INT_DIGITS() + " does not fit in an int: the highest is 9223372036854775807")
+    }
+    return p
+}
+
 fn p_cur(p: Parser) -> Token {
     if p.pos < p.tokens.len() {
         return p.tokens[p.pos]
@@ -4317,8 +4472,9 @@ fn parse_prefix_at(p: Parser) -> ParseExprResult {
 
     -- Integer literal
     if tok.kind == TK_INTEGER() {
+        pp = p_check_int(pp)
         pp = p_advance(pp)
-        return ParseExprResult { p: pp, expr: expr_int(parse_int(tok.value), tok.line, tok.col) }
+        return ParseExprResult { p: pp, expr: expr_int(int_token_value(tok, false), tok.line, tok.col) }
     }
 
     -- Float literal
@@ -4351,6 +4507,12 @@ fn parse_prefix_at(p: Parser) -> ParseExprResult {
     -- Unary minus
     if tok.kind == TK_MINUS() {
         pp = p_advance(pp)
+        if p_cur(pp).kind == TK_INTEGER() and p_cur(pp).value == LOWEST_INT_DIGITS() {
+            -- The lowest int: its digits alone are no int to negate
+            let lowest = p_cur(pp)
+            pp = p_advance(pp)
+            return ParseExprResult { p: pp, expr: expr_int(int_token_value(lowest, true), tok.line, tok.col) }
+        }
         let operand = parse_expr_pratt(pp, PREFIX_PREC())
         return ParseExprResult { p: operand.p, expr: expr_unary(UNOP_NEG(), operand.expr, tok.line, tok.col) }
     }
@@ -5005,10 +5167,11 @@ fn parse_variant_value(p: Parser, into: Pattern) -> ParsePatternResult {
     }
     let mut literal = expr_int(0, tok.line, tok.col)
     if tok.kind == TK_INTEGER() {
-        literal = expr_int(parse_int(tok.value), tok.line, tok.col)
+        pp = p_check_int(pp)
+        literal = expr_int(int_token_value(tok, false), tok.line, tok.col)
     } else if tok.kind == TK_MINUS() and p_cur(p_advance(pp)).kind == TK_INTEGER() {
         pp = p_advance(pp)
-        literal = expr_int(0 - parse_int(p_cur(pp).value), tok.line, tok.col)
+        literal = expr_int(int_token_value(p_cur(pp), true), tok.line, tok.col)
     } else if tok.kind == TK_STRING() {
         literal = expr_string(tok.value, tok.line, tok.col)
     } else if tok.kind == TK_TRUE() or tok.kind == TK_FALSE() {
@@ -5039,15 +5202,16 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
 
     -- Integer literal pattern
     if tok.kind == TK_INTEGER() {
+        pp = p_check_int(pp)
         pp = p_advance(pp)
         let mut pat = pattern_new(PAT_LITERAL())
-        pat.literal_expr = Box_new(expr_int(parse_int(tok.value), tok.line, tok.col))
+        pat.literal_expr = Box_new(expr_int(int_token_value(tok, false), tok.line, tok.col))
         return ParsePatternResult { p: pp, pattern: pat }
     }
     if tok.kind == TK_MINUS() and p_cur(p_advance(pp)).kind == TK_INTEGER() {
         pp = p_advance(pp)
         let mut pat = pattern_new(PAT_LITERAL())
-        pat.literal_expr = Box_new(expr_int(0 - parse_int(p_cur(pp).value), tok.line, tok.col))
+        pat.literal_expr = Box_new(expr_int(int_token_value(p_cur(pp), true), tok.line, tok.col))
         pp = p_advance(pp)
         return ParsePatternResult { p: pp, pattern: pat }
     }
@@ -9324,6 +9488,45 @@ fn generate_while_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
     return gen_result(g, exit_block)
 }
 
+
+-- The step of a for loop that counts in the variable at idx_alloca_id:
+-- a block that adds one to it and goes back to the loop's test. The
+-- end of the loop's body goes to this block, and so does `continue`:
+-- until 2026-11-22 `continue` went to the test, the count stayed as
+-- it was, and the loop never ended.
+fn index_step_block(gen: IRGenerator, step_label: string, idx_alloca_id: int, header_label: string) -> GenResult {
+    let mut g = gen
+    let mut step = ir_block_new(step_label)
+    let mut load_idx = ir_inst_new(g.builder.next_id, OP_LOAD())
+    load_idx.load_ptr = ir_val_inst(idx_alloca_id)
+    load_idx.load_type = "i64"
+    load_idx.result_type = "i64"
+    load_idx.has_result = true
+    step.instructions.push(load_idx)
+    let idx_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+
+    let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
+    add_inst.lhs = ir_val_inst(idx_id)
+    add_inst.rhs = ir_val_int(1)
+    add_inst.result_type = "i64"
+    add_inst.has_result = true
+    step.instructions.push(add_inst)
+    let next_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+
+    let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
+    store_idx.store_ptr = ir_val_inst(idx_alloca_id)
+    store_idx.store_val = ir_val_inst(next_id)
+    store_idx.has_result = false
+    step.instructions.push(store_idx)
+    g.builder.next_id = g.builder.next_id + 1
+
+    step.terminator = Box_new(term_br(header_label))
+    step.has_terminator = true
+    return gen_result(g, step)
+}
+
 -- ============================================================
 -- FOR LOOP
 -- ============================================================
@@ -9468,6 +9671,8 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g = gen_advance_label(g)
     let exit_label = gen_next_label(g, "for_exit")
     g = gen_advance_label(g)
+    let step_label = gen_next_label(g, "for_step")
+    g = gen_advance_label(g)
 
     -- Save break/continue targets
     let prev_break = g.break_target
@@ -9475,7 +9680,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let prev_has_break = g.has_break_target
     let prev_has_continue = g.has_continue_target
     g.break_target = exit_label
-    g.continue_target = header_label
+    g.continue_target = step_label
     g.has_break_target = true
     g.has_continue_target = true
 
@@ -9592,36 +9797,13 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g = body_result.gen
     body_block = body_result.block
 
-    -- Increment index
+    -- The body goes on to the step, and so does `continue`
     if body_block.has_terminator == false {
-        let mut load_idx3 = ir_inst_new(g.builder.next_id, OP_LOAD())
-        load_idx3.load_ptr = ir_val_inst(idx_alloca_id)
-        load_idx3.load_type = "i64"
-        load_idx3.result_type = "i64"
-        load_idx3.has_result = true
-        body_block.instructions.push(load_idx3)
-        let idx_val3_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
-        add_inst.lhs = ir_val_inst(idx_val3_id)
-        add_inst.rhs = ir_val_int(1)
-        add_inst.result_type = "i64"
-        add_inst.has_result = true
-        body_block.instructions.push(add_inst)
-        let next_idx_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_idx.store_ptr = ir_val_inst(idx_alloca_id)
-        store_idx.store_val = ir_val_inst(next_idx_id)
-        store_idx.has_result = false
-        body_block.instructions.push(store_idx)
-        g.builder.next_id = g.builder.next_id + 1
-
-        body_block.terminator = Box_new(term_br(header_label))
+        body_block.terminator = Box_new(term_br(step_label))
         body_block.has_terminator = true
     }
+    let stepped = index_step_block(g, step_label, idx_alloca_id, header_label)
+    g = stepped.gen
 
     -- Restore break/continue
     g.break_target = prev_break
@@ -9634,6 +9816,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.completed_blocks.push(first_header)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
+    g.completed_blocks.push(stepped.block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -9689,13 +9872,15 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     g = gen_advance_label(g)
     let exit_label = gen_next_label(g, "range_exit")
     g = gen_advance_label(g)
+    let step_label = gen_next_label(g, "for_step")
+    g = gen_advance_label(g)
 
     let prev_break = g.break_target
     let prev_continue = g.continue_target
     let prev_has_break = g.has_break_target
     let prev_has_continue = g.has_continue_target
     g.break_target = exit_label
-    g.continue_target = header_label
+    g.continue_target = step_label
     g.has_break_target = true
     g.has_continue_target = true
 
@@ -9735,36 +9920,13 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     g = body_result.gen
     body_block = body_result.block
 
-    -- Increment
+    -- The body goes on to the step, and so does `continue`
     if body_block.has_terminator == false {
-        let mut load_idx2 = ir_inst_new(g.builder.next_id, OP_LOAD())
-        load_idx2.load_ptr = ir_val_inst(idx_alloca_id)
-        load_idx2.load_type = "i64"
-        load_idx2.result_type = "i64"
-        load_idx2.has_result = true
-        body_block.instructions.push(load_idx2)
-        let idx_val2_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
-        add_inst.lhs = ir_val_inst(idx_val2_id)
-        add_inst.rhs = ir_val_int(1)
-        add_inst.result_type = "i64"
-        add_inst.has_result = true
-        body_block.instructions.push(add_inst)
-        let next_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_idx.store_ptr = ir_val_inst(idx_alloca_id)
-        store_idx.store_val = ir_val_inst(next_id)
-        store_idx.has_result = false
-        body_block.instructions.push(store_idx)
-        g.builder.next_id = g.builder.next_id + 1
-
-        body_block.terminator = Box_new(term_br(header_label))
+        body_block.terminator = Box_new(term_br(step_label))
         body_block.has_terminator = true
     }
+    let stepped = index_step_block(g, step_label, idx_alloca_id, header_label)
+    g = stepped.gen
 
     g.break_target = prev_break
     g.continue_target = prev_continue
@@ -9775,6 +9937,7 @@ fn generate_range_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, ra
     g.completed_blocks.push(b)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
+    g.completed_blocks.push(stepped.block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -9846,13 +10009,15 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
     g = gen_advance_label(g)
     let exit_label = gen_next_label(g, "strfor_exit")
     g = gen_advance_label(g)
+    let step_label = gen_next_label(g, "for_step")
+    g = gen_advance_label(g)
 
     let prev_break = g.break_target
     let prev_continue = g.continue_target
     let prev_has_break = g.has_break_target
     let prev_has_continue = g.has_continue_target
     g.break_target = exit_label
-    g.continue_target = header_label
+    g.continue_target = step_label
     g.has_break_target = true
     g.has_continue_target = true
 
@@ -9916,35 +10081,13 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
     g = body_result.gen
     body_block = body_result.block
 
+    -- The body goes on to the step, and so does `continue`
     if body_block.has_terminator == false {
-        let mut load_idx3 = ir_inst_new(g.builder.next_id, OP_LOAD())
-        load_idx3.load_ptr = ir_val_inst(idx_alloca_id)
-        load_idx3.load_type = "i64"
-        load_idx3.result_type = "i64"
-        load_idx3.has_result = true
-        body_block.instructions.push(load_idx3)
-        let idx_val3_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut add_inst = ir_inst_new(g.builder.next_id, OP_ADD())
-        add_inst.lhs = ir_val_inst(idx_val3_id)
-        add_inst.rhs = ir_val_int(1)
-        add_inst.result_type = "i64"
-        add_inst.has_result = true
-        body_block.instructions.push(add_inst)
-        let next_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
-
-        let mut store_idx = ir_inst_new(g.builder.next_id, OP_STORE())
-        store_idx.store_ptr = ir_val_inst(idx_alloca_id)
-        store_idx.store_val = ir_val_inst(next_id)
-        store_idx.has_result = false
-        body_block.instructions.push(store_idx)
-        g.builder.next_id = g.builder.next_id + 1
-
-        body_block.terminator = Box_new(term_br(header_label))
+        body_block.terminator = Box_new(term_br(step_label))
         body_block.has_terminator = true
     }
+    let stepped = index_step_block(g, step_label, idx_alloca_id, header_label)
+    g = stepped.gen
 
     g.break_target = prev_break
     g.continue_target = prev_continue
@@ -9955,6 +10098,7 @@ fn generate_string_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt, i
     g.completed_blocks.push(b)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
+    g.completed_blocks.push(stepped.block)
 
     let exit_block = ir_block_new(exit_label)
     return gen_result(g, exit_block)
@@ -11734,12 +11878,29 @@ fn generate_addr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResul
 -- or field is used in place. Any other list value (a call result, a
 -- list element) is copied to a temporary and `ok` is false, because
 -- changes to that copy would be lost.
+--
+-- The pointer is the list's place, and not the list's value: the
+-- value of a list that is read from a variable is the list as it
+-- was then (generate_header_load in llvm_gen.dm), which a push would
+-- not reach and a loop over the list would not see grow.
 fn generate_list_handle(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> AddrResult {
     let mut g = gen
     let mut b = block
     let list_t = static_type(g, expr)
     if expr.kind == EXPR_IDENTIFIER() {
-        -- A list variable's value is already a pointer to its storage
+        if g.param_ptr_map.contains(expr.name) and g.variable_types.contains(expr.name) {
+            -- A mut parameter points at the caller's list
+            let place = emit_place_load(g, b, ir_val_param(g.param_ptr_map.get(expr.name)), g.variable_types.get(expr.name))
+            return addr_result(place.gen, place.block, ir_val_inst(place.val_id), list_t)
+        }
+        if g.variable_map.contains(expr.name) {
+            -- A variable's storage is the list's header
+            let slot = g.variable_map.get(expr.name)
+            if slot >= 0 {
+                return addr_result(g, b, ir_val_inst(slot), list_t)
+            }
+        }
+        -- A constant: its value, which nothing changes
         let var_result = generate_expr(g, b, expr)
         return addr_result(var_result.gen, var_result.block, ir_val_inst(var_result.val_id), list_t)
     }
@@ -11769,6 +11930,24 @@ fn generate_list_handle(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ad
     let mut copy = addr_result(g, b, ir_val_inst(tmp_id), list_t)
     copy.ok = false
     return copy
+}
+
+-- A string or a list where it is, at the address `ptr`: a load that
+-- is marked "place", which LLVM generation never turns into a copy of
+-- the header (generate_header_load). ty is the IR type.
+fn emit_place_load(gen: IRGenerator, block: IRBasicBlock, ptr: IRValue, ty: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let id = g.builder.next_id
+    let mut load = ir_inst_new(id, OP_LOAD())
+    load.load_ptr = ptr
+    load.load_type = ty
+    load.result_type = ty
+    load.callee = "place"
+    load.has_result = true
+    b.instructions.push(load)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
 }
 
 -- The address of element idx_id of the list whose header is at
@@ -14652,12 +14831,12 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     if len(obj_var_name) > 0 and g.list_elem_kinds.contains(obj_var_name) {
         let ek = g.list_elem_kinds.get(obj_var_name)
         let raw_list_ptr = g.variable_map.get(obj_var_name)
-        -- For mut params (negative sentinel), generate expr to get the actual pointer
+        -- A mut parameter (negative sentinel) points at the caller's list
         if raw_list_ptr < 0 and g.param_ptr_map.contains(obj_var_name) {
-            let obj_result = generate_expr(g, b, obj_expr)
-            g = obj_result.gen
-            b = obj_result.block
-            return generate_list_method_call(g, b, ek, obj_result.val_id, obj_var_name, method_name, args)
+            let place = generate_list_handle(g, b, obj_expr)
+            g = place.gen
+            b = place.block
+            return generate_list_method_call(g, b, ek, place.ptr.ref_id, obj_var_name, method_name, args)
         }
         return generate_list_method_call(g, b, ek, raw_list_ptr, obj_var_name, method_name, args)
     }
@@ -26081,11 +26260,19 @@ fn mem_copy(gen: LLVMGenerator, dst: int, src: int, ty: int) {
 -- this block it is the pool's, until the value's last use; otherwise
 -- it is an alloca that is the value's for the whole function.
 fn take_temp(gen: LLVMGenerator, ty: int, id: int) -> LLVMGenerator {
+    let mut g = gen
+    g.mv_kind[id] = 2
+    g.mv_ty[id] = ty
+    g.mv_owns[id] = 1
+    return take_storage(g, ty, id)
+}
+
+-- Storage of the LLVM type for value `id`, as take_temp finds it,
+-- for a value that is no struct in memory: the header of a string
+-- or a list (generate_header_load)
+fn take_storage(gen: LLVMGenerator, ty: int, id: int) -> LLVMGenerator {
     unsafe {
         let mut g = gen
-        g.mv_kind[id] = 2
-        g.mv_ty[id] = ty
-        g.mv_owns[id] = 1
         if g.mv_far[id] != 0 {
             g.mv_temp[id] = -1
             g.value_map.insert(int_to_string(id), dm_llvm_build_alloca(g.builder, ty, "mem.own"))
@@ -26173,6 +26360,44 @@ fn generate_mem_load(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             return g
         }
         g = take_temp(g, ty, id)
+        mem_copy(g, temp_of(g, id), from, ty)
+        return g
+    }
+}
+
+-- A string or a list read from memory: the value is the address of
+-- its header, { data, len, capacity }. That is the place it was read
+-- from, with no copy, when every use of the value is in its block
+-- and no store or call lies between the load and its last use: the
+-- place cannot have changed by then. Otherwise the header is copied
+-- to storage of the value's own, so that the value is the string or
+-- the list as it was when it was read. Without the copy, the first
+-- argument of join(s, append(s, "b")) was `s` as append left it,
+-- where append takes `mut s`.
+--
+-- What changes a list (push, pop, an assignment to an element) and a
+-- loop over a list take the list's place: the address of its variable
+-- or field, or a load that IR generation marked "place"
+-- (generate_list_handle). A value read here is never the list that
+-- was to change.
+fn generate_header_load(gen: LLVMGenerator, inst: IRInst, from: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let id = inst.id
+        let mut copied = id >= 0 and id < g.mv_count
+        if copied {
+            if g.mv_uses[id] == 0 {
+                copied = false
+            } else if g.mv_far[id] == 0 and mv_window_clear(g, g.cur_ii, g.mv_last[id]) {
+                copied = false
+            }
+        }
+        if copied == false {
+            g.value_map.insert(int_to_string(id), from)
+            return g
+        }
+        let ty = map_ir_type_to_llvm(g, inst.load_type)
+        g = take_storage(g, ty, id)
         mem_copy(g, temp_of(g, id), from, ty)
         return g
     }
@@ -26972,20 +27197,19 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Memory: load
         if op == OP_LOAD() {
-            if inst.load_type == "string" {
-                -- String loads return the pointer itself (dm_string is always by pointer)
+            if inst.load_type == "string" or starts_with(inst.load_type, "dm_list_") or inst.load_type == "list" or starts_with(inst.load_type, "List[") {
+                -- A string or a list is held by the address of its header
                 let ptr_val = resolve_value(g, inst.load_ptr)
                 g = resolve_value_with_counter(g, inst.load_ptr)
                 g.string_ptrs.insert(id_key, true)
-                if inst.has_result { g.value_map.insert(id_key, ptr_val) }
-                return g
-            }
-            -- List loads return the pointer itself (aggregate types, always by pointer)
-            if starts_with(inst.load_type, "dm_list_") or inst.load_type == "list" or starts_with(inst.load_type, "List[") {
-                let ptr_val = resolve_value(g, inst.load_ptr)
-                g = resolve_value_with_counter(g, inst.load_ptr)
-                g.string_ptrs.insert(id_key, true)
-                if inst.has_result { g.value_map.insert(id_key, ptr_val) }
+                if inst.has_result {
+                    if inst.callee == "place" {
+                        -- The string or the list where it is (emit_place_load)
+                        g.value_map.insert(id_key, ptr_val)
+                    } else {
+                        g = generate_header_load(g, inst, ptr_val)
+                    }
+                }
                 return g
             }
             if is_mem_type(g, inst.load_type) {
@@ -28950,7 +29174,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "6baf74b177700561"
+    return "1cb053da739fed91"
 }
 
 

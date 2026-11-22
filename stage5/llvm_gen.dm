@@ -1892,11 +1892,19 @@ fn mem_copy(gen: LLVMGenerator, dst: int, src: int, ty: int) {
 -- this block it is the pool's, until the value's last use; otherwise
 -- it is an alloca that is the value's for the whole function.
 fn take_temp(gen: LLVMGenerator, ty: int, id: int) -> LLVMGenerator {
+    let mut g = gen
+    g.mv_kind[id] = 2
+    g.mv_ty[id] = ty
+    g.mv_owns[id] = 1
+    return take_storage(g, ty, id)
+}
+
+-- Storage of the LLVM type for value `id`, as take_temp finds it,
+-- for a value that is no struct in memory: the header of a string
+-- or a list (generate_header_load)
+fn take_storage(gen: LLVMGenerator, ty: int, id: int) -> LLVMGenerator {
     unsafe {
         let mut g = gen
-        g.mv_kind[id] = 2
-        g.mv_ty[id] = ty
-        g.mv_owns[id] = 1
         if g.mv_far[id] != 0 {
             g.mv_temp[id] = -1
             g.value_map.insert(int_to_string(id), dm_llvm_build_alloca(g.builder, ty, "mem.own"))
@@ -1984,6 +1992,44 @@ fn generate_mem_load(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             return g
         }
         g = take_temp(g, ty, id)
+        mem_copy(g, temp_of(g, id), from, ty)
+        return g
+    }
+}
+
+-- A string or a list read from memory: the value is the address of
+-- its header, { data, len, capacity }. That is the place it was read
+-- from, with no copy, when every use of the value is in its block
+-- and no store or call lies between the load and its last use: the
+-- place cannot have changed by then. Otherwise the header is copied
+-- to storage of the value's own, so that the value is the string or
+-- the list as it was when it was read. Without the copy, the first
+-- argument of join(s, append(s, "b")) was `s` as append left it,
+-- where append takes `mut s`.
+--
+-- What changes a list (push, pop, an assignment to an element) and a
+-- loop over a list take the list's place: the address of its variable
+-- or field, or a load that IR generation marked "place"
+-- (generate_list_handle). A value read here is never the list that
+-- was to change.
+fn generate_header_load(gen: LLVMGenerator, inst: IRInst, from: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let id = inst.id
+        let mut copied = id >= 0 and id < g.mv_count
+        if copied {
+            if g.mv_uses[id] == 0 {
+                copied = false
+            } else if g.mv_far[id] == 0 and mv_window_clear(g, g.cur_ii, g.mv_last[id]) {
+                copied = false
+            }
+        }
+        if copied == false {
+            g.value_map.insert(int_to_string(id), from)
+            return g
+        }
+        let ty = map_ir_type_to_llvm(g, inst.load_type)
+        g = take_storage(g, ty, id)
         mem_copy(g, temp_of(g, id), from, ty)
         return g
     }
@@ -2783,20 +2829,19 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Memory: load
         if op == OP_LOAD() {
-            if inst.load_type == "string" {
-                -- String loads return the pointer itself (dm_string is always by pointer)
+            if inst.load_type == "string" or starts_with(inst.load_type, "dm_list_") or inst.load_type == "list" or starts_with(inst.load_type, "List[") {
+                -- A string or a list is held by the address of its header
                 let ptr_val = resolve_value(g, inst.load_ptr)
                 g = resolve_value_with_counter(g, inst.load_ptr)
                 g.string_ptrs.insert(id_key, true)
-                if inst.has_result { g.value_map.insert(id_key, ptr_val) }
-                return g
-            }
-            -- List loads return the pointer itself (aggregate types, always by pointer)
-            if starts_with(inst.load_type, "dm_list_") or inst.load_type == "list" or starts_with(inst.load_type, "List[") {
-                let ptr_val = resolve_value(g, inst.load_ptr)
-                g = resolve_value_with_counter(g, inst.load_ptr)
-                g.string_ptrs.insert(id_key, true)
-                if inst.has_result { g.value_map.insert(id_key, ptr_val) }
+                if inst.has_result {
+                    if inst.callee == "place" {
+                        -- The string or the list where it is (emit_place_load)
+                        g.value_map.insert(id_key, ptr_val)
+                    } else {
+                        g = generate_header_load(g, inst, ptr_val)
+                    }
+                }
                 return g
             }
             if is_mem_type(g, inst.load_type) {
