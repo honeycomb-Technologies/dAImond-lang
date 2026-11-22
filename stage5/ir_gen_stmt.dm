@@ -1055,7 +1055,35 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let cmp_id = g.builder.next_id
     g.builder.next_id = g.builder.next_id + 1
 
-    header_block.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), body_label, exit_label))
+    -- The loop visits the elements the list had when it began. A body
+    -- that shortens the list ends the loop at the list's new end, so
+    -- the index is also tested against the length the list has now;
+    -- elements the body adds are not visited.
+    let now_label = gen_next_label(g, "for_len_now")
+    g = gen_advance_label(g)
+    header_block.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), now_label, exit_label))
+    header_block.has_terminator = true
+    let first_header = header_block
+    header_block = ir_block_new(now_label)
+    let mut now_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+    now_inst.callee = len_fn
+    let mut now_args: List[IRValue] = []
+    now_args.push(ir_val_inst(list_ptr))
+    now_inst.call_args = now_args
+    now_inst.result_type = "i64"
+    now_inst.has_result = true
+    header_block.instructions.push(now_inst)
+    let now_len_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+    let mut now_cmp = ir_inst_new(g.builder.next_id, OP_LT())
+    now_cmp.lhs = ir_val_inst(idx_val_id)
+    now_cmp.rhs = ir_val_inst(now_len_id)
+    now_cmp.result_type = "bool"
+    now_cmp.has_result = true
+    header_block.instructions.push(now_cmp)
+    let now_cmp_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+    header_block.terminator = Box_new(term_br_cond(ir_val_inst(now_cmp_id), body_label, exit_label))
     header_block.has_terminator = true
 
     -- Body: get element, run body, increment
@@ -1155,6 +1183,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
 
     -- Push completed blocks
     g.completed_blocks.push(b)
+    g.completed_blocks.push(first_header)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
 
@@ -1556,10 +1585,12 @@ fn generate_continue(gen: IRGenerator, block: IRBasicBlock) -> GenResult {
 -- ASSIGNMENT
 -- ============================================================
 
--- Compound assignment (+=, -=, *=, /=, %=): load the current value of
--- type ty from ptr_val and combine it with val_id. Signed integer
--- add/sub/mul are overflow-checked. Returns the new value.
-fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRValue, ty: string, assign_op: int, val_id: int, value_expr: Expr) -> ExprResult {
+-- The new value of `target op= value`: what the place at ptr_val holds
+-- (a `ty`), combined with the value by the operator, as `target op
+-- value` would be: checked for overflow and a zero divisor, strings
+-- concatenated, an integer literal taking the place's type. The result
+-- has the place's type.
+fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRValue, ty: string, assign_op: int, val_id: int, value_expr: Expr, target: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
     -- Load current value
@@ -1572,41 +1603,46 @@ fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRVal
     let old_val_id = g.builder.next_id
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Compute new value (checked for signed int add/sub/mul)
-    let op = if assign_op == ASSIGN_ADD() { OP_ADD() }
-    else if assign_op == ASSIGN_SUB() { OP_SUB() }
-    else if assign_op == ASSIGN_MUL() { OP_MUL() }
-    else if assign_op == ASSIGN_DIV() { OP_DIV() }
-    else { OP_MOD() }
+    let binop = if assign_op == ASSIGN_ADD() { BINOP_ADD() }
+    else if assign_op == ASSIGN_SUB() { BINOP_SUB() }
+    else if assign_op == ASSIGN_MUL() { BINOP_MUL() }
+    else if assign_op == ASSIGN_DIV() { BINOP_DIV() }
+    else { BINOP_MOD() }
+    let whole = expr_binary(binop, target, value_expr, value_expr.line, value_expr.col)
+    let val_type = infer_expr_type(g, value_expr)
 
-    let mut new_val_id = 0
-    let cmp_val_type = infer_expr_type(g, value_expr)
-    if (assign_op == ASSIGN_ADD() or assign_op == ASSIGN_SUB() or assign_op == ASSIGN_MUL()) and is_signed_int_type(ty) and is_signed_int_type(cmp_val_type) {
-        let cmp_callee = if assign_op == ASSIGN_ADD() { "dm_checked_add_i64" }
-        else if assign_op == ASSIGN_SUB() { "dm_checked_sub_i64" }
-        else { "dm_checked_mul_i64" }
-        let mut cmp_fit = ""
-        if type_bit_width(ty) < 64 { cmp_fit = ty }
-        let cmp_chk = emit_checked_int_arith(g, b, cmp_callee, ir_val_inst(old_val_id), ty, ir_val_inst(val_id), cmp_val_type, cmp_fit)
-        g = cmp_chk.gen
-        b = cmp_chk.block
-        new_val_id = cmp_chk.val_id
-    } else {
-        let mut arith_inst = ir_inst_new(g.builder.next_id, op)
-        arith_inst.lhs = ir_val_inst(old_val_id)
-        arith_inst.rhs = ir_val_inst(val_id)
-        arith_inst.result_type = ty
-        arith_inst.has_result = true
-        b.instructions.push(arith_inst)
-        new_val_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
+    -- A wider integer does not fit the place
+    if is_integer_type(ty) and is_integer_type(val_type) and is_int_literal_expr(branch_value_expr(value_expr)) == false and type_bit_width(val_type) > type_bit_width(ty) {
+        g = ir_type_error(g, "the value has type " + builtin_src_type(val_type) + ", which does not fit in " + ty + "; convert it with `as " + ty + "`", value_expr.line)
     }
 
-    return expr_result(g, b, new_val_id)
+    -- A struct that defines the operator: its method, called with what
+    -- the place holds and the value
+    let method = arith_overload_method(binop)
+    if method != "" and g.struct_defs.contains(ty) and struct_has_method(g, ty, method) {
+        let held = bind_hidden_value(g, b, "%compound.place", old_val_id, ty, static_type(g, target))
+        let given = bind_hidden_value(held.gen, held.block, "%compound.value", val_id, val_type, static_type(held.gen, value_expr))
+        let mut method_args: List[Expr] = []
+        method_args.push(expr_ident("%compound.value", value_expr.line, value_expr.col))
+        let called = generate_struct_method_call(given.gen, given.block, ty, expr_ident("%compound.place", value_expr.line, value_expr.col), method, method_args)
+        g = unbind_hidden_value(unbind_hidden_value(called.gen, "%compound.place"), "%compound.value")
+        return expr_result(g, called.block, called.val_id)
+    }
+
+    let combined = emit_binary_op(g, b, whole, old_val_id, ty, val_id, val_type)
+    -- Integers of two types met at one of them; the place takes its own
+    let met = common_int_type(whole, ty, val_type)
+    if met != "" and met != ty {
+        return emit_ir_cast(combined.gen, combined.block, ir_val_inst(combined.val_id), met, ty)
+    }
+    return combined
 }
 
--- list[index] = value for the list at list_ptr, with a bounds check
-fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_type: string, list_ptr: IRValue, index_expr: Expr, val_id: int, value_expr: Expr, set_ctx: string) -> GenResult {
+-- list[index] = value for the list at list_ptr, with a bounds check;
+-- with a compound operator (assign_op), list[index] op= value, which
+-- reads the element where it lies and writes the result there.
+-- `target` is the element as an expression.
+fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_type: string, list_ptr: IRValue, index_expr: Expr, val_id: int, value_expr: Expr, set_ctx: string, assign_op: int, target: Expr) -> GenResult {
     let mut g = gen
     let mut b = block
     -- Generate the index expression
@@ -1634,14 +1670,18 @@ fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_
     g = set_chk.gen
     b = set_chk.block
 
-    -- The index is in range: write the element where it lies. An
-    -- integer value takes the element's type first.
+    -- The index is in range: write the element where it lies
     let slot_type = list_slot_ir_type(ek, elem_type)
-    let conv = convert_int_value(g, b, val_id, value_expr, infer_expr_type(g, value_expr), map_type_name(slot_type), "the assigned value")
-    g = conv.gen
-    b = conv.block
     let elem_addr = emit_list_elem_addr(g, b, list_ptr, idx_result.val_id, slot_type)
-    return emit_ir_store(elem_addr.gen, elem_addr.block, ir_val_inst(elem_addr.val_id), ir_val_inst(conv.val_id))
+    g = elem_addr.gen
+    b = elem_addr.block
+    if assign_op != ASSIGN_EQ() {
+        let compound = generate_compound_value(g, b, ir_val_inst(elem_addr.val_id), map_type_name(slot_type), assign_op, val_id, value_expr, target)
+        return emit_ir_store(compound.gen, compound.block, ir_val_inst(elem_addr.val_id), ir_val_inst(compound.val_id))
+    }
+    -- An integer value takes the element's type first
+    let conv = convert_int_value(g, b, val_id, value_expr, infer_expr_type(g, value_expr), map_type_name(slot_type), "the assigned value")
+    return emit_ir_store(conv.gen, conv.block, ir_val_inst(elem_addr.val_id), ir_val_inst(conv.val_id))
 }
 
 fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
@@ -1803,7 +1843,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     ptr_val = ir_val_param(pidx)
                 }
 
-                let compound = generate_compound_value(g, b, ptr_val, ty, assign_op, val_result.val_id, *stmt.assign_value)
+                let compound = generate_compound_value(g, b, ptr_val, ty, assign_op, val_result.val_id, *stmt.assign_value, target)
                 g = compound.gen
                 b = compound.block
                 let new_val_id = compound.val_id
@@ -1834,7 +1874,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             b = conv.block
             store_val_id = conv.val_id
         } else {
-            let compound = generate_compound_value(g, b, fa.ptr, map_type_name(fa.src_type), assign_op, val_result.val_id, *stmt.assign_value)
+            let compound = generate_compound_value(g, b, fa.ptr, map_type_name(fa.src_type), assign_op, val_result.val_id, *stmt.assign_value, target)
             g = compound.gen
             b = compound.block
             store_val_id = compound.val_id
@@ -1859,7 +1899,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 g = ir_type_error(g, "element assignment would change a temporary copy of this list; store the list in a variable or field first", stmt.line)
             }
             let elem_src = extract_inner_type(obj_static, "List[")
-            let set_res = generate_list_index_set(g, b, classify_list_elem(elem_src), list_elem_ir_type(elem_src), h.ptr, *target.index, val_result.val_id, *stmt.assign_value, "(list)")
+            let set_res = generate_list_index_set(g, b, classify_list_elem(elem_src), list_elem_ir_type(elem_src), h.ptr, *target.index, val_result.val_id, *stmt.assign_value, "(list)", assign_op, target)
             g = set_res.gen
             b = set_res.block
         }
@@ -1871,7 +1911,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 let list_ptr = g.variable_map.get(obj_name)
                 let set_elem_type = if g.list_elem_types.contains(obj_name) { g.list_elem_types.get(obj_name) } else { "i64" }
                 let set_ctx = if g.array_var_names.contains(obj_name) { "(array)" } else { "(list)" }
-                let set_res = generate_list_index_set(g, b, ek, set_elem_type, ir_val_inst(list_ptr), *target.index, val_result.val_id, *stmt.assign_value, set_ctx)
+                let set_res = generate_list_index_set(g, b, ek, set_elem_type, ir_val_inst(list_ptr), *target.index, val_result.val_id, *stmt.assign_value, set_ctx, assign_op, target)
                 g = set_res.gen
                 b = set_res.block
             }

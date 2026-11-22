@@ -62,6 +62,7 @@ fn TK_PLUSEQ() -> int { return 69 }
 fn TK_MINUSEQ() -> int { return 70 }
 fn TK_STAREQ() -> int { return 71 }
 fn TK_SLASHEQ() -> int { return 72 }
+fn TK_PERCENTEQ() -> int { return 73 }
 fn TK_LPAREN() -> int { return 80 }
 fn TK_RPAREN() -> int { return 81 }
 fn TK_LBRACE() -> int { return 82 }
@@ -275,6 +276,7 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_SELF() { return "'self'" }
     if kind == TK_SEMICOLON() { return "';'" }
     if kind == TK_SLASHEQ() { return "'/='" }
+    if kind == TK_PERCENTEQ() { return "'%='" }
     if kind == TK_STAREQ() { return "'*='" }
     if kind == TK_UNDERSCORE() { return "'_'" }
     if kind == TK_WITH() { return "'with'" }
@@ -554,9 +556,15 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                     lex.col = lex.col + 1
                 }
             } else if ch == "%" {
-                tokens.push(token_new(TK_PERCENT(), "%", sl, sc))
-                lex.pos = lex.pos + 1
-                lex.col = lex.col + 1
+                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
+                    tokens.push(token_new(TK_PERCENTEQ(), "%=", sl, sc))
+                    lex.pos = lex.pos + 2
+                    lex.col = lex.col + 2
+                } else {
+                    tokens.push(token_new(TK_PERCENT(), "%", sl, sc))
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
+                }
             } else if ch == "=" {
                 if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
                     tokens.push(token_new(TK_EQEQ(), "==", sl, sc))
@@ -2819,6 +2827,7 @@ extern fn dm_llvm_initialize_all_targets()
 extern fn dm_llvm_get_default_target_triple() -> int
 extern fn dm_llvm_create_target_machine(triple: string, opt_level: int) -> int
 extern fn dm_llvm_add_function_attr(func: int, name: string)
+extern fn dm_llvm_add_call_param_attr(call: int, param: int, name: string)
 extern fn dm_llvm_dispose_target_machine(tm: int)
 extern fn dm_llvm_target_machine_emit_to_file(tm: int, mod: int, filename: string, file_type: int) -> int
 extern fn dm_llvm_get_target_data_layout(tm: int) -> int
@@ -4198,7 +4207,7 @@ fn parse_stmt(p: Parser) -> ParseStmtResult {
     -- Check for assignment: expr = value, expr += value, etc.
     pp = p_skip_newlines(pp)
     let assign_kind = p_peek(pp)
-    if assign_kind == TK_EQ() or assign_kind == TK_PLUSEQ() or assign_kind == TK_MINUSEQ() or assign_kind == TK_STAREQ() or assign_kind == TK_SLASHEQ() {
+    if assign_kind == TK_EQ() or assign_kind == TK_PLUSEQ() or assign_kind == TK_MINUSEQ() or assign_kind == TK_STAREQ() or assign_kind == TK_SLASHEQ() or assign_kind == TK_PERCENTEQ() {
         let assign_op = token_to_assign_op(assign_kind)
         pp = p_advance(pp)
         let val = parse_expr(pp)
@@ -4222,6 +4231,7 @@ fn token_to_assign_op(kind: int) -> int {
     if kind == TK_MINUSEQ() { return ASSIGN_SUB() }
     if kind == TK_STAREQ() { return ASSIGN_MUL() }
     if kind == TK_SLASHEQ() { return ASSIGN_DIV() }
+    if kind == TK_PERCENTEQ() { return ASSIGN_MOD() }
     return ASSIGN_EQ()
 }
 
@@ -8525,7 +8535,35 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     let cmp_id = g.builder.next_id
     g.builder.next_id = g.builder.next_id + 1
 
-    header_block.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), body_label, exit_label))
+    -- The loop visits the elements the list had when it began. A body
+    -- that shortens the list ends the loop at the list's new end, so
+    -- the index is also tested against the length the list has now;
+    -- elements the body adds are not visited.
+    let now_label = gen_next_label(g, "for_len_now")
+    g = gen_advance_label(g)
+    header_block.terminator = Box_new(term_br_cond(ir_val_inst(cmp_id), now_label, exit_label))
+    header_block.has_terminator = true
+    let first_header = header_block
+    header_block = ir_block_new(now_label)
+    let mut now_inst = ir_inst_new(g.builder.next_id, OP_CALL())
+    now_inst.callee = len_fn
+    let mut now_args: List[IRValue] = []
+    now_args.push(ir_val_inst(list_ptr))
+    now_inst.call_args = now_args
+    now_inst.result_type = "i64"
+    now_inst.has_result = true
+    header_block.instructions.push(now_inst)
+    let now_len_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+    let mut now_cmp = ir_inst_new(g.builder.next_id, OP_LT())
+    now_cmp.lhs = ir_val_inst(idx_val_id)
+    now_cmp.rhs = ir_val_inst(now_len_id)
+    now_cmp.result_type = "bool"
+    now_cmp.has_result = true
+    header_block.instructions.push(now_cmp)
+    let now_cmp_id = g.builder.next_id
+    g.builder.next_id = g.builder.next_id + 1
+    header_block.terminator = Box_new(term_br_cond(ir_val_inst(now_cmp_id), body_label, exit_label))
     header_block.has_terminator = true
 
     -- Body: get element, run body, increment
@@ -8625,6 +8663,7 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
 
     -- Push completed blocks
     g.completed_blocks.push(b)
+    g.completed_blocks.push(first_header)
     g.completed_blocks.push(header_block)
     g.completed_blocks.push(body_block)
 
@@ -9026,10 +9065,12 @@ fn generate_continue(gen: IRGenerator, block: IRBasicBlock) -> GenResult {
 -- ASSIGNMENT
 -- ============================================================
 
--- Compound assignment (+=, -=, *=, /=, %=): load the current value of
--- type ty from ptr_val and combine it with val_id. Signed integer
--- add/sub/mul are overflow-checked. Returns the new value.
-fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRValue, ty: string, assign_op: int, val_id: int, value_expr: Expr) -> ExprResult {
+-- The new value of `target op= value`: what the place at ptr_val holds
+-- (a `ty`), combined with the value by the operator, as `target op
+-- value` would be: checked for overflow and a zero divisor, strings
+-- concatenated, an integer literal taking the place's type. The result
+-- has the place's type.
+fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRValue, ty: string, assign_op: int, val_id: int, value_expr: Expr, target: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
     -- Load current value
@@ -9042,41 +9083,46 @@ fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRVal
     let old_val_id = g.builder.next_id
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Compute new value (checked for signed int add/sub/mul)
-    let op = if assign_op == ASSIGN_ADD() { OP_ADD() }
-    else if assign_op == ASSIGN_SUB() { OP_SUB() }
-    else if assign_op == ASSIGN_MUL() { OP_MUL() }
-    else if assign_op == ASSIGN_DIV() { OP_DIV() }
-    else { OP_MOD() }
+    let binop = if assign_op == ASSIGN_ADD() { BINOP_ADD() }
+    else if assign_op == ASSIGN_SUB() { BINOP_SUB() }
+    else if assign_op == ASSIGN_MUL() { BINOP_MUL() }
+    else if assign_op == ASSIGN_DIV() { BINOP_DIV() }
+    else { BINOP_MOD() }
+    let whole = expr_binary(binop, target, value_expr, value_expr.line, value_expr.col)
+    let val_type = infer_expr_type(g, value_expr)
 
-    let mut new_val_id = 0
-    let cmp_val_type = infer_expr_type(g, value_expr)
-    if (assign_op == ASSIGN_ADD() or assign_op == ASSIGN_SUB() or assign_op == ASSIGN_MUL()) and is_signed_int_type(ty) and is_signed_int_type(cmp_val_type) {
-        let cmp_callee = if assign_op == ASSIGN_ADD() { "dm_checked_add_i64" }
-        else if assign_op == ASSIGN_SUB() { "dm_checked_sub_i64" }
-        else { "dm_checked_mul_i64" }
-        let mut cmp_fit = ""
-        if type_bit_width(ty) < 64 { cmp_fit = ty }
-        let cmp_chk = emit_checked_int_arith(g, b, cmp_callee, ir_val_inst(old_val_id), ty, ir_val_inst(val_id), cmp_val_type, cmp_fit)
-        g = cmp_chk.gen
-        b = cmp_chk.block
-        new_val_id = cmp_chk.val_id
-    } else {
-        let mut arith_inst = ir_inst_new(g.builder.next_id, op)
-        arith_inst.lhs = ir_val_inst(old_val_id)
-        arith_inst.rhs = ir_val_inst(val_id)
-        arith_inst.result_type = ty
-        arith_inst.has_result = true
-        b.instructions.push(arith_inst)
-        new_val_id = g.builder.next_id
-        g.builder.next_id = g.builder.next_id + 1
+    -- A wider integer does not fit the place
+    if is_integer_type(ty) and is_integer_type(val_type) and is_int_literal_expr(branch_value_expr(value_expr)) == false and type_bit_width(val_type) > type_bit_width(ty) {
+        g = ir_type_error(g, "the value has type " + builtin_src_type(val_type) + ", which does not fit in " + ty + "; convert it with `as " + ty + "`", value_expr.line)
     }
 
-    return expr_result(g, b, new_val_id)
+    -- A struct that defines the operator: its method, called with what
+    -- the place holds and the value
+    let method = arith_overload_method(binop)
+    if method != "" and g.struct_defs.contains(ty) and struct_has_method(g, ty, method) {
+        let held = bind_hidden_value(g, b, "%compound.place", old_val_id, ty, static_type(g, target))
+        let given = bind_hidden_value(held.gen, held.block, "%compound.value", val_id, val_type, static_type(held.gen, value_expr))
+        let mut method_args: List[Expr] = []
+        method_args.push(expr_ident("%compound.value", value_expr.line, value_expr.col))
+        let called = generate_struct_method_call(given.gen, given.block, ty, expr_ident("%compound.place", value_expr.line, value_expr.col), method, method_args)
+        g = unbind_hidden_value(unbind_hidden_value(called.gen, "%compound.place"), "%compound.value")
+        return expr_result(g, called.block, called.val_id)
+    }
+
+    let combined = emit_binary_op(g, b, whole, old_val_id, ty, val_id, val_type)
+    -- Integers of two types met at one of them; the place takes its own
+    let met = common_int_type(whole, ty, val_type)
+    if met != "" and met != ty {
+        return emit_ir_cast(combined.gen, combined.block, ir_val_inst(combined.val_id), met, ty)
+    }
+    return combined
 }
 
--- list[index] = value for the list at list_ptr, with a bounds check
-fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_type: string, list_ptr: IRValue, index_expr: Expr, val_id: int, value_expr: Expr, set_ctx: string) -> GenResult {
+-- list[index] = value for the list at list_ptr, with a bounds check;
+-- with a compound operator (assign_op), list[index] op= value, which
+-- reads the element where it lies and writes the result there.
+-- `target` is the element as an expression.
+fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_type: string, list_ptr: IRValue, index_expr: Expr, val_id: int, value_expr: Expr, set_ctx: string, assign_op: int, target: Expr) -> GenResult {
     let mut g = gen
     let mut b = block
     -- Generate the index expression
@@ -9104,14 +9150,18 @@ fn generate_list_index_set(gen: IRGenerator, block: IRBasicBlock, ek: int, elem_
     g = set_chk.gen
     b = set_chk.block
 
-    -- The index is in range: write the element where it lies. An
-    -- integer value takes the element's type first.
+    -- The index is in range: write the element where it lies
     let slot_type = list_slot_ir_type(ek, elem_type)
-    let conv = convert_int_value(g, b, val_id, value_expr, infer_expr_type(g, value_expr), map_type_name(slot_type), "the assigned value")
-    g = conv.gen
-    b = conv.block
     let elem_addr = emit_list_elem_addr(g, b, list_ptr, idx_result.val_id, slot_type)
-    return emit_ir_store(elem_addr.gen, elem_addr.block, ir_val_inst(elem_addr.val_id), ir_val_inst(conv.val_id))
+    g = elem_addr.gen
+    b = elem_addr.block
+    if assign_op != ASSIGN_EQ() {
+        let compound = generate_compound_value(g, b, ir_val_inst(elem_addr.val_id), map_type_name(slot_type), assign_op, val_id, value_expr, target)
+        return emit_ir_store(compound.gen, compound.block, ir_val_inst(elem_addr.val_id), ir_val_inst(compound.val_id))
+    }
+    -- An integer value takes the element's type first
+    let conv = convert_int_value(g, b, val_id, value_expr, infer_expr_type(g, value_expr), map_type_name(slot_type), "the assigned value")
+    return emit_ir_store(conv.gen, conv.block, ir_val_inst(elem_addr.val_id), ir_val_inst(conv.val_id))
 }
 
 fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenResult {
@@ -9273,7 +9323,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                     ptr_val = ir_val_param(pidx)
                 }
 
-                let compound = generate_compound_value(g, b, ptr_val, ty, assign_op, val_result.val_id, *stmt.assign_value)
+                let compound = generate_compound_value(g, b, ptr_val, ty, assign_op, val_result.val_id, *stmt.assign_value, target)
                 g = compound.gen
                 b = compound.block
                 let new_val_id = compound.val_id
@@ -9304,7 +9354,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
             b = conv.block
             store_val_id = conv.val_id
         } else {
-            let compound = generate_compound_value(g, b, fa.ptr, map_type_name(fa.src_type), assign_op, val_result.val_id, *stmt.assign_value)
+            let compound = generate_compound_value(g, b, fa.ptr, map_type_name(fa.src_type), assign_op, val_result.val_id, *stmt.assign_value, target)
             g = compound.gen
             b = compound.block
             store_val_id = compound.val_id
@@ -9329,7 +9379,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 g = ir_type_error(g, "element assignment would change a temporary copy of this list; store the list in a variable or field first", stmt.line)
             }
             let elem_src = extract_inner_type(obj_static, "List[")
-            let set_res = generate_list_index_set(g, b, classify_list_elem(elem_src), list_elem_ir_type(elem_src), h.ptr, *target.index, val_result.val_id, *stmt.assign_value, "(list)")
+            let set_res = generate_list_index_set(g, b, classify_list_elem(elem_src), list_elem_ir_type(elem_src), h.ptr, *target.index, val_result.val_id, *stmt.assign_value, "(list)", assign_op, target)
             g = set_res.gen
             b = set_res.block
         }
@@ -9341,7 +9391,7 @@ fn generate_assignment(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Gen
                 let list_ptr = g.variable_map.get(obj_name)
                 let set_elem_type = if g.list_elem_types.contains(obj_name) { g.list_elem_types.get(obj_name) } else { "i64" }
                 let set_ctx = if g.array_var_names.contains(obj_name) { "(array)" } else { "(list)" }
-                let set_res = generate_list_index_set(g, b, ek, set_elem_type, ir_val_inst(list_ptr), *target.index, val_result.val_id, *stmt.assign_value, set_ctx)
+                let set_res = generate_list_index_set(g, b, ek, set_elem_type, ir_val_inst(list_ptr), *target.index, val_result.val_id, *stmt.assign_value, set_ctx, assign_op, target)
                 g = set_res.gen
                 b = set_res.block
             }
@@ -11353,10 +11403,73 @@ fn binary_left_is_binary(expr: Expr) -> bool {
     return left.kind == EXPR_BINARY()
 }
 
+-- Whether the struct has a method of this name, declared or generic
+fn struct_has_method(g: IRGenerator, struct_name: string, method: string) -> bool {
+    let mangled = struct_name + "_" + method
+    let mut fci = 0
+    while fci < g.ir_mod.functions.len() {
+        if g.ir_mod.functions[fci].name == mangled { return true }
+        fci = fci + 1
+    }
+    if g.generic_fn_decls.contains(mangled) { return true }
+    -- A method that is declared further down the file
+    let mut dci = 0
+    while dci < g.declarations.len() {
+        let decl = g.declarations[dci]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.name == mangled { return true }
+        }
+        dci = dci + 1
+    }
+    return false
+}
+
+-- The method a struct defines an arithmetic operator with
+fn arith_overload_method(op: int) -> string {
+    if op == BINOP_ADD() { return "add" }
+    if op == BINOP_SUB() { return "sub" }
+    if op == BINOP_MUL() { return "mul" }
+    if op == BINOP_DIV() { return "div" }
+    return ""
+}
+
+-- A variable no source can name (its name begins with %), which holds
+-- a value that is generated already, so that the value can be given
+-- where an expression is expected. ty is its IR type and src its
+-- source type. unbind_hidden_value forgets it.
+fn bind_hidden_value(gen: IRGenerator, block: IRBasicBlock, name: string, val_id: int, ty: string, src: string) -> GenResult {
+    let mut g = gen
+    let mut b = block
+    let slot_id = g.builder.next_id
+    let mut slot = ir_inst_new(slot_id, OP_ALLOCA())
+    slot.alloc_type = ty
+    slot.result_type = "ptr(" + ty + ")"
+    slot.has_result = true
+    b.instructions.push(slot)
+    g.builder.next_id = slot_id + 1
+    let stored = emit_ir_store(g, b, ir_val_inst(slot_id), ir_val_inst(val_id))
+    g = stored.gen
+    g.variable_map.insert(name, slot_id)
+    g.variable_types.insert(name, ty)
+    if src != "" { g.var_src_types.insert(name, src) }
+    if g.struct_defs.contains(ty) { g.var_struct_types.insert(name, ty) }
+    return gen_result(g, stored.block)
+}
+
+fn unbind_hidden_value(gen: IRGenerator, name: string) -> IRGenerator {
+    let mut g = gen
+    if g.variable_map.contains(name) { g.variable_map.remove(name) }
+    if g.variable_types.contains(name) { g.variable_types.remove(name) }
+    if g.var_src_types.contains(name) { g.var_src_types.remove(name) }
+    if g.var_struct_types.contains(name) { g.var_struct_types.remove(name) }
+    return g
+}
+
 -- One binary operator. lhs_done is the value of its left operand when
 -- that is generated already, and -1 when it is not. It is only given
 -- for an operator that is not `and` or `or` and whose left operand is
--- itself a binary operator, which is never an overloaded one's.
+-- itself a binary operator.
 fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_done: int) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -11542,7 +11655,9 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
                 left_struct_name = g.var_struct_types.get(left_expr.name)
             }
         }
-        if left_struct_name == "" and left_expr.kind == EXPR_IDENTIFIER() {
+        if left_struct_name == "" {
+            -- Any other left operand that is a struct: a field, a call,
+            -- another operator's result
             let ltype = infer_expr_type(g, left_expr)
             if g.struct_defs.contains(ltype) {
                 left_struct_name = ltype
@@ -11550,38 +11665,17 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
         }
 
         if len(left_struct_name) > 0 {
-            let mangled = left_struct_name + "_" + overload_method
-            -- Check if method exists (declared or generic)
-            let mut method_exists = false
-            let mut fci = 0
-            while fci < g.ir_mod.functions.len() {
-                if g.ir_mod.functions[fci].name == mangled {
-                    method_exists = true
-                }
-                fci = fci + 1
-            }
-            if method_exists == false and g.generic_fn_decls.contains(mangled) {
-                method_exists = true
-            }
-            -- Also check pending declarations
-            if method_exists == false {
-                let mut dci = 0
-                while dci < g.declarations.len() {
-                    let decl = g.declarations[dci]
-                    if decl.kind == DECL_FUNCTION() {
-                        let fd = *decl.func_decl
-                        if fd.name == mangled {
-                            method_exists = true
-                        }
-                    }
-                    dci = dci + 1
-                }
-            }
-
-            if method_exists {
+            if struct_has_method(g, left_struct_name, overload_method) {
                 -- Call the overloaded operator method: struct_method(left, right)
                 let mut op_args: List[Expr] = []
                 op_args.push(*expr.right)
+                if lhs_done >= 0 {
+                    -- The left operand is generated already (a + b + c):
+                    -- the method takes that value
+                    let held = bind_hidden_value(g, b, "%operand.left", lhs_done, left_struct_name, static_type(g, left_expr))
+                    let called = generate_struct_method_call(held.gen, held.block, left_struct_name, expr_ident("%operand.left", expr.line, expr.col), overload_method, op_args)
+                    return expr_result(unbind_hidden_value(called.gen, "%operand.left"), called.block, called.val_id)
+                }
                 return generate_struct_method_call(g, b, left_struct_name, left_expr, overload_method, op_args)
             }
         }
@@ -11607,12 +11701,26 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
     b = rhs_result.block
     let mut rhs_id = rhs_result.val_id
 
-    -- Infer the type of the left operand to select the correct op family
-    let mut lhs_type = infer_expr_type(g, *expr.left)
-    let mut rhs_type = infer_expr_type(g, *expr.right)
+    -- The operands' types select the operation
+    return emit_binary_op(g, b, expr, lhs_id, infer_expr_type(g, *expr.left), rhs_id, infer_expr_type(g, *expr.right))
+}
+
+-- The operation of the binary operator `expr` on two values that are
+-- generated already, with their types. Not `and` and `or`, which do
+-- not evaluate both operands, and not an overloaded operator. A
+-- compound assignment (generate_compound_value) gives the value its
+-- place holds as the left operand.
+fn emit_binary_op(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_val_id: int, lhs_in_type: string, rhs_val_id: int, rhs_in_type: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let op = expr.op
+    let mut lhs_id = lhs_val_id
+    let mut rhs_id = rhs_val_id
+    let mut lhs_type = lhs_in_type
+    let mut rhs_type = rhs_in_type
 
     -- Integers of different types meet at one type (see binary_int_type)
-    let common_t = binary_int_type(g, expr)
+    let common_t = common_int_type(expr, lhs_type, rhs_type)
     if common_t != "" {
         if lhs_type != common_t {
             g = check_int_literal_fits(g, *expr.left, common_t)
@@ -12324,7 +12432,7 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Box_new(value)
     if fn_name == "Box_new" {
-        return generate_box_new_call(g, b, expr.args)
+        return generate_box_new_call(g, b, expr)
     }
 
     -- Box_null()
@@ -12628,11 +12736,19 @@ fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name
     -- Get the actual lambda function name
     let lambda_name = g.fn_ptr_vars.get(var_name)
 
-    -- Generate explicit arguments
+    -- Generate explicit arguments; an integer becomes the parameter's
+    -- integer type
+    let mut param_types: List[string] = []
+    if g.fn_src_param_types.contains(lambda_name) {
+        param_types = string_split(g.fn_src_param_types.get(lambda_name), "|")
+    }
     let mut call_args: List[IRValue] = []
     let mut i = 0
     while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
+        let mut arg_result = generate_expr(g, b, args[i])
+        if i < param_types.len() {
+            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], param_types[i], "argument " + int_to_string(i + 1) + " of '" + var_name + "'")
+        }
         g = arg_result.gen
         b = arg_result.block
         call_args.push(ir_val_inst(arg_result.val_id))
@@ -12856,6 +12972,17 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
         res_type = g.current_return_type
     }
 
+    -- An integer becomes the Result's integer type
+    let mut err_val = val_result
+    if starts_with(res_type, "Result[") {
+        let res_args = split_type_args(extract_inner_type(res_type, "Result["))
+        if res_args.len() > 1 {
+            err_val = convert_int_to_place(g, b, val_result.val_id, args[0], res_args[1], "the value of 'Err'")
+            g = err_val.gen
+            b = err_val.block
+        }
+    }
+
     -- Build the Result struct: { tag: 1, ok_val: undef, err_val: payload }
     -- Use undef as the base (not alloca), since insertvalue works on values not pointers
 
@@ -12885,7 +13012,7 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
     let insert_err_id = g.builder.next_id
     let mut insert_err = ir_inst_new(insert_err_id, OP_INSERT_FIELD())
     insert_err.field_base = ir_val_inst(insert_ok_id)
-    insert_err.field_value = ir_val_inst(val_result.val_id)
+    insert_err.field_value = ir_val_inst(err_val.val_id)
     insert_err.field_index = 2
     insert_err.result_type = res_type
     insert_err.has_result = true
@@ -16872,6 +16999,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     lambda_func.source_line = expr.line
 
     -- Add lambda parameters
+    let mut lambda_param_src = ""
     let mut pi = 0
     while pi < expr.lambda_params.len() {
         let lp = expr.lambda_params[pi]
@@ -16881,8 +17009,16 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
             "i64"
         }
         lambda_func.params.push(ir_param_new(lp.name, ptype))
+        if pi > 0 { lambda_param_src = lambda_param_src + "|" }
+        if len(lp.type_name) > 0 {
+            lambda_param_src = lambda_param_src + lp.type_name
+        } else {
+            lambda_param_src = lambda_param_src + "int"
+        }
         pi = pi + 1
     }
+    -- What a call of the lambda by its name converts its arguments to
+    g.fn_src_param_types.insert(lambda_name, lambda_param_src)
 
     -- Collect captured variables: the variables of the current scope
     -- that the lambda's body mentions. A lambda that captures nothing
@@ -17638,11 +17774,16 @@ fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: s
     b.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Generate arguments
+    -- Generate arguments; an integer becomes the integer type the
+    -- function type names for it
+    let param_types = ty_fn_params(var_type)
     let mut call_args: List[IRValue] = []
     let mut i = 0
     while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
+        let mut arg_result = generate_expr(g, b, args[i])
+        if i < param_types.len() {
+            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], param_types[i], "argument " + int_to_string(i + 1) + " of '" + var_name + "'")
+        }
         g = arg_result.gen
         b = arg_result.block
         call_args.push(ir_val_inst(arg_result.val_id))
@@ -18302,16 +18443,22 @@ fn end_block_after_panic(gen: IRGenerator, block: IRBasicBlock, id: int) -> Expr
 
 -- Generate a Box_new(value) call.
 -- Allocates the value on the heap via malloc and stores it.
-fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
+fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+    let args = expr.args
 
     if args.len() < 1 {
         return expr_result(g, b, 0)
     }
 
-    -- Generate the value to box
-    let val_result = generate_expr(g, b, args[0])
+    -- Generate the value to box. An integer becomes the integer type
+    -- of the box the checker found for the place the box goes to.
+    let mut val_result = generate_expr(g, b, args[0])
+    let box_type = checked_type(g, expr)
+    if starts_with(box_type, "Box[") {
+        val_result = convert_int_to_place(val_result.gen, val_result.block, val_result.val_id, args[0], extract_inner_type(box_type, "Box["), "the value of 'Box_new'")
+    }
     g = val_result.gen
     b = val_result.block
 
@@ -24496,6 +24643,7 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
         let call_name = if returns_string { "c_result" } else { "" }
         g = check_call_args(g, c_fn_ty, real_fn)
         let c_result = dm_llvm_build_call2_buf(g.builder, c_fn_ty, real_fn, call_name)
+        mark_narrow_c_args(g, c_result, func.name, func.params.len())
 
         if returns_string {
             let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)
@@ -24633,6 +24781,22 @@ fn string_arg_as_cstr(gen: LLVMGenerator, arg: IRValue, val: int) -> int {
             return dm_llvm_build_extract_value(b, val, 0, "cstr")
         }
         return val
+    }
+}
+
+-- C's calling convention has the caller widen an argument narrower
+-- than int to 32 bits, and a C function may read all 32. Mark such
+-- arguments of `call`, a call of the C function declared as fn_name,
+-- so that LLVM widens them: signed types by sign, the others by zeros.
+fn mark_narrow_c_args(gen: LLVMGenerator, call: int, fn_name: string, nparams: int) {
+    unsafe {
+        let mut i = 0
+        while i < nparams {
+            let t = func_param_type_at(gen, fn_name, i)
+            if t == "i8" or t == "i16" { dm_llvm_add_call_param_attr(call, i, "signext") }
+            if t == "u8" or t == "u16" or t == "bool" { dm_llvm_add_call_param_attr(call, i, "zeroext") }
+            i = i + 1
+        }
     }
 }
 
@@ -24915,6 +25079,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         g = check_call_args(g, fn_ty, callee)
         let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
+        if is_source_extern { mark_narrow_c_args(g, result, callee_name, nparams) }
         if is_source_extern and inst.has_result and (inst.result_type == "ptr" or is_int_type(inst.result_type)) {
             result = coerce_ptr_int(g, result, map_ir_type_to_llvm(g, inst.result_type))
         }
@@ -25567,7 +25732,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "e6bda0e5ba2e4a5f"
+    return "fe7969a310300b9b"
 }
 
 
@@ -27253,6 +27418,18 @@ fn duplicate_declarations(sf: SourceFile) -> List[string] {
         }
         if first_line >= 0 {
             errors.push(error_at(sf.files, what + " '" + name + "' is declared more than once (first at " + line_ref(sf.files, first_line, line) + ")", line))
+        }
+        -- A call by a builtin's name is always the builtin's, so a
+        -- function of that name could never be called
+        if decl.kind == DECL_FUNCTION() {
+            let named = *decl.func_decl
+            if is_builtin_fn(named.name) or named.name == "Some" or named.name == "Ok" or named.name == "Err" {
+                if named.is_extern {
+                    errors.push(error_at(sf.files, "'" + named.name + "' is a builtin function; give the extern another name and bind it to the C symbol: extern fn c_" + named.name + "(...) = \"" + named.name + "\"", named.line))
+                } else {
+                    errors.push(error_at(sf.files, "'" + named.name + "' is a builtin function; give this function another name", named.line))
+                }
+            }
         }
         i = i + 1
     }

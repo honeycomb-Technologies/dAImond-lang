@@ -145,6 +145,7 @@ extern fn dm_llvm_initialize_all_targets()
 extern fn dm_llvm_get_default_target_triple() -> int
 extern fn dm_llvm_create_target_machine(triple: string, opt_level: int) -> int
 extern fn dm_llvm_add_function_attr(func: int, name: string)
+extern fn dm_llvm_add_call_param_attr(call: int, param: int, name: string)
 extern fn dm_llvm_dispose_target_machine(tm: int)
 extern fn dm_llvm_target_machine_emit_to_file(tm: int, mod: int, filename: string, file_type: int) -> int
 extern fn dm_llvm_get_target_data_layout(tm: int) -> int

@@ -62,6 +62,7 @@ fn TK_PLUSEQ() -> int { return 69 }
 fn TK_MINUSEQ() -> int { return 70 }
 fn TK_STAREQ() -> int { return 71 }
 fn TK_SLASHEQ() -> int { return 72 }
+fn TK_PERCENTEQ() -> int { return 73 }
 fn TK_LPAREN() -> int { return 80 }
 fn TK_RPAREN() -> int { return 81 }
 fn TK_LBRACE() -> int { return 82 }
@@ -275,6 +276,7 @@ fn token_kind_name(kind: int) -> string {
     if kind == TK_SELF() { return "'self'" }
     if kind == TK_SEMICOLON() { return "';'" }
     if kind == TK_SLASHEQ() { return "'/='" }
+    if kind == TK_PERCENTEQ() { return "'%='" }
     if kind == TK_STAREQ() { return "'*='" }
     if kind == TK_UNDERSCORE() { return "'_'" }
     if kind == TK_WITH() { return "'with'" }

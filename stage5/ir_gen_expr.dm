@@ -2001,10 +2001,73 @@ fn binary_left_is_binary(expr: Expr) -> bool {
     return left.kind == EXPR_BINARY()
 }
 
+-- Whether the struct has a method of this name, declared or generic
+fn struct_has_method(g: IRGenerator, struct_name: string, method: string) -> bool {
+    let mangled = struct_name + "_" + method
+    let mut fci = 0
+    while fci < g.ir_mod.functions.len() {
+        if g.ir_mod.functions[fci].name == mangled { return true }
+        fci = fci + 1
+    }
+    if g.generic_fn_decls.contains(mangled) { return true }
+    -- A method that is declared further down the file
+    let mut dci = 0
+    while dci < g.declarations.len() {
+        let decl = g.declarations[dci]
+        if decl.kind == DECL_FUNCTION() {
+            let fd = *decl.func_decl
+            if fd.name == mangled { return true }
+        }
+        dci = dci + 1
+    }
+    return false
+}
+
+-- The method a struct defines an arithmetic operator with
+fn arith_overload_method(op: int) -> string {
+    if op == BINOP_ADD() { return "add" }
+    if op == BINOP_SUB() { return "sub" }
+    if op == BINOP_MUL() { return "mul" }
+    if op == BINOP_DIV() { return "div" }
+    return ""
+}
+
+-- A variable no source can name (its name begins with %), which holds
+-- a value that is generated already, so that the value can be given
+-- where an expression is expected. ty is its IR type and src its
+-- source type. unbind_hidden_value forgets it.
+fn bind_hidden_value(gen: IRGenerator, block: IRBasicBlock, name: string, val_id: int, ty: string, src: string) -> GenResult {
+    let mut g = gen
+    let mut b = block
+    let slot_id = g.builder.next_id
+    let mut slot = ir_inst_new(slot_id, OP_ALLOCA())
+    slot.alloc_type = ty
+    slot.result_type = "ptr(" + ty + ")"
+    slot.has_result = true
+    b.instructions.push(slot)
+    g.builder.next_id = slot_id + 1
+    let stored = emit_ir_store(g, b, ir_val_inst(slot_id), ir_val_inst(val_id))
+    g = stored.gen
+    g.variable_map.insert(name, slot_id)
+    g.variable_types.insert(name, ty)
+    if src != "" { g.var_src_types.insert(name, src) }
+    if g.struct_defs.contains(ty) { g.var_struct_types.insert(name, ty) }
+    return gen_result(g, stored.block)
+}
+
+fn unbind_hidden_value(gen: IRGenerator, name: string) -> IRGenerator {
+    let mut g = gen
+    if g.variable_map.contains(name) { g.variable_map.remove(name) }
+    if g.variable_types.contains(name) { g.variable_types.remove(name) }
+    if g.var_src_types.contains(name) { g.var_src_types.remove(name) }
+    if g.var_struct_types.contains(name) { g.var_struct_types.remove(name) }
+    return g
+}
+
 -- One binary operator. lhs_done is the value of its left operand when
 -- that is generated already, and -1 when it is not. It is only given
 -- for an operator that is not `and` or `or` and whose left operand is
--- itself a binary operator, which is never an overloaded one's.
+-- itself a binary operator.
 fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_done: int) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -2190,7 +2253,9 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
                 left_struct_name = g.var_struct_types.get(left_expr.name)
             }
         }
-        if left_struct_name == "" and left_expr.kind == EXPR_IDENTIFIER() {
+        if left_struct_name == "" {
+            -- Any other left operand that is a struct: a field, a call,
+            -- another operator's result
             let ltype = infer_expr_type(g, left_expr)
             if g.struct_defs.contains(ltype) {
                 left_struct_name = ltype
@@ -2198,38 +2263,17 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
         }
 
         if len(left_struct_name) > 0 {
-            let mangled = left_struct_name + "_" + overload_method
-            -- Check if method exists (declared or generic)
-            let mut method_exists = false
-            let mut fci = 0
-            while fci < g.ir_mod.functions.len() {
-                if g.ir_mod.functions[fci].name == mangled {
-                    method_exists = true
-                }
-                fci = fci + 1
-            }
-            if method_exists == false and g.generic_fn_decls.contains(mangled) {
-                method_exists = true
-            }
-            -- Also check pending declarations
-            if method_exists == false {
-                let mut dci = 0
-                while dci < g.declarations.len() {
-                    let decl = g.declarations[dci]
-                    if decl.kind == DECL_FUNCTION() {
-                        let fd = *decl.func_decl
-                        if fd.name == mangled {
-                            method_exists = true
-                        }
-                    }
-                    dci = dci + 1
-                }
-            }
-
-            if method_exists {
+            if struct_has_method(g, left_struct_name, overload_method) {
                 -- Call the overloaded operator method: struct_method(left, right)
                 let mut op_args: List[Expr] = []
                 op_args.push(*expr.right)
+                if lhs_done >= 0 {
+                    -- The left operand is generated already (a + b + c):
+                    -- the method takes that value
+                    let held = bind_hidden_value(g, b, "%operand.left", lhs_done, left_struct_name, static_type(g, left_expr))
+                    let called = generate_struct_method_call(held.gen, held.block, left_struct_name, expr_ident("%operand.left", expr.line, expr.col), overload_method, op_args)
+                    return expr_result(unbind_hidden_value(called.gen, "%operand.left"), called.block, called.val_id)
+                }
                 return generate_struct_method_call(g, b, left_struct_name, left_expr, overload_method, op_args)
             }
         }
@@ -2255,12 +2299,26 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
     b = rhs_result.block
     let mut rhs_id = rhs_result.val_id
 
-    -- Infer the type of the left operand to select the correct op family
-    let mut lhs_type = infer_expr_type(g, *expr.left)
-    let mut rhs_type = infer_expr_type(g, *expr.right)
+    -- The operands' types select the operation
+    return emit_binary_op(g, b, expr, lhs_id, infer_expr_type(g, *expr.left), rhs_id, infer_expr_type(g, *expr.right))
+}
+
+-- The operation of the binary operator `expr` on two values that are
+-- generated already, with their types. Not `and` and `or`, which do
+-- not evaluate both operands, and not an overloaded operator. A
+-- compound assignment (generate_compound_value) gives the value its
+-- place holds as the left operand.
+fn emit_binary_op(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_val_id: int, lhs_in_type: string, rhs_val_id: int, rhs_in_type: string) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let op = expr.op
+    let mut lhs_id = lhs_val_id
+    let mut rhs_id = rhs_val_id
+    let mut lhs_type = lhs_in_type
+    let mut rhs_type = rhs_in_type
 
     -- Integers of different types meet at one type (see binary_int_type)
-    let common_t = binary_int_type(g, expr)
+    let common_t = common_int_type(expr, lhs_type, rhs_type)
     if common_t != "" {
         if lhs_type != common_t {
             g = check_int_literal_fits(g, *expr.left, common_t)
@@ -2972,7 +3030,7 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
 
     -- Box_new(value)
     if fn_name == "Box_new" {
-        return generate_box_new_call(g, b, expr.args)
+        return generate_box_new_call(g, b, expr)
     }
 
     -- Box_null()
@@ -3276,11 +3334,19 @@ fn generate_lambda_indirect_call(gen: IRGenerator, block: IRBasicBlock, var_name
     -- Get the actual lambda function name
     let lambda_name = g.fn_ptr_vars.get(var_name)
 
-    -- Generate explicit arguments
+    -- Generate explicit arguments; an integer becomes the parameter's
+    -- integer type
+    let mut param_types: List[string] = []
+    if g.fn_src_param_types.contains(lambda_name) {
+        param_types = string_split(g.fn_src_param_types.get(lambda_name), "|")
+    }
     let mut call_args: List[IRValue] = []
     let mut i = 0
     while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
+        let mut arg_result = generate_expr(g, b, args[i])
+        if i < param_types.len() {
+            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], param_types[i], "argument " + int_to_string(i + 1) + " of '" + var_name + "'")
+        }
         g = arg_result.gen
         b = arg_result.block
         call_args.push(ir_val_inst(arg_result.val_id))
@@ -3504,6 +3570,17 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
         res_type = g.current_return_type
     }
 
+    -- An integer becomes the Result's integer type
+    let mut err_val = val_result
+    if starts_with(res_type, "Result[") {
+        let res_args = split_type_args(extract_inner_type(res_type, "Result["))
+        if res_args.len() > 1 {
+            err_val = convert_int_to_place(g, b, val_result.val_id, args[0], res_args[1], "the value of 'Err'")
+            g = err_val.gen
+            b = err_val.block
+        }
+    }
+
     -- Build the Result struct: { tag: 1, ok_val: undef, err_val: payload }
     -- Use undef as the base (not alloca), since insertvalue works on values not pointers
 
@@ -3533,7 +3610,7 @@ fn generate_err_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprR
     let insert_err_id = g.builder.next_id
     let mut insert_err = ir_inst_new(insert_err_id, OP_INSERT_FIELD())
     insert_err.field_base = ir_val_inst(insert_ok_id)
-    insert_err.field_value = ir_val_inst(val_result.val_id)
+    insert_err.field_value = ir_val_inst(err_val.val_id)
     insert_err.field_index = 2
     insert_err.result_type = res_type
     insert_err.has_result = true
@@ -7520,6 +7597,7 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     lambda_func.source_line = expr.line
 
     -- Add lambda parameters
+    let mut lambda_param_src = ""
     let mut pi = 0
     while pi < expr.lambda_params.len() {
         let lp = expr.lambda_params[pi]
@@ -7529,8 +7607,16 @@ fn generate_lambda_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
             "i64"
         }
         lambda_func.params.push(ir_param_new(lp.name, ptype))
+        if pi > 0 { lambda_param_src = lambda_param_src + "|" }
+        if len(lp.type_name) > 0 {
+            lambda_param_src = lambda_param_src + lp.type_name
+        } else {
+            lambda_param_src = lambda_param_src + "int"
+        }
         pi = pi + 1
     }
+    -- What a call of the lambda by its name converts its arguments to
+    g.fn_src_param_types.insert(lambda_name, lambda_param_src)
 
     -- Collect captured variables: the variables of the current scope
     -- that the lambda's body mentions. A lambda that captures nothing
@@ -8286,11 +8372,16 @@ fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: s
     b.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Generate arguments
+    -- Generate arguments; an integer becomes the integer type the
+    -- function type names for it
+    let param_types = ty_fn_params(var_type)
     let mut call_args: List[IRValue] = []
     let mut i = 0
     while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
+        let mut arg_result = generate_expr(g, b, args[i])
+        if i < param_types.len() {
+            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], param_types[i], "argument " + int_to_string(i + 1) + " of '" + var_name + "'")
+        }
         g = arg_result.gen
         b = arg_result.block
         call_args.push(ir_val_inst(arg_result.val_id))

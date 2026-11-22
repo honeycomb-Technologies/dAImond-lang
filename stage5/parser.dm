@@ -1274,7 +1274,7 @@ fn parse_stmt(p: Parser) -> ParseStmtResult {
     -- Check for assignment: expr = value, expr += value, etc.
     pp = p_skip_newlines(pp)
     let assign_kind = p_peek(pp)
-    if assign_kind == TK_EQ() or assign_kind == TK_PLUSEQ() or assign_kind == TK_MINUSEQ() or assign_kind == TK_STAREQ() or assign_kind == TK_SLASHEQ() {
+    if assign_kind == TK_EQ() or assign_kind == TK_PLUSEQ() or assign_kind == TK_MINUSEQ() or assign_kind == TK_STAREQ() or assign_kind == TK_SLASHEQ() or assign_kind == TK_PERCENTEQ() {
         let assign_op = token_to_assign_op(assign_kind)
         pp = p_advance(pp)
         let val = parse_expr(pp)
@@ -1298,6 +1298,7 @@ fn token_to_assign_op(kind: int) -> int {
     if kind == TK_MINUSEQ() { return ASSIGN_SUB() }
     if kind == TK_STAREQ() { return ASSIGN_MUL() }
     if kind == TK_SLASHEQ() { return ASSIGN_DIV() }
+    if kind == TK_PERCENTEQ() { return ASSIGN_MOD() }
     return ASSIGN_EQ()
 }
 

@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (496 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (505 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,11 +341,11 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 496 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 505 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
-- Structs, enums with payloads, `impl` methods with bare `self`, operator overloading through `add`, `sub`, `mul`, `div`, `eq`, `lt` and the other comparison methods
+- Structs, enums with payloads, `impl` methods with bare `self`, operator overloading through `add`, `sub`, `mul`, `div`, `eq`, `lt` and the other comparison methods; compound assignment with `+=`, `-=`, `*=`, `/=` and `%=`
 - Pattern matching on enums, `Option`, `Result`, strings and numbers; `?` error propagation
 - Generic functions (monomorphized, with type arguments inferred at the call) and generic structs (`struct Table[K, V]`, with type arguments written out)
 - `List[T]`, `Map[K, V]` and `Box[T]`, `for`-in over lists, maps and ranges

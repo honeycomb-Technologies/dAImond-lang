@@ -1702,6 +1702,18 @@ fn duplicate_declarations(sf: SourceFile) -> List[string] {
         if first_line >= 0 {
             errors.push(error_at(sf.files, what + " '" + name + "' is declared more than once (first at " + line_ref(sf.files, first_line, line) + ")", line))
         }
+        -- A call by a builtin's name is always the builtin's, so a
+        -- function of that name could never be called
+        if decl.kind == DECL_FUNCTION() {
+            let named = *decl.func_decl
+            if is_builtin_fn(named.name) or named.name == "Some" or named.name == "Ok" or named.name == "Err" {
+                if named.is_extern {
+                    errors.push(error_at(sf.files, "'" + named.name + "' is a builtin function; give the extern another name and bind it to the C symbol: extern fn c_" + named.name + "(...) = \"" + named.name + "\"", named.line))
+                } else {
+                    errors.push(error_at(sf.files, "'" + named.name + "' is a builtin function; give this function another name", named.line))
+                }
+            }
+        }
         i = i + 1
     }
     return errors

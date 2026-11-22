@@ -2572,6 +2572,7 @@ fn declare_user_extern_wrapper(gen: LLVMGenerator, func: IRFunction) -> LLVMGene
         let call_name = if returns_string { "c_result" } else { "" }
         g = check_call_args(g, c_fn_ty, real_fn)
         let c_result = dm_llvm_build_call2_buf(g.builder, c_fn_ty, real_fn, call_name)
+        mark_narrow_c_args(g, c_result, func.name, func.params.len())
 
         if returns_string {
             let sret_ptr = dm_llvm_get_param(wrapper_fn, 0)

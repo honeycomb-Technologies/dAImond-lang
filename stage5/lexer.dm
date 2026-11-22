@@ -274,9 +274,15 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
                     lex.col = lex.col + 1
                 }
             } else if ch == "%" {
-                tokens.push(token_new(TK_PERCENT(), "%", sl, sc))
-                lex.pos = lex.pos + 1
-                lex.col = lex.col + 1
+                if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
+                    tokens.push(token_new(TK_PERCENTEQ(), "%=", sl, sc))
+                    lex.pos = lex.pos + 2
+                    lex.col = lex.col + 2
+                } else {
+                    tokens.push(token_new(TK_PERCENT(), "%", sl, sc))
+                    lex.pos = lex.pos + 1
+                    lex.col = lex.col + 1
+                }
             } else if ch == "=" {
                 if lex.pos + 1 < lex.src_len and char_at(lex.source, lex.pos + 1) == "=" {
                     tokens.push(token_new(TK_EQEQ(), "==", sl, sc))

@@ -537,16 +537,22 @@ fn end_block_after_panic(gen: IRGenerator, block: IRBasicBlock, id: int) -> Expr
 
 -- Generate a Box_new(value) call.
 -- Allocates the value on the heap via malloc and stores it.
-fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]) -> ExprResult {
+fn generate_box_new_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
+    let args = expr.args
 
     if args.len() < 1 {
         return expr_result(g, b, 0)
     }
 
-    -- Generate the value to box
-    let val_result = generate_expr(g, b, args[0])
+    -- Generate the value to box. An integer becomes the integer type
+    -- of the box the checker found for the place the box goes to.
+    let mut val_result = generate_expr(g, b, args[0])
+    let box_type = checked_type(g, expr)
+    if starts_with(box_type, "Box[") {
+        val_result = convert_int_to_place(val_result.gen, val_result.block, val_result.val_id, args[0], extract_inner_type(box_type, "Box["), "the value of 'Box_new'")
+    }
     g = val_result.gen
     b = val_result.block
 

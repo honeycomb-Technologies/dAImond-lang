@@ -1,0 +1,7 @@
+the value of 'Err' has type int, which does not fit in i32; convert it with `as i32` at line 8
+argument 1 of 'f' has type int, which does not fit in i32; convert it with `as i32` at line 14
+argument 1 of 'g' has type int, which does not fit in i32; convert it with `as i32` at line 16
+the value of 'Box_new' has type int, which does not fit in i32; convert it with `as i32` at line 17
+the value has type int, which does not fit in i8; convert it with `as i8` at line 19
+the value has type int, which does not fit in i32; convert it with `as i32` at line 21
+6 type errors

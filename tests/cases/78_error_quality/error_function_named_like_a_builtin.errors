@@ -1,0 +1,4 @@
+Error: 'exit' is a builtin function; give this function another name at line 3
+Error: 'len' is a builtin function; give this function another name at line 7
+Error: 'system' is a builtin function; give the extern another name and bind it to the C symbol: extern fn c_system(...) = "system" at line 11
+Error: 'Some' is a builtin function; give this function another name at line 13

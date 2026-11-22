@@ -76,6 +76,22 @@ fn string_arg_as_cstr(gen: LLVMGenerator, arg: IRValue, val: int) -> int {
     }
 }
 
+-- C's calling convention has the caller widen an argument narrower
+-- than int to 32 bits, and a C function may read all 32. Mark such
+-- arguments of `call`, a call of the C function declared as fn_name,
+-- so that LLVM widens them: signed types by sign, the others by zeros.
+fn mark_narrow_c_args(gen: LLVMGenerator, call: int, fn_name: string, nparams: int) {
+    unsafe {
+        let mut i = 0
+        while i < nparams {
+            let t = func_param_type_at(gen, fn_name, i)
+            if t == "i8" or t == "i16" { dm_llvm_add_call_param_attr(call, i, "signext") }
+            if t == "u8" or t == "u16" or t == "bool" { dm_llvm_add_call_param_attr(call, i, "zeroext") }
+            i = i + 1
+        }
+    }
+}
+
 -- An argument past a variadic C function's parameters, with C's default
 -- promotions: float to double, and bool, i8 and i16 to int
 fn promote_vararg(gen: LLVMGenerator, val: int) -> int {
@@ -355,6 +371,7 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         g = check_call_args(g, fn_ty, callee)
         let mut result = dm_llvm_build_call2_buf(b, fn_ty, callee, call_name)
+        if is_source_extern { mark_narrow_c_args(g, result, callee_name, nparams) }
         if is_source_extern and inst.has_result and (inst.result_type == "ptr" or is_int_type(inst.result_type)) {
             result = coerce_ptr_int(g, result, map_ir_type_to_llvm(g, inst.result_type))
         }

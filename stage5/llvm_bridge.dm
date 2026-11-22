@@ -124,6 +124,7 @@ extern fn LLVMGetOperand(value: int, index: u32) -> int
 -- Blocks and the builder
 extern fn LLVMAppendBasicBlockInContext(ctx: int, func: int, name: string) -> int
 extern fn LLVMGetBasicBlockParent(block: int) -> int
+extern fn LLVMGetInstructionParent(inst: int) -> int
 extern fn LLVMGetEntryBasicBlock(func: int) -> int
 extern fn LLVMGetFirstInstruction(block: int) -> int
 extern fn LLVMGetNextInstruction(inst: int) -> int
@@ -911,6 +912,17 @@ fn dm_llvm_add_function_attr(func: int, name: string) {
         -- 4294967295 is LLVMAttributeFunctionIndex: the function itself,
         -- not one of its parameters
         LLVMAddAttributeAtIndex(func, 4294967295, LLVMCreateEnumAttribute(ctx, kind, 0))
+    }
+}
+
+-- Add an attribute that is only a name, such as "signext", to argument
+-- `param` (from 0) of a call
+fn dm_llvm_add_call_param_attr(call: int, param: int, name: string) {
+    unsafe {
+        let kind = LLVMGetEnumAttributeKindForName(name, len(name))
+        let ctx = LLVMGetModuleContext(LLVMGetGlobalParent(LLVMGetBasicBlockParent(LLVMGetInstructionParent(call))))
+        -- Index 0 is the call's result; argument i is index i + 1
+        LLVMAddCallSiteAttribute(call, (param + 1) as u32, LLVMCreateEnumAttribute(ctx, kind, 0))
     }
 }
 
