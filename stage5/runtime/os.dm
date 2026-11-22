@@ -352,6 +352,121 @@ fn rt_system(command: string) -> int {
     }
 }
 
+-- ---- Programs ----
+
+extern fn libc_posix_spawnp(pid: int, file: int, file_actions: int, attributes: int, argv: int, envp: int) -> i32 = "posix_spawnp"
+extern fn libc_posix_spawn_file_actions_init(actions: int) -> i32 = "posix_spawn_file_actions_init"
+extern fn libc_posix_spawn_file_actions_addopen(actions: int, fd: i32, path: int, flags: i32, mode: u32) -> i32 = "posix_spawn_file_actions_addopen"
+extern fn libc_posix_spawn_file_actions_destroy(actions: int) -> i32 = "posix_spawn_file_actions_destroy"
+extern fn libc_posix_spawnattr_init(attributes: int) -> i32 = "posix_spawnattr_init"
+extern fn libc_posix_spawnattr_setsigdefault(attributes: int, signals: int) -> i32 = "posix_spawnattr_setsigdefault"
+extern fn libc_posix_spawnattr_setflags(attributes: int, flags: i16) -> i32 = "posix_spawnattr_setflags"
+extern fn libc_posix_spawnattr_destroy(attributes: int) -> i32 = "posix_spawnattr_destroy"
+extern fn libc_sigemptyset(signals: int) -> i32 = "sigemptyset"
+extern fn libc_sigaddset(signals: int, signal: i32) -> i32 = "sigaddset"
+extern fn libc_signal(signal: i32, handler: int) -> int = "signal"
+extern fn libc_waitpid(pid: i32, status: int, options: i32) -> i32 = "waitpid"
+extern fn libc_calloc(count: int, size: int) -> int = "calloc"
+
+-- run_command(args) and run_command_io(args, input, output, errors):
+-- run the program args[0] with the arguments args[1..] and wait for
+-- it. No shell takes part: each argument reaches the program as it is.
+-- A name without a slash is looked for on PATH. input, output and
+-- errors are files that stand for the program's standard input, output
+-- and error; "" leaves the stream as this program's own. Gives the
+-- program's exit code, 128 plus the signal's number when a signal
+-- ended it, or 127 when it could not be started.
+--
+-- `list` is the address of the List[string]'s header. As libc's
+-- system() does, this program ignores an interrupt (SIGINT, SIGQUIT)
+-- while it waits, so that Ctrl-C ends the program that runs and leaves
+-- this one to see its exit code.
+fn rt_run_command(list: int, input: string, output: string, errors: string) -> int {
+    unsafe {
+        let count = load_i64(list + 8)
+        if count < 1 {
+            return 127
+        }
+        let data = load_i64(list)
+        if load_i64(data + 8) == 0 {
+            return 127
+        }
+        -- argv: the address of each argument's bytes, then a null
+        let argv = libc_malloc((count + 1) * 8)
+        if argv == 0 {
+            panic("out of memory")
+        }
+        let mut i = 0
+        while i < count {
+            store_i64(argv + i * 8, load_i64(data + i * 24))
+            i = i + 1
+        }
+        store_i64(argv + count * 8, 0)
+
+        -- What this program has written so far comes before the
+        -- other program's output
+        libc_fflush(0)
+
+        -- Room for glibc's posix_spawn_file_actions_t (80 bytes),
+        -- posix_spawnattr_t (336 bytes) and sigset_t (128 bytes) on
+        -- x86-64 Linux, each with room to spare
+        let room = libc_calloc(1, 1024)
+        if room == 0 {
+            panic("out of memory")
+        }
+        let actions = room
+        let attributes = room + 256
+        let defaults = room + 768
+        libc_posix_spawn_file_actions_init(actions)
+        -- 0 is O_RDONLY; 577 is O_WRONLY | O_CREAT | O_TRUNC; 420 is mode 0644
+        if len(input) > 0 { libc_posix_spawn_file_actions_addopen(actions, 0, string_data(input), 0, 0) }
+        if len(output) > 0 { libc_posix_spawn_file_actions_addopen(actions, 1, string_data(output), 577, 420) }
+        if len(errors) > 0 { libc_posix_spawn_file_actions_addopen(actions, 2, string_data(errors), 577, 420) }
+
+        -- 2 is SIGINT and 3 is SIGQUIT; the handler 1 is SIG_IGN. The
+        -- program that runs gets back the default for each signal that
+        -- this program did not already ignore.
+        libc_posix_spawnattr_init(attributes)
+        libc_sigemptyset(defaults)
+        let old_int = libc_signal(2, 1)
+        let old_quit = libc_signal(3, 1)
+        if old_int != 1 { libc_sigaddset(defaults, 2) }
+        if old_quit != 1 { libc_sigaddset(defaults, 3) }
+        libc_posix_spawnattr_setsigdefault(attributes, defaults)
+        -- 4 is POSIX_SPAWN_SETSIGDEF
+        libc_posix_spawnattr_setflags(attributes, 4)
+
+        let mut pid = 0
+        let started = libc_posix_spawnp(addr_of(pid), load_i64(argv), actions, attributes, argv, load_i64(symbol_addr("environ")))
+        libc_posix_spawn_file_actions_destroy(actions)
+        libc_posix_spawnattr_destroy(attributes)
+        libc_free(argv)
+        libc_free(room)
+
+        let mut code = 127
+        if started == 0 {
+            let mut status = 0
+            let mut waited = libc_waitpid(load_i32(addr_of(pid)) as i32, addr_of(status), 0)
+            -- 4 is EINTR: a signal arrived while waiting
+            while waited < 0 and load_i32(libc_errno_location()) == 4 {
+                waited = libc_waitpid(load_i32(addr_of(pid)) as i32, addr_of(status), 0)
+            }
+            if waited >= 0 {
+                let st = load_i32(addr_of(status))
+                let low = st % 128
+                if low == 0 {
+                    code = (st / 256) % 256
+                } else {
+                    code = 128 + low
+                }
+            }
+        }
+        libc_signal(2, old_int)
+        libc_signal(3, old_quit)
+        return code
+    }
+}
+
 -- ---- Time ----
 
 -- libc's struct timespec on x86-64 Linux

@@ -961,6 +961,7 @@ fn map_builtin_name(name: string) -> string {
     if name == "mem_mark" { return "dm_mem_mark" }
     if name == "mem_sweep" { return "dm_mem_sweep" }
     if name == "system" { return "dm_system" }
+    if name == "run_command" or name == "run_command_io" { return "dm_run_command" }
     if name == "assert" { return "dm_assert" }
     if name == "assert_eq" { return "dm_assert_eq" }
     -- Character classification
@@ -1074,6 +1075,7 @@ fn is_builtin_fn(name: string) -> bool {
     if name == "args_len" or name == "args_get" { return true }
     if name == "mem_mark" or name == "mem_sweep" { return true }
     if name == "system" { return true }
+    if name == "run_command" or name == "run_command_io" { return true }
     if name == "assert" or name == "assert_eq" { return true }
     if name == "Box_new" or name == "Box_null" { return true }
     if name == "Map_new" { return true }
@@ -1129,6 +1131,7 @@ fn builtin_return_type(name: string) -> string {
     if name == "mem_mark" { return "i64" }
     if name == "mem_sweep" { return "void" }
     if name == "system" { return "i64" }
+    if name == "run_command" or name == "run_command_io" { return "i64" }
     if name == "assert" or name == "assert_eq" { return "void" }
     -- Character classification
     if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" { return "bool" }

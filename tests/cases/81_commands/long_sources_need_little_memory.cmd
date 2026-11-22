@@ -1,0 +1,1 @@
+cd {work} && {compiler} run {source} > big.dm && {compiler} run {source} -- lines > lines.dm && ( ulimit -v 1000000 && {compiler} big.dm -o big && {compiler} fmt lines.dm -o out.dm ) && ./big && wc -l < out.dm && sed -n 3p out.dm

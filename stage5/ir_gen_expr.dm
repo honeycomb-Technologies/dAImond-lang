@@ -3166,6 +3166,9 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
                 return expr_result(g, b, 0)
             }
         }
+        if fn_name == "run_command" or fn_name == "run_command_io" {
+            return generate_run_command_call(g, b, expr)
+        }
         return generate_builtin_call(g, b, fn_name, expr.args)
     }
 

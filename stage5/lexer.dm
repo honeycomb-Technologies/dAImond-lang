@@ -395,44 +395,67 @@ fn tokenize_file(source: string, name: string, file: int) -> List[Token] {
 -- EXPRESSION KINDS
 -- ============================================================
 
+-- The strings joined into one. They are joined in pairs, then the
+-- pairs in pairs, so the text is copied once for each level of
+-- pairing. Adding them one after another to a growing string copies
+-- the whole string so far each time, and no string is ever freed: the
+-- 60 KB string that holds the runtime's source took 1.6 GB that way.
+fn join_strings(pieces: List[string]) -> string {
+    let mut level = pieces
+    while level.len() > 1 {
+        let mut next: List[string] = []
+        let mut i = 0
+        while i + 1 < level.len() {
+            next.push(level[i] + level[i + 1])
+            i = i + 2
+        }
+        if i < level.len() {
+            next.push(level[i])
+        }
+        level = next
+    }
+    if level.len() == 0 {
+        return ""
+    }
+    return level[0]
+}
+
+-- The text of a string literal with its escapes (\n, \t, \r, \\,
+-- \" and \') replaced by what they stand for. A backslash before
+-- any other character stays as it is.
 fn unescape_string(s: string) -> string {
     -- Quick check: if no backslashes, return as-is
     if string_find(s, "\\") < 0 {
         return s
     }
-    let mut result = ""
-    let mut i = 0
+    -- The stretches between escapes, and what the escapes stand for
+    let mut pieces: List[string] = []
     let slen = len(s)
+    let mut start = 0
+    let mut i = 0
     while i < slen {
-        let ch = char_at(s, i)
-        if ch == "\\" and i + 1 < slen {
-            let next = char_at(s, i + 1)
-            if next == "n" {
-                result = result + "\n"
+        -- 92 is a backslash
+        if byte_at(s, i) == 92 and i + 1 < slen {
+            let next = byte_at(s, i + 1)
+            let mut stands_for = ""
+            if next == 110 { stands_for = "\n" }
+            if next == 116 { stands_for = "\t" }
+            if next == 114 { stands_for = "\r" }
+            if next == 92 { stands_for = "\\" }
+            if next == 34 { stands_for = "\"" }
+            if next == 39 { stands_for = "'" }
+            if stands_for != "" {
+                if i > start { pieces.push(substr(s, start, i - start)) }
+                pieces.push(stands_for)
                 i = i + 2
-            } else if next == "t" {
-                result = result + "\t"
-                i = i + 2
-            } else if next == "r" {
-                result = result + "\r"
-                i = i + 2
-            } else if next == "\\" {
-                result = result + "\\"
-                i = i + 2
-            } else if next == "\"" {
-                result = result + "\""
-                i = i + 2
-            } else if next == "'" {
-                result = result + "'"
-                i = i + 2
+                start = i
             } else {
-                result = result + ch
                 i = i + 1
             }
         } else {
-            result = result + ch
             i = i + 1
         }
     }
-    return result
+    if slen > start { pieces.push(substr(s, start, slen - start)) }
+    return join_strings(pieces)
 }

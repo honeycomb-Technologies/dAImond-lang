@@ -1,0 +1,74 @@
+# Builds the compiler from its seed and runs the suite, with LLVM's
+# tools only: stand-ins for zig and the C compilers come first on PATH
+# and fail the job when anything calls them.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bootstrap-and-suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 19 and lld
+        run: |
+          sudo apt-get update
+          if ! sudo apt-get install -y llvm-19-dev lld-19 libc6-dev; then
+            wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+            echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | sudo tee /etc/apt/sources.list.d/llvm-19.list
+            sudo apt-get update
+            sudo apt-get install -y llvm-19-dev lld-19 libc6-dev
+          fi
+          /usr/lib/llvm-19/bin/llvm-config --version
+
+      - name: Put failing stand-ins for zig and the C compilers on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/no-cc"
+          for tool in cc c99 cpp gcc g++ c++ clang clang++ zig; do
+            printf '#!/bin/sh\necho "$0 $*" >> "%s/no-cc/calls.log"\nexit 97\n' "$RUNNER_TEMP" > "$RUNNER_TEMP/no-cc/$tool"
+            chmod +x "$RUNNER_TEMP/no-cc/$tool"
+          done
+          echo "$RUNNER_TEMP/no-cc" >> "$GITHUB_PATH"
+
+      - name: Build the compiler from the seed, to a fixed point
+        env:
+          LLVM_BIN: /usr/lib/llvm-19/bin
+        run: bash bootstrap.sh
+
+      - name: main.dm and prelude.dm are what the modules give
+        env:
+          LLVM_BIN: /usr/lib/llvm-19/bin
+        run: |
+          export PATH="$LLVM_BIN:$PATH"
+          build/daimond run stage5/gen_bootstrap.dm -- --check
+
+      - name: Run the suite
+        env:
+          LLVM_BIN: /usr/lib/llvm-19/bin
+        run: |
+          export PATH="$LLVM_BIN:$PATH"
+          build/daimond tests/harness.dm -o build/harness
+          build/harness build/daimond
+
+      - name: The examples and the language server build
+        run: |
+          export PATH="/usr/lib/llvm-19/bin:$PATH"
+          for program in examples/hello.dm examples/arithmetic.dm examples/fibonacci.dm examples/calculator.dm examples/snake.dm examples/breakout/main.dm lsp/main.dm; do
+            build/daimond "$program" -o "$RUNNER_TEMP/program"
+          done
+
+      - name: No zig and no C compiler was called
+        run: |
+          if [ -s "$RUNNER_TEMP/no-cc/calls.log" ]; then
+            cat "$RUNNER_TEMP/no-cc/calls.log"
+            exit 1
+          fi

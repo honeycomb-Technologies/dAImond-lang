@@ -14,7 +14,7 @@ dAImond is a systems programming language designed to be:
 The compiler is written in dAImond and builds itself. It needs x86-64 Linux with glibc, LLVM 19 or newer with `lld`, and the C library's development files (`libc6-dev` or `glibc-devel`). It needs no C compiler and no other language's toolchain.
 
 ```bash
-bash bootstrap.sh          # builds build/daimond (about five minutes, 2 GB of memory)
+bash bootstrap.sh          # builds build/daimond (about six minutes, 1.4 GB of memory)
 build/daimond examples/hello.dm -o hello && ./hello
 ```
 
@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (505 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (508 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -65,7 +65,7 @@ dAImond-lang/
 │   │   └── string.dm, convert.dm, list.dm, map.dm, os.dm, path.dm, io.dm, net.dm, thread.dm
 │   ├── prelude.dm             # Generated: the runtime's source as a string, and the build ID
 │   ├── main.dm                # Generated: the modules as one file, which bootstrap.sh compiles
-│   └── gen_bootstrap.sh       # Writes prelude.dm and main.dm
+│   └── gen_bootstrap.dm       # A dAImond program that writes prelude.dm and main.dm
 ├── lsp/                       # The language server, written in dAImond
 ├── stdlib/                    # Standard library modules (io, math, collections, string, os, fs, net, thread, test)
 ├── tests/
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 505 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 508 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 

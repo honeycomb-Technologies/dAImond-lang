@@ -3,7 +3,7 @@ module map
 -- ============================================================
 -- Map[K, V]
 -- The hash map behind Map[K, V] in every program Stage 5
--- compiles. gen_bootstrap.sh embeds this file in the compiler
+-- compiles. gen_bootstrap.dm embeds this file in the compiler
 -- (prelude.dm), which adds it to each program's declarations.
 -- Keys are strings or integers; hash_key picks the hash.
 --

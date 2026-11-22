@@ -724,12 +724,13 @@ fn run_file(cli: CLIArgs) -> int {
 -- at their ends; braces in strings and comments do not count.
 fn format_source(source: string) -> string {
     let lines = string_split(source, "\n")
-    let mut out = ""
+    -- The pieces of the result, joined at the end (see join_strings)
+    let mut pieces: List[string] = []
     let mut level = 0
     let mut li = 0
     while li < lines.len() {
         if li > 0 {
-            out = out + "\n"
+            pieces.push("\n")
         }
         let line = string_trim(lines[li])
         if len(line) > 0 {
@@ -739,10 +740,10 @@ fn format_source(source: string) -> string {
             }
             let mut indent = 0
             while indent < level {
-                out = out + "    "
+                pieces.push("    ")
                 indent = indent + 1
             }
-            out = out + line
+            pieces.push(line)
 
             -- The braces of this line change the level of the next ones
             let mut in_string = false
@@ -775,8 +776,9 @@ fn format_source(source: string) -> string {
         }
         li = li + 1
     }
+    let out = join_strings(pieces)
     if len(out) > 0 and ends_with(out, "\n") == false {
-        out = out + "\n"
+        return out + "\n"
     }
     return out
 }
@@ -822,7 +824,7 @@ fn test_main_source(names: List[string]) -> string {
     let mut src = "fn dm_test_run(name: string, log: string) -> bool {\n"
     src = src + "    print(\"  test \" + name + \" ... \")\n"
     src = src + "    flush()\n"
-    src = src + "    let status = system(args_get(0) + \" \" + name + \" 2> \" + log)\n"
+    src = src + "    let status = run_command_io([args_get(0), name], \"\", \"\", log)\n"
     src = src + "    if status == 0 {\n        println(\"PASS\")\n        return true\n    }\n"
     src = src + "    let mut message = \"\"\n"
     src = src + "    if file_exists(log) {\n        message = string_trim(file_read(log))\n    }\n"
@@ -1551,7 +1553,7 @@ fn builtin_required_effect(name: string) -> string {
     if name == "read_key" or name == "read_key_nb" { return "Console" }
     if name == "args_get" or name == "args_len" { return "IO" }
     if name == "flush" or name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return "IO" }
-    if name == "system" or name == "exit" { return "Process" }
+    if name == "system" or name == "exit" or name == "run_command" or name == "run_command_io" { return "Process" }
     return ""
 }
 

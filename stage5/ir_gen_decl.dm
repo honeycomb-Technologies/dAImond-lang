@@ -314,6 +314,7 @@ fn declare_runtime_functions(gen: IRGenerator) -> IRGenerator {
 
     -- System
     g = declare_extern(g, "dm_system", "string", "i64")
+    g = declare_extern4(g, "dm_run_command", "ptr", "string", "string", "string", "i64")
     g = declare_extern0(g, "dm_args_len", "i64")
     g = declare_extern(g, "dm_args_get", "i64", "string")
     g = declare_extern0(g, "dm_start", "void")

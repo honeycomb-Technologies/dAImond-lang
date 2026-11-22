@@ -1,0 +1,4 @@
+run_command() takes the program and its arguments as a List[string] at line 4
+run_command() takes 1 argument, not 2 at line 5
+run_command_io() takes 4 arguments, not 3 at line 6
+argument 4 of 'run_command_io' is a file's path, a string at line 7

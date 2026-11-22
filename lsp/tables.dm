@@ -63,6 +63,8 @@ fn builtin_functions() -> List[string] {
     b.push("fn args_len() -> int\tThe number of command-line arguments, the program's name included.")
     b.push("fn args_get(i: int) -> string\tThe command-line argument at index `i`.")
     b.push("fn system(command: string) -> int\tRun a shell command and give its wait status.")
+    b.push("fn run_command(args: List[string]) -> int\tRun the program `args[0]` with the arguments after it, without a shell, and give its exit code.")
+    b.push("fn run_command_io(args: List[string], input: string, output: string, errors: string) -> int\tRun a program as `run_command` does, with files as its standard input, output and error (\"\" leaves a stream as it is).")
     b.push("fn read_key() -> int\tThe next byte of standard input, waiting for it; -1 at the end of input.")
     b.push("fn read_key_nb() -> int\tThe next byte of standard input without waiting; -1 when none is waiting.")
     b.push("fn term_width() -> int\tThe terminal's width in columns.")

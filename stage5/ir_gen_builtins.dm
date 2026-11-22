@@ -600,6 +600,62 @@ fn generate_box_null_call(gen: IRGenerator, block: IRBasicBlock) -> ExprResult {
 }
 
 -- ============================================================
+-- RUN COMMAND BUILTINS
+-- run_command(args) and run_command_io(args, input, output, errors)
+-- both call dm_run_command(list, input, output, errors); run_command
+-- gives "" for the three files, which leaves the streams as they are.
+-- ============================================================
+
+fn generate_run_command_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
+    let mut g = gen
+    let mut b = block
+    let args = expr.args
+    let callee = *expr.callee
+    let fn_name = callee.name
+    let takes = if fn_name == "run_command" { "1 argument" } else { "4 arguments" }
+    let wanted = if fn_name == "run_command" { 1 } else { 4 }
+    if args.len() != wanted {
+        g = ir_type_error(g, fn_name + "() takes " + takes + ", not " + int_to_string(args.len()), expr.line)
+        return expr_result(g, b, 0)
+    }
+    if static_type(g, args[0]) != "List[string]" {
+        g = ir_type_error(g, fn_name + "() takes the program and its arguments as a List[string]", expr.line)
+        return expr_result(g, b, 0)
+    }
+    -- The list goes to the runtime as the address of its header
+    let handle = generate_list_handle(g, b, args[0])
+    g = handle.gen
+    b = handle.block
+    let mut call_args: List[IRValue] = []
+    call_args.push(handle.ptr)
+    let mut i = 1
+    while i < 4 {
+        if i < args.len() {
+            if infer_expr_type(g, args[i]) != "string" {
+                g = ir_type_error(g, "argument " + int_to_string(i + 1) + " of '" + fn_name + "' is a file's path, a string", expr.line)
+                return expr_result(g, b, 0)
+            }
+            let file = generate_expr(g, b, args[i])
+            g = file.gen
+            b = file.block
+            call_args.push(ir_val_inst(file.val_id))
+        } else {
+            call_args.push(ir_val_string(""))
+        }
+        i = i + 1
+    }
+    let id = g.builder.next_id
+    let mut call_inst = ir_inst_new(id, OP_CALL())
+    call_inst.callee = "dm_run_command"
+    call_inst.call_args = call_args
+    call_inst.result_type = "i64"
+    call_inst.has_result = true
+    b.instructions.push(call_inst)
+    g.builder.next_id = id + 1
+    return expr_result(g, b, id)
+}
+
+-- ============================================================
 -- STRING SPLIT BUILTIN
 -- string_split(s, delim) returns List[string]
 -- Needs special handling: allocates a list, calls dm_string_split

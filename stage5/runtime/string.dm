@@ -3,7 +3,7 @@ module string
 -- ============================================================
 -- Strings
 -- The string functions behind every program Stage 5 compiles.
--- gen_bootstrap.sh embeds this file in the compiler (prelude.dm),
+-- gen_bootstrap.dm embeds this file in the compiler (prelude.dm),
 -- which adds it to each program's declarations.
 --
 -- A string is { data, len, cap }: the address of its bytes, their

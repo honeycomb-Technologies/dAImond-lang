@@ -10,7 +10,7 @@
 To write the seed again after changing the compiler:
 
 ```bash
-cd stage5 && bash gen_bootstrap.sh && cd ..
+build/daimond run stage5/gen_bootstrap.dm
 LLVM_BIN=/usr/lib/llvm-19/bin bash bootstrap.sh --update-seed
 ```
 
