@@ -1,0 +1,20 @@
+Error: type mismatch in argument 1 of 'println': expected a string, a number or a bool, found Point at line 10
+Error: println() takes 1 argument, not 2 at line 11
+Error: substr() takes 3 arguments, not 2 at line 12
+Error: type mismatch in argument 1 of 'int_to_string': expected int, found string at line 13
+Error: type mismatch in argument 1 of 'int_to_string': expected int, found float at line 14
+Error: type mismatch in argument 1 of 'float_to_string': expected float, found int at line 15
+Error: type mismatch in argument 1 of 'parse_int': expected string, found int at line 16
+Error: type mismatch in argument 2 of 'starts_with': expected string, found int at line 17
+Error: type mismatch in argument 1 of 'chr': expected int, found string at line 18
+Error: time_ms() takes no arguments, not 1 at line 19
+Error: type mismatch in argument 1 of 'sleep_ms': expected int, found string at line 20
+Error: file_write() takes 2 arguments, not 1 at line 21
+Error: string_split() takes 2 arguments, not 1 at line 22
+Error: type mismatch in argument 1 of 'exit': expected int, found string at line 23
+Error: type mismatch in argument 1 of 'assert': expected bool, found int at line 24
+Error: assert_eq() compares two values of one type, not int and string at line 25
+Error: argument 1 of 'println' is the result of a call that returns no value at line 26
+Error: len() takes 1 argument, not 2 at line 27
+Error: type mismatch in argument 1 of 'bool_to_string': expected bool, found int at line 28
+Error: 19 type errors

@@ -1,0 +1,9 @@
+Error: 'push' changes a part of 'self', which is not declared 'mut' at line 13
+Error: 'pop' changes 'xs', which is not declared 'mut' at line 22
+Error: 'push' changes 'xs', which is not declared 'mut' at line 28
+Error: 'pop' changes 'xs', which is not declared 'mut' at line 29
+Error: the call of 'grow' changes 'xs', which is not declared 'mut' at line 30
+Error: 'Counter.bump' changes 'c', which is not declared 'mut' at line 32
+Error: 'push' changes a part of 'c', which is not declared 'mut' at line 33
+Error: 'Map.insert' changes 'ages', which is not declared 'mut' at line 35
+Error: 8 type errors

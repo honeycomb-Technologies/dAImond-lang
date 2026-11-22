@@ -1082,6 +1082,11 @@ struct Stmt {
     while_body: List[Stmt],
     -- Loop
     loop_body: List[Stmt],
+    -- An `if` statement as the expression it is where a block that
+    -- ends in it is used as a value (see stmt_value_expr). It shares
+    -- the condition and the statements of if_cond, if_then and if_else.
+    if_expr: Box[Expr],
+    has_if_expr: bool,
     -- Match statement
     match_expr: Box[Expr],
     match_stmt_arms: List[MatchArm],
@@ -1096,12 +1101,50 @@ struct Stmt {
     assign_value: Box[Expr]
 }
 
+-- Whether a block that ends in the statement has a value: an
+-- expression, a `match`, or an `if` with an `else`
+fn stmt_gives_value(s: Stmt) -> bool {
+    if s.kind == STMT_EXPRESSION() or s.kind == STMT_MATCH() { return true }
+    return s.kind == STMT_IF() and s.has_else_branch and s.has_if_expr
+}
+
+-- The expression that gives a block that ends in the statement its
+-- value (see stmt_gives_value)
+fn stmt_value_expr(s: Stmt) -> Expr {
+    if s.kind == STMT_MATCH() { return *s.match_expr }
+    if s.kind == STMT_IF() { return *s.if_expr }
+    return *s.expr
+}
+
+-- The `if` statement that an `if` expression is where its value is
+-- not used
+fn if_stmt_of(e: Expr) -> Stmt {
+    let mut s = stmt_new(STMT_IF(), e.line, e.col)
+    s.if_cond = e.condition
+    let then_block = *e.then_branch
+    s.if_then = then_block.stmts
+    if e.has_else {
+        s.has_else_branch = true
+        let other = *e.else_branch
+        if other.kind == EXPR_IF() {
+            -- else if: one statement in the else block
+            s.if_else.push(if_stmt_of(other))
+        } else {
+            s.if_else = other.stmts
+        }
+    }
+    s.if_expr = Box_new(e)
+    s.has_if_expr = true
+    return s
+}
+
 fn stmt_new(kind: int, line: int, col: int) -> Stmt {
     return Stmt {
         kind: kind, line: line, col: col,
         let_name: "", let_type: "", let_value: Box_null(), let_is_mut: false,
         ret_value: Box_null(), has_ret_value: false,
         if_cond: Box_null(), if_then: [], if_else: [], has_else_branch: false,
+        if_expr: Box_null(), has_if_expr: false,
         for_var: "", for_iter: Box_null(), for_body: [],
         while_cond: Box_null(), while_body: [],
         loop_body: [],
@@ -1643,12 +1686,6 @@ fn branch_value_expr(e: Expr) -> Expr {
 fn expr_names(e: Expr) -> List[string] {
     let none: List[string] = []
     return names_in_expr(e, none, false)
-}
-
--- Every name the statements call as `name(...)`, at any depth
-fn stmts_calls(stmts: List[Stmt]) -> List[string] {
-    let none: List[string] = []
-    return names_in_stmts(stmts, none, true)
 }
 
 -- ============================================================
@@ -4338,41 +4375,11 @@ fn parse_return_stmt(p: Parser) -> ParseStmtResult {
     return ParseStmtResult { p: pp, stmt: s }
 }
 
+-- An `if` statement is parsed as the expression, which it is where
+-- the block it ends is used as a value (if_stmt_of in ast.dm)
 fn parse_if_stmt(p: Parser) -> ParseStmtResult {
-    let mut pp = p
-    let tok = p_cur(pp)
-    pp = p_advance(pp) -- skip 'if'
-    let cond = parse_expr(pp)
-    pp = cond.p
-    pp = p_expect(pp, TK_LBRACE())
-    let then_block = parse_block_body(pp)
-    pp = then_block.p
-    pp = p_expect(pp, TK_RBRACE())
-
-    let mut s = stmt_new(STMT_IF(), tok.line, tok.col)
-    s.if_cond = Box_new(cond.expr)
-    s.if_then = then_block.stmts
-
-    pp = p_skip_newlines(pp)
-    if p_peek(pp) == TK_ELSE() {
-        pp = p_advance(pp)
-        pp = p_skip_newlines(pp)
-        s.has_else_branch = true
-        if p_peek(pp) == TK_IF() {
-            -- else if: wrap as a single-statement else block
-            let elif = parse_if_stmt(pp)
-            pp = elif.p
-            s.if_else.push(elif.stmt)
-        } else {
-            pp = p_expect(pp, TK_LBRACE())
-            let else_block = parse_block_body(pp)
-            pp = else_block.p
-            pp = p_expect(pp, TK_RBRACE())
-            s.if_else = else_block.stmts
-        }
-    }
-
-    return ParseStmtResult { p: pp, stmt: s }
+    let parsed = parse_if_expr(p)
+    return ParseStmtResult { p: parsed.p, stmt: if_stmt_of(parsed.expr) }
 }
 
 fn parse_while_stmt(p: Parser) -> ParseStmtResult {
@@ -5262,6 +5269,10 @@ struct IRGenerator {
     -- True while the value of a `let` that is a lambda is generated:
     -- the one place a lambda that captures variables may be written
     lambda_bound_by_let: bool,
+    -- The id of the `match` that is a statement, while it is
+    -- generated: its arms' values go nowhere (see match_slot_type in
+    -- ir_gen_expr.dm). -1 otherwise.
+    unused_match: int,
     -- Method name -> struct type name
     method_struct_map: Map[string, string],
     -- The functions of impl blocks that take no self, by mangled name
@@ -5349,6 +5360,9 @@ struct IRGenerator {
     -- The type arguments the checker found for each call of a generic
     -- function, at the call's id, joined with "|"
     checked_type_args: List[string],
+    -- What a method call calls where it is no method, at the call's
+    -- id: "call:f" for x.f(a), which is f(x, a)
+    checked_targets: List[string],
     -- -g: say where each variable lives (OP_DEBUG_VAR)
     debug_info: bool,
     -- Declared source return types of functions and impl methods
@@ -5384,6 +5398,7 @@ fn ir_generator_new() -> IRGenerator {
         fn_ptr_vars: Map_new(),
         lambda_captures: Map_new(),
         lambda_bound_by_let: false,
+        unused_match: -1,
         method_struct_map: Map_new(),
         static_fns: Map_new(),
         var_struct_types: Map_new(),
@@ -5426,6 +5441,7 @@ fn ir_generator_new() -> IRGenerator {
         type_errors: [],
         checked_types: [],
         checked_type_args: [],
+        checked_targets: [],
         debug_info: false,
         fn_src_return_types: Map_new(),
         fn_src_param_types: Map_new(),
@@ -5663,6 +5679,13 @@ fn checked_type_args(gen: IRGenerator, call: Expr) -> List[string] {
     let joined = gen.checked_type_args[call.id]
     if joined == "" { return none }
     return string_split(joined, "|")
+}
+
+-- What the checker found the method call to call, where it is no
+-- method: "call:f" for x.f(a), which is f(x, a). "" for a method.
+fn checked_target(gen: IRGenerator, call: Expr) -> string {
+    if call.id < 0 or call.id >= gen.checked_targets.len() { return "" }
+    return gen.checked_targets[call.id]
 }
 
 -- The IR type of the expression's value as the checker found it. ""
@@ -6194,6 +6217,24 @@ fn raw_builtin_return_type(name: string) -> string {
     if name == "string_from_raw" { return "string" }
     if name == "load_f32" or name == "load_f64" { return "f64" }
     return "i64"
+}
+
+-- "no arguments", "1 argument", "2 arguments"
+fn arguments_text(count: int) -> string {
+    if count == 0 { return "no arguments" }
+    if count == 1 { return "1 argument" }
+    return int_to_string(count) + " arguments"
+}
+
+-- The effect a function must declare to call the builtin, or ""
+fn builtin_required_effect(name: string) -> string {
+    if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
+    if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
+    if name == "read_key" or name == "read_key_nb" { return "Console" }
+    if name == "args_get" or name == "args_len" { return "IO" }
+    if name == "flush" or name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return "IO" }
+    if name == "system" or name == "exit" or name == "run_command" or name == "run_command_io" { return "Process" }
+    return ""
 }
 
 fn is_builtin_fn(name: string) -> bool {
@@ -7705,11 +7746,20 @@ fn generate_statement_kind(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) ->
         return generate_assignment(gen, block, stmt)
     }
     if stmt.kind == STMT_EXPRESSION() {
-        let result = generate_expr(gen, block, *stmt.expr)
+        let stated = *stmt.expr
+        if stated.kind == EXPR_BLOCK() and stated.has_result == false {
+            -- A block that is a statement of its own gives no value
+            return generate_block_stmts(gen, block, stated.stmts)
+        }
+        let result = generate_expr(gen, block, stated)
         return gen_result(result.gen, result.block)
     }
     if stmt.kind == STMT_MATCH() {
-        let result = generate_match_expr(gen, block, *stmt.match_expr)
+        -- The arms' values go nowhere: they may be of different types
+        let matched = *stmt.match_expr
+        let mut g_match = gen
+        g_match.unused_match = matched.id
+        let result = generate_match_expr(g_match, block, matched)
         return gen_result(result.gen, result.block)
     }
     if stmt.kind == STMT_REGION() {
@@ -10319,7 +10369,7 @@ fn generate_raw_builtin(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
     }
     let want = if fn_name == "string_from_raw" { 3 } else if starts_with(fn_name, "store_") or fn_name == "static_addr" { 2 } else if fn_name == "size_of" { 0 } else { 1 }
     if args.len() != want {
-        g = ir_type_error(g, fn_name + "() takes " + int_to_string(want) + " arguments, not " + int_to_string(args.len()), expr.line)
+        g = ir_type_error(g, fn_name + "() takes " + arguments_text(want) + ", not " + int_to_string(args.len()), expr.line)
         return expr_result(g, b, 0)
     }
     let mem_t = raw_mem_type(fn_name)
@@ -10569,6 +10619,9 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return ""
     }
     if k == EXPR_METHOD_CALL() {
+        if starts_with(checked_target(gen, expr), "call:") {
+            return static_type(gen, method_as_call(gen, expr))
+        }
         let static_target = static_call_target(gen, expr)
         if static_target != "" {
             return static_type(gen, static_call_expr(expr, static_target))
@@ -11171,11 +11224,12 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return then_t
     }
     if expr.kind == EXPR_BLOCK() {
-        -- Type of the block's trailing expression statement
+        -- The type of the expression that ends the block, which an
+        -- `if` with an `else` and a `match` are too
         if expr.stmts.len() > 0 {
             let last = expr.stmts[expr.stmts.len() - 1]
-            if last.kind == STMT_EXPRESSION() {
-                return infer_expr_type(gen, *last.expr)
+            if stmt_gives_value(last) {
+                return infer_expr_type(gen, stmt_value_expr(last))
             }
         }
         return "void"
@@ -11286,6 +11340,9 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return "i64"
     }
     if expr.kind == EXPR_METHOD_CALL() {
+        if starts_with(checked_target(gen, expr), "call:") {
+            return infer_expr_type(gen, method_as_call(gen, expr))
+        }
         let static_target = static_call_target(gen, expr)
         if static_target != "" {
             return infer_expr_type(gen, static_call_expr(expr, static_target))
@@ -13327,6 +13384,23 @@ fn infer_arg_type(gen: IRGenerator, arg: Expr) -> string {
 -- string methods, struct methods.
 -- ============================================================
 
+-- x.f(a) as the call f(x, a), which it is where the checker found that
+-- the type of x has no method f (checked_target). The call keeps the
+-- id, at which the checker recorded its type and its type arguments.
+fn method_as_call(gen: IRGenerator, expr: Expr) -> Expr {
+    let target = checked_target(gen, expr)
+    let mut call_args: List[Expr] = []
+    call_args.push(*expr.object)
+    let mut i = 0
+    while i < expr.args.len() {
+        call_args.push(expr.args[i])
+        i = i + 1
+    }
+    let mut as_call = expr_call(expr_ident(substr(target, 5, len(target) - 5), expr.line, expr.col), call_args, expr.line, expr.col)
+    as_call.id = expr.id
+    return as_call
+}
+
 fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -13338,6 +13412,13 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     if is_map_ctor(expr) {
         g = ir_type_error(g, "cannot tell which Map type Map.new() creates here; give it one, e.g. let m: Map[string, int] = Map.new()", expr.line)
         return expr_result(g, b, 0)
+    }
+
+    -- x.f(a) where the type of x has no method f is the call f(x, a),
+    -- as the checker found. The call keeps the id, at which the checker
+    -- recorded its type and its type arguments.
+    if starts_with(checked_target(g, expr), "call:") {
+        return generate_function_call(g, b, method_as_call(g, expr))
     }
 
     -- Region escape: push/insert/set store their argument into the
@@ -16033,13 +16114,13 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
     let scrut_bind_type = static_type(g, *expr.scrutinee)
 
     -- Infer the match result type from arm bodies
-    let match_type = checked_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
+    let match_type = match_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = match_type
-    result_alloca.result_type = "ptr(" + match_type + ")"
+    result_alloca.alloc_type = slot_alloc_type(match_type)
+    result_alloca.result_type = "ptr(" + slot_alloc_type(match_type) + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -16241,8 +16322,8 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = match_type
-    load_inst.result_type = match_type
+    load_inst.load_type = slot_alloc_type(match_type)
+    load_inst.result_type = slot_alloc_type(match_type)
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -16267,13 +16348,13 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     let scrut_bind_type = enum_type
 
     -- Infer match result type from arm bodies
-    let ematch_type = checked_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
+    let ematch_type = match_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
 
     -- Allocate result slot
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = ematch_type
-    result_alloca.result_type = "ptr(" + ematch_type + ")"
+    result_alloca.alloc_type = slot_alloc_type(ematch_type)
+    result_alloca.result_type = "ptr(" + slot_alloc_type(ematch_type) + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -16466,8 +16547,8 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = ematch_type
-    load_inst.result_type = ematch_type
+    load_inst.load_type = slot_alloc_type(ematch_type)
+    load_inst.result_type = slot_alloc_type(ematch_type)
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -16513,11 +16594,11 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 
     -- Allocate result slot. Its type is the one the checker found for
     -- the match; without it, a match that gives a value gives an int
-    let slot_type = checked_slot_type(g, expr, "i64")
+    let slot_type = match_slot_type(g, expr, "i64")
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = slot_type
-    result_alloca.result_type = "ptr(" + slot_type + ")"
+    result_alloca.alloc_type = slot_alloc_type(slot_type)
+    result_alloca.result_type = "ptr(" + slot_alloc_type(slot_type) + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -16717,8 +16798,8 @@ fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = slot_type
-    load_inst.result_type = slot_type
+    load_inst.load_type = slot_alloc_type(slot_type)
+    load_inst.result_type = slot_alloc_type(slot_type)
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -16743,11 +16824,11 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 
     -- Allocate result slot. Its type is the one the checker found for
     -- the match; without it, a match that gives a value gives an int
-    let slot_type = checked_slot_type(g, expr, "i64")
+    let slot_type = match_slot_type(g, expr, "i64")
     let result_alloca_id = g.builder.next_id
     let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = slot_type
-    result_alloca.result_type = "ptr(" + slot_type + ")"
+    result_alloca.alloc_type = slot_alloc_type(slot_type)
+    result_alloca.result_type = "ptr(" + slot_alloc_type(slot_type) + ")"
     result_alloca.has_result = true
     b.instructions.push(result_alloca)
     g.builder.next_id = g.builder.next_id + 1
@@ -16910,8 +16991,8 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
     let load_id = g.builder.next_id
     let mut load_inst = ir_inst_new(load_id, OP_LOAD())
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = slot_type
-    load_inst.result_type = slot_type
+    load_inst.load_type = slot_alloc_type(slot_type)
+    load_inst.result_type = slot_alloc_type(slot_type)
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -16922,6 +17003,20 @@ fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scru
 -- ============================================================
 -- BLOCK EXPRESSION
 -- ============================================================
+
+-- Whether the block, which ends in an `if` or a `match` statement, has
+-- that statement's value: as the checker found, and where it recorded
+-- nothing (the body of a generic function), as the statement's
+-- branches say
+fn block_ends_in_value(gen: IRGenerator, expr: Expr) -> bool {
+    if expr.id >= 0 and expr.id < gen.checked_types.len() {
+        let checked = gen.checked_types[expr.id]
+        if checked == "void" { return false }
+        if checked != "" { return true }
+    }
+    let last = expr.stmts[expr.stmts.len() - 1]
+    return infer_expr_type(gen, stmt_value_expr(last)) != "void"
+}
 
 fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
@@ -16946,6 +17041,24 @@ fn generate_block_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
                 return expr_result(g, b, g.builder.next_id - 1)
             }
             return generate_expr(g, b, *last.expr)
+        }
+        -- A block that ends in an `if` with an `else` or in a `match`
+        -- has that statement's value, unless the checker found that
+        -- it gives none
+        if last.kind != STMT_EXPRESSION() and stmt_gives_value(last) and block_ends_in_value(g, expr) {
+            let mut lead: List[Stmt] = []
+            let mut li = 0
+            while li < n - 1 {
+                lead.push(expr.stmts[li])
+                li = li + 1
+            }
+            let lead_result = generate_block_stmts(g, b, lead)
+            g = lead_result.gen
+            b = lead_result.block
+            if b.has_terminator {
+                return expr_result(g, b, g.builder.next_id - 1)
+            }
+            return generate_expr(g, b, stmt_value_expr(last))
         }
     }
 
@@ -17856,6 +17969,8 @@ fn generate_fn_ptr_param_call(gen: IRGenerator, block: IRBasicBlock, var_name: s
 fn store_branch_value(gen: IRGenerator, block: IRBasicBlock, slot_id: int, slot_type: string, val_id: int, value: Expr) -> GenResult {
     let mut g = gen
     let mut b = block
+    -- A `match` that is a statement keeps no value
+    if slot_type == "void" { return gen_result(g, b) }
     let mut store_id = val_id
     -- The type is asked for here, where the branch's variables are known
     let from = infer_expr_type(g, value)
@@ -17875,14 +17990,31 @@ fn store_branch_value(gen: IRGenerator, block: IRBasicBlock, slot_id: int, slot_
     return emit_ir_store(g, b, ir_val_inst(slot_id), ir_val_inst(store_id))
 }
 
+-- The type of the slot that holds the value of the `match`: the
+-- checker's, else `inferred` (checked_slot_type); and "void" for a
+-- `match` that is a statement, whose arms' values are not stored
+fn match_slot_type(gen: IRGenerator, expr: Expr, inferred: string) -> string {
+    if gen.unused_match == expr.id and expr.id >= 0 { return "void" }
+    return checked_slot_type(gen, expr, inferred)
+}
+
+-- The type a slot of the type is allocated with: a slot that is not
+-- used still has a size
+fn slot_alloc_type(slot_type: string) -> string {
+    if slot_type == "void" { return "i64" }
+    return slot_type
+}
+
 -- The block of a match arm. When it ends in an expression of the type
 -- of the match's slot, or in a number where the slot holds a number
 -- of another width, that value is the arm's and goes into the slot.
+-- An `if` with an `else` or a `match` that ends the block is such an
+-- expression (stmt_value_expr).
 fn generate_arm_block(gen: IRGenerator, block: IRBasicBlock, stmts: List[Stmt], slot_id: int, slot_type: string) -> GenResult {
     let n = stmts.len()
     if n == 0 { return gen_result(gen, block) }
     let last = stmts[n - 1]
-    if last.kind != STMT_EXPRESSION() { return generate_block_stmts(gen, block, stmts) }
+    if slot_type == "void" or stmt_gives_value(last) == false { return generate_block_stmts(gen, block, stmts) }
     let mut lead: List[Stmt] = []
     let mut li = 0
     while li < n - 1 {
@@ -17894,7 +18026,7 @@ fn generate_arm_block(gen: IRGenerator, block: IRBasicBlock, stmts: List[Stmt], 
     let mut b = lead_result.block
     if b.has_terminator { return gen_result(g, b) }
     -- The type is asked for here, where the block's variables are known
-    let value = *last.expr
+    let value = stmt_value_expr(last)
     let value_type = infer_expr_type(g, value)
     let both_integers = is_integer_type(value_type) and is_integer_type(slot_type)
     let both_floats = is_float_type(value_type) and is_float_type(slot_type)
@@ -19870,7 +20002,14 @@ struct FnSig {
     -- The type parameters of the impl block, then the function's own
     generics: List[string],
     has_self: bool,
-    is_async: bool
+    is_async: bool,
+    -- Whether each parameter is `mut`: the function changes the
+    -- variable it is given, which must then be `mut` itself
+    changes: List[bool],
+    -- An extern fn that takes more arguments than it has parameters
+    variadic: bool,
+    -- The effects the function declares it has
+    effects: List[string]
 }
 
 struct StructSig {
@@ -19909,6 +20048,14 @@ struct Checker {
     -- What the function or lambda being checked returns: "void" for
     -- nothing, "" when it is not known
     ret_type: string,
+    -- The id of the call that an `await` is waiting for, while that
+    -- call is checked; -3 once the call is found to be of an async
+    -- function, and -2 outside an `await`
+    awaited: int,
+    -- The function being checked and the effects it declares. One
+    -- that declares none is not held to any.
+    fn_name: string,
+    fn_effects: List[string],
     -- Names that stand for other types where the checker is: Self,
     -- and the type parameters in scope, which stand for "?"
     norm_names: List[string],
@@ -19918,6 +20065,9 @@ struct Checker {
     -- For a call of a generic function, at the call's id: what the
     -- function's type parameters stand for, joined with "|"
     type_args: List[string],
+    -- For a method call that is a call of a function, at the call's
+    -- id: "call:f" for x.f(a), which is f(x, a)
+    targets: List[string],
     -- False in the body of a generic function or method, where the
     -- types depend on the type arguments and none is recorded
     record: bool
@@ -19930,7 +20080,10 @@ struct Checked {
     types: List[string],
     -- The type arguments of each call of a generic function at the
     -- call's id, joined with "|"; "" where they are not all known
-    type_args: List[string]
+    type_args: List[string],
+    -- What a method call calls, at the call's id, where it is not a
+    -- method: "call:f" for x.f(a), which is f(x, a)
+    targets: List[string]
 }
 
 -- A checker and the type of the expression it has just checked
@@ -20145,17 +20298,55 @@ fn ty_fn_ret(t: string) -> string {
     return "void"
 }
 
+-- Whether two types are the same type, as far as both are known:
+-- "List[?]" is the same as "List[int]", and "int" is not "i32"
+fn ty_same(a: string, b: string) -> bool {
+    if a == b { return true }
+    if ty_known(a) == false or ty_known(b) == false { return true }
+    if starts_with(a, "fn(") and starts_with(b, "fn(") { return ty_fn_agrees(a, b) }
+    if starts_with(a, "fn(") or starts_with(b, "fn(") { return false }
+    if starts_with(a, "dyn ") or starts_with(b, "dyn ") { return true }
+    if starts_with(a, "[") or starts_with(b, "[") { return true }
+    if ty_head(a) != ty_head(b) { return false }
+    let a_args = ty_args(a)
+    let b_args = ty_args(b)
+    if a_args.len() != b_args.len() { return false }
+    let mut i = 0
+    while i < a_args.len() {
+        if ty_same(a_args[i], b_args[i]) == false { return false }
+        i = i + 1
+    }
+    return true
+}
+
+-- Whether two function types take the same parameters and return the
+-- same type. A function is called with the types its own type names,
+-- so a parameter of another width is another type here.
+fn ty_fn_agrees(a: string, b: string) -> bool {
+    let a_params = ty_fn_params(a)
+    let b_params = ty_fn_params(b)
+    if a_params.len() != b_params.len() { return false }
+    let mut i = 0
+    while i < a_params.len() {
+        if ty_same(a_params[i], b_params[i]) == false { return false }
+        i = i + 1
+    }
+    return ty_same(ty_fn_ret(a), ty_fn_ret(b))
+}
+
 -- Whether a value of type `got` can go where `want` is expected.
 -- Unknown types fit anything. Integers of every width fit each other
 -- (code generation checks the narrowing), and so do the float types.
--- Function, array and dyn types are not compared.
+-- Two function types must agree (ty_fn_agrees). Array and dyn types
+-- are not compared.
 fn ty_fits(want: string, got: string) -> bool {
     if want == got { return true }
     if ty_known(want) == false or ty_known(got) == false { return true }
     if ty_is_int(want) and ty_is_int(got) { return true }
     if ty_is_float(want) and ty_is_float(got) { return true }
     if starts_with(want, "dyn ") or starts_with(got, "dyn ") { return true }
-    if starts_with(want, "fn(") or starts_with(got, "fn(") { return true }
+    if starts_with(want, "fn(") and starts_with(got, "fn(") { return ty_fn_agrees(want, got) }
+    if starts_with(want, "fn(") or starts_with(got, "fn(") { return false }
     if starts_with(want, "[") or starts_with(got, "[") { return true }
     if ty_head(want) != ty_head(got) { return false }
     let want_args = ty_args(want)
@@ -20381,9 +20572,11 @@ fn ck_sig(fd: FunctionDecl, self_type: string, outer_generics: List[string]) -> 
         gi = gi + 1
     }
     let mut params: List[string] = []
+    let mut changes: List[bool] = []
     let mut i = 0
     while i < fd.params.len() {
         params.push(ty_rewrite(fd.params[i].type_name, names, repls))
+        changes.push(fd.params[i].is_mut)
         i = i + 1
     }
     let mut has_self = false
@@ -20395,7 +20588,10 @@ fn ck_sig(fd: FunctionDecl, self_type: string, outer_generics: List[string]) -> 
         ret: ty_rewrite(fd.return_type, names, repls),
         generics: generics,
         has_self: has_self,
-        is_async: fd.is_async
+        is_async: fd.is_async,
+        changes: changes,
+        variadic: fd.is_variadic,
+        effects: fd.effects
     }
 }
 
@@ -20610,8 +20806,8 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
 fn ck_settle_last(c: Checker, stmts: List[Stmt], want: string) -> Checker {
     if stmts.len() == 0 { return c }
     let last = stmts[stmts.len() - 1]
-    if last.kind != STMT_EXPRESSION() { return c }
-    return ck_settle(c, *last.expr, want)
+    if stmt_gives_value(last) == false { return c }
+    return ck_settle(c, stmt_value_expr(last), want)
 }
 
 -- The type of the expression, which is recorded at its id
@@ -20653,11 +20849,42 @@ fn ck_expr_of_kind(c: Checker, e: Expr) -> Typed {
         let high = ck_expr(low.c, *e.right)
         return ck_typed(high.c, "")
     }
-    if k == EXPR_AWAIT() {
-        let awaited = ck_expr(c, *e.operand)
-        return ck_typed(awaited.c, "")
-    }
+    if k == EXPR_AWAIT() { return ck_await(c, e) }
     return ck_typed(c, "")
+}
+
+-- await f(args): the value of a call of an async function. The call
+-- runs the function to its end: an async function is called under
+-- `await` and nowhere else, so there is no call still running to wait
+-- for, and no value that stands for one.
+fn ck_await(c0: Checker, e: Expr) -> Typed {
+    let mut c = c0
+    let mut call = *e.operand
+    while call.kind == EXPR_GROUPED() {
+        call = *call.operand
+    }
+    let outer = c.awaited
+    c.awaited = call.id
+    let found = ck_expr(c, *e.operand)
+    c = found.c
+    let was_async = c.awaited == -3
+    c.awaited = outer
+    if was_async == false {
+        c = ck_error(c, "'await' takes a call of an async function", e.line)
+    }
+    return ck_typed(c, found.t)
+}
+
+-- A call of the function with the signature, by the expression with
+-- the id: an async function is called under `await`
+fn ck_async_call(c: Checker, sig: FnSig, shown: string, id: int, line: int) -> Checker {
+    if sig.is_async == false { return c }
+    let mut out = c
+    if id >= 0 and id == c.awaited {
+        out.awaited = -3
+        return out
+    }
+    return ck_error(out, "the call of the async function '" + shown + "' needs 'await'", line)
 }
 
 -- The types of the expressions, in order
@@ -20687,8 +20914,15 @@ fn ck_identifier(c: Checker, e: Expr) -> Typed {
     let at = ck_var(c, name)
     if at >= 0 { return ck_typed(c, c.var_types[at]) }
     if c.consts.contains(name) { return ck_typed(c, c.consts.get(name)) }
-    -- A function's name is a value: its address
-    if c.fns.contains(name) or is_builtin_fn(name) { return ck_typed(c, "") }
+    -- A function's name is a value: its address. Naming a function
+    -- that has effects is using them.
+    if c.fns.contains(name) {
+        let sig = c.fns.get(name)
+        let named = ck_effects(c, name, sig.effects, " not in caller's effects", "uses", e.line)
+        if is_builtin_fn(name) or sig.variadic { return ck_typed(named, "") }
+        return ck_typed(named, ty_fn_text(sig))
+    }
+    if is_builtin_fn(name) { return ck_typed(c, "") }
     if ck_names_type(c, name) { return ck_typed(c, "") }
     return ck_typed(ck_error(c, "undefined variable '" + name + "'", e.line), "")
 }
@@ -20878,7 +21112,193 @@ fn ck_index(c0: Checker, e: Expr) -> Typed {
 -- where the variadic externs are known.)
 fn ck_arity(c: Checker, sig: FnSig, shown: string, first: int, count: int, line: int) -> Checker {
     if first + count == sig.params.len() { return c }
-    return ck_error(c, "call to '" + shown + "' passes " + int_to_string(count) + " arguments, expected " + int_to_string(sig.params.len() - first), line)
+    if sig.variadic and first + count > sig.params.len() { return c }
+    let mut expected = int_to_string(sig.params.len() - first)
+    if sig.variadic { expected = "at least " + expected }
+    return ck_error(c, "call to '" + shown + "' passes " + int_to_string(count) + " arguments, expected " + expected, line)
+}
+
+-- The type of the function as a value: "fn(int, string) -> bool".
+-- A type parameter is "?".
+fn ty_fn_text(sig: FnSig) -> string {
+    let none: List[string] = []
+    let mut text = "fn("
+    let mut i = 0
+    while i < sig.params.len() {
+        if i > 0 { text = text + ", " }
+        text = text + ty_apply(sig.params[i], sig.generics, none)
+        i = i + 1
+    }
+    return text + ") -> " + ty_apply(sig.ret, sig.generics, none)
+}
+
+-- An error for each of the effects that the function being checked
+-- does not declare. `shown` is what needs them, `how` what the
+-- function does with it ("calls" or "uses"), and `tail` ends the
+-- message. A function that declares no effects is not held to any.
+fn ck_effects(c0: Checker, shown: string, effects: List[string], tail: string, how: string, line: int) -> Checker {
+    let mut c = c0
+    if c.fn_effects.len() == 0 { return c }
+    let mut i = 0
+    while i < effects.len() {
+        if ck_index_of(c.fn_effects, effects[i]) < 0 {
+            c = ck_error(c, "function '" + c.fn_name + "' " + how + " '" + shown + "' which requires effect '" + effects[i] + "'" + tail, line)
+        }
+        i = i + 1
+    }
+    return c
+}
+
+-- The type of a place, read from the types of its parts without
+-- checking it: a variable's, a field's, an element's. "" for any other
+-- expression.
+fn ck_place_type(c: Checker, e: Expr) -> string {
+    if e.kind == EXPR_IDENTIFIER() {
+        let at = ck_var(c, e.name)
+        if at >= 0 { return c.var_types[at] }
+        return ""
+    }
+    if e.kind == EXPR_GROUPED() { return ck_place_type(c, *e.operand) }
+    if e.kind == EXPR_FIELD_ACCESS() {
+        return ck_field_type(c, ty_unbox(ck_place_type(c, *e.object)), e.field)
+    }
+    if e.kind == EXPR_INDEX_ACCESS() {
+        let held = ty_unbox(ck_place_type(c, *e.object))
+        if ty_head(held) == "Map" { return ty_arg(held, 1) }
+        return ty_iterated(held)
+    }
+    return ""
+}
+
+-- The variable that must be `mut` for the place to be changed, when it
+-- is not: p for p.x and for p.xs[i].y. "" when the place may be
+-- changed: its variable is `mut`, it is no part of a variable (the
+-- result of a call, say), or it is reached through a Box. A Box is a
+-- pointer to a value of its own, which every copy of the Box shares:
+-- `mut` on a variable that holds one is about the variable.
+fn ck_fixed_root(c: Checker, e: Expr) -> string {
+    let mut cur = e
+    let mut walking = true
+    while walking {
+        if ty_head(ck_place_type(c, cur)) == "Box" { return "" }
+        if cur.kind == EXPR_FIELD_ACCESS() or cur.kind == EXPR_INDEX_ACCESS() {
+            cur = *cur.object
+        } else if cur.kind == EXPR_GROUPED() {
+            cur = *cur.operand
+        } else if cur.kind == EXPR_UNARY() and cur.op == UNOP_DEREF() {
+            return ""
+        } else {
+            walking = false
+        }
+    }
+    if cur.kind != EXPR_IDENTIFIER() { return "" }
+    let at = ck_var(c, cur.name)
+    if at < 0 { return "" }
+    if c.var_flags[at] != 0 { return "" }
+    return cur.name
+}
+
+-- A value that a call changes must be one that may be changed. `what`
+-- says what changes it.
+fn ck_changes(c: Checker, e: Expr, what: string, line: int) -> Checker {
+    let root = ck_fixed_root(c, e)
+    if root == "" { return c }
+    if e.kind == EXPR_IDENTIFIER() {
+        return ck_error(c, what + " changes '" + root + "', which is not declared 'mut'", line)
+    }
+    return ck_error(c, what + " changes a part of '" + root + "', which is not declared 'mut'", line)
+}
+
+-- The arguments that go to `mut` parameters of the function are
+-- changed by the call, from its parameter `first` on
+fn ck_mut_args(c0: Checker, sig: FnSig, shown: string, first: int, args: List[Expr]) -> Checker {
+    let mut c = c0
+    let mut i = 0
+    while i < args.len() and first + i < sig.changes.len() {
+        if sig.changes[first + i] {
+            c = ck_changes(c, args[i], "the call of '" + shown + "'", args[i].line)
+        }
+        i = i + 1
+    }
+    return c
+}
+
+-- ---- Builtin functions ----
+
+-- The parameter types of a builtin function, joined with "|"; "" for
+-- one that takes nothing. "*" is a parameter of any type, and
+-- "printable" one that print() takes: a string, a number or a bool.
+-- "skip" for a builtin whose arguments code generation checks.
+fn ck_builtin_params(name: string) -> string {
+    if name == "print" or name == "println" or name == "eprint" or name == "eprintln" { return "printable" }
+    if name == "panic" or name == "parse_int" or name == "parse_float" or name == "string_to_int" { return "string" }
+    if name == "string_trim" or name == "string_to_upper" or name == "string_to_lower" { return "string" }
+    if name == "is_alpha" or name == "is_digit" or name == "is_whitespace" or name == "is_alnum" or name == "char_to_string" { return "string" }
+    if name == "file_read" or name == "file_exists" or name == "system" { return "string" }
+    if name == "path_dirname" or name == "path_basename" or name == "path_extension" or name == "path_stem" { return "string" }
+    if name == "fs_readdir" or name == "fs_mkdir" or name == "fs_remove" or name == "os_getenv" or name == "env_get" { return "string" }
+    if name == "tcp_listen" or name == "tcp_connect" { return "string" }
+    if name == "exit" or name == "int_to_string" or name == "args_get" or name == "mem_sweep" or name == "chr" or name == "sleep_ms" { return "int" }
+    if name == "tcp_accept" or name == "tcp_close" or name == "thread_join" { return "int" }
+    if name == "mutex_lock" or name == "mutex_unlock" or name == "mutex_destroy" { return "int" }
+    if name == "float_to_string" { return "float" }
+    if name == "bool_to_string" or name == "assert" { return "bool" }
+    if name == "char_at" or name == "byte_at" { return "string|int" }
+    if name == "substr" { return "string|int|int" }
+    if name == "string_contains" or name == "string_find" or name == "starts_with" or name == "ends_with" or name == "string_split" { return "string|string" }
+    if name == "file_write" or name == "file_append" or name == "path_join" or name == "fs_rename" { return "string|string" }
+    if name == "string_replace" { return "string|string|string" }
+    if name == "tcp_read" { return "int|int" }
+    if name == "tcp_write" { return "int|string" }
+    if name == "read_line" or name == "args_len" or name == "mem_mark" or name == "flush" or name == "fs_getcwd" { return "" }
+    if name == "read_key" or name == "read_key_nb" or name == "term_width" or name == "term_height" or name == "time_ms" or name == "mutex_new" { return "" }
+    if name == "Box_null" or name == "Map_new" { return "" }
+    if name == "Box_new" or name == "hash_key" or name == "len" { return "*" }
+    if name == "assert_eq" { return "*|*" }
+    return "skip"
+}
+
+-- Check the arguments of a call of a builtin function, and the
+-- effect it needs
+fn ck_builtin_call(c0: Checker, name: string, arg_types: List[string], args: List[Expr], line: int) -> Checker {
+    let mut c = c0
+    let effect = builtin_required_effect(name)
+    if effect != "" {
+        let mut needs: List[string] = []
+        needs.push(effect)
+        c = ck_effects(c, name, needs, "", "calls", line)
+    }
+    let joined = ck_builtin_params(name)
+    if joined == "skip" { return c }
+    let mut params: List[string] = []
+    if joined != "" { params = string_split(joined, "|") }
+    if params.len() != arg_types.len() {
+        return ck_error(c, name + "() takes " + arguments_text(params.len()) + ", not " + int_to_string(arg_types.len()), line)
+    }
+    let mut i = 0
+    while i < params.len() {
+        let got = arg_types[i]
+        if got == "void" {
+            c = ck_error(c, "argument " + int_to_string(i + 1) + " of '" + name + "' is the result of a call that returns no value", args[i].line)
+        } else if params[i] == "printable" {
+            if ty_known(got) and ty_kind(got) == "" {
+                c = ck_error(c, "type mismatch in argument 1 of '" + name + "': expected a string, a number or a bool, found " + got, args[i].line)
+            }
+        } else if params[i] != "*" {
+            if ck_fits(c, params[i], got) == false {
+                c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + name + "': expected " + params[i] + ", found " + got, args[i].line)
+            } else {
+                c = ck_settle(c, args[i], params[i])
+            }
+        }
+        i = i + 1
+    }
+    if name == "assert_eq" {
+        if ck_fits(c, arg_types[0], arg_types[1]) == false and ck_fits(c, arg_types[1], arg_types[0]) == false {
+            c = ck_error(c, "assert_eq() compares two values of one type, not " + arg_types[0] + " and " + arg_types[1], line)
+        }
+    }
+    return c
 }
 
 -- What the signature's type parameters stand for in a call with
@@ -20926,7 +21346,6 @@ fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[str
         }
         i = i + 1
     }
-    if sig.is_async { return ck_typed(c, "") }
     return ck_typed(c, ty_apply(sig.ret, sig.generics, binds))
 }
 
@@ -20934,7 +21353,13 @@ fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[str
 -- that holds a lambda
 fn ck_call_value(c0: Checker, held: string, shown: string, arg_types: List[string], args: List[Expr], line: int) -> Typed {
     let mut c = c0
-    if starts_with(held, "fn(") == false { return ck_typed(c, "") }
+    if starts_with(held, "fn(") == false {
+        if ty_known(held) == false { return ck_typed(c, "") }
+        if shown == "a function value" {
+            return ck_typed(ck_error(c, "a value of type " + held + " cannot be called", line), "")
+        }
+        return ck_typed(ck_error(c, "'" + shown + "' is a value of type " + held + ", which cannot be called", line), "")
+    }
     let params = ty_fn_params(held)
     if params.len() != arg_types.len() {
         c = ck_error(c, "call to '" + shown + "' passes " + int_to_string(arg_types.len()) + " arguments, expected " + int_to_string(params.len()), line)
@@ -20974,8 +21399,9 @@ fn ck_call_named(c0: Checker, name: string, generic_args: List[string], arg_type
     if name == "Ok" { return ck_typed(c, "Result[" + first_type + ", ?]") }
     if name == "Err" { return ck_typed(c, "Result[?, " + first_type + "]") }
     if name == "Box_new" { return ck_typed(c, "Box[" + first_type + "]") }
-    if name == "Box_null" { return ck_typed(c, "Box[?]") }
-    if name == "Map_new" { return ck_typed(c, "Map[?, ?]") }
+    if name == "Box_null" { return ck_typed(ck_builtin_call(c, name, arg_types, args, line), "Box[?]") }
+    if name == "Map_new" { return ck_typed(ck_builtin_call(c, name, arg_types, args, line), "Map[?, ?]") }
+    if name == "List_new" { return ck_typed(c, "List[?]") }
     -- A variable that holds a function
     let at = ck_var(c, name)
     if at >= 0 {
@@ -20995,12 +21421,17 @@ fn ck_call_named(c0: Checker, name: string, generic_args: List[string], arg_type
             binds[gi] = ty_rewrite(generic_args[gi], none, none)
             gi = gi + 1
         }
-        let applied = ck_apply(c, sig, name, 0, binds, arg_types, args)
+        let mut counted = ck_arity(c, sig, name, 0, arg_types.len(), line)
+        counted = ck_async_call(counted, sig, name, call_id, line)
+        counted = ck_effects(counted, name, sig.effects, " not in caller's effects", "calls", line)
+        counted = ck_mut_args(counted, sig, name, 0, args)
+        let applied = ck_apply(counted, sig, name, 0, binds, arg_types, args)
         if sig.generics.len() == 0 { return applied }
         return ck_typed(ck_note_type_args(applied.c, call_id, ck_binds(sig, 0, binds, arg_types)), applied.t)
     }
-    if builtin { return ck_typed(c, ck_builtin_type(name)) }
-    return ck_typed(c, "")
+    if builtin { return ck_typed(ck_builtin_call(c, name, arg_types, args, line), ck_builtin_type(name)) }
+    if is_simd_builtin(name) { return ck_typed(c, "") }
+    return ck_typed(ck_error(c, "undefined function '" + name + "'", line), "")
 }
 
 fn ck_call(c0: Checker, e: Expr) -> Typed {
@@ -21084,10 +21515,43 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
     let key = type_name + "_" + method
     if c.fns.contains(key) {
         let sig = c.fns.get(key)
-        let counted = ck_arity(c, sig, type_name + "." + method, 0, arg_types.len(), e.line)
+        let mut counted = ck_arity(c, sig, type_name + "." + method, 0, arg_types.len(), e.line)
+        counted = ck_async_call(counted, sig, type_name + "." + method, e.id, e.line)
+        counted = ck_effects(counted, type_name + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
+        counted = ck_mut_args(counted, sig, type_name + "." + method, 0, e.args)
         return ck_apply(counted, sig, type_name + "." + method, 0, ty_unbound(sig.generics.len()), arg_types, e.args)
     }
     return ck_typed(c, "")
+}
+
+fn ck_method_arity(c: Checker, recv: string, method: string, want: int, got: int, line: int) -> Checker {
+    if want == got { return c }
+    return ck_error(c, "'" + method + "' of a " + ty_head(recv) + " takes " + arguments_text(want) + ", not " + int_to_string(got), line)
+}
+
+-- A method call on a value whose type has no such method: x.f(a) is
+-- f(x, a) when there is a function f, and else the error `message`
+fn ck_no_method(c0: Checker, e: Expr, recv: string, arg_types: List[string], message: string) -> Typed {
+    let mut c = c0
+    let method = e.method
+    if c.fns.contains(method) == false or is_builtin_fn(method) or ck_var(c, method) >= 0 {
+        return ck_typed(ck_error(c, message, e.line), "")
+    }
+    let mut types: List[string] = []
+    types.push(recv)
+    let mut args: List[Expr] = []
+    args.push(*e.object)
+    let mut i = 0
+    while i < e.args.len() {
+        types.push(arg_types[i])
+        args.push(e.args[i])
+        i = i + 1
+    }
+    if c.record and e.id >= 0 and e.id < c.targets.len() {
+        c.targets[e.id] = "call:" + method
+    }
+    let none: List[string] = []
+    return ck_call_named(c, method, none, types, args, e.line, e.id)
 }
 
 fn ck_method_call(c0: Checker, e: Expr) -> Typed {
@@ -21116,10 +21580,15 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
     if type_name != "" { return ck_static_call(c, type_name, e, arg_types) }
 
     if starts_with(recv, "dyn ") {
-        let key = substr(recv, 4, len(recv) - 4) + "_" + method
+        let trait_name = substr(recv, 4, len(recv) - 4)
+        let key = trait_name + "_" + method
         if c.fns.contains(key) {
             let sig = c.fns.get(key)
+            c = ck_effects(c, trait_name + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
             return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_unbound(0)))
+        }
+        if c.traits.contains(trait_name) {
+            return ck_typed(ck_error(c, "trait '" + trait_name + "' has no method '" + method + "'", e.line), "")
         }
         return ck_typed(c, "")
     }
@@ -21127,6 +21596,11 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
     if ty_known(head) == false { return ck_typed(c, "") }
     if c.fns.contains(head + "_" + method) {
         let sig = c.fns.get(head + "_" + method)
+        c = ck_effects(c, head + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
+        c = ck_async_call(c, sig, head + "." + method, e.id, e.line)
+        if sig.has_self {
+            if sig.changes[0] { c = ck_changes(c, object, "'" + head + "." + method + "'", e.line) }
+        }
         -- The receiver's type arguments are the impl block's type parameters
         let mut binds = ty_unbound(sig.generics.len())
         let recv_args = ty_args(recv)
@@ -21138,11 +21612,14 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
         let mut first = 0
         if sig.has_self { first = 1 }
         c = ck_arity(c, sig, head + "." + method, first, arg_types.len(), e.line)
+        c = ck_mut_args(c, sig, head + "." + method, first, e.args)
         return ck_apply(c, sig, head + "." + method, first, binds, arg_types, e.args)
     }
     if head == "List" {
         let elem = ty_arg(recv, 0)
         if method == "push" {
+            c = ck_method_arity(c, recv, method, 1, arg_types.len(), e.line)
+            c = ck_changes(c, object, "'push'", e.line)
             if arg_types.len() == 1 {
                 if ck_fits(c, elem, arg_types[0]) == false {
                     c = ck_error(c, "type mismatch in the value pushed to a " + recv + ": expected " + elem + ", found " + arg_types[0], e.line)
@@ -21152,30 +21629,50 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             }
             return ck_typed(c, "void")
         }
-        if method == "pop" or method == "get" { return ck_typed(c, elem) }
-        if method == "len" { return ck_typed(c, "int") }
-        if method == "contains" { return ck_typed(c, "bool") }
-        return ck_typed(c, "")
+        if method == "pop" {
+            c = ck_method_arity(c, recv, method, 0, arg_types.len(), e.line)
+            return ck_typed(ck_changes(c, object, "'pop'", e.line), elem)
+        }
+        if method == "len" { return ck_typed(ck_method_arity(c, recv, method, 0, arg_types.len(), e.line), "int") }
+        if method == "contains" {
+            c = ck_method_arity(c, recv, method, 1, arg_types.len(), e.line)
+            if arg_types.len() == 1 {
+                if ck_fits(c, elem, arg_types[0]) == false {
+                    c = ck_error(c, "type mismatch in the value looked for in a " + recv + ": expected " + elem + ", found " + arg_types[0], e.line)
+                } else {
+                    c = ck_settle(c, e.args[0], elem)
+                }
+            }
+            return ck_typed(c, "bool")
+        }
+        return ck_no_method(c, e, recv, arg_types, "a " + recv + " has no method '" + method + "': a list has push, pop, len and contains")
     }
     if recv == "string" {
-        if method == "len" { return ck_typed(c, "int") }
-        return ck_typed(c, "")
+        if method == "len" { return ck_typed(ck_method_arity(c, recv, method, 0, arg_types.len(), e.line), "int") }
+        return ck_no_method(c, e, recv, arg_types, "a string has no method '" + method + "': it has len, and the string functions take it as an argument")
     }
     if c.structs.contains(head) or c.enums.contains(head) {
         -- A field that holds a function is called like a method
         if c.structs.contains(head) {
             let sig = c.structs.get(head)
             let at = ck_index_of(sig.field_names, method)
-            if at >= 0 { return ck_typed(c, ty_fn_ret(ty_apply(sig.field_types[at], sig.generics, ty_args(recv)))) }
+            if at >= 0 {
+                let held = ty_apply(sig.field_types[at], sig.generics, ty_args(recv))
+                if starts_with(held, "fn(") == false {
+                    return ck_typed(ck_error(c, "field '" + method + "' of '" + head + "' is a " + held + ", which cannot be called", e.line), "")
+                }
+                return ck_call_value(c, held, head + "." + method, arg_types, e.args, e.line)
+            }
         }
         let from_trait = ck_trait_method(c, head, method)
         if from_trait != "" {
             let sig = c.fns.get(from_trait + "_" + method)
+            c = ck_effects(c, from_trait + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
             return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_unbound(0)))
         }
-        return ck_typed(ck_error(c, "type '" + head + "' has no method '" + method + "'", e.line), "")
+        return ck_no_method(c, e, recv, arg_types, "type '" + head + "' has no method '" + method + "'")
     }
-    return ck_typed(c, "")
+    return ck_no_method(c, e, recv, arg_types, "type '" + recv + "' has no method '" + method + "'")
 }
 
 fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
@@ -21267,7 +21764,7 @@ fn ck_condition(c: Checker, t: string, what: string, line: int) -> Checker {
 }
 
 -- The statements, and the value of the last when it is an expression
-fn ck_body_value(c0: Checker, stmts: List[Stmt]) -> Typed {
+fn ck_body_value(c0: Checker, stmts: List[Stmt], used: bool) -> Typed {
     let n = stmts.len()
     if n == 0 { return ck_typed(c0, "void") }
     let mut c = c0
@@ -21278,6 +21775,9 @@ fn ck_body_value(c0: Checker, stmts: List[Stmt]) -> Typed {
     }
     let last = stmts[n - 1]
     if last.kind == STMT_EXPRESSION() { return ck_expr(c, *last.expr) }
+    -- A block that is used as a value and ends in an `if` with an
+    -- `else`, or in a `match`, has the value of that statement
+    if used and stmt_gives_value(last) { return ck_expr(c, stmt_value_expr(last)) }
     return ck_typed(ck_stmt(c, last), "void")
 }
 
@@ -21288,7 +21788,7 @@ fn ck_block(c0: Checker, e: Expr) -> Typed {
         let result = ck_expr(c, *e.result)
         return ck_typed(ck_unbind(result.c, mark), result.t)
     }
-    let value = ck_body_value(c0, e.stmts)
+    let value = ck_body_value(c0, e.stmts, true)
     return ck_typed(ck_unbind(value.c, mark), value.t)
 }
 
@@ -21517,7 +22017,7 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
             arm_type = value.t
             arm_literal = is_int_literal_expr(branch_value_expr(*arm.body_expr))
         } else {
-            let value = ck_body_value(c, arm.body)
+            let value = ck_body_value(c, arm.body, used)
             c = value.c
             arm_type = value.t
             arm_literal = stmts_value_is_int_literal(arm.body)
@@ -21718,28 +22218,14 @@ fn ck_assign_op(op: int) -> int {
     return BINOP_MOD()
 }
 
--- The variable a place is a part of: p for p.x and for p.xs[i].y,
--- and "" for a place that is a part of none
-fn ck_place_root(e: Expr) -> string {
-    let mut cur = e
-    while cur.kind == EXPR_FIELD_ACCESS() or cur.kind == EXPR_INDEX_ACCESS() {
-        cur = *cur.object
-    }
-    if cur.kind == EXPR_IDENTIFIER() { return cur.name }
-    return ""
-}
-
 fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
     let mut c = c0
     let target = *s.assign_target
     let mut shown = ""
     if target.kind == EXPR_FIELD_ACCESS() or target.kind == EXPR_INDEX_ACCESS() {
-        let root = ck_place_root(target)
-        let root_at = ck_var(c, root)
-        if root_at >= 0 {
-            if c.var_flags[root_at] == 0 {
-                c = ck_error(c, "cannot assign to a part of '" + root + "', which is not declared 'mut'", s.line)
-            }
+        let root = ck_fixed_root(c, *target.object)
+        if root != "" {
+            c = ck_error(c, "cannot assign to a part of '" + root + "', which is not declared 'mut'", s.line)
         }
     }
     if target.kind == EXPR_IDENTIFIER() {
@@ -21801,7 +22287,12 @@ fn ck_stmt(c0: Checker, s: Stmt) -> Checker {
     if k == STMT_LET() { return ck_let(c0, s) }
     if k == STMT_RETURN() { return ck_return(c0, s) }
     if k == STMT_EXPRESSION() {
-        let value = ck_expr(c0, *s.expr)
+        let stated = *s.expr
+        if stated.kind == EXPR_BLOCK() and stated.has_result == false {
+            -- A block that is a statement of its own gives no value
+            return ck_note(ck_scope(c0, stated.stmts), stated.id, "void")
+        }
+        let value = ck_expr(c0, stated)
         return value.c
     }
     if k == STMT_ASSIGNMENT() { return ck_assignment(c0, s) }
@@ -21927,12 +22418,10 @@ fn ck_block_needs_value(c: Checker, stmts: List[Stmt], line: int) -> Checker {
         return ck_error(c, "this block is used as a value, and it is empty", line)
     }
     let last = stmts[stmts.len() - 1]
-    if last.kind == STMT_EXPRESSION() { return ck_needs_value(c, *last.expr, true) }
+    if stmt_gives_value(last) { return ck_needs_value(c, stmt_value_expr(last), true) }
     if ck_leaves(stmts) { return c }
-    if last.kind == STMT_IF() or last.kind == STMT_MATCH() {
-        let mut word = "an 'if'"
-        if last.kind == STMT_MATCH() { word = "a 'match'" }
-        return ck_error(c, "this block is used as a value, and it ends in " + word + " statement, which gives none: put it in parentheses to use its value", last.line)
+    if last.kind == STMT_IF() {
+        return ck_error(c, "this block is used as a value, and it ends in an 'if' that has no 'else' to give one", last.line)
     }
     return ck_error(c, "this block is used as a value, and it ends in a statement that gives none", last.line)
 }
@@ -22004,9 +22493,10 @@ fn ck_function(c0: Checker, fd: FunctionDecl, self_type: string, outer_generics:
     c = ck_type_exists(c, fd.return_type, fd.line)
     if fd.is_extern { return c }
 
-    let mut ret = ck_norm(c, fd.return_type)
-    if fd.is_async { ret = "" }
+    let ret = ck_norm(c, fd.return_type)
     c.ret_type = ret
+    c.fn_name = fd.name
+    c.fn_effects = fd.effects
     c = ck_stmts(c, fd.body)
     if ty_known(ret) and ret != "void" and fd.name != "main" and ck_always_returns(fd.body) == false {
         c = ck_error(c, "function '" + fd.name + "' can reach its end without returning a value of type " + ret, fd.line)
@@ -22103,11 +22593,13 @@ fn check_program(sf: SourceFile) -> Checked {
     -- Two lists: a copy of a list shares its storage
     let mut types: List[string] = []
     let mut type_args: List[string] = []
+    let mut targets: List[string] = []
     let count = expr_id_count()
     let mut ti = 0
     while ti < count {
         types.push("")
         type_args.push("")
+        targets.push("")
         ti = ti + 1
     }
     let mut c = Checker {
@@ -22123,10 +22615,14 @@ fn check_program(sf: SourceFile) -> Checked {
         var_types: [],
         var_flags: [],
         ret_type: "",
+        awaited: -2,
+        fn_name: "",
+        fn_effects: [],
         norm_names: [],
         norm_repls: [],
         types: types,
         type_args: type_args,
+        targets: targets,
         record: true
     }
     c = ck_collect(c, sf)
@@ -22156,7 +22652,7 @@ fn check_program(sf: SourceFile) -> Checked {
         }
         i = i + 1
     }
-    return Checked { errors: c.errors, types: c.types, type_args: c.type_args }
+    return Checked { errors: c.errors, types: c.types, type_args: c.type_args, targets: c.targets }
 }
 
 
@@ -25835,7 +26331,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "53dce90e4231e097"
+    return "550a589171628a92"
 }
 
 
@@ -26350,6 +26846,7 @@ fn build_runtime_object(prelude_sf: SourceFile, checked: Checked, obj_file: stri
     let mut ir_gen = ir_generator_new()
     ir_gen.checked_types = checked.types
     ir_gen.checked_type_args = checked.type_args
+    ir_gen.checked_targets = checked.targets
     ir_gen = generate_module(ir_gen, prelude_sf)
     if ir_gen.type_errors.len() > 0 { return 1 }
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_runtime")
@@ -27114,18 +27611,8 @@ fn compile(cli: CLIArgs) -> int {
     sf.files.push(PRELUDE_NAME())
     sf = add_prelude(sf, prelude_sf)
 
-    -- Effect system enforcement
-    let effect_errors = validate_effects(sf)
-    if effect_errors.len() > 0 {
-        let mut ei2 = 0
-        while ei2 < effect_errors.len() {
-            eprintln(effect_errors[ei2])
-            ei2 = ei2 + 1
-        }
-        exit(1)
-    }
-
-    -- Names and types (check.dm). The types found go to IR generation.
+    -- Names, types and effects (check.dm). The types found go to IR
+    -- generation.
     let checked = check_program(sf)
     let check_errors = checked.errors
     if check_errors.len() > 0 {
@@ -27156,6 +27643,7 @@ fn compile(cli: CLIArgs) -> int {
     ir_gen.debug_info = cli.debug_info
     ir_gen.checked_types = checked.types
     ir_gen.checked_type_args = checked.type_args
+    ir_gen.checked_targets = checked.targets
     ir_gen = generate_module(ir_gen, sf)
     if ir_gen.type_errors.len() > 0 {
         let mut te = 0
@@ -27409,99 +27897,8 @@ fn main() -> int {
     return compile(cli)
 }
 
-fn builtin_required_effect(name: string) -> string {
-    if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
-    if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
-    if name == "read_key" or name == "read_key_nb" { return "Console" }
-    if name == "args_get" or name == "args_len" { return "IO" }
-    if name == "flush" or name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return "IO" }
-    if name == "system" or name == "exit" or name == "run_command" or name == "run_command_io" { return "Process" }
-    return ""
-}
-
-fn list_contains_str(lst: List[string], val: string) -> bool {
-    let mut i = 0
-    while i < lst.len() {
-        if lst[i] == val { return true }
-        i = i + 1
-    }
-    return false
-}
-
--- An error for each call in the function's body that needs an effect
--- the function does not declare, added to `found`. A function that
--- declares no effects is not checked. The calls are the ones made by
--- name, at any depth of the body: a builtin needs its effect, and a
--- function needs the effects it declares (fn_effects). Calls of methods
--- and calls through a function value are not checked.
-fn function_effect_errors(fd: FunctionDecl, fn_effects: Map[string, List[string]], found: List[string]) -> List[string] {
-    let mut errors = found
-    if fd.effects.len() == 0 {
-        return errors
-    }
-    let call_names = stmts_calls(fd.body)
-    let mut ci = 0
-    while ci < call_names.len() {
-        let callee = call_names[ci]
-        let req = builtin_required_effect(callee)
-        if len(req) > 0 {
-            if list_contains_str(fd.effects, req) == false {
-                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
-            }
-        }
-        if fn_effects.contains(callee) {
-            let callee_effects = fn_effects.get(callee)
-            let mut ei = 0
-            while ei < callee_effects.len() {
-                let eff = callee_effects[ei]
-                if list_contains_str(fd.effects, eff) == false {
-                    errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
-                }
-                ei = ei + 1
-            }
-        }
-        ci = ci + 1
-    }
-    return errors
-}
-
--- The effect errors of every function and method in the file
-fn validate_effects(sf: SourceFile) -> List[string] {
-    let mut errors: List[string] = []
-    -- Build map: function name -> declared effects
-    let mut fn_effects: Map[string, List[string]] = Map_new()
-    let mut i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            if fd.effects.len() > 0 {
-                fn_effects.insert(fd.name, fd.effects)
-            }
-        }
-        i = i + 1
-    }
-
-    i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            errors = function_effect_errors(*decl.func_decl, fn_effects, errors)
-        } else if decl.kind == DECL_IMPL() {
-            let ib = *decl.impl_block
-            let mut mi = 0
-            while mi < ib.methods.len() {
-                errors = function_effect_errors(ib.methods[mi], fn_effects, errors)
-                mi = mi + 1
-            }
-        }
-        i = i + 1
-    }
-    return errors
-}
-
 -- ============================================================
--- COMPILATION PIPELINE
+-- CHECKS OF DECLARATIONS
 -- ============================================================
 
 -- An error for each function, type or constant that is declared more
@@ -27604,7 +28001,3 @@ fn validate_source_file(sf: SourceFile) -> List[string] {
     }
     return errors
 }
-
--- ============================================================
--- EFFECT SYSTEM ENFORCEMENT
--- ============================================================

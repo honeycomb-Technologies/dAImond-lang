@@ -1382,41 +1382,11 @@ fn parse_return_stmt(p: Parser) -> ParseStmtResult {
     return ParseStmtResult { p: pp, stmt: s }
 }
 
+-- An `if` statement is parsed as the expression, which it is where
+-- the block it ends is used as a value (if_stmt_of in ast.dm)
 fn parse_if_stmt(p: Parser) -> ParseStmtResult {
-    let mut pp = p
-    let tok = p_cur(pp)
-    pp = p_advance(pp) -- skip 'if'
-    let cond = parse_expr(pp)
-    pp = cond.p
-    pp = p_expect(pp, TK_LBRACE())
-    let then_block = parse_block_body(pp)
-    pp = then_block.p
-    pp = p_expect(pp, TK_RBRACE())
-
-    let mut s = stmt_new(STMT_IF(), tok.line, tok.col)
-    s.if_cond = Box_new(cond.expr)
-    s.if_then = then_block.stmts
-
-    pp = p_skip_newlines(pp)
-    if p_peek(pp) == TK_ELSE() {
-        pp = p_advance(pp)
-        pp = p_skip_newlines(pp)
-        s.has_else_branch = true
-        if p_peek(pp) == TK_IF() {
-            -- else if: wrap as a single-statement else block
-            let elif = parse_if_stmt(pp)
-            pp = elif.p
-            s.if_else.push(elif.stmt)
-        } else {
-            pp = p_expect(pp, TK_LBRACE())
-            let else_block = parse_block_body(pp)
-            pp = else_block.p
-            pp = p_expect(pp, TK_RBRACE())
-            s.if_else = else_block.stmts
-        }
-    }
-
-    return ParseStmtResult { p: pp, stmt: s }
+    let parsed = parse_if_expr(p)
+    return ParseStmtResult { p: parsed.p, stmt: if_stmt_of(parsed.expr) }
 }
 
 fn parse_while_stmt(p: Parser) -> ParseStmtResult {

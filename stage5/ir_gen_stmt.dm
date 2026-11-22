@@ -198,11 +198,20 @@ fn generate_statement_kind(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) ->
         return generate_assignment(gen, block, stmt)
     }
     if stmt.kind == STMT_EXPRESSION() {
-        let result = generate_expr(gen, block, *stmt.expr)
+        let stated = *stmt.expr
+        if stated.kind == EXPR_BLOCK() and stated.has_result == false {
+            -- A block that is a statement of its own gives no value
+            return generate_block_stmts(gen, block, stated.stmts)
+        }
+        let result = generate_expr(gen, block, stated)
         return gen_result(result.gen, result.block)
     }
     if stmt.kind == STMT_MATCH() {
-        let result = generate_match_expr(gen, block, *stmt.match_expr)
+        -- The arms' values go nowhere: they may be of different types
+        let matched = *stmt.match_expr
+        let mut g_match = gen
+        g_match.unused_match = matched.id
+        let result = generate_match_expr(g_match, block, matched)
         return gen_result(result.gen, result.block)
     }
     if stmt.kind == STMT_REGION() {

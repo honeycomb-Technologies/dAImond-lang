@@ -124,6 +124,10 @@ struct IRGenerator {
     -- True while the value of a `let` that is a lambda is generated:
     -- the one place a lambda that captures variables may be written
     lambda_bound_by_let: bool,
+    -- The id of the `match` that is a statement, while it is
+    -- generated: its arms' values go nowhere (see match_slot_type in
+    -- ir_gen_expr.dm). -1 otherwise.
+    unused_match: int,
     -- Method name -> struct type name
     method_struct_map: Map[string, string],
     -- The functions of impl blocks that take no self, by mangled name
@@ -211,6 +215,9 @@ struct IRGenerator {
     -- The type arguments the checker found for each call of a generic
     -- function, at the call's id, joined with "|"
     checked_type_args: List[string],
+    -- What a method call calls where it is no method, at the call's
+    -- id: "call:f" for x.f(a), which is f(x, a)
+    checked_targets: List[string],
     -- -g: say where each variable lives (OP_DEBUG_VAR)
     debug_info: bool,
     -- Declared source return types of functions and impl methods
@@ -246,6 +253,7 @@ fn ir_generator_new() -> IRGenerator {
         fn_ptr_vars: Map_new(),
         lambda_captures: Map_new(),
         lambda_bound_by_let: false,
+        unused_match: -1,
         method_struct_map: Map_new(),
         static_fns: Map_new(),
         var_struct_types: Map_new(),
@@ -288,6 +296,7 @@ fn ir_generator_new() -> IRGenerator {
         type_errors: [],
         checked_types: [],
         checked_type_args: [],
+        checked_targets: [],
         debug_info: false,
         fn_src_return_types: Map_new(),
         fn_src_param_types: Map_new(),
@@ -525,6 +534,13 @@ fn checked_type_args(gen: IRGenerator, call: Expr) -> List[string] {
     let joined = gen.checked_type_args[call.id]
     if joined == "" { return none }
     return string_split(joined, "|")
+}
+
+-- What the checker found the method call to call, where it is no
+-- method: "call:f" for x.f(a), which is f(x, a). "" for a method.
+fn checked_target(gen: IRGenerator, call: Expr) -> string {
+    if call.id < 0 or call.id >= gen.checked_targets.len() { return "" }
+    return gen.checked_targets[call.id]
 }
 
 -- The IR type of the expression's value as the checker found it. ""
@@ -1056,6 +1072,24 @@ fn raw_builtin_return_type(name: string) -> string {
     if name == "string_from_raw" { return "string" }
     if name == "load_f32" or name == "load_f64" { return "f64" }
     return "i64"
+}
+
+-- "no arguments", "1 argument", "2 arguments"
+fn arguments_text(count: int) -> string {
+    if count == 0 { return "no arguments" }
+    if count == 1 { return "1 argument" }
+    return int_to_string(count) + " arguments"
+}
+
+-- The effect a function must declare to call the builtin, or ""
+fn builtin_required_effect(name: string) -> string {
+    if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
+    if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
+    if name == "read_key" or name == "read_key_nb" { return "Console" }
+    if name == "args_get" or name == "args_len" { return "IO" }
+    if name == "flush" or name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return "IO" }
+    if name == "system" or name == "exit" or name == "run_command" or name == "run_command_io" { return "Process" }
+    return ""
 }
 
 fn is_builtin_fn(name: string) -> bool {

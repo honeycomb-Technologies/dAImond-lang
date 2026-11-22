@@ -1,0 +1,16 @@
+Error: undefined function 'missing' at line 20
+Error: a List[int] has no method 'first': a list has push, pop, len and contains at line 22
+Error: 'len' of a List takes no arguments, not 1 at line 23
+Error: type mismatch in the value looked for in a List[int]: expected int, found string at line 24
+Error: a string has no method 'upper': it has len, and the string functions take it as an argument at line 26
+Error: 'e' is a value of type int, which cannot be called at line 28
+Error: type mismatch in argument 1 of 'Button.on_click': expected int, found string at line 30
+Error: call to 'Button.on_click' passes 2 arguments, expected 1 at line 31
+Error: field 'label' of 'Button' is a string, which cannot be called at line 32
+Error: type 'Button' has no method 'pressed' at line 33
+Error: type mismatch in argument 1 of 'apply': expected fn(int) -> int, found fn(string, string) -> string at line 34
+Error: type mismatch in the value of 'm': expected fn(string) -> string, found fn(int) -> int at line 36
+Error: type mismatch in field 'on_click' of 'Button': expected fn(int) -> int, found fn(string, string) -> string at line 37
+Error: call to 'printf' passes 0 arguments, expected at least 1 at line 39
+Error: undefined function 'gone' at line 42
+Error: 15 type errors

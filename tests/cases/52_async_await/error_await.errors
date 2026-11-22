@@ -1,0 +1,7 @@
+Error: type mismatch in the value of 'b': expected string, found int at line 25
+Error: the call of the async function 'add' needs 'await' at line 26
+Error: 'await' takes a call of an async function at line 27
+Error: 'await' takes a call of an async function at line 28
+Error: type mismatch in the value of 'g': expected int, found string at line 30
+Error: the call of the async function 'Job.run' needs 'await' at line 33
+Error: 6 type errors

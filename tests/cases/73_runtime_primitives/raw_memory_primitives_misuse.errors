@@ -3,5 +3,5 @@ addr_of() takes a variable, a field or a list element at line 6
 load_i32() takes an integer address, not 'string' at line 7
 store_i64() cannot store a value of type 'string' at line 8
 size_of: unknown type 'Nope' at line 9
-load_u8() takes 1 arguments, not 2 at line 10
+load_u8() takes 1 argument, not 2 at line 10
 string_data() takes a string, not 'int' at line 11

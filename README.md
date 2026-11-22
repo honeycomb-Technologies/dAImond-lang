@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (509 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (517 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 509 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 517 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
@@ -359,16 +359,16 @@ The compiler passes its suite of 509 cases, builds itself to a fixed point, and 
 - `extern fn` with C-width integer types, variadic C functions and link names; raw memory inside `unsafe`
 - Files, directories, paths, the environment, processes, time, the terminal, TCP sockets, threads and mutexes
 - Runtime checks: integer overflow, division by zero, list bounds, narrowing casts
-- A type checker: mismatched types, undefined names, assignment to what is not `mut`, missing returns, and matches that leave a variant out are compile errors
+- A type checker: mismatched types, undefined names and functions, wrong arguments, changes to what is not `mut`, missing returns, matches that leave a variant out and effects that are not declared are compile errors
 - Tooling: `run`, `check`, `fmt`, `test`, debug info (`-g`), the language server (errors as you type, hover, go to definition, references, outline, completion, signature help, formatting)
 
 ### Known gaps
 
-- The type checker reports a mismatch only where it knows both types. It does not check the arguments of a function held in a struct field, whether two function types agree, or the type of an `await`. Code generation takes the checker's types for `None`, `Some`, `Ok` and `Err`, for the value of an `if` or a `match` and for calls of generic functions, but not inside the body of a generic function.
+- The type checker reports a mismatch only where it knows both types, and it checks the body of a generic function with its type parameters standing for any type. Code generation takes the checker's types for `None`, `Some`, `Ok` and `Err`, for the value of an `if` or a `match` and for calls of generic functions, but not inside the body of a generic function.
 - `dyn Trait` is not dynamic dispatch: a `dyn` variable is the struct it is declared with, and a `dyn Trait` parameter takes one implementing type.
 - A guard on the arm of a variant (`Color.Blue(n) if n > 5 =>`) is a compile error; generic enums do not compile.
 - There are no closure values. A lambda that uses a variable of the function around it can be bound with `let` and called by that name; passing, returning or storing it is a compile error. A lambda that uses none is a plain function and can go anywhere.
-- Effects are checked for the calls a function makes by name. Calls of methods and calls through a function value are not checked.
+- `async fn` and `await` are synchronous: `await f()` runs `f` to its end.
 - Strings are never freed, and neither is what a region allocates.
 - Trait bounds on generic functions (`fn f[T: Display]`) are not parsed.
 - Only x86-64 Linux with glibc is supported.

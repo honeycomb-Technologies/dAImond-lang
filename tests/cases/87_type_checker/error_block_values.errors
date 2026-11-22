@@ -1,0 +1,6 @@
+Error: the branches of this 'if' give int and string at line 10
+Error: this block is used as a value, and it ends in an 'if' that has no 'else' to give one at line 13
+Error: type mismatch in the value of 'd': expected string, found int at line 15
+Error: this is used as a value, and it is a call that returns none at line 22
+Error: this is used as a value, and it is a call that returns none at line 22
+Error: this block is used as a value, and it ends in a statement that gives none at line 25

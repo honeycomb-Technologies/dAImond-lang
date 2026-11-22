@@ -340,6 +340,11 @@ struct Stmt {
     while_body: List[Stmt],
     -- Loop
     loop_body: List[Stmt],
+    -- An `if` statement as the expression it is where a block that
+    -- ends in it is used as a value (see stmt_value_expr). It shares
+    -- the condition and the statements of if_cond, if_then and if_else.
+    if_expr: Box[Expr],
+    has_if_expr: bool,
     -- Match statement
     match_expr: Box[Expr],
     match_stmt_arms: List[MatchArm],
@@ -354,12 +359,50 @@ struct Stmt {
     assign_value: Box[Expr]
 }
 
+-- Whether a block that ends in the statement has a value: an
+-- expression, a `match`, or an `if` with an `else`
+fn stmt_gives_value(s: Stmt) -> bool {
+    if s.kind == STMT_EXPRESSION() or s.kind == STMT_MATCH() { return true }
+    return s.kind == STMT_IF() and s.has_else_branch and s.has_if_expr
+}
+
+-- The expression that gives a block that ends in the statement its
+-- value (see stmt_gives_value)
+fn stmt_value_expr(s: Stmt) -> Expr {
+    if s.kind == STMT_MATCH() { return *s.match_expr }
+    if s.kind == STMT_IF() { return *s.if_expr }
+    return *s.expr
+}
+
+-- The `if` statement that an `if` expression is where its value is
+-- not used
+fn if_stmt_of(e: Expr) -> Stmt {
+    let mut s = stmt_new(STMT_IF(), e.line, e.col)
+    s.if_cond = e.condition
+    let then_block = *e.then_branch
+    s.if_then = then_block.stmts
+    if e.has_else {
+        s.has_else_branch = true
+        let other = *e.else_branch
+        if other.kind == EXPR_IF() {
+            -- else if: one statement in the else block
+            s.if_else.push(if_stmt_of(other))
+        } else {
+            s.if_else = other.stmts
+        }
+    }
+    s.if_expr = Box_new(e)
+    s.has_if_expr = true
+    return s
+}
+
 fn stmt_new(kind: int, line: int, col: int) -> Stmt {
     return Stmt {
         kind: kind, line: line, col: col,
         let_name: "", let_type: "", let_value: Box_null(), let_is_mut: false,
         ret_value: Box_null(), has_ret_value: false,
         if_cond: Box_null(), if_then: [], if_else: [], has_else_branch: false,
+        if_expr: Box_null(), has_if_expr: false,
         for_var: "", for_iter: Box_null(), for_body: [],
         while_cond: Box_null(), while_body: [],
         loop_body: [],
@@ -901,10 +944,4 @@ fn branch_value_expr(e: Expr) -> Expr {
 fn expr_names(e: Expr) -> List[string] {
     let none: List[string] = []
     return names_in_expr(e, none, false)
-}
-
--- Every name the statements call as `name(...)`, at any depth
-fn stmts_calls(stmts: List[Stmt]) -> List[string] {
-    let none: List[string] = []
-    return names_in_stmts(stmts, none, true)
 }

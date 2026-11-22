@@ -3,7 +3,14 @@ module nbody_bench
 -- N-body simulation of the solar system (5 bodies)
 -- Tests struct operations and floating-point math
 
-extern fn sqrt(x: float) -> float
+extern fn c_sqrt(x: float) -> float = "sqrt"
+
+-- A call of C needs an unsafe block
+fn sqrt(x: float) -> float {
+    unsafe {
+        return c_sqrt(x)
+    }
+}
 
 struct Body {
     x: float,

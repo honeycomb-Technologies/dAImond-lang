@@ -530,6 +530,7 @@ fn build_runtime_object(prelude_sf: SourceFile, checked: Checked, obj_file: stri
     let mut ir_gen = ir_generator_new()
     ir_gen.checked_types = checked.types
     ir_gen.checked_type_args = checked.type_args
+    ir_gen.checked_targets = checked.targets
     ir_gen = generate_module(ir_gen, prelude_sf)
     if ir_gen.type_errors.len() > 0 { return 1 }
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_runtime")
@@ -1294,18 +1295,8 @@ fn compile(cli: CLIArgs) -> int {
     sf.files.push(PRELUDE_NAME())
     sf = add_prelude(sf, prelude_sf)
 
-    -- Effect system enforcement
-    let effect_errors = validate_effects(sf)
-    if effect_errors.len() > 0 {
-        let mut ei2 = 0
-        while ei2 < effect_errors.len() {
-            eprintln(effect_errors[ei2])
-            ei2 = ei2 + 1
-        }
-        exit(1)
-    }
-
-    -- Names and types (check.dm). The types found go to IR generation.
+    -- Names, types and effects (check.dm). The types found go to IR
+    -- generation.
     let checked = check_program(sf)
     let check_errors = checked.errors
     if check_errors.len() > 0 {
@@ -1336,6 +1327,7 @@ fn compile(cli: CLIArgs) -> int {
     ir_gen.debug_info = cli.debug_info
     ir_gen.checked_types = checked.types
     ir_gen.checked_type_args = checked.type_args
+    ir_gen.checked_targets = checked.targets
     ir_gen = generate_module(ir_gen, sf)
     if ir_gen.type_errors.len() > 0 {
         let mut te = 0
@@ -1589,99 +1581,8 @@ fn main() -> int {
     return compile(cli)
 }
 
-fn builtin_required_effect(name: string) -> string {
-    if name == "file_read" or name == "file_write" or name == "file_append" or name == "file_exists" { return "FileSystem" }
-    if name == "println" or name == "print" or name == "eprintln" or name == "eprint" or name == "read_line" { return "Console" }
-    if name == "read_key" or name == "read_key_nb" { return "Console" }
-    if name == "args_get" or name == "args_len" { return "IO" }
-    if name == "flush" or name == "term_width" or name == "term_height" or name == "time_ms" or name == "sleep_ms" { return "IO" }
-    if name == "system" or name == "exit" or name == "run_command" or name == "run_command_io" { return "Process" }
-    return ""
-}
-
-fn list_contains_str(lst: List[string], val: string) -> bool {
-    let mut i = 0
-    while i < lst.len() {
-        if lst[i] == val { return true }
-        i = i + 1
-    }
-    return false
-}
-
--- An error for each call in the function's body that needs an effect
--- the function does not declare, added to `found`. A function that
--- declares no effects is not checked. The calls are the ones made by
--- name, at any depth of the body: a builtin needs its effect, and a
--- function needs the effects it declares (fn_effects). Calls of methods
--- and calls through a function value are not checked.
-fn function_effect_errors(fd: FunctionDecl, fn_effects: Map[string, List[string]], found: List[string]) -> List[string] {
-    let mut errors = found
-    if fd.effects.len() == 0 {
-        return errors
-    }
-    let call_names = stmts_calls(fd.body)
-    let mut ci = 0
-    while ci < call_names.len() {
-        let callee = call_names[ci]
-        let req = builtin_required_effect(callee)
-        if len(req) > 0 {
-            if list_contains_str(fd.effects, req) == false {
-                errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + req + "'")
-            }
-        }
-        if fn_effects.contains(callee) {
-            let callee_effects = fn_effects.get(callee)
-            let mut ei = 0
-            while ei < callee_effects.len() {
-                let eff = callee_effects[ei]
-                if list_contains_str(fd.effects, eff) == false {
-                    errors.push("Error: function '" + fd.name + "' calls '" + callee + "' which requires effect '" + eff + "' not in caller's effects")
-                }
-                ei = ei + 1
-            }
-        }
-        ci = ci + 1
-    }
-    return errors
-}
-
--- The effect errors of every function and method in the file
-fn validate_effects(sf: SourceFile) -> List[string] {
-    let mut errors: List[string] = []
-    -- Build map: function name -> declared effects
-    let mut fn_effects: Map[string, List[string]] = Map_new()
-    let mut i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            let fd = *decl.func_decl
-            if fd.effects.len() > 0 {
-                fn_effects.insert(fd.name, fd.effects)
-            }
-        }
-        i = i + 1
-    }
-
-    i = 0
-    while i < sf.declarations.len() {
-        let decl = sf.declarations[i]
-        if decl.kind == DECL_FUNCTION() {
-            errors = function_effect_errors(*decl.func_decl, fn_effects, errors)
-        } else if decl.kind == DECL_IMPL() {
-            let ib = *decl.impl_block
-            let mut mi = 0
-            while mi < ib.methods.len() {
-                errors = function_effect_errors(ib.methods[mi], fn_effects, errors)
-                mi = mi + 1
-            }
-        }
-        i = i + 1
-    }
-    return errors
-}
-
 -- ============================================================
--- COMPILATION PIPELINE
+-- CHECKS OF DECLARATIONS
 -- ============================================================
 
 -- An error for each function, type or constant that is declared more
@@ -1784,7 +1685,3 @@ fn validate_source_file(sf: SourceFile) -> List[string] {
     }
     return errors
 }
-
--- ============================================================
--- EFFECT SYSTEM ENFORCEMENT
--- ============================================================
