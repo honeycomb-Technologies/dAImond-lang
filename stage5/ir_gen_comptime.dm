@@ -628,9 +628,20 @@ fn eval_match_comptime(gen: IRGenerator, e: Expr) -> IRValue {
         let matches = comptime_pattern_matches(scrutinee_val, pat)
 
         if matches {
+            -- An arm that is a name binds the matched value, for its
+            -- guard and its body
+            let mut g = gen
+            if pat.kind == PAT_IDENTIFIER() {
+                let mut bound = ir_global_new(pat.name, "i64")
+                bound.init_value = scrutinee_val
+                bound.has_init = true
+                bound.is_const = true
+                g.ir_mod.globals.push(bound)
+            }
+
             -- If guard present, evaluate it
             if arm.has_guard {
-                let guard_val = eval_comptime_expr(gen, *arm.guard)
+                let guard_val = eval_comptime_expr(g, *arm.guard)
                 if guard_val.kind == VAL_CONST_BOOL() and guard_val.bool_val == false {
                     -- Guard failed, try next arm
                     i = i + 1
@@ -640,11 +651,11 @@ fn eval_match_comptime(gen: IRGenerator, e: Expr) -> IRValue {
 
             -- Evaluate the arm body
             if arm.is_expr_body {
-                return eval_comptime_expr(gen, *arm.body_expr)
+                return eval_comptime_expr(g, *arm.body_expr)
             }
 
             -- Statement body: look for return
-            let body_val = eval_comptime_stmts(gen, arm.body, 0)
+            let body_val = eval_comptime_stmts(g, arm.body, 0)
             if body_val.kind != VAL_UNDEF() {
                 return body_val
             }

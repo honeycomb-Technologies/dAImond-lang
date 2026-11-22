@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (530 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (539 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,13 +341,13 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 530 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 539 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
 - Structs, enums with payloads, `impl` methods with bare `self`, operator overloading through `add`, `sub`, `mul`, `div`, `eq`, `lt` and the other comparison methods; compound assignment with `+=`, `-=`, `*=`, `/=` and `%=`
 - Pattern matching on enums, `Option`, `Result`, strings and numbers; `?` error propagation
-- Generic functions (monomorphized, with type arguments inferred at the call) and generic structs (`struct Table[K, V]`, with type arguments written out)
+- Generic functions (monomorphized, with type arguments inferred at the call) generic structs (`struct Table[K, V]`, with type arguments written out) and generic enums (`enum Opt[T]`, with type arguments found from the values or the place)
 - `List[T]`, `Map[K, V]` and `Box[T]`, `for`-in over lists, maps and ranges
 - Traits with static dispatch, and `dyn Trait` values
 - Lambdas, the pipeline operator `|>`, bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `~`)
@@ -366,7 +366,7 @@ The compiler passes its suite of 530 cases, builds itself to a fixed point, and 
 
 - The type checker reports a mismatch only where it knows both types, and it checks the body of a generic function with its type parameters standing for any type. Code generation takes the checker's types for `None`, `Some`, `Ok` and `Err`, for the value of an `if` or a `match` and for calls of generic functions, but not inside the body of a generic function.
 - `dyn Trait` is not dynamic dispatch: a `dyn` variable is the struct it is declared with, and a `dyn Trait` parameter takes one implementing type.
-- A guard on the arm of a variant (`Color.Blue(n) if n > 5 =>`) is a compile error; generic enums do not compile.
+- In the body of a generic function, a `match` used as a value is wrong for a type wider than 8 bytes; a `match` statement whose arms `return` is right.
 - There are no closure values. A lambda that uses a variable of the function around it can be bound with `let` and called by that name; passing, returning or storing it is a compile error. A lambda that uses none is a plain function and can go anywhere.
 - `async fn` and `await` are synchronous: `await f()` runs `f` to its end.
 - Strings are never freed, and neither is what a region allocates.

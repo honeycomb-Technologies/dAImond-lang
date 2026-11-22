@@ -161,7 +161,31 @@ fn line_ref(files: List[string], line: int, from: int) -> string {
 -- The text of an error at a line: "Error: MESSAGE at line L", after
 -- "NAME: " in another file than the one being compiled
 fn error_at(files: List[string], msg: string, line: int) -> string {
-    return file_prefix(files, line) + "Error: " + msg + " at line " + int_to_string(line_in_file(line))
+    return file_prefix(files, line) + "Error: " + source_name(msg) + " at line " + int_to_string(line_in_file(line))
+}
+
+-- The text with each variable's name as it is in the source: without
+-- the `$N` that a variable which shadows another has by the time IR
+-- is generated (see SHADOWED NAMES in ast.dm)
+fn source_name(text: string) -> string {
+    if string_contains(text, "$") == false { return text }
+    let n = len(text)
+    let mut out = ""
+    let mut from = 0
+    let mut i = 0
+    while i < n {
+        if byte_at(text, i) == 36 and i + 1 < n and byte_at(text, i + 1) >= 48 and byte_at(text, i + 1) <= 57 {
+            out = out + substr(text, from, i - from)
+            i = i + 1
+            while i < n and byte_at(text, i) >= 48 and byte_at(text, i) <= 57 {
+                i = i + 1
+            }
+            from = i
+        } else {
+            i = i + 1
+        }
+    }
+    return out + substr(text, from, n - from)
 }
 
 fn keyword_lookup(name: string) -> int {

@@ -1081,7 +1081,12 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
     if k == EXPR_LITERAL_BOOL() { return "bool" }
     if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
-    if k == EXPR_ENUM_LITERAL() { return expr.enum_name }
+    if k == EXPR_ENUM_LITERAL() {
+        if is_generic_enum(gen, expr.enum_name) {
+            return canon_type(gen, generic_enum_type(gen, expr, expr.enum_name, expr.variant_name, expr.payload))
+        }
+        return expr.enum_name
+    }
     if k == EXPR_ARRAY_LITERAL() {
         -- A list of its first element's type
         if expr.elements.len() == 0 { return "" }
@@ -1152,6 +1157,11 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         if call_object.kind == EXPR_IDENTIFIER() and gen.enum_defs.contains(call_object.name) and gen.variable_map.contains(call_object.name) == false {
             if enum_variant_index(gen.enum_defs.get(call_object.name), expr.method) >= 0 {
                 return call_object.name
+            }
+        }
+        if call_object.kind == EXPR_IDENTIFIER() and gen.variable_map.contains(call_object.name) == false and is_generic_enum(gen, call_object.name) {
+            if generic_enum_has_variant(gen, call_object.name, expr.method) {
+                return canon_type(gen, generic_enum_type(gen, expr, call_object.name, expr.method, expr.args))
             }
         }
         let recv_t = strip_box_type(static_type(gen, *expr.object))
@@ -1729,6 +1739,9 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return canon_type(gen, expr.type_name)
     }
     if expr.kind == EXPR_ENUM_LITERAL() {
+        if is_generic_enum(gen, expr.enum_name) {
+            return canon_type(gen, generic_enum_type(gen, expr, expr.enum_name, expr.variant_name, expr.payload))
+        }
         return expr.enum_name
     }
     if expr.kind == EXPR_IF() {
@@ -3971,6 +3984,15 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         if g.enum_defs.contains(obj_name) and g.variable_map.contains(obj_name) == false {
             return generate_enum_method_construct(g, b, obj_name, method_name, args, expr.line)
         }
+        if g.variable_map.contains(obj_name) == false and is_generic_enum(g, obj_name) {
+            if generic_enum_has_variant(g, obj_name, method_name) {
+                let instance = generic_enum_instance(g, expr, obj_name, method_name, args)
+                if instance.gen.enum_defs.contains(instance.name) == false {
+                    return expr_result(instance.gen, b, 0)
+                }
+                return generate_enum_method_construct(instance.gen, b, instance.name, method_name, args, expr.line)
+            }
+        }
     }
 
     -- --------------------------------------------------------
@@ -6157,12 +6179,101 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
 -- Enum Literal: EnumName.VariantName or EnumName.VariantName(payload...)
 -- ============================================================
 
+-- ============================================================
+-- GENERIC ENUMS
+-- `enum Opt[T] { Has(T), Empty }` is one enum for each set of type
+-- arguments it is used with, as a generic struct is: Opt[int] is the
+-- enum Opt_i64 (ensure_type_instances). A constructor names no type
+-- arguments, `Opt.Has(3)`, `Opt.Empty`: they are what the checker
+-- found, from the values or from the place the value goes to.
+-- ============================================================
+
+-- Whether the generic enum has the variant
+fn generic_enum_has_variant(gen: IRGenerator, enum_name: string, variant: string) -> bool {
+    let decl = gen.declarations[gen.generic_struct_decls.get(enum_name)]
+    let ed = *decl.enum_decl
+    let mut i = 0
+    while i < ed.variants.len() {
+        if ed.variants[i].name == variant { return true }
+        i = i + 1
+    }
+    return false
+}
+
+-- The type of the value that `expr`, a constructor of a variant of the
+-- generic enum, makes: "Opt[int]". "" when nothing says.
+fn generic_enum_type(gen: IRGenerator, expr: Expr, enum_name: string, variant: string, args: List[Expr]) -> string {
+    if expr.id >= 0 and expr.id < gen.checked_types.len() {
+        let checked = gen.checked_types[expr.id]
+        if starts_with(checked, enum_name + "[") and string_contains(checked, "?") == false { return checked }
+    }
+    -- In the body of a generic function the checker records nothing:
+    -- the types of the values, then the type the function returns
+    let decl = gen.declarations[gen.generic_struct_decls.get(enum_name)]
+    let ed = *decl.enum_decl
+    let mut binds = ty_unbound(ed.generic_params.len())
+    let mut vi = 0
+    while vi < ed.variants.len() {
+        let v = ed.variants[vi]
+        if v.name == variant {
+            let mut ai = 0
+            while ai < args.len() and ai < v.payload_types.len() {
+                binds = ty_bind(v.payload_types[ai], static_type(gen, args[ai]), ed.generic_params, binds)
+                ai = ai + 1
+            }
+        }
+        vi = vi + 1
+    }
+    let mut t = enum_name + "["
+    let mut whole = true
+    let mut bi = 0
+    while bi < binds.len() {
+        if binds[bi] == "" { whole = false }
+        if bi > 0 { t = t + ", " }
+        t = t + binds[bi]
+        bi = bi + 1
+    }
+    if whole { return t + "]" }
+    if starts_with(gen.current_return_type, enum_name + "[") { return gen.current_return_type }
+    -- An instance of the function has the instance it returns by name
+    let returned = canon_type(gen, gen.current_return_type)
+    if gen.generic_instances.contains(returned) {
+        if gen.generic_instances.get(returned) == enum_name { return returned }
+    }
+    return ""
+}
+
+struct EnumInstance {
+    gen: IRGenerator,
+    -- The instance's name; the generic enum's own when nothing says
+    -- which instance it is, which is then reported
+    name: string
+}
+
+-- The instance of the generic enum that `expr` makes a value of (see
+-- generic_enum_type), registered
+fn generic_enum_instance(gen: IRGenerator, expr: Expr, enum_name: string, variant: string, args: List[Expr]) -> EnumInstance {
+    let mut g = gen
+    let t = generic_enum_type(g, expr, enum_name, variant, args)
+    if t == "" {
+        g = ir_type_error(g, "cannot tell the type arguments of '" + enum_name + "' from '" + enum_name + "." + variant + "': give the place the value goes to a type, such as `let v: " + enum_name + "[int] = ...`", expr.line)
+        return EnumInstance { gen: g, name: enum_name }
+    }
+    g = ensure_type_instances(g, t, expr.line)
+    return EnumInstance { gen: g, name: canon_type(g, t) }
+}
+
 fn generate_enum_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    let enum_name = expr.enum_name
+    let mut enum_name = expr.enum_name
     let variant_name = expr.variant_name
+    if is_generic_enum(g, enum_name) {
+        let instance = generic_enum_instance(g, expr, enum_name, variant_name, expr.payload)
+        g = instance.gen
+        enum_name = instance.name
+    }
 
     -- Look up the enum definition
     if g.enum_defs.contains(enum_name) == false {
@@ -6574,9 +6685,14 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         }
     }
 
-    -- Check match arms for enum variant patterns to detect enum matching
-    if expr.match_arms.len() > 0 {
-        let first_arm = expr.match_arms[0]
+    -- Check match arms for enum variant patterns to detect enum matching:
+    -- the first arm that names a variant says which kind of value it is
+    let mut variant_arm = 0
+    while variant_arm < expr.match_arms.len() and expr.match_arms[variant_arm].pattern.kind != PAT_ENUM_VARIANT() {
+        variant_arm = variant_arm + 1
+    }
+    if variant_arm < expr.match_arms.len() {
+        let first_arm = expr.match_arms[variant_arm]
         let first_pat = first_arm.pattern
 
         -- Check for bare Ok/Err patterns (Result type)
@@ -6616,7 +6732,16 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
             }
             -- General enum variant pattern with known type
             if len(first_pat.enum_type) > 0 {
-                return generate_enum_match(g, b, expr, scrut_id, first_pat.enum_type)
+                let mut matched_enum = first_pat.enum_type
+                if is_generic_enum(g, matched_enum) {
+                    -- Which instance it is, the matched value's type says
+                    matched_enum = canon_type(g, static_type(g, scrut_expr))
+                    if g.enum_defs.contains(matched_enum) == false {
+                        g = ir_type_error(g, "cannot tell which '" + first_pat.enum_type + "' this match is on: give the matched value a type", expr.line)
+                        return expr_result(g, b, scrut_id)
+                    }
+                }
+                return generate_enum_match(g, b, expr, scrut_id, matched_enum)
             }
         }
     }
@@ -6859,16 +6984,70 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
 -- ============================================================
 
 fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, enum_type: string) -> ExprResult {
+    if gen.enum_defs.contains(enum_type) == false {
+        return generate_literal_match(gen, block, expr, scrut_id)
+    }
+    return generate_variant_match(gen, block, expr, scrut_id, gen.enum_defs.get(enum_type), enum_type)
+}
+
+-- A Result is matched as the enum it is laid out as: the tag, 0 for
+-- Ok, then Ok's value and Err's value
+fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, result_type_name: string) -> ExprResult {
+    let mut ok_type = "int"
+    let mut err_type = "int"
+    if starts_with(result_type_name, "Result[") {
+        let res_args = split_type_args(extract_inner_type(result_type_name, "Result["))
+        if res_args.len() == 2 {
+            ok_type = res_args[0]
+            err_type = res_args[1]
+        }
+    }
+    let mut info = enum_info_new("Result")
+    info.variant_names.push("Ok")
+    info.variant_tags.push(0)
+    info.variant_payload_types.push(ok_type)
+    info.variant_has_payload.push(true)
+    info.variant_payloads.push(ok_type)
+    info.variant_names.push("Err")
+    info.variant_tags.push(1)
+    info.variant_payload_types.push(err_type)
+    info.variant_has_payload.push(true)
+    info.variant_payloads.push(err_type)
+    return generate_variant_match(gen, block, expr, scrut_id, info, result_type_name)
+}
+
+-- An Option is matched as the enum it is laid out as: the tag, 1 for
+-- Some, then Some's value
+fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, option_type_name: string) -> ExprResult {
+    let mut some_type = "int"
+    if starts_with(option_type_name, "Option[") {
+        some_type = extract_inner_type(option_type_name, "Option[")
+    }
+    let mut info = enum_info_new("Option")
+    info.variant_names.push("Some")
+    info.variant_tags.push(1)
+    info.variant_payload_types.push(some_type)
+    info.variant_has_payload.push(true)
+    info.variant_payloads.push(some_type)
+    info.variant_names.push("None")
+    info.variant_tags.push(0)
+    info.variant_payload_types.push("")
+    info.variant_has_payload.push(false)
+    info.variant_payloads.push("")
+    return generate_variant_match(gen, block, expr, scrut_id, info, option_type_name)
+}
+
+-- A match on the variants of an enum, an Option or a Result. The arms
+-- are tried in the order they are written: an arm of a variant is
+-- taken when the value is that variant and the arm's guard, if it has
+-- one, holds; a name or `_` takes any value. `scrut_type` is the type
+-- of the matched value, "" when it is not known.
+fn generate_variant_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, enum_info: EnumInfo, scrut_type: string) -> ExprResult {
     let mut g = gen
     let mut b = block
-
-    -- Get enum definition
-    if g.enum_defs.contains(enum_type) == false {
-        return generate_literal_match(g, b, expr, scrut_id)
-    }
-    let enum_info = g.enum_defs.get(enum_type)
+    let enum_type = enum_info.name
     -- The type of the matched value, for an arm that binds it to a name
-    let scrut_bind_type = enum_type
+    let scrut_bind_type = scrut_type
 
     -- Infer match result type from arm bodies
     let ematch_type = match_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
@@ -6938,6 +7117,17 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 }
             }
 
+            -- With a guard, the arm is taken when the guard holds
+            if arm.has_guard {
+                let guard = generate_expr(g, b, *arm.guard)
+                g = guard.gen
+                b = guard.block
+                b.terminator = Box_new(term_br_cond(ir_val_inst(guard.val_id), arm_label, next_label))
+                b.has_terminator = true
+                g.completed_blocks.push(b)
+                b = ir_block_new(arm_label)
+            }
+
             -- Generate arm body in current block
             if arm.is_expr_body {
                 let body_result = generate_expr(g, b, *arm.body_expr)
@@ -6958,8 +7148,14 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 b.has_terminator = true
             }
             g.completed_blocks.push(b)
-            final_block_pushed = true
-            arm_idx = expr.match_arms.len()
+            if arm.has_guard {
+                b = ir_block_new(next_label)
+                arm_idx = arm_idx + 1
+            } else {
+                -- No arm after this one is reached
+                final_block_pushed = true
+                arm_idx = expr.match_arms.len()
+            }
         } else if pat.kind == PAT_ENUM_VARIANT() {
             -- Find variant tag value from enum definition
             let variant_name = pat.variant
@@ -7030,6 +7226,21 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 bi = bi + 1
             }
 
+            -- With a guard, which may read the values just bound, the
+            -- arm is taken when the guard holds; the arms after it are
+            -- tried when it does not
+            if arm.has_guard {
+                let guard = generate_expr(g, arm_block, *arm.guard)
+                g = guard.gen
+                arm_block = guard.block
+                let body_label = gen_next_label(g, "ematch_body")
+                g = gen_advance_label(g)
+                arm_block.terminator = Box_new(term_br_cond(ir_val_inst(guard.val_id), body_label, next_label))
+                arm_block.has_terminator = true
+                g.completed_blocks.push(arm_block)
+                arm_block = ir_block_new(body_label)
+            }
+
             if arm.is_expr_body {
                 let body_result = generate_expr(g, arm_block, *arm.body_expr)
                 g = body_result.gen
@@ -7072,450 +7283,6 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
     load_inst.load_type = slot_alloc_type(ematch_type)
     load_inst.result_type = slot_alloc_type(ematch_type)
-    load_inst.has_result = true
-    join_block.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, join_block, load_id)
-}
-
--- ============================================================
--- RESULT MATCH (Ok/Err patterns)
--- ============================================================
-
-fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, result_type_name: string) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Parse Result[T, E] to get ok_type and err_type
-    let mut ok_field_type = "i64"
-    let mut err_field_type = "i64"
-    if starts_with(result_type_name, "Result[") {
-        let inner = substr(result_type_name, 7, len(result_type_name) - 8)
-        let mut comma_pos = 0 - 1
-        let mut depth = 0
-        let mut ci = 0
-        while ci < len(inner) {
-            let ch = char_at(inner, ci)
-            if ch == "[" { depth = depth + 1 }
-            if ch == "]" { depth = depth - 1 }
-            if ch == "," and depth == 0 {
-                comma_pos = ci
-                ci = len(inner)
-            }
-            ci = ci + 1
-        }
-        if comma_pos >= 0 {
-            ok_field_type = map_type_name(substr(inner, 0, comma_pos))
-            let mut err_start = comma_pos + 1
-            if err_start < len(inner) and char_at(inner, err_start) == " " {
-                err_start = err_start + 1
-            }
-            err_field_type = map_type_name(substr(inner, err_start, len(inner) - err_start))
-        }
-    }
-
-    -- Allocate result slot. Its type is the one the checker found for
-    -- the match; without it, a match that gives a value gives an int
-    let slot_type = match_slot_type(g, expr, "i64")
-    let result_alloca_id = g.builder.next_id
-    let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = slot_alloc_type(slot_type)
-    result_alloca.result_type = "ptr(" + slot_alloc_type(slot_type) + ")"
-    result_alloca.has_result = true
-    b.instructions.push(result_alloca)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Extract tag from scrutinee (field 0: 0=Ok, 1=Err)
-    let tag_id = g.builder.next_id
-    let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
-    tag_inst.field_base = ir_val_inst(scrut_id)
-    tag_inst.field_index = 0
-    tag_inst.field_type = "i32"
-    tag_inst.result_type = "i32"
-    tag_inst.has_result = true
-    b.instructions.push(tag_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Compare tag to 0 (Ok)
-    let is_ok_id = g.builder.next_id
-    let mut is_ok_cmp = ir_inst_new(is_ok_id, OP_EQ())
-    is_ok_cmp.lhs = ir_val_inst(tag_id)
-    is_ok_cmp.rhs = ir_val_int(0)
-    is_ok_cmp.result_type = "bool"
-    is_ok_cmp.has_result = true
-    b.instructions.push(is_ok_cmp)
-    g.builder.next_id = g.builder.next_id + 1
-
-    let ok_label = gen_next_label(g, "result_ok")
-    g = gen_advance_label(g)
-    let err_label = gen_next_label(g, "result_err")
-    g = gen_advance_label(g)
-    let join_label = gen_next_label(g, "result_end")
-    g = gen_advance_label(g)
-
-    b.terminator = Box_new(term_br_cond(ir_val_inst(is_ok_id), ok_label, err_label))
-    b.has_terminator = true
-    g.completed_blocks.push(b)
-
-    -- Find Ok and Err arms
-    let mut ok_arm_idx = -1
-    let mut err_arm_idx = -1
-    let mut wildcard_arm_idx = -1
-    let mut ai = 0
-    while ai < expr.match_arms.len() {
-        let arm = expr.match_arms[ai]
-        let pat = arm.pattern
-        if pat.kind == PAT_ENUM_VARIANT() {
-            if pat.variant == "Ok" {
-                ok_arm_idx = ai
-            } else if pat.variant == "Err" {
-                err_arm_idx = ai
-            }
-        } else if pat.kind == PAT_WILDCARD() or pat.kind == PAT_IDENTIFIER() {
-            wildcard_arm_idx = ai
-        }
-        ai = ai + 1
-    }
-
-    -- Generate Ok arm
-    let mut ok_block = ir_block_new(ok_label)
-    if ok_arm_idx >= 0 {
-        let ok_arm = expr.match_arms[ok_arm_idx]
-        let ok_pat = ok_arm.pattern
-
-        -- Extract Ok payload (field 1) and bind
-        if ok_pat.bindings.len() > 0 {
-            let ok_val_id = g.builder.next_id
-            let mut ok_extract = ir_inst_new(ok_val_id, OP_EXTRACT_FIELD())
-            ok_extract.field_base = ir_val_inst(scrut_id)
-            ok_extract.field_index = 1
-            ok_extract.field_type = ok_field_type
-            ok_extract.result_type = ok_field_type
-            ok_extract.has_result = true
-            ok_block.instructions.push(ok_extract)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let bind_name = ok_pat.bindings[0]
-            let ok_bind_id = g.builder.next_id
-            let mut ok_bind = ir_inst_new(ok_bind_id, OP_ALLOCA())
-            ok_bind.alloc_type = ok_field_type
-            ok_bind.result_type = "ptr(" + ok_field_type + ")"
-            ok_bind.has_result = true
-            ok_block.instructions.push(ok_bind)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut ok_store = ir_inst_new(g.builder.next_id, OP_STORE())
-            ok_store.store_ptr = ir_val_inst(ok_bind_id)
-            ok_store.store_val = ir_val_inst(ok_val_id)
-            ok_store.has_result = false
-            ok_block.instructions.push(ok_store)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(bind_name, ok_bind_id)
-            g.variable_types.insert(bind_name, ok_field_type)
-            if starts_with(result_type_name, "Result[") {
-                g = track_bound_variable(g, bind_name, ok_field_type)
-            }
-        }
-
-        if ok_arm.is_expr_body {
-            let body_result = generate_expr(g, ok_block, *ok_arm.body_expr)
-            g = body_result.gen
-            ok_block = body_result.block
-
-            let stored_body = store_branch_value(g, ok_block, result_alloca_id, slot_type, body_result.val_id, *ok_arm.body_expr)
-            g = stored_body.gen
-            ok_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, ok_block, ok_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            ok_block = body_gen.block
-        }
-    }
-    if ok_block.has_terminator == false {
-        ok_block.terminator = Box_new(term_br(join_label))
-        ok_block.has_terminator = true
-    }
-    g.completed_blocks.push(ok_block)
-
-    -- Generate Err arm
-    let mut err_block = ir_block_new(err_label)
-    if err_arm_idx >= 0 {
-        let err_arm = expr.match_arms[err_arm_idx]
-        let err_pat = err_arm.pattern
-
-        -- Extract Err payload (field 2 for error value) and bind
-        if err_pat.bindings.len() > 0 {
-            let err_val_id = g.builder.next_id
-            let mut err_extract = ir_inst_new(err_val_id, OP_EXTRACT_FIELD())
-            err_extract.field_base = ir_val_inst(scrut_id)
-            err_extract.field_index = 2
-            err_extract.field_type = err_field_type
-            err_extract.result_type = err_field_type
-            err_extract.has_result = true
-            err_block.instructions.push(err_extract)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let bind_name = err_pat.bindings[0]
-            let err_bind_id = g.builder.next_id
-            let mut err_bind = ir_inst_new(err_bind_id, OP_ALLOCA())
-            err_bind.alloc_type = err_field_type
-            err_bind.result_type = "ptr(" + err_field_type + ")"
-            err_bind.has_result = true
-            err_block.instructions.push(err_bind)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut err_store = ir_inst_new(g.builder.next_id, OP_STORE())
-            err_store.store_ptr = ir_val_inst(err_bind_id)
-            err_store.store_val = ir_val_inst(err_val_id)
-            err_store.has_result = false
-            err_block.instructions.push(err_store)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(bind_name, err_bind_id)
-            g.variable_types.insert(bind_name, err_field_type)
-            if starts_with(result_type_name, "Result[") {
-                g = track_bound_variable(g, bind_name, err_field_type)
-            }
-        }
-
-        if err_arm.is_expr_body {
-            let body_result = generate_expr(g, err_block, *err_arm.body_expr)
-            g = body_result.gen
-            err_block = body_result.block
-
-            let stored_body = store_branch_value(g, err_block, result_alloca_id, slot_type, body_result.val_id, *err_arm.body_expr)
-            g = stored_body.gen
-            err_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, err_block, err_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            err_block = body_gen.block
-        }
-    } else if wildcard_arm_idx >= 0 {
-        -- Use wildcard arm for Err path
-        let wild_arm = expr.match_arms[wildcard_arm_idx]
-        if wild_arm.is_expr_body {
-            let body_result = generate_expr(g, err_block, *wild_arm.body_expr)
-            g = body_result.gen
-            err_block = body_result.block
-
-            let stored_body = store_branch_value(g, err_block, result_alloca_id, slot_type, body_result.val_id, *wild_arm.body_expr)
-            g = stored_body.gen
-            err_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, err_block, wild_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            err_block = body_gen.block
-        }
-    }
-    if err_block.has_terminator == false {
-        err_block.terminator = Box_new(term_br(join_label))
-        err_block.has_terminator = true
-    }
-    g.completed_blocks.push(err_block)
-
-    -- Create join block and load result
-    let mut join_block = ir_block_new(join_label)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = slot_alloc_type(slot_type)
-    load_inst.result_type = slot_alloc_type(slot_type)
-    load_inst.has_result = true
-    join_block.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, join_block, load_id)
-}
-
--- ============================================================
--- OPTION MATCH (Some/None patterns)
--- ============================================================
-
-fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, option_type_name: string) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Parse Option[T] to get the inner type
-    let mut some_field_type = "i64"
-    if starts_with(option_type_name, "Option[") {
-        let inner = substr(option_type_name, 7, len(option_type_name) - 8)
-        some_field_type = map_type_name(inner)
-    }
-
-    -- Allocate result slot. Its type is the one the checker found for
-    -- the match; without it, a match that gives a value gives an int
-    let slot_type = match_slot_type(g, expr, "i64")
-    let result_alloca_id = g.builder.next_id
-    let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = slot_alloc_type(slot_type)
-    result_alloca.result_type = "ptr(" + slot_alloc_type(slot_type) + ")"
-    result_alloca.has_result = true
-    b.instructions.push(result_alloca)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Extract tag (field 0: 1=Some/has_value, 0=None)
-    let tag_id = g.builder.next_id
-    let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
-    tag_inst.field_base = ir_val_inst(scrut_id)
-    tag_inst.field_index = 0
-    tag_inst.field_type = "i32"
-    tag_inst.result_type = "i32"
-    tag_inst.has_result = true
-    b.instructions.push(tag_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Compare tag to 1 (Some = has_value = 1)
-    let is_some_id = g.builder.next_id
-    let mut is_some_cmp = ir_inst_new(is_some_id, OP_EQ())
-    is_some_cmp.lhs = ir_val_inst(tag_id)
-    is_some_cmp.rhs = ir_val_int(1)
-    is_some_cmp.result_type = "bool"
-    is_some_cmp.has_result = true
-    b.instructions.push(is_some_cmp)
-    g.builder.next_id = g.builder.next_id + 1
-
-    let some_label = gen_next_label(g, "option_some")
-    g = gen_advance_label(g)
-    let none_label = gen_next_label(g, "option_none")
-    g = gen_advance_label(g)
-    let join_label = gen_next_label(g, "option_end")
-    g = gen_advance_label(g)
-
-    b.terminator = Box_new(term_br_cond(ir_val_inst(is_some_id), some_label, none_label))
-    b.has_terminator = true
-    g.completed_blocks.push(b)
-
-    -- Find Some and None arms
-    let mut some_arm_idx = -1
-    let mut none_arm_idx = -1
-    let mut wildcard_arm_idx = -1
-    let mut ai = 0
-    while ai < expr.match_arms.len() {
-        let arm = expr.match_arms[ai]
-        let pat = arm.pattern
-        if pat.kind == PAT_ENUM_VARIANT() {
-            if pat.variant == "Some" {
-                some_arm_idx = ai
-            } else if pat.variant == "None" {
-                none_arm_idx = ai
-            }
-        } else if pat.kind == PAT_WILDCARD() or pat.kind == PAT_IDENTIFIER() {
-            wildcard_arm_idx = ai
-        }
-        ai = ai + 1
-    }
-
-    -- Generate Some arm
-    let mut some_block = ir_block_new(some_label)
-    if some_arm_idx >= 0 {
-        let some_arm = expr.match_arms[some_arm_idx]
-        let some_pat = some_arm.pattern
-
-        -- Extract Some payload (field 1) and bind
-        if some_pat.bindings.len() > 0 {
-            let some_val_id = g.builder.next_id
-            let mut some_extract = ir_inst_new(some_val_id, OP_EXTRACT_FIELD())
-            some_extract.field_base = ir_val_inst(scrut_id)
-            some_extract.field_index = 1
-            some_extract.field_type = some_field_type
-            some_extract.result_type = some_field_type
-            some_extract.has_result = true
-            some_block.instructions.push(some_extract)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let bind_name = some_pat.bindings[0]
-            let some_bind_id = g.builder.next_id
-            let mut some_bind = ir_inst_new(some_bind_id, OP_ALLOCA())
-            some_bind.alloc_type = some_field_type
-            some_bind.result_type = "ptr(" + some_field_type + ")"
-            some_bind.has_result = true
-            some_block.instructions.push(some_bind)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut some_store = ir_inst_new(g.builder.next_id, OP_STORE())
-            some_store.store_ptr = ir_val_inst(some_bind_id)
-            some_store.store_val = ir_val_inst(some_val_id)
-            some_store.has_result = false
-            some_block.instructions.push(some_store)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(bind_name, some_bind_id)
-            g.variable_types.insert(bind_name, some_field_type)
-            if starts_with(option_type_name, "Option[") {
-                g = track_bound_variable(g, bind_name, some_field_type)
-            }
-        }
-
-        if some_arm.is_expr_body {
-            let body_result = generate_expr(g, some_block, *some_arm.body_expr)
-            g = body_result.gen
-            some_block = body_result.block
-
-            let stored_body = store_branch_value(g, some_block, result_alloca_id, slot_type, body_result.val_id, *some_arm.body_expr)
-            g = stored_body.gen
-            some_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, some_block, some_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            some_block = body_gen.block
-        }
-    }
-    if some_block.has_terminator == false {
-        some_block.terminator = Box_new(term_br(join_label))
-        some_block.has_terminator = true
-    }
-    g.completed_blocks.push(some_block)
-
-    -- Generate None arm
-    let mut none_block = ir_block_new(none_label)
-    if none_arm_idx >= 0 {
-        let none_arm = expr.match_arms[none_arm_idx]
-
-        if none_arm.is_expr_body {
-            let body_result = generate_expr(g, none_block, *none_arm.body_expr)
-            g = body_result.gen
-            none_block = body_result.block
-
-            let stored_body = store_branch_value(g, none_block, result_alloca_id, slot_type, body_result.val_id, *none_arm.body_expr)
-            g = stored_body.gen
-            none_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, none_block, none_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            none_block = body_gen.block
-        }
-    } else if wildcard_arm_idx >= 0 {
-        let wild_arm = expr.match_arms[wildcard_arm_idx]
-        if wild_arm.is_expr_body {
-            let body_result = generate_expr(g, none_block, *wild_arm.body_expr)
-            g = body_result.gen
-            none_block = body_result.block
-
-            let stored_body = store_branch_value(g, none_block, result_alloca_id, slot_type, body_result.val_id, *wild_arm.body_expr)
-            g = stored_body.gen
-            none_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, none_block, wild_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            none_block = body_gen.block
-        }
-    }
-    if none_block.has_terminator == false {
-        none_block.terminator = Box_new(term_br(join_label))
-        none_block.has_terminator = true
-    }
-    g.completed_blocks.push(none_block)
-
-    -- Create join block and load result
-    let mut join_block = ir_block_new(join_label)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = slot_alloc_type(slot_type)
-    load_inst.result_type = slot_alloc_type(slot_type)
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1

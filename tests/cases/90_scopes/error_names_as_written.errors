@@ -1,0 +1,1 @@
+Error: the value of 'count' has type int, which does not fit in i8; convert it with `as i8` at line 8

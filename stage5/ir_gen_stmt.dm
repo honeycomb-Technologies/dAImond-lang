@@ -115,7 +115,7 @@ fn debug_var(gen: IRGenerator, block: IRBasicBlock, name: string, line: int, arg
     } else {
         inst.operand = ir_val_inst(storage)
     }
-    inst.callee = name
+    inst.callee = source_name(name)
     inst.alloc_type = debug_var_type(g, name)
     inst.field_index = arg
     inst.result_type = "void"

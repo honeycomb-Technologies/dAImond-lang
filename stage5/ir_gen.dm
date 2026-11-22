@@ -438,8 +438,15 @@ fn generic_instance_name(base: string, args: List[string]) -> string {
     return name
 }
 
--- A source type with type parameters substituted and generic struct
--- instances named: Table[K, List[V]] -> Table_string_List_i64
+-- Whether the name is a generic enum's, such as Opt for enum Opt[T]
+fn is_generic_enum(gen: IRGenerator, name: string) -> bool {
+    if gen.generic_struct_decls.contains(name) == false { return false }
+    let decl = gen.declarations[gen.generic_struct_decls.get(name)]
+    return decl.kind == DECL_ENUM()
+}
+
+-- A source type with type parameters substituted and the instances of
+-- generic structs and enums named: Table[K, List[V]] -> Table_string_List_i64
 fn canon_type(gen: IRGenerator, t: string) -> string {
     if gen.type_substitutions.contains(t) {
         return gen.type_substitutions.get(t)
@@ -1199,30 +1206,41 @@ fn builtin_return_type(name: string) -> string {
 -- GENERATE MODULE: Entry point for IR generation from AST
 -- ============================================================
 
-fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
+fn generate_module(gen: IRGenerator, parsed: SourceFile) -> IRGenerator {
     let mut g = gen
+    -- IR generation knows a function's variables by name
+    let mut source = parsed
+    source.declarations = unshadowed_declarations(parsed.declarations)
     g.declarations = source.declarations
     g.ir_mod.files = source.files
 
     -- Phase 1: Register all struct and enum definitions. Generic structs
-    -- are recorded first; each use with type arguments registers an
-    -- instance (ensure_type_instances).
+    -- and enums are recorded first; each use with type arguments
+    -- registers an instance (ensure_type_instances).
     let mut i = 0
     while i < source.declarations.len() {
         let decl = source.declarations[i]
+        let mut generic_name = ""
+        let mut generic_params: List[string] = []
         if decl.kind == DECL_STRUCT() {
             let sd = *decl.struct_decl
-            if sd.generic_params.len() > 0 {
-                g.generic_struct_decls.insert(sd.name, i)
-                let mut params = ""
-                let mut pi = 0
-                while pi < sd.generic_params.len() {
-                    if pi > 0 { params = params + "|" }
-                    params = params + sd.generic_params[pi]
-                    pi = pi + 1
-                }
-                g.generic_struct_params.insert(sd.name, params)
+            generic_name = sd.name
+            generic_params = sd.generic_params
+        } else if decl.kind == DECL_ENUM() {
+            let ed = *decl.enum_decl
+            generic_name = ed.name
+            generic_params = ed.generic_params
+        }
+        if generic_params.len() > 0 {
+            g.generic_struct_decls.insert(generic_name, i)
+            let mut params = ""
+            let mut pi = 0
+            while pi < generic_params.len() {
+                if pi > 0 { params = params + "|" }
+                params = params + generic_params[pi]
+                pi = pi + 1
             }
+            g.generic_struct_params.insert(generic_name, params)
         }
         i = i + 1
     }
@@ -1236,7 +1254,9 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
             }
         } else if decl.kind == DECL_ENUM() {
             let ed = *decl.enum_decl
-            g = register_enum(g, ed)
+            if ed.generic_params.len() == 0 {
+                g = register_enum(g, ed)
+            }
         }
         i = i + 1
     }

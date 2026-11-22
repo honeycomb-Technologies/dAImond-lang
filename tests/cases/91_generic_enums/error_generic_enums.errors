@@ -1,0 +1,7 @@
+Error: this match has no arm for Opt.Empty at line 9
+Error: type mismatch in the value of 'a': expected Opt[int], found Opt[string] at line 15
+Error: variant 'Opt.Has' carries 1 value, not 2 at line 16
+Error: type mismatch in argument 1 of 'show': expected Opt[int], found Opt[float] at line 17
+Error: enum 'Opt' has no variant or function 'Missing' at line 18
+Error: 'Opt' takes 1 type arguments, got 2 in 'Opt[int, int]' at line 19
+Error: 'Opt' takes 1 type arguments, got 2 in 'List[Opt[int, string]]' at line 20

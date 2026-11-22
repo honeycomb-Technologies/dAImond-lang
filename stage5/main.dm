@@ -161,7 +161,31 @@ fn line_ref(files: List[string], line: int, from: int) -> string {
 -- The text of an error at a line: "Error: MESSAGE at line L", after
 -- "NAME: " in another file than the one being compiled
 fn error_at(files: List[string], msg: string, line: int) -> string {
-    return file_prefix(files, line) + "Error: " + msg + " at line " + int_to_string(line_in_file(line))
+    return file_prefix(files, line) + "Error: " + source_name(msg) + " at line " + int_to_string(line_in_file(line))
+}
+
+-- The text with each variable's name as it is in the source: without
+-- the `$N` that a variable which shadows another has by the time IR
+-- is generated (see SHADOWED NAMES in ast.dm)
+fn source_name(text: string) -> string {
+    if string_contains(text, "$") == false { return text }
+    let n = len(text)
+    let mut out = ""
+    let mut from = 0
+    let mut i = 0
+    while i < n {
+        if byte_at(text, i) == 36 and i + 1 < n and byte_at(text, i + 1) >= 48 and byte_at(text, i + 1) <= 57 {
+            out = out + substr(text, from, i - from)
+            i = i + 1
+            while i < n and byte_at(text, i) >= 48 and byte_at(text, i) <= 57 {
+                i = i + 1
+            }
+            from = i
+        } else {
+            i = i + 1
+        }
+    }
+    return out + substr(text, from, n - from)
 }
 
 fn keyword_lookup(name: string) -> int {
@@ -887,7 +911,6 @@ fn PAT_LITERAL() -> int { return 1 }
 fn PAT_IDENTIFIER() -> int { return 2 }
 fn PAT_WILDCARD() -> int { return 3 }
 fn PAT_ENUM_VARIANT() -> int { return 4 }
-fn PAT_STRUCT() -> int { return 5 }
 
 -- ============================================================
 -- AST NODE STRUCTS
@@ -1221,10 +1244,7 @@ struct Pattern {
     -- Enum variant pattern
     enum_type: string,
     variant: string,
-    bindings: List[string],
-    -- Struct pattern
-    struct_type: string,
-    field_patterns: List[FieldPattern]
+    bindings: List[string]
 }
 
 fn pattern_new(kind: int) -> Pattern {
@@ -1232,8 +1252,7 @@ fn pattern_new(kind: int) -> Pattern {
         kind: kind,
         literal_expr: Box_null(),
         name: "", is_mut: false,
-        enum_type: "", variant: "", bindings: [],
-        struct_type: "", field_patterns: []
+        enum_type: "", variant: "", bindings: []
     }
 }
 
@@ -1253,16 +1272,6 @@ fn pattern_enum_variant(enum_type: string, variant: string, bindings: List[strin
     p.variant = variant
     p.bindings = bindings
     return p
-}
-
--- Field pattern for struct destructuring
-struct FieldPattern {
-    name: string,
-    binding: string
-}
-
-fn field_pattern_new(name: string, binding: string) -> FieldPattern {
-    return FieldPattern { name: name, binding: binding }
 }
 
 -- ============================================================
@@ -1710,6 +1719,547 @@ fn branch_value_expr(e: Expr) -> Expr {
 fn expr_names(e: Expr) -> List[string] {
     let none: List[string] = []
     return names_in_expr(e, none, false)
+}
+
+-- ============================================================
+-- SHADOWED NAMES
+-- IR generation keeps a function's variables by name, in maps that
+-- know nothing of scopes: a `let x` in a block took the place of an
+-- outer `x` for the rest of the function, and so did a loop's
+-- variable, a lambda's parameter and a name that a match arm binds.
+-- So before IR is generated, a variable that is declared while
+-- another of its name is in scope gets a name of its own, `x$1`,
+-- and so does each mention of it. What is in scope where is what
+-- the checker says (ck_scope, ck_block, ck_for, ck_match and
+-- ck_lambda in check.dm). A copy of an expression keeps its id, so
+-- the types the checker recorded still belong to it. source_name
+-- (token.dm) gives the name as it is written.
+-- ============================================================
+
+struct Scopes {
+    -- The variables in scope, the innermost last: each one's name
+    -- in the source, and its name now
+    names: List[string],
+    now: List[string],
+    -- How many variables of the function have a new name
+    renamed: int
+}
+
+fn scopes_new() -> Scopes {
+    return Scopes { names: [], now: [], renamed: 0 }
+}
+
+-- Where the innermost variable of the name is in s.names, or -1
+fn sc_find(s: Scopes, name: string) -> int {
+    let mut i = s.names.len() - 1
+    while i >= 0 {
+        if s.names[i] == name { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+-- The name a mention of `name` has now
+fn sc_name(s: Scopes, name: string) -> string {
+    let at = sc_find(s, name)
+    if at < 0 { return name }
+    return s.now[at]
+}
+
+-- Declare a variable; sc_name gives its name from here on
+fn sc_declare(s0: Scopes, name: string) -> Scopes {
+    let mut s = s0
+    let mut now = name
+    if name != "_" and sc_find(s, name) >= 0 {
+        s.renamed = s.renamed + 1
+        now = name + "$" + int_to_string(s.renamed)
+    }
+    s.names.push(name)
+    s.now.push(now)
+    return s
+}
+
+-- Leave a scope: the variables declared since s.names had `mark`
+-- names are gone
+fn sc_leave(s0: Scopes, mark: int) -> Scopes {
+    let mut s = s0
+    while s.names.len() > mark {
+        s.names.pop()
+        s.now.pop()
+    }
+    return s
+}
+
+struct ScopedExpr {
+    s: Scopes,
+    e: Expr
+}
+
+struct ScopedExprs {
+    s: Scopes,
+    exprs: List[Expr]
+}
+
+struct ScopedStmts {
+    s: Scopes,
+    stmts: List[Stmt]
+}
+
+-- ---- Whether a function shadows any variable: a walk that builds
+-- ---- nothing, since most functions shadow none
+
+fn sc_scan_exprs(s0: Scopes, exprs: List[Expr]) -> Scopes {
+    let mut s = s0
+    let mut i = 0
+    while i < exprs.len() {
+        s = sc_scan_expr(s, exprs[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn sc_scan_scope(s0: Scopes, stmts: List[Stmt]) -> Scopes {
+    let mark = s0.names.len()
+    return sc_leave(sc_scan_stmts(s0, stmts), mark)
+}
+
+fn sc_scan_pattern(s0: Scopes, p: Pattern) -> Scopes {
+    let mut s = s0
+    if p.kind == PAT_IDENTIFIER() { return sc_declare(s, p.name) }
+    if p.kind == PAT_ENUM_VARIANT() {
+        let mut i = 0
+        while i < p.bindings.len() {
+            s = sc_declare(s, p.bindings[i])
+            i = i + 1
+        }
+    }
+    return s
+}
+
+fn sc_scan_expr(s0: Scopes, e: Expr) -> Scopes {
+    let mut s = s0
+    let k = e.kind
+    if k == EXPR_BINARY() or k == EXPR_RANGE() {
+        return sc_scan_expr(sc_scan_expr(s, *e.left), *e.right)
+    }
+    if k == EXPR_PIPELINE() {
+        return sc_scan_expr(sc_scan_expr(s, *e.left), *e.pipe_right)
+    }
+    if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
+        return sc_scan_expr(s, *e.operand)
+    }
+    if k == EXPR_FIELD_ACCESS() { return sc_scan_expr(s, *e.object) }
+    if k == EXPR_INDEX_ACCESS() {
+        return sc_scan_expr(sc_scan_expr(s, *e.object), *e.index)
+    }
+    if k == EXPR_METHOD_CALL() {
+        return sc_scan_exprs(sc_scan_expr(s, *e.object), e.args)
+    }
+    if k == EXPR_FUNCTION_CALL() {
+        return sc_scan_exprs(sc_scan_expr(s, *e.callee), e.args)
+    }
+    if k == EXPR_STRUCT_LITERAL() { return sc_scan_exprs(s, e.field_values) }
+    if k == EXPR_ENUM_LITERAL() { return sc_scan_exprs(s, e.payload) }
+    if k == EXPR_ARRAY_LITERAL() { return sc_scan_exprs(s, e.elements) }
+    if k == EXPR_STRING_INTERP() { return sc_scan_exprs(s, e.interp_parts) }
+    if k == EXPR_IF() {
+        s = sc_scan_expr(s, *e.condition)
+        s = sc_scan_expr(s, *e.then_branch)
+        if e.has_else { s = sc_scan_expr(s, *e.else_branch) }
+        return s
+    }
+    if k == EXPR_MATCH() {
+        s = sc_scan_expr(s, *e.scrutinee)
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            let mark = s.names.len()
+            s = sc_scan_pattern(s, arm.pattern)
+            if arm.has_guard { s = sc_scan_expr(s, *arm.guard) }
+            if arm.is_expr_body {
+                s = sc_scan_expr(s, *arm.body_expr)
+            } else {
+                s = sc_scan_stmts(s, arm.body)
+            }
+            s = sc_leave(s, mark)
+            i = i + 1
+        }
+        return s
+    }
+    if k == EXPR_BLOCK() {
+        let mark = s.names.len()
+        s = sc_scan_stmts(s, e.stmts)
+        if e.has_result { s = sc_scan_expr(s, *e.result) }
+        return sc_leave(s, mark)
+    }
+    if k == EXPR_LAMBDA() {
+        let mark = s.names.len()
+        let mut i = 0
+        while i < e.lambda_params.len() {
+            s = sc_declare(s, e.lambda_params[i].name)
+            i = i + 1
+        }
+        return sc_leave(sc_scan_expr(s, *e.lambda_body), mark)
+    }
+    return s
+}
+
+fn sc_scan_stmts(s0: Scopes, stmts: List[Stmt]) -> Scopes {
+    let mut s = s0
+    let mut i = 0
+    while i < stmts.len() {
+        let st = stmts[i]
+        let k = st.kind
+        if k == STMT_LET() {
+            s = sc_declare(sc_scan_expr(s, *st.let_value), st.let_name)
+        } else if k == STMT_RETURN() {
+            if st.has_ret_value { s = sc_scan_expr(s, *st.ret_value) }
+        } else if k == STMT_IF() {
+            if st.has_if_expr {
+                s = sc_scan_expr(s, *st.if_expr)
+            } else {
+                s = sc_scan_scope(sc_scan_expr(s, *st.if_cond), st.if_then)
+                if st.has_else_branch { s = sc_scan_scope(s, st.if_else) }
+            }
+        } else if k == STMT_MATCH() {
+            s = sc_scan_expr(s, *st.match_expr)
+        } else if k == STMT_FOR() {
+            s = sc_scan_expr(s, *st.for_iter)
+            let mark = s.names.len()
+            s = sc_leave(sc_scan_stmts(sc_declare(s, st.for_var), st.for_body), mark)
+        } else if k == STMT_WHILE() {
+            s = sc_scan_scope(sc_scan_expr(s, *st.while_cond), st.while_body)
+        } else if k == STMT_LOOP() {
+            s = sc_scan_scope(s, st.loop_body)
+        } else if k == STMT_REGION() {
+            s = sc_scan_scope(s, st.region_body)
+        } else if k == STMT_EXPRESSION() {
+            s = sc_scan_expr(s, *st.expr)
+        } else if k == STMT_ASSIGNMENT() {
+            s = sc_scan_expr(sc_scan_expr(s, *st.assign_target), *st.assign_value)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+-- ---- The same walk, building the function with the new names
+
+fn sc_exprs(s0: Scopes, exprs: List[Expr]) -> ScopedExprs {
+    let mut s = s0
+    let mut out: List[Expr] = []
+    let mut i = 0
+    while i < exprs.len() {
+        let r = sc_expr(s, exprs[i])
+        s = r.s
+        out.push(r.e)
+        i = i + 1
+    }
+    return ScopedExprs { s: s, exprs: out }
+}
+
+fn sc_scope(s0: Scopes, stmts: List[Stmt]) -> ScopedStmts {
+    let mark = s0.names.len()
+    let r = sc_stmts(s0, stmts)
+    return ScopedStmts { s: sc_leave(r.s, mark), stmts: r.stmts }
+}
+
+fn sc_expr(s0: Scopes, e: Expr) -> ScopedExpr {
+    let mut s = s0
+    let mut out = e
+    let k = e.kind
+    if k == EXPR_IDENTIFIER() {
+        out.name = sc_name(s, e.name)
+    } else if k == EXPR_BINARY() or k == EXPR_RANGE() {
+        let l = sc_expr(s, *e.left)
+        let r = sc_expr(l.s, *e.right)
+        s = r.s
+        out.left = Box_new(l.e)
+        out.right = Box_new(r.e)
+    } else if k == EXPR_PIPELINE() {
+        let l = sc_expr(s, *e.left)
+        let r = sc_expr(l.s, *e.pipe_right)
+        s = r.s
+        out.left = Box_new(l.e)
+        out.pipe_right = Box_new(r.e)
+    } else if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
+        let r = sc_expr(s, *e.operand)
+        s = r.s
+        out.operand = Box_new(r.e)
+    } else if k == EXPR_FIELD_ACCESS() {
+        let r = sc_expr(s, *e.object)
+        s = r.s
+        out.object = Box_new(r.e)
+    } else if k == EXPR_INDEX_ACCESS() {
+        let o = sc_expr(s, *e.object)
+        let r = sc_expr(o.s, *e.index)
+        s = r.s
+        out.object = Box_new(o.e)
+        out.index = Box_new(r.e)
+    } else if k == EXPR_METHOD_CALL() {
+        let o = sc_expr(s, *e.object)
+        let r = sc_exprs(o.s, e.args)
+        s = r.s
+        out.object = Box_new(o.e)
+        out.args = r.exprs
+    } else if k == EXPR_FUNCTION_CALL() {
+        let c = sc_expr(s, *e.callee)
+        let r = sc_exprs(c.s, e.args)
+        s = r.s
+        out.callee = Box_new(c.e)
+        out.args = r.exprs
+    } else if k == EXPR_STRUCT_LITERAL() {
+        let r = sc_exprs(s, e.field_values)
+        s = r.s
+        out.field_values = r.exprs
+    } else if k == EXPR_ENUM_LITERAL() {
+        let r = sc_exprs(s, e.payload)
+        s = r.s
+        out.payload = r.exprs
+    } else if k == EXPR_ARRAY_LITERAL() {
+        let r = sc_exprs(s, e.elements)
+        s = r.s
+        out.elements = r.exprs
+    } else if k == EXPR_STRING_INTERP() {
+        let r = sc_exprs(s, e.interp_parts)
+        s = r.s
+        out.interp_parts = r.exprs
+    } else if k == EXPR_IF() {
+        let c = sc_expr(s, *e.condition)
+        let t = sc_expr(c.s, *e.then_branch)
+        s = t.s
+        out.condition = Box_new(c.e)
+        out.then_branch = Box_new(t.e)
+        if e.has_else {
+            let other = sc_expr(s, *e.else_branch)
+            s = other.s
+            out.else_branch = Box_new(other.e)
+        }
+    } else if k == EXPR_MATCH() {
+        let scrutinee = sc_expr(s, *e.scrutinee)
+        s = scrutinee.s
+        out.scrutinee = Box_new(scrutinee.e)
+        let mut arms: List[MatchArm] = []
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let mut arm = e.match_arms[i]
+            let mark = s.names.len()
+            let mut pattern = arm.pattern
+            if pattern.kind == PAT_IDENTIFIER() {
+                s = sc_declare(s, pattern.name)
+                pattern.name = s.now[s.now.len() - 1]
+            } else if pattern.kind == PAT_ENUM_VARIANT() {
+                let mut bindings: List[string] = []
+                let mut bi = 0
+                while bi < pattern.bindings.len() {
+                    s = sc_declare(s, pattern.bindings[bi])
+                    bindings.push(s.now[s.now.len() - 1])
+                    bi = bi + 1
+                }
+                pattern.bindings = bindings
+            }
+            arm.pattern = pattern
+            if arm.has_guard {
+                let guard = sc_expr(s, *arm.guard)
+                s = guard.s
+                arm.guard = Box_new(guard.e)
+            }
+            if arm.is_expr_body {
+                let body = sc_expr(s, *arm.body_expr)
+                s = body.s
+                arm.body_expr = Box_new(body.e)
+            } else {
+                let body = sc_stmts(s, arm.body)
+                s = body.s
+                arm.body = body.stmts
+            }
+            s = sc_leave(s, mark)
+            arms.push(arm)
+            i = i + 1
+        }
+        out.match_arms = arms
+    } else if k == EXPR_BLOCK() {
+        let mark = s.names.len()
+        let body = sc_stmts(s, e.stmts)
+        s = body.s
+        out.stmts = body.stmts
+        if e.has_result {
+            let r = sc_expr(s, *e.result)
+            s = r.s
+            out.result = Box_new(r.e)
+        }
+        s = sc_leave(s, mark)
+    } else if k == EXPR_LAMBDA() {
+        let mark = s.names.len()
+        let mut params: List[LambdaParam] = []
+        let mut i = 0
+        while i < e.lambda_params.len() {
+            let mut lp = e.lambda_params[i]
+            s = sc_declare(s, lp.name)
+            lp.name = s.now[s.now.len() - 1]
+            params.push(lp)
+            i = i + 1
+        }
+        out.lambda_params = params
+        let body = sc_expr(s, *e.lambda_body)
+        out.lambda_body = Box_new(body.e)
+        s = sc_leave(body.s, mark)
+    }
+    return ScopedExpr { s: s, e: out }
+}
+
+fn sc_stmts(s0: Scopes, stmts: List[Stmt]) -> ScopedStmts {
+    let mut s = s0
+    let mut result: List[Stmt] = []
+    let mut i = 0
+    while i < stmts.len() {
+        let st = stmts[i]
+        let mut out = st
+        let k = st.kind
+        if k == STMT_LET() {
+            -- The value is found before the variable exists:
+            -- `let x = x + 1` reads the x before it
+            let value = sc_expr(s, *st.let_value)
+            s = sc_declare(value.s, st.let_name)
+            out.let_value = Box_new(value.e)
+            out.let_name = s.now[s.now.len() - 1]
+        } else if k == STMT_RETURN() {
+            if st.has_ret_value {
+                let value = sc_expr(s, *st.ret_value)
+                s = value.s
+                out.ret_value = Box_new(value.e)
+            }
+        } else if k == STMT_IF() {
+            if st.has_if_expr {
+                -- The statement's parts are those of its expression
+                let whole = sc_expr(s, *st.if_expr)
+                s = whole.s
+                out = if_stmt_of(whole.e)
+                out.line = st.line
+                out.col = st.col
+            } else {
+                let cond = sc_expr(s, *st.if_cond)
+                let then_part = sc_scope(cond.s, st.if_then)
+                s = then_part.s
+                out.if_cond = Box_new(cond.e)
+                out.if_then = then_part.stmts
+                if st.has_else_branch {
+                    let else_part = sc_scope(s, st.if_else)
+                    s = else_part.s
+                    out.if_else = else_part.stmts
+                }
+            }
+        } else if k == STMT_MATCH() {
+            let matched = sc_expr(s, *st.match_expr)
+            s = matched.s
+            out.match_expr = Box_new(matched.e)
+        } else if k == STMT_FOR() {
+            let iter = sc_expr(s, *st.for_iter)
+            s = iter.s
+            out.for_iter = Box_new(iter.e)
+            let mark = s.names.len()
+            s = sc_declare(s, st.for_var)
+            out.for_var = s.now[s.now.len() - 1]
+            let body = sc_stmts(s, st.for_body)
+            out.for_body = body.stmts
+            s = sc_leave(body.s, mark)
+        } else if k == STMT_WHILE() {
+            let cond = sc_expr(s, *st.while_cond)
+            let body = sc_scope(cond.s, st.while_body)
+            s = body.s
+            out.while_cond = Box_new(cond.e)
+            out.while_body = body.stmts
+        } else if k == STMT_LOOP() {
+            let body = sc_scope(s, st.loop_body)
+            s = body.s
+            out.loop_body = body.stmts
+        } else if k == STMT_REGION() {
+            let body = sc_scope(s, st.region_body)
+            s = body.s
+            out.region_body = body.stmts
+        } else if k == STMT_EXPRESSION() {
+            let value = sc_expr(s, *st.expr)
+            s = value.s
+            out.expr = Box_new(value.e)
+        } else if k == STMT_ASSIGNMENT() {
+            let target = sc_expr(s, *st.assign_target)
+            let value = sc_expr(target.s, *st.assign_value)
+            s = value.s
+            out.assign_target = Box_new(target.e)
+            out.assign_value = Box_new(value.e)
+        }
+        result.push(out)
+        i = i + 1
+    }
+    return ScopedStmts { s: s, stmts: result }
+}
+
+-- The function with a name of its own for each variable that shadows
+-- another; the function itself when it shadows none
+fn unshadowed_function(fd: FunctionDecl) -> FunctionDecl {
+    if fd.is_extern { return fd }
+    let mut s = scopes_new()
+    let mut i = 0
+    while i < fd.params.len() {
+        s.names.push(fd.params[i].name)
+        s.now.push(fd.params[i].name)
+        i = i + 1
+    }
+    let scanned = sc_scan_stmts(s, fd.body)
+    if scanned.renamed == 0 { return fd }
+    let mut params = scopes_new()
+    i = 0
+    while i < fd.params.len() {
+        params.names.push(fd.params[i].name)
+        params.now.push(fd.params[i].name)
+        i = i + 1
+    }
+    let body = sc_stmts(params, fd.body)
+    let mut out = fd
+    out.body = body.stmts
+    return out
+}
+
+fn unshadowed_functions(fns: List[FunctionDecl]) -> List[FunctionDecl] {
+    let mut out: List[FunctionDecl] = []
+    let mut i = 0
+    while i < fns.len() {
+        out.push(unshadowed_function(fns[i]))
+        i = i + 1
+    }
+    return out
+}
+
+-- The declarations with every function, method and constant as
+-- unshadowed_function gives it (see SHADOWED NAMES)
+fn unshadowed_declarations(decls: List[Declaration]) -> List[Declaration] {
+    let mut out: List[Declaration] = []
+    let mut i = 0
+    while i < decls.len() {
+        let mut d = decls[i]
+        if d.kind == DECL_FUNCTION() {
+            d.func_decl = Box_new(unshadowed_function(*d.func_decl))
+        } else if d.kind == DECL_IMPL() {
+            let mut block = *d.impl_block
+            block.methods = unshadowed_functions(block.methods)
+            d.impl_block = Box_new(block)
+        } else if d.kind == DECL_TRAIT() {
+            let mut td = *d.trait_decl
+            td.methods = unshadowed_functions(td.methods)
+            d.trait_decl = Box_new(td)
+        } else if d.kind == DECL_CONST() {
+            let mut cd = *d.const_decl
+            let scanned = sc_scan_expr(scopes_new(), *cd.value)
+            if scanned.renamed > 0 {
+                let value = sc_expr(scopes_new(), *cd.value)
+                cd.value = Box_new(value.e)
+                d.const_decl = Box_new(cd)
+            }
+        }
+        out.push(d)
+        i = i + 1
+    }
+    return out
 }
 
 -- ============================================================
@@ -5649,8 +6199,15 @@ fn generic_instance_name(base: string, args: List[string]) -> string {
     return name
 }
 
--- A source type with type parameters substituted and generic struct
--- instances named: Table[K, List[V]] -> Table_string_List_i64
+-- Whether the name is a generic enum's, such as Opt for enum Opt[T]
+fn is_generic_enum(gen: IRGenerator, name: string) -> bool {
+    if gen.generic_struct_decls.contains(name) == false { return false }
+    let decl = gen.declarations[gen.generic_struct_decls.get(name)]
+    return decl.kind == DECL_ENUM()
+}
+
+-- A source type with type parameters substituted and the instances of
+-- generic structs and enums named: Table[K, List[V]] -> Table_string_List_i64
 fn canon_type(gen: IRGenerator, t: string) -> string {
     if gen.type_substitutions.contains(t) {
         return gen.type_substitutions.get(t)
@@ -6410,30 +6967,41 @@ fn builtin_return_type(name: string) -> string {
 -- GENERATE MODULE: Entry point for IR generation from AST
 -- ============================================================
 
-fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
+fn generate_module(gen: IRGenerator, parsed: SourceFile) -> IRGenerator {
     let mut g = gen
+    -- IR generation knows a function's variables by name
+    let mut source = parsed
+    source.declarations = unshadowed_declarations(parsed.declarations)
     g.declarations = source.declarations
     g.ir_mod.files = source.files
 
     -- Phase 1: Register all struct and enum definitions. Generic structs
-    -- are recorded first; each use with type arguments registers an
-    -- instance (ensure_type_instances).
+    -- and enums are recorded first; each use with type arguments
+    -- registers an instance (ensure_type_instances).
     let mut i = 0
     while i < source.declarations.len() {
         let decl = source.declarations[i]
+        let mut generic_name = ""
+        let mut generic_params: List[string] = []
         if decl.kind == DECL_STRUCT() {
             let sd = *decl.struct_decl
-            if sd.generic_params.len() > 0 {
-                g.generic_struct_decls.insert(sd.name, i)
-                let mut params = ""
-                let mut pi = 0
-                while pi < sd.generic_params.len() {
-                    if pi > 0 { params = params + "|" }
-                    params = params + sd.generic_params[pi]
-                    pi = pi + 1
-                }
-                g.generic_struct_params.insert(sd.name, params)
+            generic_name = sd.name
+            generic_params = sd.generic_params
+        } else if decl.kind == DECL_ENUM() {
+            let ed = *decl.enum_decl
+            generic_name = ed.name
+            generic_params = ed.generic_params
+        }
+        if generic_params.len() > 0 {
+            g.generic_struct_decls.insert(generic_name, i)
+            let mut params = ""
+            let mut pi = 0
+            while pi < generic_params.len() {
+                if pi > 0 { params = params + "|" }
+                params = params + generic_params[pi]
+                pi = pi + 1
             }
+            g.generic_struct_params.insert(generic_name, params)
         }
         i = i + 1
     }
@@ -6447,7 +7015,9 @@ fn generate_module(gen: IRGenerator, source: SourceFile) -> IRGenerator {
             }
         } else if decl.kind == DECL_ENUM() {
             let ed = *decl.enum_decl
-            g = register_enum(g, ed)
+            if ed.generic_params.len() == 0 {
+                g = register_enum(g, ed)
+            }
         }
         i = i + 1
     }
@@ -6649,11 +7219,14 @@ fn ensure_type_instances(gen: IRGenerator, t: string, line: int) -> IRGenerator 
         return g
     }
     let instance = generic_instance_name(base, args)
-    if g.struct_defs.contains(instance) {
+    if g.struct_defs.contains(instance) or g.enum_defs.contains(instance) {
         return g
     }
     let sd_idx: int = g.generic_struct_decls.get(base)
     let decl = g.declarations[sd_idx]
+    if decl.kind == DECL_ENUM() {
+        return register_enum_instance(g, *decl.enum_decl, instance, args, t, line)
+    }
     let generic_sd = *decl.struct_decl
     if args.len() != generic_sd.generic_params.len() {
         g = ir_type_error(g, "'" + base + "' takes " + int_to_string(generic_sd.generic_params.len()) + " type arguments, got " + int_to_string(args.len()) + " in '" + t + "'", line)
@@ -6700,6 +7273,63 @@ fn ensure_type_instances(gen: IRGenerator, t: string, line: int) -> IRGenerator 
 -- ============================================================
 -- ENUM REGISTRATION
 -- ============================================================
+
+-- Register `instance`, the generic enum with `args` for its type
+-- parameters: Opt_i64 for Opt[int]. `t` is the type as it was written.
+fn register_enum_instance(gen: IRGenerator, generic_ed: EnumDecl, instance: string, args: List[string], t: string, line: int) -> IRGenerator {
+    let mut g = gen
+    let base = generic_ed.name
+    if args.len() != generic_ed.generic_params.len() {
+        return ir_type_error(g, "'" + base + "' takes " + int_to_string(generic_ed.generic_params.len()) + " type arguments, got " + int_to_string(args.len()) + " in '" + t + "'", line)
+    }
+    let mut arg_list = ""
+    let mut i = 0
+    while i < args.len() {
+        if i > 0 { arg_list = arg_list + "|" }
+        arg_list = arg_list + args[i]
+        i = i + 1
+    }
+    g.generic_instances.insert(instance, base)
+    g.generic_instance_args.insert(instance, arg_list)
+
+    -- The instance is the generic enum with its arguments substituted
+    let mut ed = generic_ed
+    ed.name = instance
+    let empty_params: List[string] = []
+    ed.generic_params = empty_params
+    let mut variants: List[EnumVariant] = []
+    i = 0
+    while i < generic_ed.variants.len() {
+        let mut v = generic_ed.variants[i]
+        let mut payload_types: List[string] = []
+        let mut pi = 0
+        while pi < v.payload_types.len() {
+            payload_types.push(instance_type(g, instance, v.payload_types[pi]))
+            pi = pi + 1
+        }
+        v.payload_types = payload_types
+        variants.push(v)
+        i = i + 1
+    }
+    ed.variants = variants
+    g = register_enum(g, ed)
+
+    -- The types of the values can name further instances
+    let saved_subs = g.type_substitutions
+    g.type_substitutions = instance_subs(g, instance)
+    i = 0
+    while i < generic_ed.variants.len() {
+        let v = generic_ed.variants[i]
+        let mut pi = 0
+        while pi < v.payload_types.len() {
+            g = ensure_type_instances(g, v.payload_types[pi], generic_ed.line)
+            pi = pi + 1
+        }
+        i = i + 1
+    }
+    g.type_substitutions = saved_subs
+    return g
+}
 
 fn register_enum(gen: IRGenerator, ed: EnumDecl) -> IRGenerator {
     let mut g = gen
@@ -7652,7 +8282,7 @@ fn debug_var(gen: IRGenerator, block: IRBasicBlock, name: string, line: int, arg
     } else {
         inst.operand = ir_val_inst(storage)
     }
-    inst.callee = name
+    inst.callee = source_name(name)
     inst.alloc_type = debug_var_type(g, name)
     inst.field_index = arg
     inst.result_type = "void"
@@ -10554,7 +11184,12 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
     if k == EXPR_LITERAL_BOOL() { return "bool" }
     if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
-    if k == EXPR_ENUM_LITERAL() { return expr.enum_name }
+    if k == EXPR_ENUM_LITERAL() {
+        if is_generic_enum(gen, expr.enum_name) {
+            return canon_type(gen, generic_enum_type(gen, expr, expr.enum_name, expr.variant_name, expr.payload))
+        }
+        return expr.enum_name
+    }
     if k == EXPR_ARRAY_LITERAL() {
         -- A list of its first element's type
         if expr.elements.len() == 0 { return "" }
@@ -10625,6 +11260,11 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         if call_object.kind == EXPR_IDENTIFIER() and gen.enum_defs.contains(call_object.name) and gen.variable_map.contains(call_object.name) == false {
             if enum_variant_index(gen.enum_defs.get(call_object.name), expr.method) >= 0 {
                 return call_object.name
+            }
+        }
+        if call_object.kind == EXPR_IDENTIFIER() and gen.variable_map.contains(call_object.name) == false and is_generic_enum(gen, call_object.name) {
+            if generic_enum_has_variant(gen, call_object.name, expr.method) {
+                return canon_type(gen, generic_enum_type(gen, expr, call_object.name, expr.method, expr.args))
             }
         }
         let recv_t = strip_box_type(static_type(gen, *expr.object))
@@ -11202,6 +11842,9 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return canon_type(gen, expr.type_name)
     }
     if expr.kind == EXPR_ENUM_LITERAL() {
+        if is_generic_enum(gen, expr.enum_name) {
+            return canon_type(gen, generic_enum_type(gen, expr, expr.enum_name, expr.variant_name, expr.payload))
+        }
         return expr.enum_name
     }
     if expr.kind == EXPR_IF() {
@@ -13444,6 +14087,15 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         if g.enum_defs.contains(obj_name) and g.variable_map.contains(obj_name) == false {
             return generate_enum_method_construct(g, b, obj_name, method_name, args, expr.line)
         }
+        if g.variable_map.contains(obj_name) == false and is_generic_enum(g, obj_name) {
+            if generic_enum_has_variant(g, obj_name, method_name) {
+                let instance = generic_enum_instance(g, expr, obj_name, method_name, args)
+                if instance.gen.enum_defs.contains(instance.name) == false {
+                    return expr_result(instance.gen, b, 0)
+                }
+                return generate_enum_method_construct(instance.gen, b, instance.name, method_name, args, expr.line)
+            }
+        }
     }
 
     -- --------------------------------------------------------
@@ -15630,12 +16282,101 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
 -- Enum Literal: EnumName.VariantName or EnumName.VariantName(payload...)
 -- ============================================================
 
+-- ============================================================
+-- GENERIC ENUMS
+-- `enum Opt[T] { Has(T), Empty }` is one enum for each set of type
+-- arguments it is used with, as a generic struct is: Opt[int] is the
+-- enum Opt_i64 (ensure_type_instances). A constructor names no type
+-- arguments, `Opt.Has(3)`, `Opt.Empty`: they are what the checker
+-- found, from the values or from the place the value goes to.
+-- ============================================================
+
+-- Whether the generic enum has the variant
+fn generic_enum_has_variant(gen: IRGenerator, enum_name: string, variant: string) -> bool {
+    let decl = gen.declarations[gen.generic_struct_decls.get(enum_name)]
+    let ed = *decl.enum_decl
+    let mut i = 0
+    while i < ed.variants.len() {
+        if ed.variants[i].name == variant { return true }
+        i = i + 1
+    }
+    return false
+}
+
+-- The type of the value that `expr`, a constructor of a variant of the
+-- generic enum, makes: "Opt[int]". "" when nothing says.
+fn generic_enum_type(gen: IRGenerator, expr: Expr, enum_name: string, variant: string, args: List[Expr]) -> string {
+    if expr.id >= 0 and expr.id < gen.checked_types.len() {
+        let checked = gen.checked_types[expr.id]
+        if starts_with(checked, enum_name + "[") and string_contains(checked, "?") == false { return checked }
+    }
+    -- In the body of a generic function the checker records nothing:
+    -- the types of the values, then the type the function returns
+    let decl = gen.declarations[gen.generic_struct_decls.get(enum_name)]
+    let ed = *decl.enum_decl
+    let mut binds = ty_unbound(ed.generic_params.len())
+    let mut vi = 0
+    while vi < ed.variants.len() {
+        let v = ed.variants[vi]
+        if v.name == variant {
+            let mut ai = 0
+            while ai < args.len() and ai < v.payload_types.len() {
+                binds = ty_bind(v.payload_types[ai], static_type(gen, args[ai]), ed.generic_params, binds)
+                ai = ai + 1
+            }
+        }
+        vi = vi + 1
+    }
+    let mut t = enum_name + "["
+    let mut whole = true
+    let mut bi = 0
+    while bi < binds.len() {
+        if binds[bi] == "" { whole = false }
+        if bi > 0 { t = t + ", " }
+        t = t + binds[bi]
+        bi = bi + 1
+    }
+    if whole { return t + "]" }
+    if starts_with(gen.current_return_type, enum_name + "[") { return gen.current_return_type }
+    -- An instance of the function has the instance it returns by name
+    let returned = canon_type(gen, gen.current_return_type)
+    if gen.generic_instances.contains(returned) {
+        if gen.generic_instances.get(returned) == enum_name { return returned }
+    }
+    return ""
+}
+
+struct EnumInstance {
+    gen: IRGenerator,
+    -- The instance's name; the generic enum's own when nothing says
+    -- which instance it is, which is then reported
+    name: string
+}
+
+-- The instance of the generic enum that `expr` makes a value of (see
+-- generic_enum_type), registered
+fn generic_enum_instance(gen: IRGenerator, expr: Expr, enum_name: string, variant: string, args: List[Expr]) -> EnumInstance {
+    let mut g = gen
+    let t = generic_enum_type(g, expr, enum_name, variant, args)
+    if t == "" {
+        g = ir_type_error(g, "cannot tell the type arguments of '" + enum_name + "' from '" + enum_name + "." + variant + "': give the place the value goes to a type, such as `let v: " + enum_name + "[int] = ...`", expr.line)
+        return EnumInstance { gen: g, name: enum_name }
+    }
+    g = ensure_type_instances(g, t, expr.line)
+    return EnumInstance { gen: g, name: canon_type(g, t) }
+}
+
 fn generate_enum_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
 
-    let enum_name = expr.enum_name
+    let mut enum_name = expr.enum_name
     let variant_name = expr.variant_name
+    if is_generic_enum(g, enum_name) {
+        let instance = generic_enum_instance(g, expr, enum_name, variant_name, expr.payload)
+        g = instance.gen
+        enum_name = instance.name
+    }
 
     -- Look up the enum definition
     if g.enum_defs.contains(enum_name) == false {
@@ -16047,9 +16788,14 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         }
     }
 
-    -- Check match arms for enum variant patterns to detect enum matching
-    if expr.match_arms.len() > 0 {
-        let first_arm = expr.match_arms[0]
+    -- Check match arms for enum variant patterns to detect enum matching:
+    -- the first arm that names a variant says which kind of value it is
+    let mut variant_arm = 0
+    while variant_arm < expr.match_arms.len() and expr.match_arms[variant_arm].pattern.kind != PAT_ENUM_VARIANT() {
+        variant_arm = variant_arm + 1
+    }
+    if variant_arm < expr.match_arms.len() {
+        let first_arm = expr.match_arms[variant_arm]
         let first_pat = first_arm.pattern
 
         -- Check for bare Ok/Err patterns (Result type)
@@ -16089,7 +16835,16 @@ fn generate_match_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
             }
             -- General enum variant pattern with known type
             if len(first_pat.enum_type) > 0 {
-                return generate_enum_match(g, b, expr, scrut_id, first_pat.enum_type)
+                let mut matched_enum = first_pat.enum_type
+                if is_generic_enum(g, matched_enum) {
+                    -- Which instance it is, the matched value's type says
+                    matched_enum = canon_type(g, static_type(g, scrut_expr))
+                    if g.enum_defs.contains(matched_enum) == false {
+                        g = ir_type_error(g, "cannot tell which '" + first_pat.enum_type + "' this match is on: give the matched value a type", expr.line)
+                        return expr_result(g, b, scrut_id)
+                    }
+                }
+                return generate_enum_match(g, b, expr, scrut_id, matched_enum)
             }
         }
     }
@@ -16332,16 +17087,70 @@ fn generate_literal_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scr
 -- ============================================================
 
 fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, enum_type: string) -> ExprResult {
+    if gen.enum_defs.contains(enum_type) == false {
+        return generate_literal_match(gen, block, expr, scrut_id)
+    }
+    return generate_variant_match(gen, block, expr, scrut_id, gen.enum_defs.get(enum_type), enum_type)
+}
+
+-- A Result is matched as the enum it is laid out as: the tag, 0 for
+-- Ok, then Ok's value and Err's value
+fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, result_type_name: string) -> ExprResult {
+    let mut ok_type = "int"
+    let mut err_type = "int"
+    if starts_with(result_type_name, "Result[") {
+        let res_args = split_type_args(extract_inner_type(result_type_name, "Result["))
+        if res_args.len() == 2 {
+            ok_type = res_args[0]
+            err_type = res_args[1]
+        }
+    }
+    let mut info = enum_info_new("Result")
+    info.variant_names.push("Ok")
+    info.variant_tags.push(0)
+    info.variant_payload_types.push(ok_type)
+    info.variant_has_payload.push(true)
+    info.variant_payloads.push(ok_type)
+    info.variant_names.push("Err")
+    info.variant_tags.push(1)
+    info.variant_payload_types.push(err_type)
+    info.variant_has_payload.push(true)
+    info.variant_payloads.push(err_type)
+    return generate_variant_match(gen, block, expr, scrut_id, info, result_type_name)
+}
+
+-- An Option is matched as the enum it is laid out as: the tag, 1 for
+-- Some, then Some's value
+fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, option_type_name: string) -> ExprResult {
+    let mut some_type = "int"
+    if starts_with(option_type_name, "Option[") {
+        some_type = extract_inner_type(option_type_name, "Option[")
+    }
+    let mut info = enum_info_new("Option")
+    info.variant_names.push("Some")
+    info.variant_tags.push(1)
+    info.variant_payload_types.push(some_type)
+    info.variant_has_payload.push(true)
+    info.variant_payloads.push(some_type)
+    info.variant_names.push("None")
+    info.variant_tags.push(0)
+    info.variant_payload_types.push("")
+    info.variant_has_payload.push(false)
+    info.variant_payloads.push("")
+    return generate_variant_match(gen, block, expr, scrut_id, info, option_type_name)
+}
+
+-- A match on the variants of an enum, an Option or a Result. The arms
+-- are tried in the order they are written: an arm of a variant is
+-- taken when the value is that variant and the arm's guard, if it has
+-- one, holds; a name or `_` takes any value. `scrut_type` is the type
+-- of the matched value, "" when it is not known.
+fn generate_variant_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, enum_info: EnumInfo, scrut_type: string) -> ExprResult {
     let mut g = gen
     let mut b = block
-
-    -- Get enum definition
-    if g.enum_defs.contains(enum_type) == false {
-        return generate_literal_match(g, b, expr, scrut_id)
-    }
-    let enum_info = g.enum_defs.get(enum_type)
+    let enum_type = enum_info.name
     -- The type of the matched value, for an arm that binds it to a name
-    let scrut_bind_type = enum_type
+    let scrut_bind_type = scrut_type
 
     -- Infer match result type from arm bodies
     let ematch_type = match_slot_type(g, expr, infer_match_result_type(g, expr.match_arms))
@@ -16411,6 +17220,17 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 }
             }
 
+            -- With a guard, the arm is taken when the guard holds
+            if arm.has_guard {
+                let guard = generate_expr(g, b, *arm.guard)
+                g = guard.gen
+                b = guard.block
+                b.terminator = Box_new(term_br_cond(ir_val_inst(guard.val_id), arm_label, next_label))
+                b.has_terminator = true
+                g.completed_blocks.push(b)
+                b = ir_block_new(arm_label)
+            }
+
             -- Generate arm body in current block
             if arm.is_expr_body {
                 let body_result = generate_expr(g, b, *arm.body_expr)
@@ -16431,8 +17251,14 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 b.has_terminator = true
             }
             g.completed_blocks.push(b)
-            final_block_pushed = true
-            arm_idx = expr.match_arms.len()
+            if arm.has_guard {
+                b = ir_block_new(next_label)
+                arm_idx = arm_idx + 1
+            } else {
+                -- No arm after this one is reached
+                final_block_pushed = true
+                arm_idx = expr.match_arms.len()
+            }
         } else if pat.kind == PAT_ENUM_VARIANT() {
             -- Find variant tag value from enum definition
             let variant_name = pat.variant
@@ -16503,6 +17329,21 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
                 bi = bi + 1
             }
 
+            -- With a guard, which may read the values just bound, the
+            -- arm is taken when the guard holds; the arms after it are
+            -- tried when it does not
+            if arm.has_guard {
+                let guard = generate_expr(g, arm_block, *arm.guard)
+                g = guard.gen
+                arm_block = guard.block
+                let body_label = gen_next_label(g, "ematch_body")
+                g = gen_advance_label(g)
+                arm_block.terminator = Box_new(term_br_cond(ir_val_inst(guard.val_id), body_label, next_label))
+                arm_block.has_terminator = true
+                g.completed_blocks.push(arm_block)
+                arm_block = ir_block_new(body_label)
+            }
+
             if arm.is_expr_body {
                 let body_result = generate_expr(g, arm_block, *arm.body_expr)
                 g = body_result.gen
@@ -16545,450 +17386,6 @@ fn generate_enum_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_
     load_inst.load_ptr = ir_val_inst(result_alloca_id)
     load_inst.load_type = slot_alloc_type(ematch_type)
     load_inst.result_type = slot_alloc_type(ematch_type)
-    load_inst.has_result = true
-    join_block.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, join_block, load_id)
-}
-
--- ============================================================
--- RESULT MATCH (Ok/Err patterns)
--- ============================================================
-
-fn generate_result_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, result_type_name: string) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Parse Result[T, E] to get ok_type and err_type
-    let mut ok_field_type = "i64"
-    let mut err_field_type = "i64"
-    if starts_with(result_type_name, "Result[") {
-        let inner = substr(result_type_name, 7, len(result_type_name) - 8)
-        let mut comma_pos = 0 - 1
-        let mut depth = 0
-        let mut ci = 0
-        while ci < len(inner) {
-            let ch = char_at(inner, ci)
-            if ch == "[" { depth = depth + 1 }
-            if ch == "]" { depth = depth - 1 }
-            if ch == "," and depth == 0 {
-                comma_pos = ci
-                ci = len(inner)
-            }
-            ci = ci + 1
-        }
-        if comma_pos >= 0 {
-            ok_field_type = map_type_name(substr(inner, 0, comma_pos))
-            let mut err_start = comma_pos + 1
-            if err_start < len(inner) and char_at(inner, err_start) == " " {
-                err_start = err_start + 1
-            }
-            err_field_type = map_type_name(substr(inner, err_start, len(inner) - err_start))
-        }
-    }
-
-    -- Allocate result slot. Its type is the one the checker found for
-    -- the match; without it, a match that gives a value gives an int
-    let slot_type = match_slot_type(g, expr, "i64")
-    let result_alloca_id = g.builder.next_id
-    let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = slot_alloc_type(slot_type)
-    result_alloca.result_type = "ptr(" + slot_alloc_type(slot_type) + ")"
-    result_alloca.has_result = true
-    b.instructions.push(result_alloca)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Extract tag from scrutinee (field 0: 0=Ok, 1=Err)
-    let tag_id = g.builder.next_id
-    let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
-    tag_inst.field_base = ir_val_inst(scrut_id)
-    tag_inst.field_index = 0
-    tag_inst.field_type = "i32"
-    tag_inst.result_type = "i32"
-    tag_inst.has_result = true
-    b.instructions.push(tag_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Compare tag to 0 (Ok)
-    let is_ok_id = g.builder.next_id
-    let mut is_ok_cmp = ir_inst_new(is_ok_id, OP_EQ())
-    is_ok_cmp.lhs = ir_val_inst(tag_id)
-    is_ok_cmp.rhs = ir_val_int(0)
-    is_ok_cmp.result_type = "bool"
-    is_ok_cmp.has_result = true
-    b.instructions.push(is_ok_cmp)
-    g.builder.next_id = g.builder.next_id + 1
-
-    let ok_label = gen_next_label(g, "result_ok")
-    g = gen_advance_label(g)
-    let err_label = gen_next_label(g, "result_err")
-    g = gen_advance_label(g)
-    let join_label = gen_next_label(g, "result_end")
-    g = gen_advance_label(g)
-
-    b.terminator = Box_new(term_br_cond(ir_val_inst(is_ok_id), ok_label, err_label))
-    b.has_terminator = true
-    g.completed_blocks.push(b)
-
-    -- Find Ok and Err arms
-    let mut ok_arm_idx = -1
-    let mut err_arm_idx = -1
-    let mut wildcard_arm_idx = -1
-    let mut ai = 0
-    while ai < expr.match_arms.len() {
-        let arm = expr.match_arms[ai]
-        let pat = arm.pattern
-        if pat.kind == PAT_ENUM_VARIANT() {
-            if pat.variant == "Ok" {
-                ok_arm_idx = ai
-            } else if pat.variant == "Err" {
-                err_arm_idx = ai
-            }
-        } else if pat.kind == PAT_WILDCARD() or pat.kind == PAT_IDENTIFIER() {
-            wildcard_arm_idx = ai
-        }
-        ai = ai + 1
-    }
-
-    -- Generate Ok arm
-    let mut ok_block = ir_block_new(ok_label)
-    if ok_arm_idx >= 0 {
-        let ok_arm = expr.match_arms[ok_arm_idx]
-        let ok_pat = ok_arm.pattern
-
-        -- Extract Ok payload (field 1) and bind
-        if ok_pat.bindings.len() > 0 {
-            let ok_val_id = g.builder.next_id
-            let mut ok_extract = ir_inst_new(ok_val_id, OP_EXTRACT_FIELD())
-            ok_extract.field_base = ir_val_inst(scrut_id)
-            ok_extract.field_index = 1
-            ok_extract.field_type = ok_field_type
-            ok_extract.result_type = ok_field_type
-            ok_extract.has_result = true
-            ok_block.instructions.push(ok_extract)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let bind_name = ok_pat.bindings[0]
-            let ok_bind_id = g.builder.next_id
-            let mut ok_bind = ir_inst_new(ok_bind_id, OP_ALLOCA())
-            ok_bind.alloc_type = ok_field_type
-            ok_bind.result_type = "ptr(" + ok_field_type + ")"
-            ok_bind.has_result = true
-            ok_block.instructions.push(ok_bind)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut ok_store = ir_inst_new(g.builder.next_id, OP_STORE())
-            ok_store.store_ptr = ir_val_inst(ok_bind_id)
-            ok_store.store_val = ir_val_inst(ok_val_id)
-            ok_store.has_result = false
-            ok_block.instructions.push(ok_store)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(bind_name, ok_bind_id)
-            g.variable_types.insert(bind_name, ok_field_type)
-            if starts_with(result_type_name, "Result[") {
-                g = track_bound_variable(g, bind_name, ok_field_type)
-            }
-        }
-
-        if ok_arm.is_expr_body {
-            let body_result = generate_expr(g, ok_block, *ok_arm.body_expr)
-            g = body_result.gen
-            ok_block = body_result.block
-
-            let stored_body = store_branch_value(g, ok_block, result_alloca_id, slot_type, body_result.val_id, *ok_arm.body_expr)
-            g = stored_body.gen
-            ok_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, ok_block, ok_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            ok_block = body_gen.block
-        }
-    }
-    if ok_block.has_terminator == false {
-        ok_block.terminator = Box_new(term_br(join_label))
-        ok_block.has_terminator = true
-    }
-    g.completed_blocks.push(ok_block)
-
-    -- Generate Err arm
-    let mut err_block = ir_block_new(err_label)
-    if err_arm_idx >= 0 {
-        let err_arm = expr.match_arms[err_arm_idx]
-        let err_pat = err_arm.pattern
-
-        -- Extract Err payload (field 2 for error value) and bind
-        if err_pat.bindings.len() > 0 {
-            let err_val_id = g.builder.next_id
-            let mut err_extract = ir_inst_new(err_val_id, OP_EXTRACT_FIELD())
-            err_extract.field_base = ir_val_inst(scrut_id)
-            err_extract.field_index = 2
-            err_extract.field_type = err_field_type
-            err_extract.result_type = err_field_type
-            err_extract.has_result = true
-            err_block.instructions.push(err_extract)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let bind_name = err_pat.bindings[0]
-            let err_bind_id = g.builder.next_id
-            let mut err_bind = ir_inst_new(err_bind_id, OP_ALLOCA())
-            err_bind.alloc_type = err_field_type
-            err_bind.result_type = "ptr(" + err_field_type + ")"
-            err_bind.has_result = true
-            err_block.instructions.push(err_bind)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut err_store = ir_inst_new(g.builder.next_id, OP_STORE())
-            err_store.store_ptr = ir_val_inst(err_bind_id)
-            err_store.store_val = ir_val_inst(err_val_id)
-            err_store.has_result = false
-            err_block.instructions.push(err_store)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(bind_name, err_bind_id)
-            g.variable_types.insert(bind_name, err_field_type)
-            if starts_with(result_type_name, "Result[") {
-                g = track_bound_variable(g, bind_name, err_field_type)
-            }
-        }
-
-        if err_arm.is_expr_body {
-            let body_result = generate_expr(g, err_block, *err_arm.body_expr)
-            g = body_result.gen
-            err_block = body_result.block
-
-            let stored_body = store_branch_value(g, err_block, result_alloca_id, slot_type, body_result.val_id, *err_arm.body_expr)
-            g = stored_body.gen
-            err_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, err_block, err_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            err_block = body_gen.block
-        }
-    } else if wildcard_arm_idx >= 0 {
-        -- Use wildcard arm for Err path
-        let wild_arm = expr.match_arms[wildcard_arm_idx]
-        if wild_arm.is_expr_body {
-            let body_result = generate_expr(g, err_block, *wild_arm.body_expr)
-            g = body_result.gen
-            err_block = body_result.block
-
-            let stored_body = store_branch_value(g, err_block, result_alloca_id, slot_type, body_result.val_id, *wild_arm.body_expr)
-            g = stored_body.gen
-            err_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, err_block, wild_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            err_block = body_gen.block
-        }
-    }
-    if err_block.has_terminator == false {
-        err_block.terminator = Box_new(term_br(join_label))
-        err_block.has_terminator = true
-    }
-    g.completed_blocks.push(err_block)
-
-    -- Create join block and load result
-    let mut join_block = ir_block_new(join_label)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = slot_alloc_type(slot_type)
-    load_inst.result_type = slot_alloc_type(slot_type)
-    load_inst.has_result = true
-    join_block.instructions.push(load_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, join_block, load_id)
-}
-
--- ============================================================
--- OPTION MATCH (Some/None patterns)
--- ============================================================
-
-fn generate_option_match(gen: IRGenerator, block: IRBasicBlock, expr: Expr, scrut_id: int, option_type_name: string) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    -- Parse Option[T] to get the inner type
-    let mut some_field_type = "i64"
-    if starts_with(option_type_name, "Option[") {
-        let inner = substr(option_type_name, 7, len(option_type_name) - 8)
-        some_field_type = map_type_name(inner)
-    }
-
-    -- Allocate result slot. Its type is the one the checker found for
-    -- the match; without it, a match that gives a value gives an int
-    let slot_type = match_slot_type(g, expr, "i64")
-    let result_alloca_id = g.builder.next_id
-    let mut result_alloca = ir_inst_new(result_alloca_id, OP_ALLOCA())
-    result_alloca.alloc_type = slot_alloc_type(slot_type)
-    result_alloca.result_type = "ptr(" + slot_alloc_type(slot_type) + ")"
-    result_alloca.has_result = true
-    b.instructions.push(result_alloca)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Extract tag (field 0: 1=Some/has_value, 0=None)
-    let tag_id = g.builder.next_id
-    let mut tag_inst = ir_inst_new(tag_id, OP_EXTRACT_FIELD())
-    tag_inst.field_base = ir_val_inst(scrut_id)
-    tag_inst.field_index = 0
-    tag_inst.field_type = "i32"
-    tag_inst.result_type = "i32"
-    tag_inst.has_result = true
-    b.instructions.push(tag_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Compare tag to 1 (Some = has_value = 1)
-    let is_some_id = g.builder.next_id
-    let mut is_some_cmp = ir_inst_new(is_some_id, OP_EQ())
-    is_some_cmp.lhs = ir_val_inst(tag_id)
-    is_some_cmp.rhs = ir_val_int(1)
-    is_some_cmp.result_type = "bool"
-    is_some_cmp.has_result = true
-    b.instructions.push(is_some_cmp)
-    g.builder.next_id = g.builder.next_id + 1
-
-    let some_label = gen_next_label(g, "option_some")
-    g = gen_advance_label(g)
-    let none_label = gen_next_label(g, "option_none")
-    g = gen_advance_label(g)
-    let join_label = gen_next_label(g, "option_end")
-    g = gen_advance_label(g)
-
-    b.terminator = Box_new(term_br_cond(ir_val_inst(is_some_id), some_label, none_label))
-    b.has_terminator = true
-    g.completed_blocks.push(b)
-
-    -- Find Some and None arms
-    let mut some_arm_idx = -1
-    let mut none_arm_idx = -1
-    let mut wildcard_arm_idx = -1
-    let mut ai = 0
-    while ai < expr.match_arms.len() {
-        let arm = expr.match_arms[ai]
-        let pat = arm.pattern
-        if pat.kind == PAT_ENUM_VARIANT() {
-            if pat.variant == "Some" {
-                some_arm_idx = ai
-            } else if pat.variant == "None" {
-                none_arm_idx = ai
-            }
-        } else if pat.kind == PAT_WILDCARD() or pat.kind == PAT_IDENTIFIER() {
-            wildcard_arm_idx = ai
-        }
-        ai = ai + 1
-    }
-
-    -- Generate Some arm
-    let mut some_block = ir_block_new(some_label)
-    if some_arm_idx >= 0 {
-        let some_arm = expr.match_arms[some_arm_idx]
-        let some_pat = some_arm.pattern
-
-        -- Extract Some payload (field 1) and bind
-        if some_pat.bindings.len() > 0 {
-            let some_val_id = g.builder.next_id
-            let mut some_extract = ir_inst_new(some_val_id, OP_EXTRACT_FIELD())
-            some_extract.field_base = ir_val_inst(scrut_id)
-            some_extract.field_index = 1
-            some_extract.field_type = some_field_type
-            some_extract.result_type = some_field_type
-            some_extract.has_result = true
-            some_block.instructions.push(some_extract)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let bind_name = some_pat.bindings[0]
-            let some_bind_id = g.builder.next_id
-            let mut some_bind = ir_inst_new(some_bind_id, OP_ALLOCA())
-            some_bind.alloc_type = some_field_type
-            some_bind.result_type = "ptr(" + some_field_type + ")"
-            some_bind.has_result = true
-            some_block.instructions.push(some_bind)
-            g.builder.next_id = g.builder.next_id + 1
-
-            let mut some_store = ir_inst_new(g.builder.next_id, OP_STORE())
-            some_store.store_ptr = ir_val_inst(some_bind_id)
-            some_store.store_val = ir_val_inst(some_val_id)
-            some_store.has_result = false
-            some_block.instructions.push(some_store)
-            g.builder.next_id = g.builder.next_id + 1
-
-            g.variable_map.insert(bind_name, some_bind_id)
-            g.variable_types.insert(bind_name, some_field_type)
-            if starts_with(option_type_name, "Option[") {
-                g = track_bound_variable(g, bind_name, some_field_type)
-            }
-        }
-
-        if some_arm.is_expr_body {
-            let body_result = generate_expr(g, some_block, *some_arm.body_expr)
-            g = body_result.gen
-            some_block = body_result.block
-
-            let stored_body = store_branch_value(g, some_block, result_alloca_id, slot_type, body_result.val_id, *some_arm.body_expr)
-            g = stored_body.gen
-            some_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, some_block, some_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            some_block = body_gen.block
-        }
-    }
-    if some_block.has_terminator == false {
-        some_block.terminator = Box_new(term_br(join_label))
-        some_block.has_terminator = true
-    }
-    g.completed_blocks.push(some_block)
-
-    -- Generate None arm
-    let mut none_block = ir_block_new(none_label)
-    if none_arm_idx >= 0 {
-        let none_arm = expr.match_arms[none_arm_idx]
-
-        if none_arm.is_expr_body {
-            let body_result = generate_expr(g, none_block, *none_arm.body_expr)
-            g = body_result.gen
-            none_block = body_result.block
-
-            let stored_body = store_branch_value(g, none_block, result_alloca_id, slot_type, body_result.val_id, *none_arm.body_expr)
-            g = stored_body.gen
-            none_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, none_block, none_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            none_block = body_gen.block
-        }
-    } else if wildcard_arm_idx >= 0 {
-        let wild_arm = expr.match_arms[wildcard_arm_idx]
-        if wild_arm.is_expr_body {
-            let body_result = generate_expr(g, none_block, *wild_arm.body_expr)
-            g = body_result.gen
-            none_block = body_result.block
-
-            let stored_body = store_branch_value(g, none_block, result_alloca_id, slot_type, body_result.val_id, *wild_arm.body_expr)
-            g = stored_body.gen
-            none_block = stored_body.block
-        } else {
-            let body_gen = generate_arm_block(g, none_block, wild_arm.body, result_alloca_id, slot_type)
-            g = body_gen.gen
-            none_block = body_gen.block
-        }
-    }
-    if none_block.has_terminator == false {
-        none_block.terminator = Box_new(term_br(join_label))
-        none_block.has_terminator = true
-    }
-    g.completed_blocks.push(none_block)
-
-    -- Create join block and load result
-    let mut join_block = ir_block_new(join_label)
-    let load_id = g.builder.next_id
-    let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-    load_inst.load_ptr = ir_val_inst(result_alloca_id)
-    load_inst.load_type = slot_alloc_type(slot_type)
-    load_inst.result_type = slot_alloc_type(slot_type)
     load_inst.has_result = true
     join_block.instructions.push(load_inst)
     g.builder.next_id = g.builder.next_id + 1
@@ -19399,9 +19796,20 @@ fn eval_match_comptime(gen: IRGenerator, e: Expr) -> IRValue {
         let matches = comptime_pattern_matches(scrutinee_val, pat)
 
         if matches {
+            -- An arm that is a name binds the matched value, for its
+            -- guard and its body
+            let mut g = gen
+            if pat.kind == PAT_IDENTIFIER() {
+                let mut bound = ir_global_new(pat.name, "i64")
+                bound.init_value = scrutinee_val
+                bound.has_init = true
+                bound.is_const = true
+                g.ir_mod.globals.push(bound)
+            }
+
             -- If guard present, evaluate it
             if arm.has_guard {
-                let guard_val = eval_comptime_expr(gen, *arm.guard)
+                let guard_val = eval_comptime_expr(g, *arm.guard)
                 if guard_val.kind == VAL_CONST_BOOL() and guard_val.bool_val == false {
                     -- Guard failed, try next arm
                     i = i + 1
@@ -19411,11 +19819,11 @@ fn eval_match_comptime(gen: IRGenerator, e: Expr) -> IRValue {
 
             -- Evaluate the arm body
             if arm.is_expr_body {
-                return eval_comptime_expr(gen, *arm.body_expr)
+                return eval_comptime_expr(g, *arm.body_expr)
             }
 
             -- Statement body: look for return
-            let body_val = eval_comptime_stmts(gen, arm.body, 0)
+            let body_val = eval_comptime_stmts(g, arm.body, 0)
             if body_val.kind != VAL_UNDEF() {
                 return body_val
             }
@@ -20546,6 +20954,30 @@ fn ck_type_exists(c: Checker, t: string, line: int) -> Checker {
         if ck_index_of(c.norm_names, word) >= 0 { continue }
         return ck_error(c, "undefined type '" + word + "'", line)
     }
+    return ck_type_arity(c, t, t, line)
+}
+
+-- Report a generic struct or enum in the type `t`, a part of the type
+-- `whole`, that has another number of type arguments than it takes
+fn ck_type_arity(c0: Checker, t: string, whole: string, line: int) -> Checker {
+    let mut c = c0
+    let args = ty_args(t)
+    if args.len() == 0 { return c }
+    let head = ty_head(t)
+    let mut takes = -1
+    if c.structs.contains(head) {
+        takes = c.structs.get(head).generics.len()
+    } else if c.enums.contains(head) {
+        takes = c.enums.get(head).generics.len()
+    }
+    if takes >= 0 and takes != args.len() {
+        return ck_error(c, "'" + head + "' takes " + int_to_string(takes) + " type arguments, got " + int_to_string(args.len()) + " in '" + whole + "'", line)
+    }
+    let mut i = 0
+    while i < args.len() {
+        c = ck_type_arity(c, args[i], whole, line)
+        i = i + 1
+    }
     return c
 }
 
@@ -20737,6 +21169,10 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
     if c0.record == false or ty_whole(want) == false or want == "void" { return c0 }
     if e.id < 0 or e.id >= c0.types.len() { return c0 }
     let mut c = c0
+    let variant_of = ck_generic_variant(c, e)
+    if variant_of != "" and ty_head(want) == variant_of {
+        return ck_settle_variant(c, e, variant_of, want)
+    }
     let have = c.types[e.id]
     -- A type the checker does not know at all stays unknown, and so
     -- does a whole type that differs, such as an i32 that goes where an
@@ -21526,6 +21962,82 @@ fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: Lis
     return c
 }
 
+-- The type of the value a variant's constructor makes: the enum, and
+-- for a generic enum what its type parameters stand for as the types
+-- of the values say, "Opt[int]" for Opt.Has(3) and "Opt[?]" for
+-- Opt.Empty, whose place says the rest (ck_settle)
+fn ck_enum_value_type(c: Checker, enum_name: string, variant: string, types: List[string]) -> string {
+    let sig = c.enums.get(enum_name)
+    if sig.generics.len() == 0 { return enum_name }
+    let mut binds = ty_unbound(sig.generics.len())
+    let at = ck_index_of(sig.variant_names, variant)
+    if at >= 0 {
+        -- A wrong number of values, which is reported, says nothing
+        let mut payloads = ck_payloads(sig, at)
+        if payloads.len() != types.len() { payloads = ty_unbound(0) }
+        let mut i = 0
+        while i < payloads.len() and i < types.len() {
+            binds = ty_bind(payloads[i], types[i], sig.generics, binds)
+            i = i + 1
+        }
+    }
+    let mut t = enum_name + "["
+    let mut bi = 0
+    while bi < binds.len() {
+        if bi > 0 { t = t + ", " }
+        if binds[bi] == "" { t = t + "?" } else { t = t + binds[bi] }
+        bi = bi + 1
+    }
+    return t + "]"
+}
+
+-- The generic enum that the expression makes a value of, when it is a
+-- variant's constructor (`Opt.Has(3)`, `Opt.Empty`); else ""
+fn ck_generic_variant(c: Checker, e: Expr) -> string {
+    let mut name = ""
+    let mut variant = ""
+    if e.kind == EXPR_ENUM_LITERAL() {
+        name = e.enum_name
+        variant = e.variant_name
+    } else if e.kind == EXPR_METHOD_CALL() {
+        let object = *e.object
+        if object.kind != EXPR_IDENTIFIER() { return "" }
+        name = object.name
+        variant = e.method
+    } else {
+        return ""
+    }
+    if ck_var(c, name) >= 0 or c.enums.contains(name) == false { return "" }
+    let sig = c.enums.get(name)
+    if sig.generics.len() == 0 or ck_index_of(sig.variant_names, variant) < 0 { return "" }
+    return name
+}
+
+-- ck_settle for the constructor of a variant of the generic enum
+-- `name`, whose value goes to a place of the type `want`
+fn ck_settle_variant(c0: Checker, e: Expr, name: string, want: string) -> Checker {
+    let mut c = c0
+    let have = c.types[e.id]
+    if have != want and ty_fits(want, have) {
+        c = ck_note(c, e.id, want)
+    }
+    let sig = c.enums.get(name)
+    let mut variant = e.variant_name
+    let mut values = e.payload
+    if e.kind == EXPR_METHOD_CALL() {
+        variant = e.method
+        values = e.args
+    }
+    let payloads = ck_payloads(sig, ck_index_of(sig.variant_names, variant))
+    let enum_args = ty_args(want)
+    let mut i = 0
+    while i < payloads.len() and i < values.len() {
+        c = ck_settle(c, values[i], ty_apply(payloads[i], sig.generics, enum_args))
+        i = i + 1
+    }
+    return c
+}
+
 -- Type.name(args): a constructor of Box, Map or List, a variant of
 -- an enum, or a function of the type's impl block
 fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string]) -> Typed {
@@ -21542,7 +22054,7 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
     if c.enums.contains(type_name) {
         let sig = c.enums.get(type_name)
         if ck_index_of(sig.variant_names, method) >= 0 {
-            return ck_typed(ck_variant_values(c, type_name, method, arg_types, e.args, e.line), type_name)
+            return ck_typed(ck_variant_values(c, type_name, method, arg_types, e.args, e.line), ck_enum_value_type(c, type_name, method, arg_types))
         }
         if c.fns.contains(type_name + "_" + method) == false and ck_trait_method(c, type_name, method) == "" {
             return ck_typed(ck_error(c, "enum '" + type_name + "' has no variant or function '" + method + "'", e.line), type_name)
@@ -21752,7 +22264,7 @@ fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
     if c.enums.contains(name) {
         let sig = c.enums.get(name)
         if ck_index_of(sig.variant_names, e.variant_name) >= 0 {
-            return ck_typed(ck_variant_values(c, name, e.variant_name, values.types, e.payload, e.line), name)
+            return ck_typed(ck_variant_values(c, name, e.variant_name, values.types, e.payload, e.line), ck_enum_value_type(c, name, e.variant_name, values.types))
         }
         if c.fns.contains(name + "_" + e.variant_name) == false and ck_trait_method(c, name, e.variant_name) == "" {
             return ck_typed(ck_error(c, "enum '" + name + "' has no variant or function '" + e.variant_name + "'", e.line), name)
@@ -21905,16 +22417,6 @@ fn ck_bind_pattern(c0: Checker, p: Pattern, t: string) -> Checker {
         }
         return c
     }
-    if p.kind == PAT_STRUCT() {
-        let mut i = 0
-        while i < p.field_patterns.len() {
-            let fp = p.field_patterns[i]
-            let mut name = fp.binding
-            if name == "" { name = fp.name }
-            c = ck_bind(c, name, "", 1)
-            i = i + 1
-        }
-    }
     return c
 }
 
@@ -21961,7 +22463,7 @@ fn ck_match_missing(c: Checker, e: Expr, t: string, used: bool) -> string {
     while i < e.match_arms.len() {
         let arm = e.match_arms[i]
         let kind = arm.pattern.kind
-        if arm.has_guard == false and (kind == PAT_WILDCARD() or kind == PAT_IDENTIFIER() or kind == PAT_STRUCT()) { return "" }
+        if arm.has_guard == false and (kind == PAT_WILDCARD() or kind == PAT_IDENTIFIER()) { return "" }
         if kind == PAT_ENUM_VARIANT() and enum_name == "" { enum_name = arm.pattern.enum_type }
         i = i + 1
     }
@@ -22037,13 +22539,6 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
             let guard_expr = *arm.guard
             let guard = ck_expr(c, guard_expr)
             c = ck_condition(guard.c, guard.t, "a match guard", guard_expr.line)
-            -- Code generation tests a variant's arm by the variant alone
-            -- (generate_enum_match, generate_result_match and
-            -- generate_option_match in ir_gen_expr.dm), so the guard
-            -- would be left out without a word
-            if arm.pattern.kind == PAT_ENUM_VARIANT() {
-                c = ck_error(c, "a guard on the arm of the variant '" + arm.pattern.variant + "' is not supported: test the condition inside the arm", guard_expr.line)
-            }
         }
         let mut arm_type = ""
         let mut arm_literal = false
@@ -26418,7 +26913,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "058cacda7fa259f9"
+    return "4277d03828c99437"
 }
 
 

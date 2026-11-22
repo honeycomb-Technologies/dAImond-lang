@@ -1,0 +1,1 @@
+Error: cannot tell the type arguments of 'Opt' from 'Opt.Empty': give the place the value goes to a type, such as `let v: Opt[int] = ...` at line 10

@@ -79,11 +79,14 @@ fn ensure_type_instances(gen: IRGenerator, t: string, line: int) -> IRGenerator 
         return g
     }
     let instance = generic_instance_name(base, args)
-    if g.struct_defs.contains(instance) {
+    if g.struct_defs.contains(instance) or g.enum_defs.contains(instance) {
         return g
     }
     let sd_idx: int = g.generic_struct_decls.get(base)
     let decl = g.declarations[sd_idx]
+    if decl.kind == DECL_ENUM() {
+        return register_enum_instance(g, *decl.enum_decl, instance, args, t, line)
+    }
     let generic_sd = *decl.struct_decl
     if args.len() != generic_sd.generic_params.len() {
         g = ir_type_error(g, "'" + base + "' takes " + int_to_string(generic_sd.generic_params.len()) + " type arguments, got " + int_to_string(args.len()) + " in '" + t + "'", line)
@@ -130,6 +133,63 @@ fn ensure_type_instances(gen: IRGenerator, t: string, line: int) -> IRGenerator 
 -- ============================================================
 -- ENUM REGISTRATION
 -- ============================================================
+
+-- Register `instance`, the generic enum with `args` for its type
+-- parameters: Opt_i64 for Opt[int]. `t` is the type as it was written.
+fn register_enum_instance(gen: IRGenerator, generic_ed: EnumDecl, instance: string, args: List[string], t: string, line: int) -> IRGenerator {
+    let mut g = gen
+    let base = generic_ed.name
+    if args.len() != generic_ed.generic_params.len() {
+        return ir_type_error(g, "'" + base + "' takes " + int_to_string(generic_ed.generic_params.len()) + " type arguments, got " + int_to_string(args.len()) + " in '" + t + "'", line)
+    }
+    let mut arg_list = ""
+    let mut i = 0
+    while i < args.len() {
+        if i > 0 { arg_list = arg_list + "|" }
+        arg_list = arg_list + args[i]
+        i = i + 1
+    }
+    g.generic_instances.insert(instance, base)
+    g.generic_instance_args.insert(instance, arg_list)
+
+    -- The instance is the generic enum with its arguments substituted
+    let mut ed = generic_ed
+    ed.name = instance
+    let empty_params: List[string] = []
+    ed.generic_params = empty_params
+    let mut variants: List[EnumVariant] = []
+    i = 0
+    while i < generic_ed.variants.len() {
+        let mut v = generic_ed.variants[i]
+        let mut payload_types: List[string] = []
+        let mut pi = 0
+        while pi < v.payload_types.len() {
+            payload_types.push(instance_type(g, instance, v.payload_types[pi]))
+            pi = pi + 1
+        }
+        v.payload_types = payload_types
+        variants.push(v)
+        i = i + 1
+    }
+    ed.variants = variants
+    g = register_enum(g, ed)
+
+    -- The types of the values can name further instances
+    let saved_subs = g.type_substitutions
+    g.type_substitutions = instance_subs(g, instance)
+    i = 0
+    while i < generic_ed.variants.len() {
+        let v = generic_ed.variants[i]
+        let mut pi = 0
+        while pi < v.payload_types.len() {
+            g = ensure_type_instances(g, v.payload_types[pi], generic_ed.line)
+            pi = pi + 1
+        }
+        i = i + 1
+    }
+    g.type_substitutions = saved_subs
+    return g
+}
 
 fn register_enum(gen: IRGenerator, ed: EnumDecl) -> IRGenerator {
     let mut g = gen

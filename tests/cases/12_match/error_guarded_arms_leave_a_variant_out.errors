@@ -1,0 +1,4 @@
+Error: this match has no arm for Color.Blue at line 9
+Error: the condition of a match guard is string, not bool at line 18
+Error: this match has no arm for Some at line 16
+Error: 3 type errors

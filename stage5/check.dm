@@ -586,6 +586,30 @@ fn ck_type_exists(c: Checker, t: string, line: int) -> Checker {
         if ck_index_of(c.norm_names, word) >= 0 { continue }
         return ck_error(c, "undefined type '" + word + "'", line)
     }
+    return ck_type_arity(c, t, t, line)
+}
+
+-- Report a generic struct or enum in the type `t`, a part of the type
+-- `whole`, that has another number of type arguments than it takes
+fn ck_type_arity(c0: Checker, t: string, whole: string, line: int) -> Checker {
+    let mut c = c0
+    let args = ty_args(t)
+    if args.len() == 0 { return c }
+    let head = ty_head(t)
+    let mut takes = -1
+    if c.structs.contains(head) {
+        takes = c.structs.get(head).generics.len()
+    } else if c.enums.contains(head) {
+        takes = c.enums.get(head).generics.len()
+    }
+    if takes >= 0 and takes != args.len() {
+        return ck_error(c, "'" + head + "' takes " + int_to_string(takes) + " type arguments, got " + int_to_string(args.len()) + " in '" + whole + "'", line)
+    }
+    let mut i = 0
+    while i < args.len() {
+        c = ck_type_arity(c, args[i], whole, line)
+        i = i + 1
+    }
     return c
 }
 
@@ -777,6 +801,10 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
     if c0.record == false or ty_whole(want) == false or want == "void" { return c0 }
     if e.id < 0 or e.id >= c0.types.len() { return c0 }
     let mut c = c0
+    let variant_of = ck_generic_variant(c, e)
+    if variant_of != "" and ty_head(want) == variant_of {
+        return ck_settle_variant(c, e, variant_of, want)
+    }
     let have = c.types[e.id]
     -- A type the checker does not know at all stays unknown, and so
     -- does a whole type that differs, such as an i32 that goes where an
@@ -1566,6 +1594,82 @@ fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: Lis
     return c
 }
 
+-- The type of the value a variant's constructor makes: the enum, and
+-- for a generic enum what its type parameters stand for as the types
+-- of the values say, "Opt[int]" for Opt.Has(3) and "Opt[?]" for
+-- Opt.Empty, whose place says the rest (ck_settle)
+fn ck_enum_value_type(c: Checker, enum_name: string, variant: string, types: List[string]) -> string {
+    let sig = c.enums.get(enum_name)
+    if sig.generics.len() == 0 { return enum_name }
+    let mut binds = ty_unbound(sig.generics.len())
+    let at = ck_index_of(sig.variant_names, variant)
+    if at >= 0 {
+        -- A wrong number of values, which is reported, says nothing
+        let mut payloads = ck_payloads(sig, at)
+        if payloads.len() != types.len() { payloads = ty_unbound(0) }
+        let mut i = 0
+        while i < payloads.len() and i < types.len() {
+            binds = ty_bind(payloads[i], types[i], sig.generics, binds)
+            i = i + 1
+        }
+    }
+    let mut t = enum_name + "["
+    let mut bi = 0
+    while bi < binds.len() {
+        if bi > 0 { t = t + ", " }
+        if binds[bi] == "" { t = t + "?" } else { t = t + binds[bi] }
+        bi = bi + 1
+    }
+    return t + "]"
+}
+
+-- The generic enum that the expression makes a value of, when it is a
+-- variant's constructor (`Opt.Has(3)`, `Opt.Empty`); else ""
+fn ck_generic_variant(c: Checker, e: Expr) -> string {
+    let mut name = ""
+    let mut variant = ""
+    if e.kind == EXPR_ENUM_LITERAL() {
+        name = e.enum_name
+        variant = e.variant_name
+    } else if e.kind == EXPR_METHOD_CALL() {
+        let object = *e.object
+        if object.kind != EXPR_IDENTIFIER() { return "" }
+        name = object.name
+        variant = e.method
+    } else {
+        return ""
+    }
+    if ck_var(c, name) >= 0 or c.enums.contains(name) == false { return "" }
+    let sig = c.enums.get(name)
+    if sig.generics.len() == 0 or ck_index_of(sig.variant_names, variant) < 0 { return "" }
+    return name
+}
+
+-- ck_settle for the constructor of a variant of the generic enum
+-- `name`, whose value goes to a place of the type `want`
+fn ck_settle_variant(c0: Checker, e: Expr, name: string, want: string) -> Checker {
+    let mut c = c0
+    let have = c.types[e.id]
+    if have != want and ty_fits(want, have) {
+        c = ck_note(c, e.id, want)
+    }
+    let sig = c.enums.get(name)
+    let mut variant = e.variant_name
+    let mut values = e.payload
+    if e.kind == EXPR_METHOD_CALL() {
+        variant = e.method
+        values = e.args
+    }
+    let payloads = ck_payloads(sig, ck_index_of(sig.variant_names, variant))
+    let enum_args = ty_args(want)
+    let mut i = 0
+    while i < payloads.len() and i < values.len() {
+        c = ck_settle(c, values[i], ty_apply(payloads[i], sig.generics, enum_args))
+        i = i + 1
+    }
+    return c
+}
+
 -- Type.name(args): a constructor of Box, Map or List, a variant of
 -- an enum, or a function of the type's impl block
 fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string]) -> Typed {
@@ -1582,7 +1686,7 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
     if c.enums.contains(type_name) {
         let sig = c.enums.get(type_name)
         if ck_index_of(sig.variant_names, method) >= 0 {
-            return ck_typed(ck_variant_values(c, type_name, method, arg_types, e.args, e.line), type_name)
+            return ck_typed(ck_variant_values(c, type_name, method, arg_types, e.args, e.line), ck_enum_value_type(c, type_name, method, arg_types))
         }
         if c.fns.contains(type_name + "_" + method) == false and ck_trait_method(c, type_name, method) == "" {
             return ck_typed(ck_error(c, "enum '" + type_name + "' has no variant or function '" + method + "'", e.line), type_name)
@@ -1792,7 +1896,7 @@ fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
     if c.enums.contains(name) {
         let sig = c.enums.get(name)
         if ck_index_of(sig.variant_names, e.variant_name) >= 0 {
-            return ck_typed(ck_variant_values(c, name, e.variant_name, values.types, e.payload, e.line), name)
+            return ck_typed(ck_variant_values(c, name, e.variant_name, values.types, e.payload, e.line), ck_enum_value_type(c, name, e.variant_name, values.types))
         }
         if c.fns.contains(name + "_" + e.variant_name) == false and ck_trait_method(c, name, e.variant_name) == "" {
             return ck_typed(ck_error(c, "enum '" + name + "' has no variant or function '" + e.variant_name + "'", e.line), name)
@@ -1945,16 +2049,6 @@ fn ck_bind_pattern(c0: Checker, p: Pattern, t: string) -> Checker {
         }
         return c
     }
-    if p.kind == PAT_STRUCT() {
-        let mut i = 0
-        while i < p.field_patterns.len() {
-            let fp = p.field_patterns[i]
-            let mut name = fp.binding
-            if name == "" { name = fp.name }
-            c = ck_bind(c, name, "", 1)
-            i = i + 1
-        }
-    }
     return c
 }
 
@@ -2001,7 +2095,7 @@ fn ck_match_missing(c: Checker, e: Expr, t: string, used: bool) -> string {
     while i < e.match_arms.len() {
         let arm = e.match_arms[i]
         let kind = arm.pattern.kind
-        if arm.has_guard == false and (kind == PAT_WILDCARD() or kind == PAT_IDENTIFIER() or kind == PAT_STRUCT()) { return "" }
+        if arm.has_guard == false and (kind == PAT_WILDCARD() or kind == PAT_IDENTIFIER()) { return "" }
         if kind == PAT_ENUM_VARIANT() and enum_name == "" { enum_name = arm.pattern.enum_type }
         i = i + 1
     }
@@ -2077,13 +2171,6 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
             let guard_expr = *arm.guard
             let guard = ck_expr(c, guard_expr)
             c = ck_condition(guard.c, guard.t, "a match guard", guard_expr.line)
-            -- Code generation tests a variant's arm by the variant alone
-            -- (generate_enum_match, generate_result_match and
-            -- generate_option_match in ir_gen_expr.dm), so the guard
-            -- would be left out without a word
-            if arm.pattern.kind == PAT_ENUM_VARIANT() {
-                c = ck_error(c, "a guard on the arm of the variant '" + arm.pattern.variant + "' is not supported: test the condition inside the arm", guard_expr.line)
-            }
         }
         let mut arm_type = ""
         let mut arm_literal = false

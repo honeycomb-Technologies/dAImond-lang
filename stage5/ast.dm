@@ -121,7 +121,6 @@ fn PAT_LITERAL() -> int { return 1 }
 fn PAT_IDENTIFIER() -> int { return 2 }
 fn PAT_WILDCARD() -> int { return 3 }
 fn PAT_ENUM_VARIANT() -> int { return 4 }
-fn PAT_STRUCT() -> int { return 5 }
 
 -- ============================================================
 -- AST NODE STRUCTS
@@ -455,10 +454,7 @@ struct Pattern {
     -- Enum variant pattern
     enum_type: string,
     variant: string,
-    bindings: List[string],
-    -- Struct pattern
-    struct_type: string,
-    field_patterns: List[FieldPattern]
+    bindings: List[string]
 }
 
 fn pattern_new(kind: int) -> Pattern {
@@ -466,8 +462,7 @@ fn pattern_new(kind: int) -> Pattern {
         kind: kind,
         literal_expr: Box_null(),
         name: "", is_mut: false,
-        enum_type: "", variant: "", bindings: [],
-        struct_type: "", field_patterns: []
+        enum_type: "", variant: "", bindings: []
     }
 }
 
@@ -487,16 +482,6 @@ fn pattern_enum_variant(enum_type: string, variant: string, bindings: List[strin
     p.variant = variant
     p.bindings = bindings
     return p
-}
-
--- Field pattern for struct destructuring
-struct FieldPattern {
-    name: string,
-    binding: string
-}
-
-fn field_pattern_new(name: string, binding: string) -> FieldPattern {
-    return FieldPattern { name: name, binding: binding }
 }
 
 -- ============================================================
@@ -944,4 +929,545 @@ fn branch_value_expr(e: Expr) -> Expr {
 fn expr_names(e: Expr) -> List[string] {
     let none: List[string] = []
     return names_in_expr(e, none, false)
+}
+
+-- ============================================================
+-- SHADOWED NAMES
+-- IR generation keeps a function's variables by name, in maps that
+-- know nothing of scopes: a `let x` in a block took the place of an
+-- outer `x` for the rest of the function, and so did a loop's
+-- variable, a lambda's parameter and a name that a match arm binds.
+-- So before IR is generated, a variable that is declared while
+-- another of its name is in scope gets a name of its own, `x$1`,
+-- and so does each mention of it. What is in scope where is what
+-- the checker says (ck_scope, ck_block, ck_for, ck_match and
+-- ck_lambda in check.dm). A copy of an expression keeps its id, so
+-- the types the checker recorded still belong to it. source_name
+-- (token.dm) gives the name as it is written.
+-- ============================================================
+
+struct Scopes {
+    -- The variables in scope, the innermost last: each one's name
+    -- in the source, and its name now
+    names: List[string],
+    now: List[string],
+    -- How many variables of the function have a new name
+    renamed: int
+}
+
+fn scopes_new() -> Scopes {
+    return Scopes { names: [], now: [], renamed: 0 }
+}
+
+-- Where the innermost variable of the name is in s.names, or -1
+fn sc_find(s: Scopes, name: string) -> int {
+    let mut i = s.names.len() - 1
+    while i >= 0 {
+        if s.names[i] == name { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+-- The name a mention of `name` has now
+fn sc_name(s: Scopes, name: string) -> string {
+    let at = sc_find(s, name)
+    if at < 0 { return name }
+    return s.now[at]
+}
+
+-- Declare a variable; sc_name gives its name from here on
+fn sc_declare(s0: Scopes, name: string) -> Scopes {
+    let mut s = s0
+    let mut now = name
+    if name != "_" and sc_find(s, name) >= 0 {
+        s.renamed = s.renamed + 1
+        now = name + "$" + int_to_string(s.renamed)
+    }
+    s.names.push(name)
+    s.now.push(now)
+    return s
+}
+
+-- Leave a scope: the variables declared since s.names had `mark`
+-- names are gone
+fn sc_leave(s0: Scopes, mark: int) -> Scopes {
+    let mut s = s0
+    while s.names.len() > mark {
+        s.names.pop()
+        s.now.pop()
+    }
+    return s
+}
+
+struct ScopedExpr {
+    s: Scopes,
+    e: Expr
+}
+
+struct ScopedExprs {
+    s: Scopes,
+    exprs: List[Expr]
+}
+
+struct ScopedStmts {
+    s: Scopes,
+    stmts: List[Stmt]
+}
+
+-- ---- Whether a function shadows any variable: a walk that builds
+-- ---- nothing, since most functions shadow none
+
+fn sc_scan_exprs(s0: Scopes, exprs: List[Expr]) -> Scopes {
+    let mut s = s0
+    let mut i = 0
+    while i < exprs.len() {
+        s = sc_scan_expr(s, exprs[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn sc_scan_scope(s0: Scopes, stmts: List[Stmt]) -> Scopes {
+    let mark = s0.names.len()
+    return sc_leave(sc_scan_stmts(s0, stmts), mark)
+}
+
+fn sc_scan_pattern(s0: Scopes, p: Pattern) -> Scopes {
+    let mut s = s0
+    if p.kind == PAT_IDENTIFIER() { return sc_declare(s, p.name) }
+    if p.kind == PAT_ENUM_VARIANT() {
+        let mut i = 0
+        while i < p.bindings.len() {
+            s = sc_declare(s, p.bindings[i])
+            i = i + 1
+        }
+    }
+    return s
+}
+
+fn sc_scan_expr(s0: Scopes, e: Expr) -> Scopes {
+    let mut s = s0
+    let k = e.kind
+    if k == EXPR_BINARY() or k == EXPR_RANGE() {
+        return sc_scan_expr(sc_scan_expr(s, *e.left), *e.right)
+    }
+    if k == EXPR_PIPELINE() {
+        return sc_scan_expr(sc_scan_expr(s, *e.left), *e.pipe_right)
+    }
+    if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
+        return sc_scan_expr(s, *e.operand)
+    }
+    if k == EXPR_FIELD_ACCESS() { return sc_scan_expr(s, *e.object) }
+    if k == EXPR_INDEX_ACCESS() {
+        return sc_scan_expr(sc_scan_expr(s, *e.object), *e.index)
+    }
+    if k == EXPR_METHOD_CALL() {
+        return sc_scan_exprs(sc_scan_expr(s, *e.object), e.args)
+    }
+    if k == EXPR_FUNCTION_CALL() {
+        return sc_scan_exprs(sc_scan_expr(s, *e.callee), e.args)
+    }
+    if k == EXPR_STRUCT_LITERAL() { return sc_scan_exprs(s, e.field_values) }
+    if k == EXPR_ENUM_LITERAL() { return sc_scan_exprs(s, e.payload) }
+    if k == EXPR_ARRAY_LITERAL() { return sc_scan_exprs(s, e.elements) }
+    if k == EXPR_STRING_INTERP() { return sc_scan_exprs(s, e.interp_parts) }
+    if k == EXPR_IF() {
+        s = sc_scan_expr(s, *e.condition)
+        s = sc_scan_expr(s, *e.then_branch)
+        if e.has_else { s = sc_scan_expr(s, *e.else_branch) }
+        return s
+    }
+    if k == EXPR_MATCH() {
+        s = sc_scan_expr(s, *e.scrutinee)
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            let mark = s.names.len()
+            s = sc_scan_pattern(s, arm.pattern)
+            if arm.has_guard { s = sc_scan_expr(s, *arm.guard) }
+            if arm.is_expr_body {
+                s = sc_scan_expr(s, *arm.body_expr)
+            } else {
+                s = sc_scan_stmts(s, arm.body)
+            }
+            s = sc_leave(s, mark)
+            i = i + 1
+        }
+        return s
+    }
+    if k == EXPR_BLOCK() {
+        let mark = s.names.len()
+        s = sc_scan_stmts(s, e.stmts)
+        if e.has_result { s = sc_scan_expr(s, *e.result) }
+        return sc_leave(s, mark)
+    }
+    if k == EXPR_LAMBDA() {
+        let mark = s.names.len()
+        let mut i = 0
+        while i < e.lambda_params.len() {
+            s = sc_declare(s, e.lambda_params[i].name)
+            i = i + 1
+        }
+        return sc_leave(sc_scan_expr(s, *e.lambda_body), mark)
+    }
+    return s
+}
+
+fn sc_scan_stmts(s0: Scopes, stmts: List[Stmt]) -> Scopes {
+    let mut s = s0
+    let mut i = 0
+    while i < stmts.len() {
+        let st = stmts[i]
+        let k = st.kind
+        if k == STMT_LET() {
+            s = sc_declare(sc_scan_expr(s, *st.let_value), st.let_name)
+        } else if k == STMT_RETURN() {
+            if st.has_ret_value { s = sc_scan_expr(s, *st.ret_value) }
+        } else if k == STMT_IF() {
+            if st.has_if_expr {
+                s = sc_scan_expr(s, *st.if_expr)
+            } else {
+                s = sc_scan_scope(sc_scan_expr(s, *st.if_cond), st.if_then)
+                if st.has_else_branch { s = sc_scan_scope(s, st.if_else) }
+            }
+        } else if k == STMT_MATCH() {
+            s = sc_scan_expr(s, *st.match_expr)
+        } else if k == STMT_FOR() {
+            s = sc_scan_expr(s, *st.for_iter)
+            let mark = s.names.len()
+            s = sc_leave(sc_scan_stmts(sc_declare(s, st.for_var), st.for_body), mark)
+        } else if k == STMT_WHILE() {
+            s = sc_scan_scope(sc_scan_expr(s, *st.while_cond), st.while_body)
+        } else if k == STMT_LOOP() {
+            s = sc_scan_scope(s, st.loop_body)
+        } else if k == STMT_REGION() {
+            s = sc_scan_scope(s, st.region_body)
+        } else if k == STMT_EXPRESSION() {
+            s = sc_scan_expr(s, *st.expr)
+        } else if k == STMT_ASSIGNMENT() {
+            s = sc_scan_expr(sc_scan_expr(s, *st.assign_target), *st.assign_value)
+        }
+        i = i + 1
+    }
+    return s
+}
+
+-- ---- The same walk, building the function with the new names
+
+fn sc_exprs(s0: Scopes, exprs: List[Expr]) -> ScopedExprs {
+    let mut s = s0
+    let mut out: List[Expr] = []
+    let mut i = 0
+    while i < exprs.len() {
+        let r = sc_expr(s, exprs[i])
+        s = r.s
+        out.push(r.e)
+        i = i + 1
+    }
+    return ScopedExprs { s: s, exprs: out }
+}
+
+fn sc_scope(s0: Scopes, stmts: List[Stmt]) -> ScopedStmts {
+    let mark = s0.names.len()
+    let r = sc_stmts(s0, stmts)
+    return ScopedStmts { s: sc_leave(r.s, mark), stmts: r.stmts }
+}
+
+fn sc_expr(s0: Scopes, e: Expr) -> ScopedExpr {
+    let mut s = s0
+    let mut out = e
+    let k = e.kind
+    if k == EXPR_IDENTIFIER() {
+        out.name = sc_name(s, e.name)
+    } else if k == EXPR_BINARY() or k == EXPR_RANGE() {
+        let l = sc_expr(s, *e.left)
+        let r = sc_expr(l.s, *e.right)
+        s = r.s
+        out.left = Box_new(l.e)
+        out.right = Box_new(r.e)
+    } else if k == EXPR_PIPELINE() {
+        let l = sc_expr(s, *e.left)
+        let r = sc_expr(l.s, *e.pipe_right)
+        s = r.s
+        out.left = Box_new(l.e)
+        out.pipe_right = Box_new(r.e)
+    } else if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
+        let r = sc_expr(s, *e.operand)
+        s = r.s
+        out.operand = Box_new(r.e)
+    } else if k == EXPR_FIELD_ACCESS() {
+        let r = sc_expr(s, *e.object)
+        s = r.s
+        out.object = Box_new(r.e)
+    } else if k == EXPR_INDEX_ACCESS() {
+        let o = sc_expr(s, *e.object)
+        let r = sc_expr(o.s, *e.index)
+        s = r.s
+        out.object = Box_new(o.e)
+        out.index = Box_new(r.e)
+    } else if k == EXPR_METHOD_CALL() {
+        let o = sc_expr(s, *e.object)
+        let r = sc_exprs(o.s, e.args)
+        s = r.s
+        out.object = Box_new(o.e)
+        out.args = r.exprs
+    } else if k == EXPR_FUNCTION_CALL() {
+        let c = sc_expr(s, *e.callee)
+        let r = sc_exprs(c.s, e.args)
+        s = r.s
+        out.callee = Box_new(c.e)
+        out.args = r.exprs
+    } else if k == EXPR_STRUCT_LITERAL() {
+        let r = sc_exprs(s, e.field_values)
+        s = r.s
+        out.field_values = r.exprs
+    } else if k == EXPR_ENUM_LITERAL() {
+        let r = sc_exprs(s, e.payload)
+        s = r.s
+        out.payload = r.exprs
+    } else if k == EXPR_ARRAY_LITERAL() {
+        let r = sc_exprs(s, e.elements)
+        s = r.s
+        out.elements = r.exprs
+    } else if k == EXPR_STRING_INTERP() {
+        let r = sc_exprs(s, e.interp_parts)
+        s = r.s
+        out.interp_parts = r.exprs
+    } else if k == EXPR_IF() {
+        let c = sc_expr(s, *e.condition)
+        let t = sc_expr(c.s, *e.then_branch)
+        s = t.s
+        out.condition = Box_new(c.e)
+        out.then_branch = Box_new(t.e)
+        if e.has_else {
+            let other = sc_expr(s, *e.else_branch)
+            s = other.s
+            out.else_branch = Box_new(other.e)
+        }
+    } else if k == EXPR_MATCH() {
+        let scrutinee = sc_expr(s, *e.scrutinee)
+        s = scrutinee.s
+        out.scrutinee = Box_new(scrutinee.e)
+        let mut arms: List[MatchArm] = []
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let mut arm = e.match_arms[i]
+            let mark = s.names.len()
+            let mut pattern = arm.pattern
+            if pattern.kind == PAT_IDENTIFIER() {
+                s = sc_declare(s, pattern.name)
+                pattern.name = s.now[s.now.len() - 1]
+            } else if pattern.kind == PAT_ENUM_VARIANT() {
+                let mut bindings: List[string] = []
+                let mut bi = 0
+                while bi < pattern.bindings.len() {
+                    s = sc_declare(s, pattern.bindings[bi])
+                    bindings.push(s.now[s.now.len() - 1])
+                    bi = bi + 1
+                }
+                pattern.bindings = bindings
+            }
+            arm.pattern = pattern
+            if arm.has_guard {
+                let guard = sc_expr(s, *arm.guard)
+                s = guard.s
+                arm.guard = Box_new(guard.e)
+            }
+            if arm.is_expr_body {
+                let body = sc_expr(s, *arm.body_expr)
+                s = body.s
+                arm.body_expr = Box_new(body.e)
+            } else {
+                let body = sc_stmts(s, arm.body)
+                s = body.s
+                arm.body = body.stmts
+            }
+            s = sc_leave(s, mark)
+            arms.push(arm)
+            i = i + 1
+        }
+        out.match_arms = arms
+    } else if k == EXPR_BLOCK() {
+        let mark = s.names.len()
+        let body = sc_stmts(s, e.stmts)
+        s = body.s
+        out.stmts = body.stmts
+        if e.has_result {
+            let r = sc_expr(s, *e.result)
+            s = r.s
+            out.result = Box_new(r.e)
+        }
+        s = sc_leave(s, mark)
+    } else if k == EXPR_LAMBDA() {
+        let mark = s.names.len()
+        let mut params: List[LambdaParam] = []
+        let mut i = 0
+        while i < e.lambda_params.len() {
+            let mut lp = e.lambda_params[i]
+            s = sc_declare(s, lp.name)
+            lp.name = s.now[s.now.len() - 1]
+            params.push(lp)
+            i = i + 1
+        }
+        out.lambda_params = params
+        let body = sc_expr(s, *e.lambda_body)
+        out.lambda_body = Box_new(body.e)
+        s = sc_leave(body.s, mark)
+    }
+    return ScopedExpr { s: s, e: out }
+}
+
+fn sc_stmts(s0: Scopes, stmts: List[Stmt]) -> ScopedStmts {
+    let mut s = s0
+    let mut result: List[Stmt] = []
+    let mut i = 0
+    while i < stmts.len() {
+        let st = stmts[i]
+        let mut out = st
+        let k = st.kind
+        if k == STMT_LET() {
+            -- The value is found before the variable exists:
+            -- `let x = x + 1` reads the x before it
+            let value = sc_expr(s, *st.let_value)
+            s = sc_declare(value.s, st.let_name)
+            out.let_value = Box_new(value.e)
+            out.let_name = s.now[s.now.len() - 1]
+        } else if k == STMT_RETURN() {
+            if st.has_ret_value {
+                let value = sc_expr(s, *st.ret_value)
+                s = value.s
+                out.ret_value = Box_new(value.e)
+            }
+        } else if k == STMT_IF() {
+            if st.has_if_expr {
+                -- The statement's parts are those of its expression
+                let whole = sc_expr(s, *st.if_expr)
+                s = whole.s
+                out = if_stmt_of(whole.e)
+                out.line = st.line
+                out.col = st.col
+            } else {
+                let cond = sc_expr(s, *st.if_cond)
+                let then_part = sc_scope(cond.s, st.if_then)
+                s = then_part.s
+                out.if_cond = Box_new(cond.e)
+                out.if_then = then_part.stmts
+                if st.has_else_branch {
+                    let else_part = sc_scope(s, st.if_else)
+                    s = else_part.s
+                    out.if_else = else_part.stmts
+                }
+            }
+        } else if k == STMT_MATCH() {
+            let matched = sc_expr(s, *st.match_expr)
+            s = matched.s
+            out.match_expr = Box_new(matched.e)
+        } else if k == STMT_FOR() {
+            let iter = sc_expr(s, *st.for_iter)
+            s = iter.s
+            out.for_iter = Box_new(iter.e)
+            let mark = s.names.len()
+            s = sc_declare(s, st.for_var)
+            out.for_var = s.now[s.now.len() - 1]
+            let body = sc_stmts(s, st.for_body)
+            out.for_body = body.stmts
+            s = sc_leave(body.s, mark)
+        } else if k == STMT_WHILE() {
+            let cond = sc_expr(s, *st.while_cond)
+            let body = sc_scope(cond.s, st.while_body)
+            s = body.s
+            out.while_cond = Box_new(cond.e)
+            out.while_body = body.stmts
+        } else if k == STMT_LOOP() {
+            let body = sc_scope(s, st.loop_body)
+            s = body.s
+            out.loop_body = body.stmts
+        } else if k == STMT_REGION() {
+            let body = sc_scope(s, st.region_body)
+            s = body.s
+            out.region_body = body.stmts
+        } else if k == STMT_EXPRESSION() {
+            let value = sc_expr(s, *st.expr)
+            s = value.s
+            out.expr = Box_new(value.e)
+        } else if k == STMT_ASSIGNMENT() {
+            let target = sc_expr(s, *st.assign_target)
+            let value = sc_expr(target.s, *st.assign_value)
+            s = value.s
+            out.assign_target = Box_new(target.e)
+            out.assign_value = Box_new(value.e)
+        }
+        result.push(out)
+        i = i + 1
+    }
+    return ScopedStmts { s: s, stmts: result }
+}
+
+-- The function with a name of its own for each variable that shadows
+-- another; the function itself when it shadows none
+fn unshadowed_function(fd: FunctionDecl) -> FunctionDecl {
+    if fd.is_extern { return fd }
+    let mut s = scopes_new()
+    let mut i = 0
+    while i < fd.params.len() {
+        s.names.push(fd.params[i].name)
+        s.now.push(fd.params[i].name)
+        i = i + 1
+    }
+    let scanned = sc_scan_stmts(s, fd.body)
+    if scanned.renamed == 0 { return fd }
+    let mut params = scopes_new()
+    i = 0
+    while i < fd.params.len() {
+        params.names.push(fd.params[i].name)
+        params.now.push(fd.params[i].name)
+        i = i + 1
+    }
+    let body = sc_stmts(params, fd.body)
+    let mut out = fd
+    out.body = body.stmts
+    return out
+}
+
+fn unshadowed_functions(fns: List[FunctionDecl]) -> List[FunctionDecl] {
+    let mut out: List[FunctionDecl] = []
+    let mut i = 0
+    while i < fns.len() {
+        out.push(unshadowed_function(fns[i]))
+        i = i + 1
+    }
+    return out
+}
+
+-- The declarations with every function, method and constant as
+-- unshadowed_function gives it (see SHADOWED NAMES)
+fn unshadowed_declarations(decls: List[Declaration]) -> List[Declaration] {
+    let mut out: List[Declaration] = []
+    let mut i = 0
+    while i < decls.len() {
+        let mut d = decls[i]
+        if d.kind == DECL_FUNCTION() {
+            d.func_decl = Box_new(unshadowed_function(*d.func_decl))
+        } else if d.kind == DECL_IMPL() {
+            let mut block = *d.impl_block
+            block.methods = unshadowed_functions(block.methods)
+            d.impl_block = Box_new(block)
+        } else if d.kind == DECL_TRAIT() {
+            let mut td = *d.trait_decl
+            td.methods = unshadowed_functions(td.methods)
+            d.trait_decl = Box_new(td)
+        } else if d.kind == DECL_CONST() {
+            let mut cd = *d.const_decl
+            let scanned = sc_scan_expr(scopes_new(), *cd.value)
+            if scanned.renamed > 0 {
+                let value = sc_expr(scopes_new(), *cd.value)
+                cd.value = Box_new(value.e)
+                d.const_decl = Box_new(cd)
+            }
+        }
+        out.push(d)
+        i = i + 1
+    }
+    return out
 }
