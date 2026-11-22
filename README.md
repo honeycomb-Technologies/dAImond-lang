@@ -14,7 +14,7 @@ dAImond is a systems programming language designed to be:
 The compiler is written in dAImond and builds itself. It needs x86-64 Linux with glibc, LLVM 19 or newer with `lld`, and the C library's development files (`libc6-dev` or `glibc-devel`). It needs no C compiler and no other language's toolchain.
 
 ```bash
-sh bootstrap.sh          # builds build/daimond (about six minutes, 1.4 GB of memory)
+sh bootstrap.sh          # builds build/daimond (about half a minute, 1.1 GB of memory)
 build/daimond examples/hello.dm -o hello && ./hello
 ```
 

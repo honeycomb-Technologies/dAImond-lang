@@ -116,7 +116,7 @@ fi
 
 # ---- The seed, as a compiler ----
 
-echo "==> Compiling the seed with llc (a minute or two)"
+echo "==> Compiling the seed with llc"
 llc -O0 -filetype=obj -relocation-model=pic "$SEED" -o "$WORK/seed.o"
 ld.lld -pie --eh-frame-hdr -dynamic-linker /lib64/ld-linux-x86-64.so.2 -o "$WORK/seed" \
     "$LIBC_DIR/Scrt1.o" "$LIBC_DIR/crti.o" "$WORK/seed.o" -L"$LIBC_DIR" \
