@@ -719,6 +719,10 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
     -- value (ck_makes_value) makes it of the type of its place.
     if ty_known(have) and have != want and ty_fits(want, have) and (ty_whole(have) == false or ck_makes_value(e)) {
         c = ck_note(c, e.id, want)
+    } else if have != want and ty_is_int(have) and ty_is_int(want) and branches_give_int_literals(e) {
+        -- An `if` or a `match` of integer constants is an integer of
+        -- the type of its place, as a literal is: 0 or 1 for an i32
+        c = ck_note(c, e.id, want)
     }
     let k = e.kind
     if k == EXPR_GROUPED() { return ck_settle(c, *e.operand, want) }

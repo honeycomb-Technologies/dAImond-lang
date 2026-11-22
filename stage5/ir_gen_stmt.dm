@@ -370,7 +370,9 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             else { "dm_list_generic_push" }
             let mut ei = 0
             while ei < init_expr.elements.len() {
-                let elem_result = generate_expr(g, b, init_expr.elements[ei])
+                let mut elem_result = generate_expr(g, b, init_expr.elements[ei])
+                -- An integer becomes the elements' integer type
+                elem_result = convert_list_elem(elem_result.gen, elem_result.block, elem_result.val_id, init_expr.elements[ei], elem_kind, inner, "element " + int_to_string(ei + 1) + " of '" + var_name + "'")
                 g = elem_result.gen
                 b = elem_result.block
                 if elem_kind == LIST_ELEM_OTHER() {
@@ -584,7 +586,13 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         -- This handles cases like `let x: i32 = 42` where the literal is i64
         let expr_type = infer_expr_type(g, val_expr)
         let mut store_val_id = result.val_id
-        if expr_type != ir_type and (is_integer_type(ir_type) or is_float_type(ir_type)) {
+        if expr_type != ir_type and is_integer_type(ir_type) and is_integer_type(expr_type) {
+            -- A wider integer needs `as`, as it does in an assignment
+            let conv = convert_int_value(g, b, result.val_id, val_expr, expr_type, ir_type, "the value of '" + var_name + "'")
+            g = conv.gen
+            b = conv.block
+            store_val_id = conv.val_id
+        } else if expr_type != ir_type and (is_integer_type(ir_type) or is_float_type(ir_type)) {
             let cast_id = g.builder.next_id
             let mut cast_inst = ir_inst_new(cast_id, OP_CAST())
             cast_inst.cast_val = ir_val_inst(result.val_id)

@@ -1,0 +1,21 @@
+the value of 'a' has type int, which does not fit in i8; convert it with `as i8` at line 19
+the value of 'b' has type i32, which does not fit in i8; convert it with `as i8` at line 20
+the value of 'c' has type int, which does not fit in i32; convert it with `as i32` at line 21
+integer literal 300 does not fit in i8 at line 22
+integer literal -1 does not fit in u8 at line 23
+the value of 'f' has type int, which does not fit in i32; convert it with `as i32` at line 24
+integer literal 300 does not fit in i8 at line 25
+the value of 'h' has type i32, which does not fit in i16; convert it with `as i16` at line 26
+argument 1 of 'take' has type i32, which does not fit in i8; convert it with `as i8` at line 27
+integer literal 300 does not fit in i8 at line 28
+field 'n' of 'S' has type i32, which does not fit in i8; convert it with `as i8` at line 29
+field 'm' of 'S' has type int, which does not fit in i32; convert it with `as i32` at line 29
+argument 1 of 'set' has type i32, which does not fit in i8; convert it with `as i8` at line 30
+integer literal 200 does not fit in i8 at line 31
+value 1 of 'E.A' has type i32, which does not fit in i8; convert it with `as i8` at line 32
+the value of 'Some' has type i32, which does not fit in i8; convert it with `as i8` at line 33
+element 1 of 'xs' has type i32, which does not fit in i8; convert it with `as i8` at line 34
+integer literal 300 does not fit in i8 at line 34
+the pushed value has type int, which does not fit in i32; convert it with `as i32` at line 36
+argument 2 of 'insert' has type int, which does not fit in i32; convert it with `as i32` at line 38
+20 type errors

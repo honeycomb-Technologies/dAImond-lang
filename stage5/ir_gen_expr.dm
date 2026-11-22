@@ -1442,6 +1442,21 @@ fn checked_type_first(gen: IRGenerator, expr: Expr) -> bool {
     return false
 }
 
+-- The function that `recv.method(...)` calls when the receiver is a
+-- struct or an enum value, or a box of one, whose type has a method of
+-- the name: "Counter_get". "" for any other receiver, and for a method
+-- of a generic struct, which is found through its instance.
+fn own_method_of(gen: IRGenerator, recv: Expr, method: string) -> string {
+    let recv_type = strip_box_type(static_type(gen, recv))
+    if recv_type == "" { return "" }
+    if gen.struct_defs.contains(recv_type) == false and gen.enum_defs.contains(recv_type) == false { return "" }
+    if gen.generic_instances.contains(recv_type) { return "" }
+    let mangled = recv_type + "_" + method
+    if gen.generic_fn_decls.contains(mangled) { return "" }
+    if gen.fn_return_types.contains(mangled) { return mangled }
+    return ""
+}
+
 fn infer_expr_type(gen: IRGenerator, expr: Expr) -> string {
     if checked_type_first(gen, expr) {
         let checked = checked_ir_type(gen, expr)
@@ -1853,6 +1868,11 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
             if mc_src == "" { return "void" }
             return map_type_name(mc_src)
         }
+        -- A struct's or an enum's own method, whatever its name: the
+        -- type it declares, not that of the list or map method of the
+        -- name, nor of another struct's method of the name
+        let own_method = own_method_of(gen, *expr.object, method)
+        if own_method != "" { return infer_call_return_type(gen, own_method) }
         if method == "len" { return "i64" }
         if method == "pop" {
             let pop_src = static_type(gen, expr)
@@ -3178,7 +3198,11 @@ fn generate_normal_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string, 
             g.builder.next_id = g.builder.next_id + 1
             call_args.push(ir_val_inst(tmp_id))
         } else {
-            let arg_result = generate_expr(g, b, args[i])
+            let mut arg_result = generate_expr(g, b, args[i])
+            if i < param_types.len() {
+                -- An integer becomes the parameter's integer type
+                arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], param_types[i], "argument " + int_to_string(i + 1) + " of '" + fn_name + "'")
+            }
             g = arg_result.gen
             b = arg_result.block
             call_args.push(ir_val_inst(arg_result.val_id))
@@ -3346,6 +3370,10 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
         let arg_type = infer_expr_type(g, args[0])
         opt_type = "Option[" + arg_type + "]"
     }
+    -- An integer becomes the Option's integer type
+    let some_val = convert_int_to_place(g, b, val_result.val_id, args[0], extract_inner_type(opt_type, "Option["), "the value of 'Some'")
+    g = some_val.gen
+    b = some_val.block
 
     -- Build the Option struct: { has_value: 1, value: payload }
     -- Use undef as the base (not alloca), since insertvalue works on values not pointers
@@ -3365,7 +3393,7 @@ fn generate_some_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
     let insert2_id = g.builder.next_id
     let mut insert2 = ir_inst_new(insert2_id, OP_INSERT_FIELD())
     insert2.field_base = ir_val_inst(insert1_id)
-    insert2.field_value = ir_val_inst(val_result.val_id)
+    insert2.field_value = ir_val_inst(some_val.val_id)
     insert2.field_index = 1
     insert2.result_type = opt_type
     insert2.has_result = true
@@ -3400,6 +3428,16 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
     if starts_with(res_type, "Result[") == false {
         res_type = g.current_return_type
     }
+    -- An integer becomes the Result's integer type
+    let mut ok_val = val_result
+    if starts_with(res_type, "Result[") {
+        let res_args = split_type_args(extract_inner_type(res_type, "Result["))
+        if res_args.len() > 0 {
+            ok_val = convert_int_to_place(g, b, val_result.val_id, args[0], res_args[0], "the value of 'Ok'")
+            g = ok_val.gen
+            b = ok_val.block
+        }
+    }
 
     -- Build the Result struct: { tag: 0, ok_val: payload, err_val: undef }
     -- Use undef as the base (not alloca), since insertvalue works on values not pointers
@@ -3419,7 +3457,7 @@ fn generate_ok_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRe
     let insert_ok_id = g.builder.next_id
     let mut insert_ok = ir_inst_new(insert_ok_id, OP_INSERT_FIELD())
     insert_ok.field_base = ir_val_inst(insert_tag_id)
-    insert_ok.field_value = ir_val_inst(val_result.val_id)
+    insert_ok.field_value = ir_val_inst(ok_val.val_id)
     insert_ok.field_index = 1
     insert_ok.result_type = res_type
     insert_ok.has_result = true
@@ -3933,11 +3971,13 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     if g.generic_instances.contains(instance_recv) {
         return generate_struct_method_call(g, b, instance_recv, unboxed_recv, method_name, args)
     }
-    if starts_with(recv_src, "Box[") and g.struct_defs.contains(instance_recv) {
-        let boxed_method = instance_recv + "_" + method_name
-        if g.fn_return_types.contains(boxed_method) or g.generic_fn_decls.contains(boxed_method) {
-            return generate_struct_method_call(g, b, instance_recv, unboxed_recv, method_name, args)
-        }
+    -- A method of the receiver's own type, before the search by the
+    -- method's name alone, which finds the last struct that has one
+    if own_method_of(g, obj_expr, method_name) != "" {
+        return generate_struct_method_call(g, b, instance_recv, unboxed_recv, method_name, args)
+    }
+    if starts_with(recv_src, "Box[") and g.struct_defs.contains(instance_recv) and g.generic_fn_decls.contains(instance_recv + "_" + method_name) {
+        return generate_struct_method_call(g, b, instance_recv, unboxed_recv, method_name, args)
     }
 
     -- --------------------------------------------------------
@@ -4055,7 +4095,8 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
         let mut ai = 0
         while ai < args.len() {
             g = check_basic_type(g, enum_payload_type(info, variant_index, ai), args[ai], "value " + int_to_string(ai + 1) + " of '" + enum_name + "." + variant_name + "'")
-            let arg_result = generate_expr(g, b, args[ai])
+            let mut arg_result = generate_expr(g, b, args[ai])
+            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[ai], enum_payload_type(info, variant_index, ai), "value " + int_to_string(ai + 1) + " of '" + enum_name + "." + variant_name + "'")
             g = arg_result.gen
             b = arg_result.block
 
@@ -4166,17 +4207,16 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
             return expr_result(g, b, 0)
         }
 
-        let val_result = generate_expr(g, b, args[0])
+        let mut val_result = generate_expr(g, b, args[0])
+        -- An integer becomes the elements' integer type
+        let pushed_elem_type = if len(obj_var_name) > 0 and g.list_elem_types.contains(obj_var_name) { g.list_elem_types.get(obj_var_name) } else { "i64" }
+        val_result = convert_list_elem(val_result.gen, val_result.block, val_result.val_id, args[0], ek, pushed_elem_type, "the pushed value")
         g = val_result.gen
         b = val_result.block
 
         if ek == LIST_ELEM_OTHER() {
             -- Generic push: alloca temp, store struct value, pass pointer + elem_size
-            let elem_type_name = if len(obj_var_name) > 0 and g.list_elem_types.contains(obj_var_name) {
-                g.list_elem_types.get(obj_var_name)
-            } else {
-                "i64"
-            }
+            let elem_type_name = pushed_elem_type
             -- Alloca temp for the value
             let temp_alloca_id = g.builder.next_id
             let mut temp_inst = ir_inst_new(temp_alloca_id, OP_ALLOCA())
@@ -4393,6 +4433,7 @@ fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: strin
     let ret_src = canon_type(g, fd.return_type)
     mono_fd.return_type = ret_src
     g.fn_src_return_types.insert(mangled, ret_src)
+    g.fn_src_param_types.insert(mangled, param_src_types(mono_fd))
     if len(ret_src) > 0 {
         g.fn_return_types.insert(mangled, parse_type_to_ir(ret_src))
     } else {
@@ -4421,6 +4462,7 @@ fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: strin
     out.user_extern_fns = g.user_extern_fns
     out.fn_return_types = g.fn_return_types
     out.fn_src_return_types = g.fn_src_return_types
+    out.fn_src_param_types = g.fn_src_param_types
     out.field_list_elem_kinds = g.field_list_elem_kinds
     out.field_list_elem_types = g.field_list_elem_types
     out.label_counter = g.label_counter
@@ -4684,10 +4726,20 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
         call_args.push(ir_val_inst(obj_result.val_id))
     }
 
+    -- The parameters' source types, self first
+    let mut method_param_types: List[string] = []
+    if g.fn_src_param_types.contains(mangled) {
+        method_param_types = string_split(g.fn_src_param_types.get(mangled), "|")
+    }
+
     -- Generate remaining arguments
     let mut i = 0
     while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
+        let mut arg_result = generate_expr(g, b, args[i])
+        if i + 1 < method_param_types.len() {
+            -- An integer becomes the parameter's integer type
+            arg_result = convert_int_to_place(arg_result.gen, arg_result.block, arg_result.val_id, args[i], method_param_types[i + 1], "argument " + int_to_string(i + 1) + " of '" + method_name + "'")
+        }
         g = arg_result.gen
         b = arg_result.block
         call_args.push(ir_val_inst(arg_result.val_id))
@@ -5015,6 +5067,64 @@ fn arms_meet_type(gen: IRGenerator, arms: List[MatchArm], first: string) -> stri
     return t
 }
 
+-- What a branch of an `if` or an arm of a `match` gives: 1 for an
+-- integer constant, itself or through an `if` or a `match` whose
+-- branches all give one; 0 for no value, as it returns or panics; -1
+-- for any other value
+fn branch_int_literal_state(e: Expr) -> int {
+    let v = branch_value_expr(e)
+    if is_int_literal_expr(v) { return 1 }
+    -- A block that ends in a statement
+    if v.kind == EXPR_BLOCK() { return 0 }
+    if v.kind == EXPR_FUNCTION_CALL() {
+        let callee = *v.callee
+        if callee.kind == EXPR_IDENTIFIER() and (callee.name == "panic" or callee.name == "exit") { return 0 }
+    }
+    if branches_give_int_literals(v) { return 1 }
+    return -1
+}
+
+-- Whether the expression is an `if` or a `match` whose every branch
+-- that gives a value gives an integer constant: its type is that of
+-- the place it goes to, as a literal's is
+fn branches_give_int_literals(e: Expr) -> bool {
+    let v = branch_value_expr(e)
+    let mut states: List[int] = []
+    if v.kind == EXPR_IF() {
+        if v.has_else == false { return false }
+        states.push(branch_int_literal_state(*v.then_branch))
+        states.push(branch_int_literal_state(*v.else_branch))
+    } else if v.kind == EXPR_MATCH() {
+        let mut ai = 0
+        while ai < v.match_arms.len() {
+            let arm = v.match_arms[ai]
+            if arm.is_expr_body {
+                states.push(branch_int_literal_state(*arm.body_expr))
+            } else if arm.body.len() == 0 {
+                states.push(0)
+            } else {
+                let last = arm.body[arm.body.len() - 1]
+                if last.kind == STMT_EXPRESSION() {
+                    states.push(branch_int_literal_state(*last.expr))
+                } else {
+                    states.push(0)
+                }
+            }
+            ai = ai + 1
+        }
+    } else {
+        return false
+    }
+    let mut any = false
+    let mut si = 0
+    while si < states.len() {
+        if states[si] < 0 { return false }
+        if states[si] == 1 { any = true }
+        si = si + 1
+    }
+    return any
+}
+
 fn int_literal_value(e: Expr) -> int {
     if e.kind == EXPR_GROUPED() { return int_literal_value(*e.operand) }
     if e.kind == EXPR_UNARY() { return 0 - int_literal_value(*e.operand) }
@@ -5031,17 +5141,47 @@ fn int_literal_value(e: Expr) -> int {
 -- Convert an integer value of type `from` to type `to` where it is
 -- stored, passed or returned as `to`: constants that fit and widening
 -- convert; narrowing anything else is an error that asks for `as`.
+-- `from` is the value's type as it is found here, which is "i64" where
+-- nothing is known, as for the value of a `?`. So a narrowing is an
+-- error only where the checker, when it has a type for the value, also
+-- finds one that does not fit. An `if` or a `match` whose branches all
+-- give constants is no narrowing: each constant is checked where its
+-- branch stores it.
 fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, from: string, to: string, what: string) -> ExprResult {
     let mut g = gen
     if is_integer_type(from) == false or is_integer_type(to) == false or from == to {
         return expr_result(g, block, val_id)
     }
-    if is_int_literal_expr(e) {
-        g = check_int_literal_fits(g, e, to)
-    } else if type_bit_width(from) > type_bit_width(to) {
-        g = ir_type_error(g, what + " has type " + builtin_src_type(from) + ", which does not fit in " + to + "; convert it with `as " + to + "`", e.line)
+    let mut value = branch_value_expr(e)
+    -- `comptime 3` is the constant 3
+    if value.kind == EXPR_COMPTIME() { value = branch_value_expr(*value.operand) }
+    if is_int_literal_expr(value) {
+        g = check_int_literal_fits(g, value, to)
+    } else if type_bit_width(from) > type_bit_width(to) and branches_give_int_literals(value) == false {
+        let checked = map_type_name(checked_type(g, e))
+        if is_integer_type(checked) == false or type_bit_width(checked) > type_bit_width(to) {
+            g = ir_type_error(g, what + " has type " + builtin_src_type(from) + ", which does not fit in " + to + "; convert it with `as " + to + "`", e.line)
+        }
     }
     return emit_ir_cast(g, block, ir_val_inst(val_id), from, to)
+}
+
+-- convert_int_value for a value that goes to a place of the source
+-- type `to`: a parameter, a field, a variant's value. Any place that
+-- is not an integer's leaves the value as it is.
+fn convert_int_to_place(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, to: string, what: string) -> ExprResult {
+    let to_ir = map_type_name(canon_type(gen, to))
+    if is_integer_type(to_ir) == false { return expr_result(gen, block, val_id) }
+    return convert_int_value(gen, block, val_id, e, infer_expr_type(gen, e), to_ir, what)
+}
+
+-- convert_int_value for an element that a list of integers stores:
+-- a List[int] holds 64-bit elements, and a list of another integer
+-- type holds elements of that type
+fn convert_list_elem(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, elem_kind: int, elem_type: string, what: string) -> ExprResult {
+    if elem_kind == LIST_ELEM_INT() { return convert_int_to_place(gen, block, val_id, e, "i64", what) }
+    if elem_kind == LIST_ELEM_OTHER() { return convert_int_to_place(gen, block, val_id, e, elem_type, what) }
+    return expr_result(gen, block, val_id)
 }
 
 -- The integer type both operands of a binary operator take when they
@@ -5842,8 +5982,10 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
         let fname = expr.field_names[i]
         let fval_expr = map_ctor_as(g, expr.field_values[i], struct_field_src_type(g, type_name, fname))
 
-        -- Generate the field value expression
-        let val_result = generate_expr(g, b, fval_expr)
+        -- Generate the field value expression; an integer becomes the
+        -- field's integer type
+        let mut val_result = generate_expr(g, b, fval_expr)
+        val_result = convert_int_to_place(val_result.gen, val_result.block, val_result.val_id, fval_expr, struct_field_src_type(g, type_name, fname), "field '" + fname + "' of '" + type_name + "'")
         g = val_result.gen
         b = val_result.block
         let val_id = val_result.val_id
@@ -5976,7 +6118,8 @@ fn generate_enum_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
             g = check_basic_type(g, enum_payload_type(info, variant_idx, pi), payload_expr, "value " + int_to_string(pi + 1) + " of '" + enum_name + "." + variant_name + "'")
 
             -- Generate the payload value
-            let pval_result = generate_expr(g, b, payload_expr)
+            let mut pval_result = generate_expr(g, b, payload_expr)
+            pval_result = convert_int_to_place(pval_result.gen, pval_result.block, pval_result.val_id, payload_expr, enum_payload_type(info, variant_idx, pi), "value " + int_to_string(pi + 1) + " of '" + enum_name + "." + variant_name + "'")
             g = pval_result.gen
             b = pval_result.block
             let pval_id = pval_result.val_id
