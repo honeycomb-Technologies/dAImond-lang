@@ -327,34 +327,42 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let nparams = dm_llvm_count_param_types(fn_ty)
         let is_source_extern = g.ir_module.user_extern_fns.contains(callee_name)
         let is_variadic = is_source_extern and dm_llvm_is_function_var_arg(fn_ty) != 0
+        let in_memory = mem_params_of(g, callee_name)
         let mut args: List[int] = []
         let mut ai = 0
         while ai < inst.call_args.len() {
             let arg = inst.call_args[ai]
-            let mut val = resolve_value(g, arg)
-            g = resolve_value_with_counter(g, arg)
-            -- Strings go to a variadic C function as char*, and arguments
-            -- past its parameters get C's default promotions
-            let is_string_arg = arg.kind == VAL_CONST_STRING() or is_string_ptr(g, arg) or dm_llvm_type_of(val) == g.dm_string_type
-            if is_variadic and is_string_arg {
-                val = string_arg_as_cstr(g, arg, val)
-            } else if is_variadic and ai >= nparams {
-                val = promote_vararg(g, val)
-            }
-            if ai < nparams and (is_variadic and is_string_arg) == false {
-                if arg.kind == VAL_CONST_STRING() and call_param_type(fn_ty, ai) == g.dm_string_type {
-                    val = string_operand(g, arg, val, true)
+            let want_mem = if ai < in_memory.len() { in_memory[ai] } else { "" }
+            if want_mem != "" {
+                -- A struct that the function takes in memory
+                g = check_mem_arg(g, arg, want_mem, callee_name, ai)
+                args.push(mem_arg(g, arg, want_mem))
+            } else {
+                let mut val = resolve_value(g, arg)
+                g = resolve_value_with_counter(g, arg)
+                -- Strings go to a variadic C function as char*, and arguments
+                -- past its parameters get C's default promotions
+                let is_string_arg = arg.kind == VAL_CONST_STRING() or is_string_ptr(g, arg) or dm_llvm_type_of(val) == g.dm_string_type
+                if is_variadic and is_string_arg {
+                    val = string_arg_as_cstr(g, arg, val)
+                } else if is_variadic and ai >= nparams {
+                    val = promote_vararg(g, val)
                 }
-                -- A string or list pointer passed by value: pass the value
-                val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
-                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
-                -- A source extern and a ported runtime function may take an
-                -- int where the compiler has a pointer, and the other way round
-                if is_source_extern or g.rt_ports.contains(callee_name) {
-                    val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
+                if ai < nparams and (is_variadic and is_string_arg) == false {
+                    if arg.kind == VAL_CONST_STRING() and call_param_type(fn_ty, ai) == g.dm_string_type {
+                        val = string_operand(g, arg, val, true)
+                    }
+                    -- A string or list pointer passed by value: pass the value
+                    val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
+                    val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
+                    -- A source extern and a ported runtime function may take an
+                    -- int where the compiler has a pointer, and the other way round
+                    if is_source_extern or g.rt_ports.contains(callee_name) {
+                        val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
+                    }
                 }
+                args.push(val)
             }
-            args.push(val)
             ai = ai + 1
         }
         -- Determine call result name (empty string for void returns)
@@ -494,14 +502,15 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         -- function of these parameters and this result: a string, an
         -- Option or a Result comes back through a pointer that is
         -- passed first
-        let needs_sret = is_sret_return_type(inst.result_type)
+        let needs_sret = returns_through_pointer(g, inst.result_type)
+        let result_in_memory = inst.has_result and is_mem_type(g, inst.result_type)
         let result_ty = map_ir_type_to_llvm(g, inst.result_type)
         let declared = string_split(inst.callee, "|")
         let mut param_tys: List[int] = []
         if needs_sret { param_tys.push(dm_llvm_pointer_type(ctx)) }
         let mut pi = 0
         while pi < declared.len() {
-            param_tys.push(map_ir_type_to_llvm(g, declared[pi]))
+            param_tys.push(param_llvm_type(g, declared[pi]))
             pi = pi + 1
         }
         dm_llvm_buf_clear()
@@ -517,8 +526,15 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let mut args: List[int] = []
         let mut sret = 0
         if needs_sret {
-            sret = dm_llvm_build_alloca(b, result_ty, "sret." + int_to_string(g.sret_counter))
-            g.sret_counter = g.sret_counter + 1
+            if result_in_memory {
+                -- The result is a struct held in memory: it is written
+                -- to the storage it stays in
+                g = take_temp(g, result_ty, inst.id)
+                sret = temp_of(g, inst.id)
+            } else {
+                sret = dm_llvm_build_alloca(b, result_ty, "sret." + int_to_string(g.sret_counter))
+                g.sret_counter = g.sret_counter + 1
+            }
             args.push(sret)
         }
         let first = args.len()
@@ -526,24 +542,30 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         while ai < inst.call_args.len() and first + ai < param_tys.len() {
             let arg = inst.call_args[ai]
             let want_ty = param_tys[first + ai]
-            let mut val = resolve_value(g, arg)
-            g = resolve_value_with_counter(g, arg)
-            if arg.kind == VAL_CONST_STRING() and want_ty == g.dm_string_type {
-                val = string_operand(g, arg, val, true)
+            if is_mem_type(g, declared[ai]) {
+                -- A struct that the function takes in memory
+                g = check_mem_arg(g, arg, declared[ai], "<function pointer>", ai)
+                args.push(mem_arg(g, arg, declared[ai]))
+            } else {
+                let mut val = resolve_value(g, arg)
+                g = resolve_value_with_counter(g, arg)
+                if arg.kind == VAL_CONST_STRING() and want_ty == g.dm_string_type {
+                    val = string_operand(g, arg, val, true)
+                }
+                -- A string or a list held by its address is passed as
+                -- the value
+                val = load_handle_as(g, arg, val, want_ty)
+                -- An integer takes the parameter's width
+                let val_ty = dm_llvm_type_of(val)
+                if dm_llvm_get_type_kind(want_ty) == 8 and dm_llvm_get_type_kind(val_ty) == 8 {
+                    let want_w = dm_llvm_get_int_type_width(want_ty)
+                    let val_w = dm_llvm_get_int_type_width(val_ty)
+                    if val_w < want_w { val = dm_llvm_build_sext(b, val, want_ty, "arg.sext") }
+                    if val_w > want_w { val = dm_llvm_build_trunc(b, val, want_ty, "arg.trunc") }
+                }
+                val = coerce_ptr_int(g, val, want_ty)
+                args.push(val)
             }
-            -- A string, a list or a struct held by its address is passed
-            -- as the value
-            val = load_handle_as(g, arg, val, want_ty)
-            -- An integer takes the parameter's width
-            let val_ty = dm_llvm_type_of(val)
-            if dm_llvm_get_type_kind(want_ty) == 8 and dm_llvm_get_type_kind(val_ty) == 8 {
-                let want_w = dm_llvm_get_int_type_width(want_ty)
-                let val_w = dm_llvm_get_int_type_width(val_ty)
-                if val_w < want_w { val = dm_llvm_build_sext(b, val, want_ty, "arg.sext") }
-                if val_w > want_w { val = dm_llvm_build_trunc(b, val, want_ty, "arg.trunc") }
-            }
-            val = coerce_ptr_int(g, val, want_ty)
-            args.push(val)
             ai = ai + 1
         }
         let mut call_name = ""
@@ -562,7 +584,7 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 -- A string stays where it is, as a string's address
                 g.string_ptrs.insert(id_key, true)
                 g.value_map.insert(id_key, sret)
-            } else {
+            } else if result_in_memory == false {
                 g.value_map.insert(id_key, dm_llvm_build_load2(b, result_ty, sret, "sret.load"))
             }
             return g
@@ -702,32 +724,47 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
         let mut g = gen
         let b = g.builder
         let id_key = int_to_string(inst.id)
-        -- Allocate stack space for the result struct (sret pattern)
-        let sret_name = "sret." + int_to_string(g.sret_counter)
-        g.sret_counter = g.sret_counter + 1
-        -- Look up the IR function to get its return type for correct alloca sizing
-        let ir_func = find_ir_function(g, callee_name)
-        let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
-        let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
+        -- The result is written to memory the caller passes first: for
+        -- a struct held in memory, the storage it stays in
+        let ret_ir = sret_type_of(g, callee_name)
+        let ret_llvm_ty = map_ir_type_to_llvm(g, ret_ir)
+        let result_in_memory = inst.has_result and is_mem_type(g, ret_ir)
+        let mut sret = 0
+        if result_in_memory {
+            g = take_temp(g, ret_llvm_ty, inst.id)
+            sret = temp_of(g, inst.id)
+        } else {
+            let sret_name = "sret." + int_to_string(g.sret_counter)
+            g.sret_counter = g.sret_counter + 1
+            sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
+        }
         -- Build args: sret pointer first, then resolved args
+        let in_memory = mem_params_of(g, callee_name)
         let mut args: List[int] = []
         args.push(sret)
         let mut ai = 0
         while ai < inst.call_args.len() {
             let arg = inst.call_args[ai]
-            let mut val = resolve_value(g, arg)
-            g = resolve_value_with_counter(g, arg)
-            -- A string or list pointer passed by value: pass the value
-            let sparam_ty = call_param_type(fn_ty, ai + 1)
-            if arg.kind == VAL_CONST_STRING() and sparam_ty == g.dm_string_type {
-                val = string_operand(g, arg, val, true)
+            let want_mem = if ai < in_memory.len() { in_memory[ai] } else { "" }
+            if want_mem != "" {
+                -- A struct that the function takes in memory
+                g = check_mem_arg(g, arg, want_mem, callee_name, ai)
+                args.push(mem_arg(g, arg, want_mem))
+            } else {
+                let mut val = resolve_value(g, arg)
+                g = resolve_value_with_counter(g, arg)
+                -- A string or list pointer passed by value: pass the value
+                let sparam_ty = call_param_type(fn_ty, ai + 1)
+                if arg.kind == VAL_CONST_STRING() and sparam_ty == g.dm_string_type {
+                    val = string_operand(g, arg, val, true)
+                }
+                if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
+                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
+                if sparam_ty != 0 and g.rt_ports.contains(callee_name) {
+                    val = coerce_ptr_int(g, val, sparam_ty)
+                }
+                args.push(val)
             }
-            if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
-            val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
-            if sparam_ty != 0 and g.rt_ports.contains(callee_name) {
-                val = coerce_ptr_int(g, val, sparam_ty)
-            }
-            args.push(val)
             ai = ai + 1
         }
         -- Call function (returns void, result written to sret pointer)
@@ -742,10 +779,10 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
         -- Load the result from the sret alloca
         if inst.has_result {
             -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
-            if ir_func.return_type == "string" {
+            if ret_ir == "string" {
                 g.string_ptrs.insert(id_key, true)
                 g.value_map.insert(id_key, sret)
-            } else {
+            } else if result_in_memory == false {
                 let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
                 g.value_map.insert(id_key, loaded)
             }

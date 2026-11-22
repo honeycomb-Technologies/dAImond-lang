@@ -12,12 +12,62 @@ import ast
 struct Parser {
     tokens: List[Token],
     pos: int,
-    errors: List[string]
+    errors: List[string],
+    -- How deep the parser is in expressions, in statements and in
+    -- types; and how many `else if`s came before the one being
+    -- parsed (see NESTING)
+    depth: int,
+    block_depth: int,
+    type_depth: int,
+    else_ifs: int
 }
 
 fn parser_new(tokens: List[Token]) -> Parser {
     let errs: List[string] = []
-    return Parser { tokens: tokens, pos: 0, errors: errs }
+    return Parser { tokens: tokens, pos: 0, errors: errs, depth: 0, block_depth: 0, type_depth: 0, else_ifs: 0 }
+}
+
+-- ============================================================
+-- NESTING
+-- The parser, the checker and the code generators call themselves
+-- once for each level an expression, a statement or a type is
+-- nested, and once for each link of a chain: a.b().c(),
+-- a + b + c, `else if` after `else if`. Each call takes stack: at
+-- most a third of a megabyte, of 64 (measured for each kind of
+-- nesting on its own). What is nested or chained further than the
+-- limits here is an error that says where. They are well under what
+-- one kind of nesting takes on its own, and do not rule out every
+-- program that is too deep: chains inside nesting inside chains add
+-- up. For those, the compiler says that its stack is full (see
+-- main), with no line.
+-- ============================================================
+
+-- The deepest nesting of expressions in expressions, of statements in
+-- statements and of types in types
+fn MAX_NESTING() -> int { return 100 }
+
+-- The most calls, fields and indexes that follow one another in one
+-- expression
+fn MAX_CHAIN() -> int { return 100 }
+
+-- The most operators that follow one another in one expression
+fn MAX_OPERATORS() -> int { return 2000 }
+
+-- The most `else if`s that follow one `if`
+fn MAX_ELSE_IFS() -> int { return 200 }
+
+-- Report what is past a limit, and move to the end of the file: the
+-- rest would be parsed out of step
+fn p_past_limit(p: Parser, what: string) -> Parser {
+    let mut pp = p_error(p, what)
+    pp.pos = pp.tokens.len()
+    return pp
+}
+
+-- What is said of an expression, a statement or a type that is
+-- nested too deeply
+fn nesting_error(what: string) -> string {
+    return what + " nested more than " + int_to_string(MAX_NESTING()) + " levels deep"
 }
 
 -- ============================================================
@@ -141,6 +191,18 @@ struct ParseDeclResult {
 -- ============================================================
 
 fn parse_type(p: Parser) -> ParseTypeResult {
+    let mut down = p
+    down.type_depth = down.type_depth + 1
+    if down.type_depth == MAX_NESTING() + 1 {
+        down = p_past_limit(down, nesting_error("a type is"))
+    }
+    let result = parse_type_at(down)
+    let mut up = result.p
+    up.type_depth = up.type_depth - 1
+    return ParseTypeResult { p: up, type_name: result.type_name }
+}
+
+fn parse_type_at(p: Parser) -> ParseTypeResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
 
@@ -278,7 +340,13 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
 
     -- Postfix: ?, field access, index, method call
     let mut cont = true
+    let mut links = 0
     while cont {
+        -- The last turn finds nothing more and ends the loop
+        links = links + 1
+        if links == MAX_CHAIN() + 2 {
+            pp = p_past_limit(pp, "more than " + int_to_string(MAX_CHAIN()) + " calls, fields and indexes follow one another in this expression")
+        }
         pp = p_skip_newlines(pp)
         let kind = p_peek(pp)
         if kind == TK_QUESTION() {
@@ -381,7 +449,12 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
 
     -- Infix: binary operators with precedence
     let mut keep_going = true
+    links = 0
     while keep_going {
+        links = links + 1
+        if links == MAX_OPERATORS() + 2 {
+            pp = p_past_limit(pp, "more than " + int_to_string(MAX_OPERATORS()) + " operators follow one another in this expression")
+        }
         pp = p_skip_newlines(pp)
         let prec = infix_prec(p_peek(pp))
         if prec < min_prec or (p_starts_line(pp) and starts_expression(p_peek(pp))) {
@@ -511,6 +584,18 @@ fn token_to_binop(kind: int) -> int {
 -- ============================================================
 
 fn parse_prefix(p: Parser) -> ParseExprResult {
+    let mut down = p
+    down.depth = down.depth + 1
+    if down.depth == MAX_NESTING() + 1 {
+        down = p_past_limit(down, nesting_error("an expression is"))
+    }
+    let result = parse_prefix_at(down)
+    let mut up = result.p
+    up.depth = up.depth - 1
+    return ParseExprResult { p: up, expr: result.expr }
+}
+
+fn parse_prefix_at(p: Parser) -> ParseExprResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
 
@@ -931,6 +1016,10 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
     let mut pp = p
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'if'
+    -- The `else if`s before this one; what is inside the branches
+    -- begins its own count
+    let before = pp.else_ifs
+    pp.else_ifs = 0
     let cond = parse_expr(pp)
     pp = cond.p
     pp = p_expect(pp, TK_LBRACE())
@@ -951,6 +1040,10 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
         pp = p_skip_newlines(pp)
         if p_peek(pp) == TK_IF() {
             -- else if
+            pp.else_ifs = before + 1
+            if pp.else_ifs == MAX_ELSE_IFS() + 1 {
+                pp = p_past_limit(pp, "more than " + int_to_string(MAX_ELSE_IFS()) + " `else if`s follow this `if` (a `match`, or `if`s that return, take any number)")
+            }
             let else_if = parse_if_expr(pp)
             pp = else_if.p
             e.else_branch = Box_new(else_if.expr)
@@ -967,6 +1060,7 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
         }
     }
 
+    pp.else_ifs = before
     return ParseExprResult { p: pp, expr: e }
 }
 
@@ -1377,6 +1471,18 @@ fn parse_block_body(p: Parser) -> ParseBlockResult {
 }
 
 fn parse_stmt(p: Parser) -> ParseStmtResult {
+    let mut down = p
+    down.block_depth = down.block_depth + 1
+    if down.block_depth == MAX_NESTING() + 1 {
+        down = p_past_limit(down, nesting_error("a statement is"))
+    }
+    let result = parse_stmt_at(down)
+    let mut up = result.p
+    up.block_depth = up.block_depth - 1
+    return ParseStmtResult { p: up, stmt: result.stmt }
+}
+
+fn parse_stmt_at(p: Parser) -> ParseStmtResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
 

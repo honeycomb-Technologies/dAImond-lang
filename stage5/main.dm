@@ -3674,6 +3674,8 @@ extern fn dm_llvm_is_alloca(val: int) -> int
 extern fn dm_llvm_abi_size_of(mod: int, ty: int) -> int
 extern fn dm_llvm_offset_of_element(mod: int, struct_ty: int, index: int) -> int
 extern fn dm_llvm_struct_field_count(ty: int) -> int
+extern fn dm_llvm_struct_element_type(ty: int, index: int) -> int
+extern fn dm_llvm_build_memcpy(b: int, dst: int, src: int, size: int) -> int
 
 -- ============================================================
 -- Convenience wrapper functions (dAImond-friendly API)
@@ -3726,12 +3728,62 @@ extern fn dm_llvm_struct_type_buf(ctx: int, count: int, is_packed: int) -> int
 struct Parser {
     tokens: List[Token],
     pos: int,
-    errors: List[string]
+    errors: List[string],
+    -- How deep the parser is in expressions, in statements and in
+    -- types; and how many `else if`s came before the one being
+    -- parsed (see NESTING)
+    depth: int,
+    block_depth: int,
+    type_depth: int,
+    else_ifs: int
 }
 
 fn parser_new(tokens: List[Token]) -> Parser {
     let errs: List[string] = []
-    return Parser { tokens: tokens, pos: 0, errors: errs }
+    return Parser { tokens: tokens, pos: 0, errors: errs, depth: 0, block_depth: 0, type_depth: 0, else_ifs: 0 }
+}
+
+-- ============================================================
+-- NESTING
+-- The parser, the checker and the code generators call themselves
+-- once for each level an expression, a statement or a type is
+-- nested, and once for each link of a chain: a.b().c(),
+-- a + b + c, `else if` after `else if`. Each call takes stack: at
+-- most a third of a megabyte, of 64 (measured for each kind of
+-- nesting on its own). What is nested or chained further than the
+-- limits here is an error that says where. They are well under what
+-- one kind of nesting takes on its own, and do not rule out every
+-- program that is too deep: chains inside nesting inside chains add
+-- up. For those, the compiler says that its stack is full (see
+-- main), with no line.
+-- ============================================================
+
+-- The deepest nesting of expressions in expressions, of statements in
+-- statements and of types in types
+fn MAX_NESTING() -> int { return 100 }
+
+-- The most calls, fields and indexes that follow one another in one
+-- expression
+fn MAX_CHAIN() -> int { return 100 }
+
+-- The most operators that follow one another in one expression
+fn MAX_OPERATORS() -> int { return 2000 }
+
+-- The most `else if`s that follow one `if`
+fn MAX_ELSE_IFS() -> int { return 200 }
+
+-- Report what is past a limit, and move to the end of the file: the
+-- rest would be parsed out of step
+fn p_past_limit(p: Parser, what: string) -> Parser {
+    let mut pp = p_error(p, what)
+    pp.pos = pp.tokens.len()
+    return pp
+}
+
+-- What is said of an expression, a statement or a type that is
+-- nested too deeply
+fn nesting_error(what: string) -> string {
+    return what + " nested more than " + int_to_string(MAX_NESTING()) + " levels deep"
 }
 
 -- ============================================================
@@ -3855,6 +3907,18 @@ struct ParseDeclResult {
 -- ============================================================
 
 fn parse_type(p: Parser) -> ParseTypeResult {
+    let mut down = p
+    down.type_depth = down.type_depth + 1
+    if down.type_depth == MAX_NESTING() + 1 {
+        down = p_past_limit(down, nesting_error("a type is"))
+    }
+    let result = parse_type_at(down)
+    let mut up = result.p
+    up.type_depth = up.type_depth - 1
+    return ParseTypeResult { p: up, type_name: result.type_name }
+}
+
+fn parse_type_at(p: Parser) -> ParseTypeResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
 
@@ -3992,7 +4056,13 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
 
     -- Postfix: ?, field access, index, method call
     let mut cont = true
+    let mut links = 0
     while cont {
+        -- The last turn finds nothing more and ends the loop
+        links = links + 1
+        if links == MAX_CHAIN() + 2 {
+            pp = p_past_limit(pp, "more than " + int_to_string(MAX_CHAIN()) + " calls, fields and indexes follow one another in this expression")
+        }
         pp = p_skip_newlines(pp)
         let kind = p_peek(pp)
         if kind == TK_QUESTION() {
@@ -4095,7 +4165,12 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
 
     -- Infix: binary operators with precedence
     let mut keep_going = true
+    links = 0
     while keep_going {
+        links = links + 1
+        if links == MAX_OPERATORS() + 2 {
+            pp = p_past_limit(pp, "more than " + int_to_string(MAX_OPERATORS()) + " operators follow one another in this expression")
+        }
         pp = p_skip_newlines(pp)
         let prec = infix_prec(p_peek(pp))
         if prec < min_prec or (p_starts_line(pp) and starts_expression(p_peek(pp))) {
@@ -4225,6 +4300,18 @@ fn token_to_binop(kind: int) -> int {
 -- ============================================================
 
 fn parse_prefix(p: Parser) -> ParseExprResult {
+    let mut down = p
+    down.depth = down.depth + 1
+    if down.depth == MAX_NESTING() + 1 {
+        down = p_past_limit(down, nesting_error("an expression is"))
+    }
+    let result = parse_prefix_at(down)
+    let mut up = result.p
+    up.depth = up.depth - 1
+    return ParseExprResult { p: up, expr: result.expr }
+}
+
+fn parse_prefix_at(p: Parser) -> ParseExprResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
 
@@ -4645,6 +4732,10 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
     let mut pp = p
     let tok = p_cur(pp)
     pp = p_advance(pp) -- skip 'if'
+    -- The `else if`s before this one; what is inside the branches
+    -- begins its own count
+    let before = pp.else_ifs
+    pp.else_ifs = 0
     let cond = parse_expr(pp)
     pp = cond.p
     pp = p_expect(pp, TK_LBRACE())
@@ -4665,6 +4756,10 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
         pp = p_skip_newlines(pp)
         if p_peek(pp) == TK_IF() {
             -- else if
+            pp.else_ifs = before + 1
+            if pp.else_ifs == MAX_ELSE_IFS() + 1 {
+                pp = p_past_limit(pp, "more than " + int_to_string(MAX_ELSE_IFS()) + " `else if`s follow this `if` (a `match`, or `if`s that return, take any number)")
+            }
             let else_if = parse_if_expr(pp)
             pp = else_if.p
             e.else_branch = Box_new(else_if.expr)
@@ -4681,6 +4776,7 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
         }
     }
 
+    pp.else_ifs = before
     return ParseExprResult { p: pp, expr: e }
 }
 
@@ -5091,6 +5187,18 @@ fn parse_block_body(p: Parser) -> ParseBlockResult {
 }
 
 fn parse_stmt(p: Parser) -> ParseStmtResult {
+    let mut down = p
+    down.block_depth = down.block_depth + 1
+    if down.block_depth == MAX_NESTING() + 1 {
+        down = p_past_limit(down, nesting_error("a statement is"))
+    }
+    let result = parse_stmt_at(down)
+    let mut up = result.p
+    up.block_depth = up.block_depth - 1
+    return ParseStmtResult { p: up, stmt: result.stmt }
+}
+
+fn parse_stmt_at(p: Parser) -> ParseStmtResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
 
@@ -11331,6 +11439,32 @@ fn static_type(gen: IRGenerator, expr: Expr) -> string {
     return checked_type(gen, expr)
 }
 
+-- The type of a binary expression, from its parts: two strings
+-- joined are a string; other operators may be overloaded, so their
+-- type is not known here. A chain a + b + c is nested once for each
+-- operator, on its left side, and is walked in a loop: a call for
+-- each level would use up the stack on a long chain.
+fn joined_strings_type(gen: IRGenerator, expr: Expr) -> string {
+    let mut cur = expr
+    let mut top = true
+    let mut walking = true
+    while walking {
+        -- A left side that the checker found to be a string
+        if top == false and checked_type(gen, cur) == "string" { return "string" }
+        if cur.kind != EXPR_BINARY() or cur.op != BINOP_ADD() {
+            walking = false
+        } else {
+            if static_type(gen, *cur.right) != "string" { return "" }
+            cur = *cur.left
+            top = false
+        }
+    }
+    -- The chain's first operand, or an expression with another operator
+    if top or cur.kind == EXPR_BINARY() { return "" }
+    if static_type(gen, cur) == "string" { return "string" }
+    return ""
+}
+
 fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     let k = expr.kind
     if k == EXPR_LITERAL_INT() { return "int" }
@@ -11354,14 +11488,7 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     }
     if k == EXPR_GROUPED() { return static_type(gen, *expr.operand) }
     if k == EXPR_ERROR_PROPAGATE() { return propagated_type(static_type(gen, *expr.operand)) }
-    if k == EXPR_BINARY() {
-        -- Two strings joined are a string; other operators may be
-        -- overloaded, so their type is not known here
-        if expr.op == BINOP_ADD() and static_type(gen, *expr.left) == "string" and static_type(gen, *expr.right) == "string" {
-            return "string"
-        }
-        return ""
-    }
+    if k == EXPR_BINARY() { return joined_strings_type(gen, expr) }
     if k == EXPR_IDENTIFIER() {
         if gen.var_src_types.contains(expr.name) { return gen.var_src_types.get(expr.name) }
         if gen.var_struct_types.contains(expr.name) { return gen.var_struct_types.get(expr.name) }
@@ -11818,10 +11945,7 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         while level >= 0 {
             -- Integers of different types meet at one type; otherwise
             -- the operator has its left operand's type
-            let common_t = common_int_type(levels[level], chain_type, infer_expr_type(gen, *levels[level].right))
-            if common_t != "" {
-                chain_type = common_t
-            }
+            chain_type = binary_ir_type(levels[level], chain_type, infer_expr_type(gen, *levels[level].right))
             level = level - 1
         }
         return chain_type
@@ -12468,19 +12592,39 @@ fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprRes
     -- for each operator. Its levels are generated in a loop, from the
     -- innermost outwards: generated by recursion, each level takes
     -- more than a megabyte of stack, and a chain of 40 overflowed it.
+    -- `and` and `or` are levels like the others: each still runs its
+    -- right side only when its left side leaves the result open.
     let mut spine: List[Expr] = []
     let mut node = expr
-    while node.op != BINOP_AND() and node.op != BINOP_OR() and binary_left_is_binary(node) {
+    while binary_left_is_binary(node) {
         spine.push(node)
         node = *node.left
     }
-    let mut result = generate_binary_level(gen, block, node, -1)
+    let mut result = generate_binary_level(gen, block, node, -1, "")
+    if spine.len() == 0 { return result }
+    -- The type of the chain so far goes with its value to the next
+    -- level. Inferred there from the left operand, it was worked out
+    -- again from the innermost operator at every level: a chain of
+    -- 800 terms took over a gigabyte.
+    let mut chain_type = infer_expr_type(result.gen, node)
     let mut i = spine.len() - 1
     while i >= 0 {
-        result = generate_binary_level(result.gen, result.block, spine[i], result.val_id)
+        result = generate_binary_level(result.gen, result.block, spine[i], result.val_id, chain_type)
+        chain_type = binary_ir_type(spine[i], chain_type, infer_expr_type(result.gen, *spine[i].right))
         i = i - 1
     }
     return result
+}
+
+-- The IR type of a binary operator whose operands have the IR types
+-- lt and rt: a bool from a comparison or a logical operator; the one
+-- type that integers of different types meet at; otherwise the left
+-- operand's
+fn binary_ir_type(expr: Expr, lt: string, rt: string) -> string {
+    if is_bool_binop(expr.op) { return "bool" }
+    let common_t = common_int_type(expr, lt, rt)
+    if common_t != "" { return common_t }
+    return lt
 }
 
 fn binary_left_is_binary(expr: Expr) -> bool {
@@ -12552,10 +12696,10 @@ fn unbind_hidden_value(gen: IRGenerator, name: string) -> IRGenerator {
 }
 
 -- One binary operator. lhs_done is the value of its left operand when
--- that is generated already, and -1 when it is not. It is only given
--- for an operator that is not `and` or `or` and whose left operand is
--- itself a binary operator.
-fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_done: int) -> ExprResult {
+-- that is generated already, and lhs_type that value's IR type; -1
+-- and "" when it is not. They are only given for an operator whose
+-- left operand is itself a binary operator.
+fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_done: int, lhs_type: string) -> ExprResult {
     let mut g = gen
     let mut b = block
     let op = expr.op
@@ -12575,10 +12719,13 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
         g.builder.next_id = g.builder.next_id + 1
 
         -- Evaluate left operand
-        let lhs_result = generate_expr(g, b, *expr.left)
-        g = lhs_result.gen
-        b = lhs_result.block
-        let lhs_id = lhs_result.val_id
+        let mut lhs_id = lhs_done
+        if lhs_done < 0 {
+            let lhs_result = generate_expr(g, b, *expr.left)
+            g = lhs_result.gen
+            b = lhs_result.block
+            lhs_id = lhs_result.val_id
+        }
 
         -- Labels for the branches
         let rhs_label = gen_next_label(g, "and_rhs")
@@ -12653,10 +12800,13 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
         g.builder.next_id = g.builder.next_id + 1
 
         -- Evaluate left operand
-        let lhs_result = generate_expr(g, b, *expr.left)
-        g = lhs_result.gen
-        b = lhs_result.block
-        let lhs_id = lhs_result.val_id
+        let mut lhs_id = lhs_done
+        if lhs_done < 0 {
+            let lhs_result = generate_expr(g, b, *expr.left)
+            g = lhs_result.gen
+            b = lhs_result.block
+            lhs_id = lhs_result.val_id
+        }
 
         -- Labels for the branches
         let short_label = gen_next_label(g, "or_short")
@@ -12808,7 +12958,7 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
         if left_struct_name == "" {
             -- Any other left operand that is a struct: a field, a call,
             -- another operator's result
-            let ltype = infer_expr_type(g, left_expr)
+            let ltype = if lhs_done >= 0 { lhs_type } else { infer_expr_type(g, left_expr) }
             if g.struct_defs.contains(ltype) {
                 left_struct_name = ltype
             }
@@ -12852,7 +13002,8 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
     let mut rhs_id = rhs_result.val_id
 
     -- The operands' types select the operation
-    return emit_binary_op(g, b, expr, lhs_id, infer_expr_type(g, *expr.left), rhs_id, infer_expr_type(g, *expr.right))
+    let left_type = if lhs_done >= 0 { lhs_type } else { infer_expr_type(g, *expr.left) }
+    return emit_binary_op(g, b, expr, lhs_id, left_type, rhs_id, infer_expr_type(g, *expr.right))
 }
 
 -- The operation of the binary operator `expr` on two values that are
@@ -24053,6 +24204,9 @@ fn instance_types_end(gen: IRGenerator, saved: InstanceTypes) -> IRGenerator {
 -- functions, the runtime's included, take strings by value and return
 -- them through a pointer the caller passes first (sret). A C function
 -- declared with `extern fn` takes and returns char*.
+--
+-- Structs, enums, Options and Results are held in memory and passed
+-- by their address: see MEMORY VALUES.
 -- ============================================================
 
 -- ============================================================
@@ -24081,8 +24235,56 @@ struct LLVMGenerator {
     wrapper_returns_string: Map[string, bool],
     -- Track which functions have wrappers
     has_wrapper: Map[string, bool],
-    -- Track which functions use sret return convention (result/option types)
+    -- The functions that return their result through a pointer they
+    -- take first, and the IR type of that result
     returns_sret: Map[string, bool],
+    sret_types: Map[string, string],
+    -- For each function with a parameter that takes a struct in
+    -- memory: the IR types of those parameters (see mem_param_types)
+    mem_params: Map[string, string],
+    -- MEMORY VALUES, for the function being generated. By the id of
+    -- an instruction: the block and the index it is at, the number of
+    -- its uses, the index of its last use in its block, and whether
+    -- it is used anywhere else (mv_scan)
+    mv_count: int,
+    mv_block: List[int],
+    mv_at: List[int],
+    mv_uses: List[int],
+    mv_last: List[int],
+    mv_far: List[int],
+    -- By id, for a value held in memory: its kind (1 the place it was
+    -- loaded from, 2 storage of its own; 0 for every other value),
+    -- its LLVM type, the pool's storage it is in (-1 for none) with
+    -- the count that storage had when the value got it, and whether
+    -- the storage is the value's alone
+    mv_kind: List[int],
+    mv_ty: List[int],
+    mv_temp: List[int],
+    mv_gen: List[int],
+    mv_owns: List[int],
+    mv_scratch: List[int],
+    -- By parameter: the LLVM type of one held in memory (0 for any
+    -- other), whether its only use is the store that opens the
+    -- function, and the copy made for one that has other uses
+    param_mem_ty: List[int],
+    param_direct: List[int],
+    param_copy: List[int],
+    -- The stores and calls before each instruction of each block
+    -- (mv_scan), and where each block's counts begin
+    clob: List[int],
+    clob_base: List[int],
+    -- The pool of storage for values in memory: the type and the
+    -- alloca of each, whether it is in use (until pool_until, the
+    -- index of an instruction of the block being generated), and how
+    -- many values have had it
+    pool_ty: List[int],
+    pool_alloca: List[int],
+    pool_busy: List[int],
+    pool_until: List[int],
+    pool_gen: List[int],
+    -- The block and the instruction being generated
+    cur_bi: int,
+    cur_ii: int,
     -- The LLVM function of each C symbol declared so far. Extern
     -- functions bound to the same symbol share it; each keeps its own
     -- function type in fn_type_map.
@@ -24159,6 +24361,32 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             wrapper_returns_string: Map_new(),
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
+            sret_types: Map_new(),
+            mem_params: Map_new(),
+            mv_count: 0,
+            mv_block: [],
+            mv_at: [],
+            mv_uses: [],
+            mv_last: [],
+            mv_far: [],
+            mv_kind: [],
+            mv_ty: [],
+            mv_temp: [],
+            mv_gen: [],
+            mv_owns: [],
+            mv_scratch: [],
+            param_mem_ty: [],
+            param_direct: [],
+            param_copy: [],
+            clob: [],
+            clob_base: [],
+            pool_ty: [],
+            pool_alloca: [],
+            pool_busy: [],
+            pool_until: [],
+            pool_gen: [],
+            cur_bi: 0,
+            cur_ii: 0,
             c_symbols: Map_new(),
             c_symbol_names: Map_new(),
             data_symbols: Map_new(),
@@ -24728,6 +24956,10 @@ fn bind_runtime_port(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     g.fn_type_map.insert(c_name, g.fn_type_map.get(func.name))
     if g.returns_sret.contains(func.name) {
         g.returns_sret.insert(c_name, true)
+        g.sret_types.insert(c_name, g.sret_types.get(func.name))
+    }
+    if g.mem_params.contains(func.name) {
+        g.mem_params.insert(c_name, g.mem_params.get(func.name))
     }
     return g
 }
@@ -25160,9 +25392,12 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             g = declare_wrapper(g, func)
             return g
         }
-        -- Regular function declaration
-        -- Check if function returns result/option (needs sret convention)
-        let needs_sret = is_sret_return_type(func.return_type) and func.name != "main"
+        -- Regular function declaration. A dAImond function takes a
+        -- struct in memory by its address and returns one through a
+        -- pointer (see MEMORY VALUES); a C function takes and returns
+        -- it as a value.
+        let in_memory = func.is_extern == false
+        let needs_sret = (is_sret_return_type(func.return_type) or (in_memory and is_mem_type(g, func.return_type))) and func.name != "main"
         let is_main = func.name == "main"
         -- IMPORTANT: Compute return type and collect param types BEFORE using the shared
         -- buffer, because map_ir_type_to_llvm may use dm_llvm_buf internally for struct types
@@ -25179,9 +25414,15 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         if needs_sret {
             param_types.push(dm_llvm_pointer_type(ctx))
         }
+        let mut param_irs: List[string] = []
         let mut i = 0
         while i < func.params.len() {
-            param_types.push(map_ir_type_to_llvm(g, func.params[i].type_id))
+            if in_memory {
+                param_types.push(param_llvm_type(g, func.params[i].type_id))
+                param_irs.push(func.params[i].type_id)
+            } else {
+                param_types.push(map_ir_type_to_llvm(g, func.params[i].type_id))
+            }
             i = i + 1
         }
         if is_main {
@@ -25203,6 +25444,7 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             g.fn_type_map.insert(func.name, fn_ty)
             if needs_sret {
                 g.returns_sret.insert(func.name, true)
+                g.sret_types.insert(func.name, func.return_type)
             }
             return g
         }
@@ -25212,6 +25454,11 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         -- Track sret functions
         if needs_sret {
             g.returns_sret.insert(func.name, true)
+            g.sret_types.insert(func.name, func.return_type)
+        }
+        let taken_in_memory = mem_param_types(g, param_irs)
+        if taken_in_memory != "" {
+            g.mem_params.insert(func.name, taken_in_memory)
         }
         -- Name parameters (offset by 1 for sret functions since param 0 is the sret ptr)
         i = 0
@@ -25263,6 +25510,7 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         g.value_map = Map_new()
         g.string_ptrs = Map_new()
         g.panic_blocks = Map_new()
+        g = mv_scan(g, func)
         -- ALLOCA HOISTING: Generate all allocas in the entry block first.
         -- This ensures all allocas are available regardless of block processing order.
         -- Standard LLVM practice: all allocas belong in the entry block.
@@ -25298,6 +25546,20 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                         si = si + 1
                     }
                     bi = bi + 1
+                }
+                -- A parameter held in memory that is used anywhere but
+                -- in the store that opens the function: a copy of its
+                -- own, made before anything can change the caller's
+                -- memory
+                let mut pci = 0
+                while pci < g.param_mem_ty.len() {
+                    if g.param_mem_ty[pci] != 0 and g.param_direct[pci] == 0 {
+                        let given = resolve_raw(g, ir_val_param(pci))
+                        let own = dm_llvm_build_alloca(g.builder, g.param_mem_ty[pci], "param.mem")
+                        mem_copy(g, own, given, g.param_mem_ty[pci])
+                        g.param_copy[pci] = own
+                    }
+                    pci = pci + 1
                 }
             }
         }
@@ -25372,17 +25634,33 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                         let bb = g.block_map.get(block.label)
                         dm_llvm_position_at_end(g.builder, bb)
                         -- Generate non-alloca instructions
+                        g.cur_bi = found_bi
                         let mut ii = 0
                         while ii < block.instructions.len() {
                             if block.instructions[ii].op != OP_ALLOCA() {
+                                g.cur_ii = ii
                                 g = generate_instruction(g, block.instructions[ii])
+                                -- The pool's storage whose value has had
+                                -- its last use is free again
+                                let mut ti = 0
+                                while ti < g.pool_busy.len() {
+                                    if g.pool_busy[ti] == 1 and g.pool_until[ti] <= ii { g.pool_busy[ti] = 0 }
+                                    ti = ti + 1
+                                }
                             }
                             ii = ii + 1
                         }
                         -- Generate terminator
+                        g.cur_ii = block.instructions.len()
                         if block.has_terminator {
                             let term = *block.terminator
                             g = generate_terminator(g, term, func)
+                        }
+                        -- No value in the pool's storage lives past its block
+                        let mut ti = 0
+                        while ti < g.pool_busy.len() {
+                            if g.pool_busy[ti] == 1 { g.pool_busy[ti] = 0 }
+                            ti = ti + 1
                         }
                     }
                 }
@@ -25395,10 +25673,791 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
 }
 
 -- ============================================================
+-- MEMORY VALUES
+-- A value of a struct type (a struct, an enum, an Option, a
+-- Result, a `dyn` value) is not an LLVM value: it is the address
+-- of memory that holds it, and it is copied with memcpy. LLVM
+-- would otherwise pass each of the struct's scalars as an
+-- argument of its own and keep every value in a stack slot of the
+-- struct's size, which made the compiler's own functions use up
+-- to 1.5 MB of stack each.
+--
+-- Strings and lists are not among them: they have their own
+-- handling (string_ptrs).
+--
+-- A function takes such a parameter as a pointer to memory that
+-- holds the value when the function begins, and returns such a
+-- value through a pointer the caller passes first (sret), as it
+-- returns a string.
+--
+-- The address is one of two kinds (mv_kind):
+--   1  the place the value was loaded from (a variable, a field,
+--      a box). No copy was made. It is the value only until that
+--      place is written to, so a load is of this kind only when
+--      every use of the value is in its block and no store or
+--      call lies between the load and its last use (mv_scan finds
+--      this before the function is generated).
+--   2  storage of the value's own: a temporary, or the memory of a
+--      parameter. A temporary is taken from a pool and goes back
+--      after the value's last use when every use is in the value's
+--      block; a value used in another block keeps an alloca of its
+--      own for the whole function.
+--
+-- resolve_value gives a struct value as the LLVM value, loading
+-- it: every instruction that has no code of its own for a value
+-- in memory gets it that way. The instructions that copy, read a
+-- field of, pass or return such a value take its address
+-- (mem_addr) and never load it.
+-- ============================================================
+
+-- Whether values of the IR type are held in memory
+fn is_mem_type(gen: LLVMGenerator, t: string) -> bool {
+    unsafe {
+        if t == "" or t == "void" or t == "ptr" or t == "bool" or t == "string" or t == "list" { return false }
+        if is_list_ir_type(t) or is_int_type(t) or lg_is_float_type(t) or lg_is_simd_type(t) { return false }
+        let ty = map_ir_type_to_llvm(gen, t)
+        if dm_llvm_get_type_kind(ty) != 10 { return false }
+        return ty != gen.dm_string_type
+    }
+}
+
+-- The LLVM type of a parameter of the IR type: a pointer for a
+-- value held in memory
+fn param_llvm_type(gen: LLVMGenerator, t: string) -> int {
+    unsafe {
+        if is_mem_type(gen, t) { return dm_llvm_pointer_type(gen.context) }
+        return map_ir_type_to_llvm(gen, t)
+    }
+}
+
+-- Whether a function with this result returns it through a pointer
+-- that is passed first
+fn returns_through_pointer(gen: LLVMGenerator, t: string) -> bool {
+    return is_sret_return_type(t) or is_mem_type(gen, t)
+}
+
+-- xs with xs[at] = v, growing the list by one when at is its length
+fn mv_put(xs: List[int], at: int, v: int) -> List[int] {
+    let mut out = xs
+    if at < out.len() {
+        out[at] = v
+    } else {
+        out.push(v)
+    }
+    return out
+}
+
+-- A value an instruction uses, as a number: the id of the
+-- instruction that made it, or -(n + 1) for parameter n
+fn mv_operand(v: IRValue) -> int {
+    if v.kind == VAL_INST_REF() { return v.ref_id }
+    if v.kind == VAL_SIZEOF() and v.str_val == "" { return v.ref_id }
+    if v.kind == VAL_PARAM_REF() { return 0 - (v.ref_id + 1) }
+    return 0
+}
+
+fn mv_is_operand(v: IRValue) -> bool {
+    return v.kind == VAL_INST_REF() or v.kind == VAL_PARAM_REF() or (v.kind == VAL_SIZEOF() and v.str_val == "")
+}
+
+-- The values the instruction uses (see mv_operand), written into
+-- `found` from index 1, with their number at index 0
+fn mv_operands(inst: IRInst, found: List[int]) -> List[int] {
+    let mut out = found
+    if out.len() == 0 { out.push(0) }
+    let mut n = 0
+    if mv_is_operand(inst.lhs) {
+        out = mv_put(out, n + 1, mv_operand(inst.lhs))
+        n = n + 1
+    }
+    if mv_is_operand(inst.rhs) {
+        out = mv_put(out, n + 1, mv_operand(inst.rhs))
+        n = n + 1
+    }
+    if mv_is_operand(inst.operand) {
+        out = mv_put(out, n + 1, mv_operand(inst.operand))
+        n = n + 1
+    }
+    if mv_is_operand(inst.load_ptr) {
+        out = mv_put(out, n + 1, mv_operand(inst.load_ptr))
+        n = n + 1
+    }
+    if mv_is_operand(inst.store_ptr) {
+        out = mv_put(out, n + 1, mv_operand(inst.store_ptr))
+        n = n + 1
+    }
+    if mv_is_operand(inst.store_val) {
+        out = mv_put(out, n + 1, mv_operand(inst.store_val))
+        n = n + 1
+    }
+    if mv_is_operand(inst.gep_base) {
+        out = mv_put(out, n + 1, mv_operand(inst.gep_base))
+        n = n + 1
+    }
+    if mv_is_operand(inst.field_base) {
+        out = mv_put(out, n + 1, mv_operand(inst.field_base))
+        n = n + 1
+    }
+    if mv_is_operand(inst.field_value) {
+        out = mv_put(out, n + 1, mv_operand(inst.field_value))
+        n = n + 1
+    }
+    if mv_is_operand(inst.callee_val) {
+        out = mv_put(out, n + 1, mv_operand(inst.callee_val))
+        n = n + 1
+    }
+    if mv_is_operand(inst.cast_val) {
+        out = mv_put(out, n + 1, mv_operand(inst.cast_val))
+        n = n + 1
+    }
+    if mv_is_operand(inst.simd_scalar) {
+        out = mv_put(out, n + 1, mv_operand(inst.simd_scalar))
+        n = n + 1
+    }
+    if mv_is_operand(inst.simd_vector) {
+        out = mv_put(out, n + 1, mv_operand(inst.simd_vector))
+        n = n + 1
+    }
+    if mv_is_operand(inst.simd_index) {
+        out = mv_put(out, n + 1, mv_operand(inst.simd_index))
+        n = n + 1
+    }
+    let mut i = 0
+    while i < inst.gep_indices.len() {
+        if mv_is_operand(inst.gep_indices[i]) {
+            out = mv_put(out, n + 1, mv_operand(inst.gep_indices[i]))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < inst.call_args.len() {
+        if mv_is_operand(inst.call_args[i]) {
+            out = mv_put(out, n + 1, mv_operand(inst.call_args[i]))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < inst.simd_elements.len() {
+        if mv_is_operand(inst.simd_elements[i]) {
+            out = mv_put(out, n + 1, mv_operand(inst.simd_elements[i]))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < inst.phi_entries.len() {
+        let entry = inst.phi_entries[i]
+        if mv_is_operand(entry.value) {
+            out = mv_put(out, n + 1, mv_operand(entry.value))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    -- The number of operands is kept in front of them
+    out = mv_put(out, 0, n)
+    return out
+}
+
+-- Count the uses that g.mv_scratch holds (see mv_operands), which
+-- are those of instruction ii of block bi. `opening_param` is the
+-- parameter that instruction copies into its variable as the function
+-- begins, or -1: that use is not counted.
+fn mv_count_uses(gen: LLVMGenerator, bi: int, ii: int, opening_param: int) -> LLVMGenerator {
+    let mut g = gen
+    let n = g.mv_scratch[0]
+    let mut oi = 1
+    while oi <= n {
+        let operand = g.mv_scratch[oi]
+        if operand < 0 {
+            -- A parameter used anywhere but in the store that opens
+            -- the function gets a copy of its own (lg_generate_function)
+            let p = 0 - operand - 1
+            if p != opening_param and p < g.param_direct.len() { g.param_direct[p] = 0 }
+        } else if operand < g.mv_count {
+            g.mv_uses[operand] = g.mv_uses[operand] + 1
+            if g.mv_block[operand] == bi and ii > g.mv_at[operand] {
+                if ii > g.mv_last[operand] { g.mv_last[operand] = ii }
+            } else {
+                g.mv_far[operand] = 1
+            }
+        }
+        oi = oi + 1
+    }
+    return g
+}
+
+-- Before a function is generated: where each of its values is made
+-- and used, and which instructions write to memory
+fn mv_scan(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        -- Ids are small numbers that begin again in every function
+        let mut top = 0
+        let mut bi = 0
+        while bi < func.blocks.len() {
+            let block = func.blocks[bi]
+            let mut ii = 0
+            while ii < block.instructions.len() {
+                let id = block.instructions[ii].id
+                if id >= top { top = id + 1 }
+                ii = ii + 1
+            }
+            bi = bi + 1
+        }
+        g.mv_count = top
+        let mut k = 0
+        while k < top {
+            g.mv_block = mv_put(g.mv_block, k, -1)
+            g.mv_at = mv_put(g.mv_at, k, 0)
+            g.mv_uses = mv_put(g.mv_uses, k, 0)
+            g.mv_last = mv_put(g.mv_last, k, -1)
+            g.mv_far = mv_put(g.mv_far, k, 0)
+            g.mv_kind = mv_put(g.mv_kind, k, 0)
+            g.mv_ty = mv_put(g.mv_ty, k, 0)
+            g.mv_temp = mv_put(g.mv_temp, k, -1)
+            g.mv_gen = mv_put(g.mv_gen, k, 0)
+            g.mv_owns = mv_put(g.mv_owns, k, 0)
+            k = k + 1
+        }
+        bi = 0
+        while bi < func.blocks.len() {
+            let block = func.blocks[bi]
+            let mut ii = 0
+            while ii < block.instructions.len() {
+                let id = block.instructions[ii].id
+                if id >= 0 and block.instructions[ii].has_result {
+                    g.mv_block[id] = bi
+                    g.mv_at[id] = ii
+                }
+                ii = ii + 1
+            }
+            bi = bi + 1
+        }
+        -- Parameters: the type of each that is held in memory, and
+        -- whether the function only copies it as it begins
+        let mut param_tys: List[int] = []
+        let mut param_direct: List[int] = []
+        let mut param_copy: List[int] = []
+        let mut pi = 0
+        while pi < func.params.len() {
+            if is_mem_type(g, func.params[pi].type_id) {
+                param_tys.push(map_ir_type_to_llvm(g, func.params[pi].type_id))
+            } else {
+                param_tys.push(0)
+            }
+            param_direct.push(1)
+            param_copy.push(0)
+            pi = pi + 1
+        }
+        g.param_mem_ty = param_tys
+        g.param_direct = param_direct
+        g.param_copy = param_copy
+        -- Uses, and the writes of each block: clob[base + i] is the
+        -- number of stores and calls among the block's first i
+        -- instructions
+        let mut bases: List[int] = []
+        let mut cn = 0
+        bi = 0
+        while bi < func.blocks.len() {
+            let block = func.blocks[bi]
+            bases.push(cn)
+            let mut writes = 0
+            -- The function begins with the stores of its parameters
+            -- into their variables
+            let mut opening = bi == 0
+            let mut ii = 0
+            while ii < block.instructions.len() {
+                let inst = block.instructions[ii]
+                g.clob = mv_put(g.clob, cn, writes)
+                cn = cn + 1
+                let mut copied_param = -1
+                if inst.op == OP_STORE() and inst.store_val.kind == VAL_PARAM_REF() {
+                    if opening { copied_param = inst.store_val.ref_id }
+                } else if inst.op != OP_ALLOCA() and inst.op != OP_DEBUG_VAR() {
+                    opening = false
+                }
+                if inst.op == OP_STORE() and inst.store_ptr.kind == VAL_PARAM_REF() { copied_param = -1 }
+                g.mv_scratch = mv_operands(inst, g.mv_scratch)
+                g = mv_count_uses(g, bi, ii, copied_param)
+                if inst.op == OP_STORE() or inst.op == OP_CALL() or inst.op == OP_CALL_PTR() {
+                    writes = writes + 1
+                }
+                ii = ii + 1
+            }
+            g.clob = mv_put(g.clob, cn, writes)
+            cn = cn + 1
+            if block.has_terminator {
+                let term = *block.terminator
+                let at = block.instructions.len()
+                if g.mv_scratch.len() == 0 { g.mv_scratch.push(0) }
+                let mut n = 0
+                if mv_is_operand(term.cond) {
+                    g.mv_scratch = mv_put(g.mv_scratch, n + 1, mv_operand(term.cond))
+                    n = n + 1
+                }
+                if mv_is_operand(term.ret_val) {
+                    g.mv_scratch = mv_put(g.mv_scratch, n + 1, mv_operand(term.ret_val))
+                    n = n + 1
+                }
+                g.mv_scratch[0] = n
+                g = mv_count_uses(g, bi, at, -1)
+            }
+            bi = bi + 1
+        }
+        g.clob_base = bases
+        let no_ints: List[int] = []
+        g.pool_ty = no_ints
+        let no_allocas: List[int] = []
+        g.pool_alloca = no_allocas
+        let no_busy: List[int] = []
+        g.pool_busy = no_busy
+        let no_until: List[int] = []
+        g.pool_until = no_until
+        let no_gen: List[int] = []
+        g.pool_gen = no_gen
+        g.cur_bi = 0
+        g.cur_ii = 0
+        return g
+    }
+}
+
+-- Whether no store and no call lies between instructions `from` and
+-- `to` of the block being generated
+fn mv_window_clear(gen: LLVMGenerator, from: int, to: int) -> bool {
+    if to <= from { return true }
+    if gen.cur_bi >= gen.clob_base.len() { return false }
+    let base = gen.clob_base[gen.cur_bi]
+    return gen.clob[base + to] - gen.clob[base + from + 1] == 0
+}
+
+-- Whether the value is held in memory, by its address
+fn is_mem(gen: LLVMGenerator, val: IRValue) -> bool {
+    if val.kind == VAL_INST_REF() {
+        return val.ref_id >= 0 and val.ref_id < gen.mv_count and gen.mv_kind[val.ref_id] != 0
+    }
+    if val.kind == VAL_PARAM_REF() {
+        return val.ref_id >= 0 and val.ref_id < gen.param_mem_ty.len() and gen.param_mem_ty[val.ref_id] != 0
+    }
+    return false
+}
+
+-- The LLVM struct type of a value held in memory
+fn mem_ty(gen: LLVMGenerator, val: IRValue) -> int {
+    if val.kind == VAL_PARAM_REF() { return gen.param_mem_ty[val.ref_id] }
+    return gen.mv_ty[val.ref_id]
+}
+
+-- The address of a value held in memory. A use that mv_scan did not
+-- see would read memory that is no longer the value's: that is a
+-- mistake in this file, and stops the compiler.
+fn mem_addr(gen: LLVMGenerator, val: IRValue) -> int {
+    if val.kind == VAL_INST_REF() {
+        let id = val.ref_id
+        if gen.mv_kind[id] == 1 {
+            if gen.cur_bi != gen.mv_block[id] or gen.cur_ii > gen.mv_last[id] {
+                panic("internal: value " + int_to_string(id) + " of '" + gen.current_func_name + "' is read after the place it was loaded from may have changed")
+            }
+        } else if gen.mv_temp[id] >= 0 {
+            if gen.pool_gen[gen.mv_temp[id]] != gen.mv_gen[id] or gen.pool_busy[gen.mv_temp[id]] == 0 {
+                panic("internal: value " + int_to_string(id) + " of '" + gen.current_func_name + "' is read after its storage was given to another value")
+            }
+        }
+    }
+    return resolve_raw(gen, val)
+}
+
+-- memcpy of a value of the LLVM type
+fn mem_copy(gen: LLVMGenerator, dst: int, src: int, ty: int) {
+    unsafe {
+        let size = dm_llvm_abi_size_of(gen.llvm_module, ty)
+        dm_llvm_build_memcpy(gen.builder, dst, src, dm_llvm_const_int(dm_llvm_int64_type(gen.context), size, 0))
+    }
+}
+
+-- Storage of its own for value `id` of the LLVM type, which
+-- temp_of(g, id) gives afterwards. When every use of the value is in
+-- this block it is the pool's, until the value's last use; otherwise
+-- it is an alloca that is the value's for the whole function.
+fn take_temp(gen: LLVMGenerator, ty: int, id: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        g.mv_kind[id] = 2
+        g.mv_ty[id] = ty
+        g.mv_owns[id] = 1
+        if g.mv_far[id] != 0 {
+            g.mv_temp[id] = -1
+            g.value_map.insert(int_to_string(id), dm_llvm_build_alloca(g.builder, ty, "mem.own"))
+            return g
+        }
+        let mut t = -1
+        let mut i = 0
+        while i < g.pool_ty.len() and t < 0 {
+            if g.pool_busy[i] == 0 and g.pool_ty[i] == ty { t = i }
+            i = i + 1
+        }
+        if t < 0 {
+            let slot = dm_llvm_build_alloca(g.builder, ty, "mem.tmp")
+            g.pool_ty.push(ty)
+            g.pool_alloca.push(slot)
+            g.pool_busy.push(0)
+            g.pool_until.push(0)
+            g.pool_gen.push(0)
+            t = g.pool_ty.len() - 1
+        }
+        g.pool_gen[t] = g.pool_gen[t] + 1
+        g.pool_busy[t] = 1
+        let mut until = g.mv_last[id]
+        if until < g.cur_ii { until = g.cur_ii }
+        g.pool_until[t] = until
+        g.mv_temp[id] = t
+        g.mv_gen[id] = g.pool_gen[t]
+        g.value_map.insert(int_to_string(id), g.pool_alloca[t])
+        return g
+    }
+}
+
+-- The storage take_temp gave value `id`
+fn temp_of(gen: LLVMGenerator, id: int) -> int {
+    return gen.value_map.get(int_to_string(id))
+}
+
+-- Value `id` is at `addr`, inside the storage of value `base`, which
+-- stays as it is for as long as `id` is used: `id` is a value in
+-- memory of the LLVM type
+fn mv_inside(gen: LLVMGenerator, id: int, base: int, addr: int, ty: int) -> LLVMGenerator {
+    let mut g = gen
+    g.mv_kind[id] = g.mv_kind[base]
+    g.mv_ty[id] = ty
+    g.mv_temp[id] = g.mv_temp[base]
+    g.mv_gen[id] = g.mv_gen[base]
+    g.mv_owns[id] = 0
+    let t = g.mv_temp[base]
+    if t >= 0 {
+        if g.mv_last[id] > g.pool_until[t] { g.pool_until[t] = g.mv_last[id] }
+    }
+    g.value_map.insert(int_to_string(id), addr)
+    return g
+}
+
+-- Whether the field of a value in memory can be used where it lies:
+-- `field` is the instruction that reads it from `base`
+fn mv_field_stays(gen: LLVMGenerator, field: int, base: IRValue) -> bool {
+    if base.kind == VAL_PARAM_REF() { return true }
+    let b = base.ref_id
+    if gen.mv_kind[b] == 1 {
+        -- The place the base was loaded from must stay unwritten
+        return gen.mv_far[field] == 0 and mv_window_clear(gen, gen.cur_ii, gen.mv_last[field])
+    }
+    -- Storage that is not the pool's stays for the whole function. A
+    -- value used in another block does not live in the pool's.
+    if gen.mv_temp[b] < 0 { return true }
+    return gen.mv_far[field] == 0
+}
+
+-- A struct value read from memory: `load T, ptr`
+fn generate_mem_load(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let id = inst.id
+        let ty = map_ir_type_to_llvm(g, inst.load_type)
+        let from = resolve_value(g, inst.load_ptr)
+        if g.mv_uses[id] == 0 { return g }
+        if g.mv_far[id] == 0 and mv_window_clear(g, g.cur_ii, g.mv_last[id]) {
+            g.mv_kind[id] = 1
+            g.mv_ty[id] = ty
+            g.mv_temp[id] = -1
+            g.mv_owns[id] = 0
+            g.value_map.insert(int_to_string(id), from)
+            return g
+        }
+        g = take_temp(g, ty, id)
+        mem_copy(g, temp_of(g, id), from, ty)
+        return g
+    }
+}
+
+-- A field read from a value in memory
+fn generate_mem_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id = inst.id
+        let id_key = int_to_string(id)
+        let base_ty = mem_ty(g, inst.field_base)
+        if inst.field_index < 0 or inst.field_index >= dm_llvm_struct_field_count(base_ty) {
+            g.type_errors.push(lg_error(g, "field " + int_to_string(inst.field_index) + " read from a value of type " + llvm_type_name(base_ty) + ", which has no such field"))
+            return g
+        }
+        let base = mem_addr(g, inst.field_base)
+        let addr = dm_llvm_build_struct_gep2(b, base_ty, base, inst.field_index, "field.addr")
+        let field_ty = dm_llvm_struct_element_type(base_ty, inst.field_index)
+        if inst.field_type == "string" {
+            -- A string is held by the address of a copy of its own
+            let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.extract")
+            dm_llvm_build_store(b, dm_llvm_build_load2(b, field_ty, addr, "field"), str_alloca)
+            g.string_ptrs.insert(id_key, true)
+            if inst.has_result { g.value_map.insert(id_key, str_alloca) }
+            return g
+        }
+        if dm_llvm_get_type_kind(field_ty) == 10 and field_ty != g.dm_string_type {
+            -- A struct in a struct: where it lies, or a copy
+            if g.mv_uses[id] == 0 { return g }
+            if mv_field_stays(g, id, inst.field_base) {
+                if inst.field_base.kind == VAL_PARAM_REF() {
+                    g.mv_kind[id] = 2
+                    g.mv_ty[id] = field_ty
+                    g.mv_temp[id] = -1
+                    g.mv_owns[id] = 0
+                    g.value_map.insert(id_key, addr)
+                    return g
+                }
+                return mv_inside(g, id, inst.field_base.ref_id, addr, field_ty)
+            }
+            g = take_temp(g, field_ty, id)
+            mem_copy(g, temp_of(g, id), addr, field_ty)
+            return g
+        }
+        if inst.has_result { g.value_map.insert(id_key, dm_llvm_build_load2(b, field_ty, addr, "field")) }
+        return g
+    }
+}
+
+-- A value in memory with one field set: the struct `base` with field
+-- field_index = field_value, or a new struct when base is undef
+fn generate_mem_insert(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id = inst.id
+        let ty = map_ir_type_to_llvm(g, inst.result_type)
+        let base = inst.field_base
+        if dm_llvm_struct_field_count(ty) == 0 and base.kind == VAL_UNDEF() {
+            -- A struct with no fields (`Empty {}`): the IR makes it
+            -- by setting a field it does not have. Its value is
+            -- storage with nothing in it.
+            if g.mv_uses[id] == 0 { return g }
+            return take_temp(g, ty, id)
+        }
+        if inst.field_index < 0 or inst.field_index >= dm_llvm_struct_field_count(ty) {
+            g.type_errors.push(lg_error(g, "field " + int_to_string(inst.field_index) + " set in a value of type " + llvm_type_name(ty) + ", which has no such field"))
+            return g
+        }
+        let mut dst = 0
+        let mut in_place = false
+        if base.kind == VAL_INST_REF() and is_mem(g, base) {
+            let bid = base.ref_id
+            -- The base's own storage becomes the result's when nothing
+            -- else uses the base and the result may live there: any
+            -- result in storage that is not the pool's, and in the
+            -- pool's one whose uses are all in this block
+            if g.mv_kind[bid] == 2 and g.mv_owns[bid] == 1 and g.mv_uses[bid] == 1 and g.mv_ty[bid] == ty {
+                if g.mv_temp[bid] < 0 or g.mv_far[id] == 0 { in_place = true }
+            }
+        }
+        if in_place {
+            let bid = base.ref_id
+            let t = g.mv_temp[bid]
+            dst = mem_addr(g, base)
+            g.mv_kind[id] = 2
+            g.mv_ty[id] = ty
+            g.mv_temp[id] = t
+            g.mv_gen[id] = g.mv_gen[bid]
+            g.mv_owns[id] = 1
+            if t >= 0 {
+                let mut until = g.mv_last[id]
+                if until < g.cur_ii { until = g.cur_ii }
+                if until > g.pool_until[t] { g.pool_until[t] = until }
+            }
+            g.value_map.insert(int_to_string(id), dst)
+        } else {
+            -- The base is read where it is, and the result gets
+            -- storage that the base is not in
+            let mut base_addr = 0
+            let mut base_val = 0
+            if base.kind != VAL_UNDEF() {
+                if is_mem(g, base) {
+                    base_addr = mem_addr(g, base)
+                } else {
+                    base_val = resolve_value(g, base)
+                    g = resolve_value_with_counter(g, base)
+                }
+            }
+            g = take_temp(g, ty, id)
+            dst = temp_of(g, id)
+            if base_addr != 0 {
+                mem_copy(g, dst, base_addr, ty)
+            } else if base_val != 0 {
+                if dm_llvm_type_of(base_val) != ty {
+                    g.type_errors.push(lg_error(g, "internal: a field is set in a " + llvm_type_name(dm_llvm_type_of(base_val)) + " to make a " + llvm_type_name(ty)))
+                    return g
+                }
+                dm_llvm_build_store(b, base_val, dst)
+            }
+        }
+        let field_addr = dm_llvm_build_struct_gep2(b, ty, dst, inst.field_index, "field.addr")
+        let exp_ty = dm_llvm_struct_element_type(ty, inst.field_index)
+        if is_mem(g, inst.field_value) {
+            if mem_ty(g, inst.field_value) != exp_ty {
+                g.type_errors.push(lg_error(g, "internal: field " + int_to_string(inst.field_index) + " of a " + llvm_type_name(ty) + " is given a " + llvm_type_name(mem_ty(g, inst.field_value))))
+                return g
+            }
+            mem_copy(g, field_addr, mem_addr(g, inst.field_value), exp_ty)
+            return g
+        }
+        let mut val = resolve_value(g, inst.field_value)
+        g = resolve_value_with_counter(g, inst.field_value)
+        val = coerce_field_value(g, inst, val, exp_ty)
+        if dm_llvm_type_of(val) != exp_ty {
+            -- LLVM would have refused the value in the struct
+            g.type_errors.push(lg_error(g, "internal: field " + int_to_string(inst.field_index) + " of a " + llvm_type_name(ty) + " is given a " + llvm_type_name(dm_llvm_type_of(val))))
+            return g
+        }
+        dm_llvm_build_store(b, val, field_addr)
+        return g
+    }
+}
+
+-- The value of an INSERT_FIELD as the field's LLVM type. The IR
+-- gives i64 constants for fields of other types (i32 tags, the
+-- payload that is not used, a box).
+fn coerce_field_value(gen: LLVMGenerator, inst: IRInst, given: int, exp_ty: int) -> int {
+    unsafe {
+        let b = gen.builder
+        let mut val = given
+        let val_ty = dm_llvm_type_of(val)
+        if val_ty != exp_ty {
+            let ek = dm_llvm_get_type_kind(exp_ty)
+            let vk = dm_llvm_get_type_kind(val_ty)
+            if inst.field_value.kind == VAL_UNDEF() {
+                val = dm_llvm_get_undef(exp_ty)
+            } else if inst.field_value.kind == VAL_CONST_INT() {
+                if ek == 8 {
+                    val = dm_llvm_const_int(exp_ty, inst.field_value.int_val, 1)
+                } else if ek == 2 or ek == 3 {
+                    val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+                } else {
+                    val = dm_llvm_const_null(exp_ty)
+                }
+            } else if ek == 8 and vk == 8 {
+                if dm_llvm_get_int_type_width(val_ty) < dm_llvm_get_int_type_width(exp_ty) {
+                    val = dm_llvm_build_sext(b, val, exp_ty, "sext")
+                } else {
+                    val = dm_llvm_build_trunc(b, val, exp_ty, "trunc")
+                }
+            } else if (ek == 2 or ek == 3) and vk == 8 {
+                val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+            } else if ek == 8 and (vk == 2 or vk == 3) {
+                val = dm_llvm_build_fp_to_si(b, val, exp_ty, "ftoi")
+            } else if ek == 12 and vk == 8 {
+                val = dm_llvm_build_int_to_ptr(b, val, exp_ty, "itop")
+            } else if ek == 8 and vk == 12 {
+                val = dm_llvm_build_ptr_to_int(b, val, exp_ty, "ptoi")
+            }
+        }
+        -- A string or a list that is held by its address
+        if dm_llvm_get_type_kind(exp_ty) == 10 and dm_llvm_get_type_kind(dm_llvm_type_of(val)) == 12 {
+            val = dm_llvm_build_load2(b, exp_ty, val, "field.load")
+        }
+        return val
+    }
+}
+
+-- The IR types of the function's parameters that take a struct in
+-- memory, at their indexes, with "" for every other parameter; empty
+-- when the function has none
+fn mem_params_of(gen: LLVMGenerator, fn_name: string) -> List[string] {
+    if gen.mem_params.contains(fn_name) {
+        return string_split(gen.mem_params.get(fn_name), "|")
+    }
+    let none: List[string] = []
+    return none
+}
+
+-- The IR types of the parameters that take a struct in memory, joined
+-- by "|" with "" for every other parameter; "" when there is none
+fn mem_param_types(gen: LLVMGenerator, types: List[string]) -> string {
+    let mut joined = ""
+    let mut any = false
+    let mut i = 0
+    while i < types.len() {
+        if i > 0 { joined = joined + "|" }
+        if is_mem_type(gen, types[i]) {
+            joined = joined + types[i]
+            any = true
+        }
+        i = i + 1
+    }
+    if any { return joined }
+    return ""
+}
+
+-- An argument for a parameter that takes a struct of the IR type
+-- want_ir in memory must be such a struct: the pointer that is passed
+-- does not say what it points at, so LLVM cannot tell
+fn check_mem_arg(gen: LLVMGenerator, arg: IRValue, want_ir: string, callee_name: string, n: int) -> LLVMGenerator {
+    unsafe {
+        let want = map_ir_type_to_llvm(gen, want_ir)
+        let mut have = dm_llvm_pointer_type(gen.context)
+        if is_mem(gen, arg) {
+            have = mem_ty(gen, arg)
+        } else if arg.kind != VAL_CONST_STRING() {
+            have = dm_llvm_type_of(resolve_raw(gen, arg))
+        }
+        if have == want { return gen }
+        let mut g = gen
+        g.type_errors.push(lg_error(g, "call to '" + callee_name + "' argument " + int_to_string(n + 1) + " has type " + llvm_type_name(have) + ", expected " + llvm_type_name(want)))
+        return g
+    }
+}
+
+-- The argument as it is passed to such a parameter: the address of
+-- memory that holds the struct. A struct that is an LLVM value is put
+-- in memory first. For an argument of another type, which
+-- check_mem_arg has reported, a null pointer.
+fn mem_arg(gen: LLVMGenerator, arg: IRValue, want_ir: string) -> int {
+    unsafe {
+        if is_mem(gen, arg) { return mem_addr(gen, arg) }
+        let want = map_ir_type_to_llvm(gen, want_ir)
+        if arg.kind == VAL_CONST_STRING() { return dm_llvm_const_null(dm_llvm_pointer_type(gen.context)) }
+        let val = resolve_raw(gen, arg)
+        if dm_llvm_type_of(val) != want { return dm_llvm_const_null(dm_llvm_pointer_type(gen.context)) }
+        let slot = dm_llvm_build_alloca(gen.builder, want, "arg.mem")
+        dm_llvm_build_store(gen.builder, val, slot)
+        return slot
+    }
+}
+
+-- The IR type a function returns through the pointer it takes first
+fn sret_type_of(gen: LLVMGenerator, fn_name: string) -> string {
+    if gen.sret_types.contains(fn_name) { return gen.sret_types.get(fn_name) }
+    return find_ir_function(gen, fn_name).return_type
+}
+
+-- ============================================================
 -- VALUE RESOLUTION
 -- ============================================================
 
+-- The LLVM value of an IR value. A struct that is held in memory
+-- (see MEMORY VALUES) is loaded: the instructions that can use its
+-- address take it with mem_addr instead.
 fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
+    unsafe {
+        if val.kind == VAL_SIZEOF() and val.str_val == "" {
+            let sized = ir_val_inst(val.ref_id)
+            if is_mem(gen, sized) { return dm_llvm_sizeof_type(mem_ty(gen, sized)) }
+        }
+        if is_mem(gen, val) {
+            return dm_llvm_build_load2(gen.builder, mem_ty(gen, val), mem_addr(gen, val), "mem.val")
+        }
+        return resolve_raw(gen, val)
+    }
+}
+
+-- The LLVM value that stands for an IR value: for a struct held in
+-- memory, its address
+fn resolve_raw(gen: LLVMGenerator, val: IRValue) -> int {
     unsafe {
         let ctx = gen.context
         if val.kind == VAL_CONST_INT() {
@@ -25426,6 +26485,9 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
             return dm_llvm_const_null(dm_llvm_int64_type(ctx))
         }
         if val.kind == VAL_PARAM_REF() {
+            if val.ref_id >= 0 and val.ref_id < gen.param_copy.len() {
+                if gen.param_copy[val.ref_id] != 0 { return gen.param_copy[val.ref_id] }
+            }
             if gen.function_map.contains(gen.current_func_name) {
                 let llvm_fn = gen.function_map.get(gen.current_func_name)
                 -- For sret functions, LLVM param 0 is the sret pointer, so user params start at index 1
@@ -25926,6 +26988,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 if inst.has_result { g.value_map.insert(id_key, ptr_val) }
                 return g
             }
+            if is_mem_type(g, inst.load_type) {
+                return generate_mem_load(g, inst)
+            }
             let load_ty = map_ir_type_to_llvm(g, inst.load_type)
             let ptr_val = resolve_value(g, inst.load_ptr)
             g = resolve_value_with_counter(g, inst.load_ptr)
@@ -25945,6 +27010,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 store_borrowed_string(g, dst, raw_ptr, literal_len_const(g, inst.store_val))
                 return g
             }
+            if is_mem(g, inst.store_val) {
+                -- A struct held in memory is copied from where it is
+                mem_copy(g, dst, mem_addr(g, inst.store_val), mem_ty(g, inst.store_val))
+                return g
+            }
             let src = resolve_value(g, inst.store_val)
             g = resolve_value_with_counter(g, inst.store_val)
             if is_string_ptr(g, inst.store_val) {
@@ -25959,6 +27029,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Struct: extract field
         if op == OP_EXTRACT_FIELD() {
+            if is_mem(g, inst.field_base) {
+                return generate_mem_extract(g, inst)
+            }
             let base = resolve_value(g, inst.field_base)
             g = resolve_value_with_counter(g, inst.field_base)
             let base_ty = dm_llvm_type_of(base)
@@ -26010,6 +27083,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Struct: insert field
         if op == OP_INSERT_FIELD() {
+            if is_mem_type(g, inst.result_type) {
+                return generate_mem_insert(g, inst)
+            }
             let mut base_val = 0
             if inst.field_base.kind == VAL_UNDEF() {
                 -- Create undef of the result type
@@ -26389,6 +27465,19 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
                 }
             } else if g.returns_sret.contains(func.name) {
                 -- sret convention: store return value to the sret output pointer (param 0), then ret void
+                if is_mem(g, term.ret_val) {
+                    -- A struct held in memory is copied from where it is
+                    let out = dm_llvm_get_param(g.function_map.get(func.name), 0)
+                    if mem_ty(g, term.ret_val) != map_ir_type_to_llvm(g, func.return_type) {
+                        -- The pointer does not say what it points at,
+                        -- so LLVM cannot tell
+                        g.type_errors.push(lg_error(g, "internal: a " + llvm_type_name(mem_ty(g, term.ret_val)) + " is returned from a function that returns " + func.return_type))
+                    } else {
+                        mem_copy(g, out, mem_addr(g, term.ret_val), mem_ty(g, term.ret_val))
+                    }
+                    dm_llvm_build_ret_void(b)
+                    return g
+                }
                 let mut ret_val = resolve_value(g, term.ret_val)
                 g = resolve_value_with_counter(g, term.ret_val)
                 -- If returning a string pointer, load the struct before storing to sret
@@ -26435,6 +27524,14 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = get_dm_string_type(g)
     -- Phase 1: Declare struct types
     g = declare_struct_types(g)
+    -- The sizes of the structs that are copied in memory come from the
+    -- module's data layout
+    unsafe {
+        let layout_tm = set_module_target(g, 0)
+        if layout_tm != 0 {
+            dm_llvm_dispose_target_machine(layout_tm)
+        }
+    }
     if g.debug_info {
         g = di_begin(g)
     }
@@ -27047,34 +28144,42 @@ fn generate_call(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let nparams = dm_llvm_count_param_types(fn_ty)
         let is_source_extern = g.ir_module.user_extern_fns.contains(callee_name)
         let is_variadic = is_source_extern and dm_llvm_is_function_var_arg(fn_ty) != 0
+        let in_memory = mem_params_of(g, callee_name)
         let mut args: List[int] = []
         let mut ai = 0
         while ai < inst.call_args.len() {
             let arg = inst.call_args[ai]
-            let mut val = resolve_value(g, arg)
-            g = resolve_value_with_counter(g, arg)
-            -- Strings go to a variadic C function as char*, and arguments
-            -- past its parameters get C's default promotions
-            let is_string_arg = arg.kind == VAL_CONST_STRING() or is_string_ptr(g, arg) or dm_llvm_type_of(val) == g.dm_string_type
-            if is_variadic and is_string_arg {
-                val = string_arg_as_cstr(g, arg, val)
-            } else if is_variadic and ai >= nparams {
-                val = promote_vararg(g, val)
-            }
-            if ai < nparams and (is_variadic and is_string_arg) == false {
-                if arg.kind == VAL_CONST_STRING() and call_param_type(fn_ty, ai) == g.dm_string_type {
-                    val = string_operand(g, arg, val, true)
+            let want_mem = if ai < in_memory.len() { in_memory[ai] } else { "" }
+            if want_mem != "" {
+                -- A struct that the function takes in memory
+                g = check_mem_arg(g, arg, want_mem, callee_name, ai)
+                args.push(mem_arg(g, arg, want_mem))
+            } else {
+                let mut val = resolve_value(g, arg)
+                g = resolve_value_with_counter(g, arg)
+                -- Strings go to a variadic C function as char*, and arguments
+                -- past its parameters get C's default promotions
+                let is_string_arg = arg.kind == VAL_CONST_STRING() or is_string_ptr(g, arg) or dm_llvm_type_of(val) == g.dm_string_type
+                if is_variadic and is_string_arg {
+                    val = string_arg_as_cstr(g, arg, val)
+                } else if is_variadic and ai >= nparams {
+                    val = promote_vararg(g, val)
                 }
-                -- A string or list pointer passed by value: pass the value
-                val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
-                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
-                -- A source extern and a ported runtime function may take an
-                -- int where the compiler has a pointer, and the other way round
-                if is_source_extern or g.rt_ports.contains(callee_name) {
-                    val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
+                if ai < nparams and (is_variadic and is_string_arg) == false {
+                    if arg.kind == VAL_CONST_STRING() and call_param_type(fn_ty, ai) == g.dm_string_type {
+                        val = string_operand(g, arg, val, true)
+                    }
+                    -- A string or list pointer passed by value: pass the value
+                    val = load_handle_as(g, arg, val, call_param_type(fn_ty, ai))
+                    val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai, val)
+                    -- A source extern and a ported runtime function may take an
+                    -- int where the compiler has a pointer, and the other way round
+                    if is_source_extern or g.rt_ports.contains(callee_name) {
+                        val = coerce_ptr_int(g, val, dm_llvm_param_type_at(fn_ty, ai))
+                    }
                 }
+                args.push(val)
             }
-            args.push(val)
             ai = ai + 1
         }
         -- Determine call result name (empty string for void returns)
@@ -27214,14 +28319,15 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         -- function of these parameters and this result: a string, an
         -- Option or a Result comes back through a pointer that is
         -- passed first
-        let needs_sret = is_sret_return_type(inst.result_type)
+        let needs_sret = returns_through_pointer(g, inst.result_type)
+        let result_in_memory = inst.has_result and is_mem_type(g, inst.result_type)
         let result_ty = map_ir_type_to_llvm(g, inst.result_type)
         let declared = string_split(inst.callee, "|")
         let mut param_tys: List[int] = []
         if needs_sret { param_tys.push(dm_llvm_pointer_type(ctx)) }
         let mut pi = 0
         while pi < declared.len() {
-            param_tys.push(map_ir_type_to_llvm(g, declared[pi]))
+            param_tys.push(param_llvm_type(g, declared[pi]))
             pi = pi + 1
         }
         dm_llvm_buf_clear()
@@ -27237,8 +28343,15 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         let mut args: List[int] = []
         let mut sret = 0
         if needs_sret {
-            sret = dm_llvm_build_alloca(b, result_ty, "sret." + int_to_string(g.sret_counter))
-            g.sret_counter = g.sret_counter + 1
+            if result_in_memory {
+                -- The result is a struct held in memory: it is written
+                -- to the storage it stays in
+                g = take_temp(g, result_ty, inst.id)
+                sret = temp_of(g, inst.id)
+            } else {
+                sret = dm_llvm_build_alloca(b, result_ty, "sret." + int_to_string(g.sret_counter))
+                g.sret_counter = g.sret_counter + 1
+            }
             args.push(sret)
         }
         let first = args.len()
@@ -27246,24 +28359,30 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         while ai < inst.call_args.len() and first + ai < param_tys.len() {
             let arg = inst.call_args[ai]
             let want_ty = param_tys[first + ai]
-            let mut val = resolve_value(g, arg)
-            g = resolve_value_with_counter(g, arg)
-            if arg.kind == VAL_CONST_STRING() and want_ty == g.dm_string_type {
-                val = string_operand(g, arg, val, true)
+            if is_mem_type(g, declared[ai]) {
+                -- A struct that the function takes in memory
+                g = check_mem_arg(g, arg, declared[ai], "<function pointer>", ai)
+                args.push(mem_arg(g, arg, declared[ai]))
+            } else {
+                let mut val = resolve_value(g, arg)
+                g = resolve_value_with_counter(g, arg)
+                if arg.kind == VAL_CONST_STRING() and want_ty == g.dm_string_type {
+                    val = string_operand(g, arg, val, true)
+                }
+                -- A string or a list held by its address is passed as
+                -- the value
+                val = load_handle_as(g, arg, val, want_ty)
+                -- An integer takes the parameter's width
+                let val_ty = dm_llvm_type_of(val)
+                if dm_llvm_get_type_kind(want_ty) == 8 and dm_llvm_get_type_kind(val_ty) == 8 {
+                    let want_w = dm_llvm_get_int_type_width(want_ty)
+                    let val_w = dm_llvm_get_int_type_width(val_ty)
+                    if val_w < want_w { val = dm_llvm_build_sext(b, val, want_ty, "arg.sext") }
+                    if val_w > want_w { val = dm_llvm_build_trunc(b, val, want_ty, "arg.trunc") }
+                }
+                val = coerce_ptr_int(g, val, want_ty)
+                args.push(val)
             }
-            -- A string, a list or a struct held by its address is passed
-            -- as the value
-            val = load_handle_as(g, arg, val, want_ty)
-            -- An integer takes the parameter's width
-            let val_ty = dm_llvm_type_of(val)
-            if dm_llvm_get_type_kind(want_ty) == 8 and dm_llvm_get_type_kind(val_ty) == 8 {
-                let want_w = dm_llvm_get_int_type_width(want_ty)
-                let val_w = dm_llvm_get_int_type_width(val_ty)
-                if val_w < want_w { val = dm_llvm_build_sext(b, val, want_ty, "arg.sext") }
-                if val_w > want_w { val = dm_llvm_build_trunc(b, val, want_ty, "arg.trunc") }
-            }
-            val = coerce_ptr_int(g, val, want_ty)
-            args.push(val)
             ai = ai + 1
         }
         let mut call_name = ""
@@ -27282,7 +28401,7 @@ fn generate_call_ptr(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 -- A string stays where it is, as a string's address
                 g.string_ptrs.insert(id_key, true)
                 g.value_map.insert(id_key, sret)
-            } else {
+            } else if result_in_memory == false {
                 g.value_map.insert(id_key, dm_llvm_build_load2(b, result_ty, sret, "sret.load"))
             }
             return g
@@ -27422,32 +28541,47 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
         let mut g = gen
         let b = g.builder
         let id_key = int_to_string(inst.id)
-        -- Allocate stack space for the result struct (sret pattern)
-        let sret_name = "sret." + int_to_string(g.sret_counter)
-        g.sret_counter = g.sret_counter + 1
-        -- Look up the IR function to get its return type for correct alloca sizing
-        let ir_func = find_ir_function(g, callee_name)
-        let ret_llvm_ty = map_ir_type_to_llvm(g, ir_func.return_type)
-        let sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
+        -- The result is written to memory the caller passes first: for
+        -- a struct held in memory, the storage it stays in
+        let ret_ir = sret_type_of(g, callee_name)
+        let ret_llvm_ty = map_ir_type_to_llvm(g, ret_ir)
+        let result_in_memory = inst.has_result and is_mem_type(g, ret_ir)
+        let mut sret = 0
+        if result_in_memory {
+            g = take_temp(g, ret_llvm_ty, inst.id)
+            sret = temp_of(g, inst.id)
+        } else {
+            let sret_name = "sret." + int_to_string(g.sret_counter)
+            g.sret_counter = g.sret_counter + 1
+            sret = dm_llvm_build_alloca(b, ret_llvm_ty, sret_name)
+        }
         -- Build args: sret pointer first, then resolved args
+        let in_memory = mem_params_of(g, callee_name)
         let mut args: List[int] = []
         args.push(sret)
         let mut ai = 0
         while ai < inst.call_args.len() {
             let arg = inst.call_args[ai]
-            let mut val = resolve_value(g, arg)
-            g = resolve_value_with_counter(g, arg)
-            -- A string or list pointer passed by value: pass the value
-            let sparam_ty = call_param_type(fn_ty, ai + 1)
-            if arg.kind == VAL_CONST_STRING() and sparam_ty == g.dm_string_type {
-                val = string_operand(g, arg, val, true)
+            let want_mem = if ai < in_memory.len() { in_memory[ai] } else { "" }
+            if want_mem != "" {
+                -- A struct that the function takes in memory
+                g = check_mem_arg(g, arg, want_mem, callee_name, ai)
+                args.push(mem_arg(g, arg, want_mem))
+            } else {
+                let mut val = resolve_value(g, arg)
+                g = resolve_value_with_counter(g, arg)
+                -- A string or list pointer passed by value: pass the value
+                let sparam_ty = call_param_type(fn_ty, ai + 1)
+                if arg.kind == VAL_CONST_STRING() and sparam_ty == g.dm_string_type {
+                    val = string_operand(g, arg, val, true)
+                }
+                if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
+                val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
+                if sparam_ty != 0 and g.rt_ports.contains(callee_name) {
+                    val = coerce_ptr_int(g, val, sparam_ty)
+                }
+                args.push(val)
             }
-            if sparam_ty != 0 { val = load_handle_as(g, arg, val, sparam_ty) }
-            val = coerce_int_call_arg(g, fn_ty, callee_name, ai, ai + 1, val)
-            if sparam_ty != 0 and g.rt_ports.contains(callee_name) {
-                val = coerce_ptr_int(g, val, sparam_ty)
-            }
-            args.push(val)
             ai = ai + 1
         }
         -- Call function (returns void, result written to sret pointer)
@@ -27462,10 +28596,10 @@ fn generate_sret_call(gen: LLVMGenerator, inst: IRInst, callee: int, fn_ty: int,
         -- Load the result from the sret alloca
         if inst.has_result {
             -- If the function returns string, keep the sret alloca as a pointer (string_ptrs convention)
-            if ir_func.return_type == "string" {
+            if ret_ir == "string" {
                 g.string_ptrs.insert(id_key, true)
                 g.value_map.insert(id_key, sret)
-            } else {
+            } else if result_in_memory == false {
                 let loaded = dm_llvm_build_load2(b, ret_llvm_ty, sret, "sret.load")
                 g.value_map.insert(id_key, loaded)
             }
@@ -27803,19 +28937,20 @@ fn prelude_source() -> string {
     pieces.push("    fn get(self, k: K) -> V {\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            panic(\"map get: key not found\")\n        }\n        return self.entry_vals[self.slots[s]]\n    }\n\n    fn contains(self, k: K) -> bool {\n        return self.find_slot(k, hash_key(k)) >= 0\n    }\n\n    fn remove(mut self, k: K) {\n        if self.moved_apart() {\n            self.rebuild()\n        }\n        let s = self.find_slot(k, hash_key(k))\n        if s < 0 {\n            return\n        }\n        self.entry_hashes[self.slots[s]] = -1\n        self.slots[s] = -2\n        self.count = self.count - 1\n    }\n\n    fn len(self) -> int {\n        return self.count\n    }\n\n    fn keys(self) -> List[K] {\n        let mut out: List[K] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_keys[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    fn values(self) -> List[V] {\n        let mut out: List[V] = []\n        let mut e = 0\n        while e < self.entry_vals.len() {\n            if self.entry_hashes[e] >= 0 {\n                out.push(self.entry_vals[e])\n            }\n            e = e + 1\n        }\n        return out\n    }\n\n    -- Whether a copy of this map has added a key since the two were\n    -- the same: the entries' allocation then holds entries that are\n    -- not this map's, and the slot table names them\n    fn moved_apart(self) -> bool {\n        unsafe {\n            return rt_list_apart(addr_of(self.entry_keys))\n        }\n    }\n\n    -- Slot holding k, whose hash is h, or -1\n    fn find_slot(self, k: K, h: int) -> int {\n        let cap = self.slots.len()\n        if cap == 0 {\n            return -1\n        }\n        let n = self.entry_keys.len()\n        let mut i = h % cap\n        while self.slots[i] != -1 {\n            let e = self.slots[i]\n            if e >= 0 and e < n {\n                if self.entry_hashes[e] == h {\n                    if self.entry_keys[e] == k {\n                        return i\n                    }\n                }\n            }\n            i = i + 1\n            if i == cap { i = 0 }\n        }\n        return -1\n    }\n\n    -- Drop removed entries, size the table for twice the live ones,\n    -- and move to lists that no other map uses\n    fn rebuild(mut self) {\n        let mut new_keys: List[K] = []\n        let mut new_vals: List[V] = []\n        let mut new_hashes: List[int] = []\n        let mut e = 0\n        while e < self.entry_keys.len() {\n            if self.entry_hashes[e] >= 0 {\n                new_keys.push(self.entry_keys[e])\n                new_vals.push(self.entry_vals[e])\n                new_hashes.push(self.entry_hashes[e])\n            }\n            e = e + 1\n        }\n        -- Counted again: a copy of this map may have removed entries\n        -- the two had in common\n        self.count = new_keys.len()\n        let mut cap = 8\n        while cap < (self.count + 1) * 2 {\n            cap = cap * 2\n        }\n        let mut new_slots: List[int] = []\n        while new_slots.len() < cap {\n            new_slots.push(-1)\n        }\n        e = 0\n        while e < new_hashes.len() {\n            let mut i = new_hashes[e] % cap\n            while new_slots[i] != -1 {\n                i = i + 1\n                if i == cap { i = 0 }\n            }\n            new_slots[i] = e\n            e = e + 1\n        }\n        self.entry_keys = new_keys\n        self.entry_vals = new_vals\n        self.entry_hashes = new_hashes\n        self.slots = new_slots\n    }\n}\n\n-- Hashes are in [0, 2^31 - 1), and every step stays far below\n-- 2^63, so the checked arithmetic never traps.\nfn rt_map_hash_string(s: string) -> int {\n    let mut h = 0\n    let n = len(s)\n    let mut i = 0\n    while i < n {\n        h = (h * 31 + byte_at(s, i) + 1) % 2147483647\n        i = i + 1\n    }\n    return h\n}\n\nfn rt_map_hash_int(n: int) -> int {\n    let h = n % 2147483647\n    if h < 0 {\n        return h + 2147483647\n    }\n    return h\n}\n")
     pieces.push("\n-- ============================================================\n-- Files, directories, the environment, the command line, processes\n-- and time\n-- file_read, file_write, file_append, file_exists, fs_mkdir,\n-- fs_readdir, fs_remove, fs_rename, fs_getcwd, env_get, args_len,\n-- args_get, system, time_ms and sleep_ms, and what a program does\n-- when it starts. See runtime/string.dm for how rt_X functions replace\n-- the C runtime.\n--\n-- Files go through libc's stdio. A path, a name or a command goes to\n-- C as the address of the string's bytes: every literal and every\n-- string the runtime builds is followed by a NUL byte.\n-- ============================================================\n\nextern fn libc_fopen(path: int, mode: int) -> int = \"fopen\"\nextern fn libc_fclose(file: int) -> i32 = \"fclose\"\nextern fn libc_fseek(file: int, offset: int, whence: i32) -> i32 = \"fseek\"\nextern fn libc_ftell(file: int) -> int = \"ftell\"\nextern fn libc_fread(buf: int, size: int, count: int, file: int) -> int = \"fread\"\nextern fn libc_fwrite(buf: int, size: int, count: int, file: int) -> int = \"fwrite\"\nextern fn libc_strlen(s: int) -> int = \"strlen\"\nextern fn libc_system(command: int) -> i32 = \"system\"\nextern fn libc_realloc(p: int, n: int) -> int = \"realloc\"\nextern fn libc_mkdir(path: int, mode: u32) -> i32 = \"mkdir\"\nextern fn libc_opendir(path: int) -> int = \"opendir\"\nextern fn libc_readdir(dir: int) -> int = \"readdir\"\nextern fn libc_closedir(dir: int) -> i32 = \"closedir\"\nextern fn libc_remove(path: int) -> i32 = \"remove\"\nextern fn libc_rename(from: int, to: int) -> i32 = \"rename\"\nextern fn libc_getcwd(buf: int, size: int) -> int = \"getcwd\"\nextern fn libc_getenv(name: int) -> int = \"getenv\"\nextern fn libc_errno_location() -> int = \"__errno_location\"\nextern fn libc_clock_gettime(clock: i32, time: int) -> i32 = \"clock_gettime\"\nextern fn libc_nanosleep(time: int, remaining: int) -> i32 = \"nanosleep\"\nextern fn libc_getrlimit(resource: i32, limit: int) -> i32 = \"getrlimit\"\nextern fn libc_setrlimit(resource: i32, limit: int) -> i32 = \"setrlimit\"\n\n-- ---- Files ----\n\n-- Open the file at path in a stdio mode such as \"rb\". Gives the\n-- FILE*, or 0 when the file cannot be opened.\nfn rt_file_open(path: string, mode: string) -> int {\n    if len(path) == 0 {\n        return 0\n    }\n    unsafe {\n        return libc_fopen(string_data(path), string_data(mode))\n    }\n}\n\n-- file_read(path): the whole file as a string. Panics when the file\n-- cannot be opened.\nfn rt_file_read(path: string) -> string {\n    let file = rt_file_open(path, \"rb\")\n    if file == 0 {\n        panic(\"file_read: cannot open file\")\n    }\n    unsafe {\n        let mut size = 0\n        if libc_fseek(file, 0, 2) == 0 {\n            size = libc_ftell(file)\n            libc_fseek(file, 0, 0)\n        }\n        -- A file that reports its size is read in one piece. One that\n        -- reports none is read piece by piece to its end: a file in\n        -- /proc reports 0, and a pipe has no size.\n        let mut room = size\n        if size <= 0 {\n            room = 4096\n        }\n        let mut buf = rt_string_buffer(room)\n        let mut count = libc_fread(buf, 1, room, file)\n        if size <= 0 {\n            let mut got = count\n            while got > 0 {\n                if count == room {\n                    let bigger = rt_string_buffer(room * 2)\n                    libc_memcpy(bigger, buf, count)\n                    libc_free(buf)\n                    buf = bigger\n                    room = room * 2\n                }\n                got = libc_fread(buf + count, 1, room - count, file)\n                count = count + got\n            }\n        }\n        libc_fclose(file)\n        if count == 0 {\n            libc_free(buf)\n            return \"\"\n        }\n        store_u8(buf + count, 0)\n        return string_from_raw(buf, count, room + 1)\n    }\n}\n\n-- Open the file at path in stdio mode `mode`, write content to it and\n-- close it. Panics with `failure` when the file cannot be opened.\n")
     pieces.push("fn rt_file_put(path: string, content: string, mode: string, failure: string) {\n    let file = rt_file_open(path, mode)\n    if file == 0 {\n        panic(failure)\n    }\n    unsafe {\n        if len(content) > 0 {\n            libc_fwrite(string_data(content), 1, len(content), file)\n        }\n        libc_fclose(file)\n    }\n}\n\n-- file_write(path, content): make content the whole of the file\nfn rt_file_write(path: string, content: string) {\n    rt_file_put(path, content, \"wb\", \"file_write: cannot open file\")\n}\n\n-- file_append(path, content): add content to the end of the file,\n-- creating the file if there is none\nfn rt_file_append(path: string, content: string) {\n    rt_file_put(path, content, \"ab\", \"file_append: cannot open file\")\n}\n\n-- file_exists(path): whether the file can be opened for reading\nfn rt_file_exists(path: string) -> bool {\n    let file = rt_file_open(path, \"r\")\n    if file == 0 {\n        return false\n    }\n    unsafe {\n        libc_fclose(file)\n    }\n    return true\n}\n\n-- ---- Directories ----\n\n-- Where the name starts in the struct dirent that readdir gives, on\n-- x86-64 Linux: after d_ino (8 bytes), d_off (8), d_reclen (2) and\n-- d_type (1)\nfn rt_dirent_name_offset() -> int {\n    return 19\n}\n\n-- fs_mkdir(path): create the directory and the directories above it\n-- that are missing. Gives 0 when the path exists afterwards and -1\n-- when it could not be created.\nfn rt_fs_mkdir(path: string) -> int {\n    let n = len(path)\n    unsafe {\n        -- A copy of the path, to end early at each \"/\" in turn\n        let buf = rt_string_buffer(n)\n        if n > 0 {\n            libc_memcpy(buf, string_data(path), n)\n        }\n        let mut i = 1\n        while i < n {\n            if load_u8(buf + i) == 47 {\n                store_u8(buf + i, 0)\n                -- 493 is mode 0755\n                libc_mkdir(buf, 493)\n                store_u8(buf + i, 47)\n            }\n            i = i + 1\n        }\n        let mut result = libc_mkdir(buf, 493) as int\n        -- 17 is EEXIST\n        if result != 0 and load_i32(libc_errno_location()) == 17 {\n            result = 0\n        }\n        libc_free(buf)\n        return result\n    }\n}\n\n-- fs_readdir(path): the names in the directory, one per line, in the\n-- order the OS gives them and without \".\" and \"..\". Gives \"\" when the\n-- directory cannot be read.\nfn rt_fs_readdir(path: string) -> string {\n    if len(path) == 0 {\n        return \"\"\n    }\n    unsafe {\n        let dir = libc_opendir(string_data(path))\n        if dir == 0 {\n            return \"\"\n        }\n        let mut room = 1024\n        let mut buf = rt_string_buffer(room)\n        let mut count = 0\n        let mut entry = libc_readdir(dir)\n        while entry != 0 {\n            let name = entry + rt_dirent_name_offset()\n            let name_len = libc_strlen(name)\n            -- 46 is \".\"\n            let is_self = name_len == 1 and load_u8(name) == 46\n            let is_parent = name_len == 2 and load_u8(name) == 46 and load_u8(name + 1) == 46\n            if is_self == false and is_parent == false {\n                -- Room for a newline and the name\n                let mut needed = room\n                while count + 1 + name_len > needed {\n                    needed = needed * 2\n                }\n                if needed != room {\n                    buf = libc_realloc(buf, needed + 1)\n                    if buf == 0 {\n                        panic(\"out of memory\")\n                    }\n                    room = needed\n                }\n                if count > 0 {\n                    store_u8(buf + count, 10)\n                    count = count + 1\n                }\n                libc_memcpy(buf + count, name, name_len)\n                count = count + name_len\n            }\n            entry = libc_readdir(dir)\n        }\n        libc_closedir(dir)\n        if count == 0 {\n            libc_free(buf)\n            return \"\"\n        }\n        store_u8(buf + count, 0)\n        return string_from_raw(buf, count, room + 1)\n    }\n}\n\n")
-    pieces.push("-- fs_remove(path): delete the file or the empty directory. Gives 0,\n-- or -1 when it could not be deleted.\nfn rt_fs_remove(path: string) -> int {\n    if len(path) == 0 {\n        return -1\n    }\n    unsafe {\n        return libc_remove(string_data(path)) as int\n    }\n}\n\n-- fs_rename(from, to): move a file or directory. Gives 0, or -1 when\n-- it could not be moved.\nfn rt_fs_rename(from: string, to: string) -> int {\n    if len(from) == 0 or len(to) == 0 {\n        return -1\n    }\n    unsafe {\n        return libc_rename(string_data(from), string_data(to)) as int\n    }\n}\n\n-- fs_getcwd(): the current directory, or \"\" when it cannot be found\nfn rt_fs_getcwd() -> string {\n    unsafe {\n        -- Given no buffer, getcwd allocates one of the size it needs\n        let cwd = libc_getcwd(0, 0)\n        if cwd == 0 {\n            return \"\"\n        }\n        let n = libc_strlen(cwd)\n        return string_from_raw(cwd, n, n + 1)\n    }\n}\n\n-- ---- Environment ----\n\n-- env_get(name): the value of the environment variable, or \"\" when\n-- it is not set\nfn rt_os_getenv(name: string) -> string {\n    if len(name) == 0 {\n        return \"\"\n    }\n    unsafe {\n        let value = libc_getenv(string_data(name))\n        if value == 0 {\n            return \"\"\n        }\n        -- A copy: the environment's own bytes move when a variable is set\n        return rt_string_copy(value, libc_strlen(value))\n    }\n}\n\n-- ---- Command line ----\n-- main stores its argument count in the symbol dm_argc, a C int, and\n-- its argument vector in dm_argv. The compiler defines both in every\n-- program.\n\n-- args_len(): the number of arguments, the program's name included\nfn rt_args_len() -> int {\n    unsafe {\n        return load_i32(symbol_addr(\"dm_argc\"))\n    }\n}\n\n-- args_get(i): argument i, or \"\" when there is no such argument.\n-- Argument 0 is the program's name.\nfn rt_args_get(i: int) -> string {\n    unsafe {\n        if i < 0 or i >= load_i32(symbol_addr(\"dm_argc\")) {\n            return \"\"\n        }\n        -- The argument's bytes stay where the OS put them, which is\n        -- theirs for as long as the program runs\n        let arg = load_i64(load_i64(symbol_addr(\"dm_argv\")) + i * 8)\n        return string_from_raw(arg, libc_strlen(arg), 0)\n    }\n}\n\n-- ---- Processes ----\n\n-- libc's struct rlimit: the limit in force, and the highest value it\n-- may be raised to. Both are unsigned, and all bits set means no limit,\n-- which reads here as -1.\nstruct RtRlimit {\n    current: int,\n    highest: int\n}\n\n-- The compiler calls this first thing in main. It raises the limit on\n-- the stack's size to 64 MB where the limit is lower: a function's\n-- structs are passed and kept by value, so deep recursion needs more\n-- than the usual 8 MB. The stack of a running program may grow up to\n-- the limit in force at the time, so this takes effect at once.\nfn rt_start() {\n    unsafe {\n        let wanted = 64 * 1024 * 1024\n        let mut limit = RtRlimit { current: 0, highest: 0 }\n        -- 3 is RLIMIT_STACK on Linux\n        if libc_getrlimit(3, addr_of(limit)) != 0 {\n            return\n        }\n        if limit.current < 0 or limit.current >= wanted {\n            return\n        }\n        limit.current = wanted\n        if limit.highest >= 0 and limit.highest < wanted {\n            limit.current = limit.highest\n        }\n        libc_setrlimit(3, addr_of(limit))\n    }\n}\n\n-- system(command): run a shell command and give its wait status, as\n-- libc's system() does\nfn rt_system(command: string) -> int {\n    if len(command) == 0 {\n        return 0\n    }\n    unsafe {\n        return libc_system(string_data(command)) as int\n    }\n}\n\n-- ---- Programs ----\n\nextern fn libc_posix_spawnp(pid: int, file: int, file_actions: int, attributes: int, argv: int, envp: int) -> i32 = \"posix_spawnp\"\nextern fn libc_posix_spawn_file_actions_init(actions: int) -> i32 = \"posix_spawn_file_actions_init\"\n")
-    pieces.push("extern fn libc_posix_spawn_file_actions_addopen(actions: int, fd: i32, path: int, flags: i32, mode: u32) -> i32 = \"posix_spawn_file_actions_addopen\"\nextern fn libc_posix_spawn_file_actions_destroy(actions: int) -> i32 = \"posix_spawn_file_actions_destroy\"\nextern fn libc_posix_spawnattr_init(attributes: int) -> i32 = \"posix_spawnattr_init\"\nextern fn libc_posix_spawnattr_setsigdefault(attributes: int, signals: int) -> i32 = \"posix_spawnattr_setsigdefault\"\nextern fn libc_posix_spawnattr_setflags(attributes: int, flags: i16) -> i32 = \"posix_spawnattr_setflags\"\nextern fn libc_posix_spawnattr_destroy(attributes: int) -> i32 = \"posix_spawnattr_destroy\"\nextern fn libc_sigemptyset(signals: int) -> i32 = \"sigemptyset\"\nextern fn libc_sigaddset(signals: int, signal: i32) -> i32 = \"sigaddset\"\nextern fn libc_signal(signal: i32, handler: int) -> int = \"signal\"\nextern fn libc_waitpid(pid: i32, status: int, options: i32) -> i32 = \"waitpid\"\nextern fn libc_calloc(count: int, size: int) -> int = \"calloc\"\n\n-- run_command(args) and run_command_io(args, input, output, errors):\n-- run the program args[0] with the arguments args[1..] and wait for\n-- it. No shell takes part: each argument reaches the program as it is.\n-- A name without a slash is looked for on PATH. input, output and\n-- errors are files that stand for the program's standard input, output\n-- and error; \"\" leaves the stream as this program's own. Gives the\n-- program's exit code, 128 plus the signal's number when a signal\n-- ended it, or 127 when it could not be started.\n--\n-- `list` is the address of the List[string]'s header. As libc's\n-- system() does, this program ignores an interrupt (SIGINT, SIGQUIT)\n-- while it waits, so that Ctrl-C ends the program that runs and leaves\n-- this one to see its exit code.\nfn rt_run_command(list: int, input: string, output: string, errors: string) -> int {\n    unsafe {\n        let count = load_i64(list + 8)\n        if count < 1 {\n            return 127\n        }\n        let data = load_i64(list)\n        if load_i64(data + 8) == 0 {\n            return 127\n        }\n        -- argv: the address of each argument's bytes, then a null\n        let argv = libc_malloc((count + 1) * 8)\n        if argv == 0 {\n            panic(\"out of memory\")\n        }\n        let mut i = 0\n        while i < count {\n            store_i64(argv + i * 8, load_i64(data + i * 24))\n            i = i + 1\n        }\n        store_i64(argv + count * 8, 0)\n\n        -- What this program has written so far comes before the\n        -- other program's output\n        libc_fflush(0)\n\n        -- Room for glibc's posix_spawn_file_actions_t (80 bytes),\n        -- posix_spawnattr_t (336 bytes) and sigset_t (128 bytes) on\n        -- x86-64 Linux, each with room to spare\n        let room = libc_calloc(1, 1024)\n        if room == 0 {\n            panic(\"out of memory\")\n        }\n        let actions = room\n        let attributes = room + 256\n        let defaults = room + 768\n        libc_posix_spawn_file_actions_init(actions)\n        -- 0 is O_RDONLY; 577 is O_WRONLY | O_CREAT | O_TRUNC; 420 is mode 0644\n        if len(input) > 0 { libc_posix_spawn_file_actions_addopen(actions, 0, string_data(input), 0, 0) }\n        if len(output) > 0 { libc_posix_spawn_file_actions_addopen(actions, 1, string_data(output), 577, 420) }\n        if len(errors) > 0 { libc_posix_spawn_file_actions_addopen(actions, 2, string_data(errors), 577, 420) }\n\n        -- 2 is SIGINT and 3 is SIGQUIT; the handler 1 is SIG_IGN. The\n        -- program that runs gets back the default for each signal that\n        -- this program did not already ignore.\n        libc_posix_spawnattr_init(attributes)\n        libc_sigemptyset(defaults)\n        let old_int = libc_signal(2, 1)\n        let old_quit = libc_signal(3, 1)\n        if old_int != 1 { libc_sigaddset(defaults, 2) }\n        if old_quit != 1 { libc_sigaddset(defaults, 3) }\n        libc_posix_spawnattr_setsigdefault(attributes, defaults)\n        -- 4 is POSIX_SPAWN_SETSIGDEF\n")
-    pieces.push("        libc_posix_spawnattr_setflags(attributes, 4)\n\n        let mut pid = 0\n        let started = libc_posix_spawnp(addr_of(pid), load_i64(argv), actions, attributes, argv, load_i64(symbol_addr(\"environ\")))\n        libc_posix_spawn_file_actions_destroy(actions)\n        libc_posix_spawnattr_destroy(attributes)\n        libc_free(argv)\n        libc_free(room)\n\n        let mut code = 127\n        if started == 0 {\n            let mut status = 0\n            let mut waited = libc_waitpid(load_i32(addr_of(pid)) as i32, addr_of(status), 0)\n            -- 4 is EINTR: a signal arrived while waiting\n            while waited < 0 and load_i32(libc_errno_location()) == 4 {\n                waited = libc_waitpid(load_i32(addr_of(pid)) as i32, addr_of(status), 0)\n            }\n            if waited >= 0 {\n                let st = load_i32(addr_of(status))\n                let low = st % 128\n                if low == 0 {\n                    code = (st / 256) % 256\n                } else {\n                    code = 128 + low\n                }\n            }\n        }\n        libc_signal(2, old_int)\n        libc_signal(3, old_quit)\n        return code\n    }\n}\n\n-- ---- Time ----\n\n-- libc's struct timespec on x86-64 Linux\nstruct RtTimespec {\n    seconds: int,\n    nanoseconds: int\n}\n\n-- time_ms(): milliseconds on a clock that only moves forward. Its\n-- zero is not a date; only the difference of two readings means\n-- something.\nfn rt_time_ms() -> int {\n    unsafe {\n        let mut now = RtTimespec { seconds: 0, nanoseconds: 0 }\n        -- 1 is CLOCK_MONOTONIC\n        libc_clock_gettime(1, addr_of(now))\n        return now.seconds * 1000 + now.nanoseconds / 1000000\n    }\n}\n\n-- sleep_ms(ms): wait for ms milliseconds. A negative ms does not wait.\nfn rt_sleep_ms(ms: int) {\n    if ms <= 0 {\n        return\n    }\n    unsafe {\n        let mut time = RtTimespec { seconds: ms / 1000, nanoseconds: (ms % 1000) * 1000000 }\n        libc_nanosleep(addr_of(time), 0)\n    }\n}\n\n-- ============================================================\n-- Paths\n-- path_dirname, path_basename, path_extension, path_stem and\n-- path_join. They work on the text of a path and never look at the\n-- file system. See runtime/string.dm for how rt_X functions replace\n-- the C runtime.\n-- ============================================================\n\n-- The index after the last \"/\" in the n bytes at data, or 0 when\n-- there is none\nfn rt_path_name_start(data: int, n: int) -> int {\n    let mut i = n\n    unsafe {\n        -- 47 is \"/\"\n        while i > 0 and load_u8(data + i - 1) != 47 {\n            i = i - 1\n        }\n    }\n    return i\n}\n\n-- path_dirname(path): the part before the last \"/\". A path with no\n-- \"/\" is in \".\", and the directory of a path in \"/\" is \"/\".\nfn rt_path_dirname(path: string) -> string {\n    unsafe {\n        let data = string_data(path)\n        let name_start = rt_path_name_start(data, len(path))\n        if name_start == 0 {\n            return \".\"\n        }\n        if name_start == 1 {\n            return \"/\"\n        }\n        return rt_string_copy(data, name_start - 1)\n    }\n}\n\n-- path_basename(path): the part after the last \"/\"\nfn rt_path_basename(path: string) -> string {\n    let n = len(path)\n    unsafe {\n        let data = string_data(path)\n        let name_start = rt_path_name_start(data, n)\n        if name_start == 0 {\n            return path\n        }\n        return rt_string_copy(data + name_start, n - name_start)\n    }\n}\n\n-- path_extension(path): the name's last \".\" and what follows it, or\n-- \"\" when the name has no \".\"\nfn rt_path_extension(path: string) -> string {\n    let n = len(path)\n    unsafe {\n        let data = string_data(path)\n        let mut i = n\n        -- 46 is \".\" and 47 is \"/\"\n        while i > 0 and load_u8(data + i - 1) != 46 and load_u8(data + i - 1) != 47 {\n            i = i - 1\n        }\n        if i == 0 or load_u8(data + i - 1) == 47 {\n            return \"\"\n        }\n        return rt_string_copy(data + i - 1, n - i + 1)\n    }\n}\n\n")
-    pieces.push("-- path_stem(path): the name without its extension. A name whose only\n-- \".\" is its first byte, such as \".bashrc\", is its own stem.\nfn rt_path_stem(path: string) -> string {\n    let base = rt_path_basename(path)\n    unsafe {\n        let data = string_data(base)\n        let mut i = len(base)\n        while i > 0 and load_u8(data + i - 1) != 46 {\n            i = i - 1\n        }\n        if i <= 1 {\n            return base\n        }\n        return rt_string_copy(data, i - 1)\n    }\n}\n\n-- path_join(a, b): a and b with one \"/\" between them, unless a ends\n-- in one. An empty part gives the other part.\nfn rt_path_join(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    if na == 0 {\n        return b\n    }\n    if nb == 0 {\n        return a\n    }\n    unsafe {\n        let mut sep = 1\n        if load_u8(string_data(a) + na - 1) == 47 {\n            sep = 0\n        }\n        let n = na + sep + nb\n        let buf = rt_string_buffer(n)\n        libc_memcpy(buf, string_data(a), na)\n        store_u8(buf + na, 47)\n        libc_memcpy(buf + na + sep, string_data(b), nb)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- ============================================================\n-- The console\n-- print, println, eprint, eprintln, flush, read_line, read_key,\n-- read_key_nb, term_width, term_height and panic. See\n-- runtime/string.dm for how rt_X functions replace the C runtime.\n--\n-- They use libc's stdio streams, so what a program prints keeps its\n-- order with what C code in the same program prints, and libc writes\n-- out what is still buffered when the program exits. Standard output\n-- is buffered and standard error is not.\n-- ============================================================\n\nextern fn libc_fputc(c: i32, stream: int) -> i32 = \"fputc\"\nextern fn libc_getline(line: int, room: int, stream: int) -> int = \"getline\"\nextern fn libc_fflush(stream: int) -> i32 = \"fflush\"\nextern fn libc_fgetc(stream: int) -> i32 = \"fgetc\"\nextern fn libc_poll(fds: int, count: int, timeout: i32) -> i32 = \"poll\"\nextern fn libc_ioctl(fd: i32, request: int, ...) -> i32 = \"ioctl\"\n\n-- libc's stdin, stdout and stderr are variables that hold a FILE*\n\nfn rt_stdin() -> int {\n    unsafe {\n        return load_i64(symbol_addr(\"stdin\"))\n    }\n}\n\nfn rt_stdout() -> int {\n    unsafe {\n        return load_i64(symbol_addr(\"stdout\"))\n    }\n}\n\nfn rt_stderr() -> int {\n    unsafe {\n        return load_i64(symbol_addr(\"stderr\"))\n    }\n}\n\n-- Write s to a stdio stream\nfn rt_stream_write(stream: int, s: string) {\n    let n = len(s)\n    if n > 0 {\n        unsafe {\n            libc_fwrite(string_data(s), 1, n, stream)\n        }\n    }\n}\n\n-- Write s and a newline to a stdio stream\nfn rt_stream_write_line(stream: int, s: string) {\n    rt_stream_write(stream, s)\n    unsafe {\n        libc_fputc(10, stream)\n    }\n}\n\nfn rt_print(s: string) {\n    rt_stream_write(rt_stdout(), s)\n}\n\nfn rt_println(s: string) {\n    rt_stream_write_line(rt_stdout(), s)\n}\n\nfn rt_eprint(s: string) {\n    rt_stream_write(rt_stderr(), s)\n}\n\nfn rt_eprintln(s: string) {\n    rt_stream_write_line(rt_stderr(), s)\n}\n\n-- panic(message): write \"PANIC: <message>\" to standard error and exit\n-- with code 1. Every failed check ends here, the compiler's and the\n-- runtime's own, so nothing here may panic or allocate.\nfn rt_panic(message: string) {\n    let err = rt_stderr()\n    rt_stream_write(err, \"PANIC: \")\n    rt_stream_write_line(err, message)\n    exit(1)\n}\n\n-- assert(cond): panic unless the condition holds\nfn rt_assert(condition: bool) {\n    if condition == false {\n        panic(\"assertion failed\")\n    }\n}\n\n-- assert_eq(a, b): the compiler passes whether a == b\nfn rt_assert_eq_values(equal: bool) {\n    if equal == false {\n        panic(\"assert_eq failed: values not equal\")\n    }\n}\n\nfn rt_assert_eq_strings(equal: bool) {\n    if equal == false {\n        panic(\"assert_eq failed: strings not equal\")\n    }\n}\n\n-- read_line(): the next line of standard input without its newline,\n-- or \"\" at the end of input\n")
-    pieces.push("fn rt_read_line() -> string {\n    unsafe {\n        -- getline allocates the line and stores its address and the\n        -- allocation's size in these two\n        let mut line = 0\n        let mut room = 0\n        let mut n = libc_getline(addr_of(line), addr_of(room), rt_stdin())\n        if n > 0 and load_u8(line + n - 1) == 10 {\n            n = n - 1\n        }\n        if n <= 0 {\n            libc_free(line)\n            return \"\"\n        }\n        store_u8(line + n, 0)\n        return string_from_raw(line, n, room)\n    }\n}\n\n-- flush(): write out what standard output still holds\nfn rt_flush() {\n    unsafe {\n        libc_fflush(rt_stdout())\n    }\n}\n\n-- read_key(): the next byte of standard input, or -1 at its end. It\n-- waits for a byte.\nfn rt_read_key() -> int {\n    unsafe {\n        return libc_fgetc(rt_stdin()) as int\n    }\n}\n\n-- read_key_nb(): the next byte of standard input, or -1 when none is\n-- waiting or the input has ended. It does not wait.\nfn rt_read_key_nb() -> int {\n    unsafe {\n        -- A struct pollfd is fd (4 bytes), events (2) and revents (2).\n        -- This one is fd 0, standard input, and event 1, POLLIN.\n        let mut pollfd = 0\n        store_u16(addr_of(pollfd) + 4, 1)\n        if libc_poll(addr_of(pollfd), 1, 0) > 0 {\n            return libc_fgetc(rt_stdin()) as int\n        }\n        return -1\n    }\n}\n\n-- The size of the terminal on standard output as the kernel's struct\n-- winsize: rows, columns and two sizes in pixels, 2 bytes each. All\n-- are 0 when standard output is not a terminal.\nfn rt_term_size() -> int {\n    unsafe {\n        let mut size = 0\n        -- 21523 is TIOCGWINSZ on Linux\n        if libc_ioctl(1, 21523, addr_of(size)) != 0 {\n            return 0\n        }\n        return size\n    }\n}\n\n-- term_width(): the terminal's width in columns, or 80 when standard\n-- output is not a terminal\nfn rt_term_width() -> int {\n    unsafe {\n        let mut size = rt_term_size()\n        let columns = load_u16(addr_of(size) + 2)\n        if columns > 0 {\n            return columns\n        }\n        return 80\n    }\n}\n\n-- term_height(): the terminal's height in rows, or 24 when standard\n-- output is not a terminal\nfn rt_term_height() -> int {\n    unsafe {\n        let mut size = rt_term_size()\n        let rows = load_u16(addr_of(size))\n        if rows > 0 {\n            return rows\n        }\n        return 24\n    }\n}\n\n-- ============================================================\n-- TCP sockets\n-- tcp_listen, tcp_accept, tcp_connect, tcp_read, tcp_write and\n-- tcp_close, over libc's sockets. IPv4 only, and no name lookup: an\n-- address is \"HOST:PORT\" with HOST a dotted address, \"localhost\" or\n-- nothing. See runtime/string.dm for how rt_X functions replace the C\n-- runtime.\n--\n-- A socket is its file descriptor. The functions that open one give\n-- -1 when they fail.\n-- ============================================================\n\nextern fn libc_socket(domain: i32, kind: i32, protocol: i32) -> i32 = \"socket\"\nextern fn libc_setsockopt(fd: i32, level: i32, option: i32, value: int, size: u32) -> i32 = \"setsockopt\"\nextern fn libc_bind(fd: i32, address: int, size: u32) -> i32 = \"bind\"\nextern fn libc_listen(fd: i32, backlog: i32) -> i32 = \"listen\"\nextern fn libc_accept(fd: i32, address: int, size: int) -> i32 = \"accept\"\nextern fn libc_connect(fd: i32, address: int, size: u32) -> i32 = \"connect\"\nextern fn libc_inet_pton(family: i32, text: int, out: int) -> i32 = \"inet_pton\"\nextern fn libc_read(fd: i32, buf: int, n: int) -> int = \"read\"\nextern fn libc_write(fd: i32, buf: int, n: int) -> int = \"write\"\nextern fn libc_close(fd: i32) -> i32 = \"close\"\n\n-- libc's struct sockaddr_in on x86-64 Linux, 16 bytes: the family\n-- (2 bytes), the port (2 bytes, high byte first), the address (4\n-- bytes) and 8 bytes of padding\nstruct RtSockaddr {\n    head: int,\n    padding: int\n}\n\n-- Whether fd can be a file descriptor, which is a C int\nfn rt_fd_ok(fd: int) -> bool {\n    return fd >= 0 and fd <= 2147483647\n}\n\n")
-    pieces.push("-- Write the address \"HOST:PORT\" into the struct sockaddr_in at\n-- sockaddr. No HOST means 0.0.0.0, which is every address of this\n-- machine to listen on, and this machine to connect to. False when\n-- the text is not an address.\nfn rt_tcp_address(text: string, sockaddr: int) -> bool {\n    -- 58 is ':'\n    let mut colon = len(text) - 1\n    while colon >= 0 and byte_at(text, colon) != 58 {\n        colon = colon - 1\n    }\n    if colon < 0 {\n        return false\n    }\n    -- The port is the digits after the colon, as C's atoi reads them\n    let mut port = 0\n    let mut i = colon + 1\n    while i < len(text) and byte_at(text, i) >= 48 and byte_at(text, i) <= 57 and port <= 65535 {\n        port = port * 10 + byte_at(text, i) - 48\n        i = i + 1\n    }\n    if port > 65535 {\n        return false\n    }\n    let mut host = substr(text, 0, colon)\n    if rt_string_eq(host, \"\") {\n        host = \"0.0.0.0\"\n    }\n    if rt_string_eq(host, \"localhost\") {\n        host = \"127.0.0.1\"\n    }\n    unsafe {\n        -- 2 is AF_INET\n        store_u16(sockaddr, 2)\n        store_u8(sockaddr + 2, port / 256)\n        store_u8(sockaddr + 3, port % 256)\n        return libc_inet_pton(2, string_data(host), sockaddr + 4) == 1\n    }\n}\n\n-- tcp_listen(address): a socket that listens on \"HOST:PORT\", or -1\nfn rt_tcp_listen(address: string) -> int {\n    unsafe {\n        let mut sockaddr = RtSockaddr { head: 0, padding: 0 }\n        if not rt_tcp_address(address, addr_of(sockaddr)) {\n            return -1\n        }\n        -- AF_INET, SOCK_STREAM\n        let fd = libc_socket(2, 1, 0)\n        if fd < 0 {\n            return -1\n        }\n        -- SOL_SOCKET, SO_REUSEADDR: a server that is started again can\n        -- take its port back at once\n        let mut on = 1\n        libc_setsockopt(fd, 1, 2, addr_of(on), 4)\n        if libc_bind(fd, addr_of(sockaddr), 16) < 0 {\n            libc_close(fd)\n            return -1\n        }\n        if libc_listen(fd, 128) < 0 {\n            libc_close(fd)\n            return -1\n        }\n        return fd as int\n    }\n}\n\n-- tcp_accept(listener): wait for a connection to the listening\n-- socket and give its socket, or -1\nfn rt_tcp_accept(listener: int) -> int {\n    if not rt_fd_ok(listener) {\n        return -1\n    }\n    unsafe {\n        return libc_accept(listener as i32, 0, 0) as int\n    }\n}\n\n-- tcp_connect(address): a socket connected to \"HOST:PORT\", or -1\nfn rt_tcp_connect(address: string) -> int {\n    unsafe {\n        let mut sockaddr = RtSockaddr { head: 0, padding: 0 }\n        if not rt_tcp_address(address, addr_of(sockaddr)) {\n            return -1\n        }\n        let fd = libc_socket(2, 1, 0)\n        if fd < 0 {\n            return -1\n        }\n        if libc_connect(fd, addr_of(sockaddr), 16) < 0 {\n            libc_close(fd)\n            return -1\n        }\n        return fd as int\n    }\n}\n\n-- tcp_read(fd, max_bytes): what the socket has, up to max_bytes\n-- bytes, waiting for the first of them. \"\" when the other side has\n-- closed the connection, or on an error. A max_bytes of 0 or less\n-- means 4096.\nfn rt_tcp_read(fd: int, max_bytes: int) -> string {\n    if not rt_fd_ok(fd) {\n        return \"\"\n    }\n    let mut room = max_bytes\n    if room <= 0 {\n        room = 4096\n    }\n    unsafe {\n        let buf = rt_string_buffer(room)\n        let n = libc_read(fd as i32, buf, room)\n        if n <= 0 {\n            libc_free(buf)\n            return \"\"\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, room + 1)\n    }\n}\n\n-- tcp_write(fd, data): send data, and give the number of bytes the\n-- socket took, 0 on an error\nfn rt_tcp_write(fd: int, data: string) -> int {\n    if not rt_fd_ok(fd) {\n        return 0\n    }\n    unsafe {\n        let n = libc_write(fd as i32, string_data(data), len(data))\n        if n < 0 {\n            return 0\n        }\n        return n\n    }\n}\n\n-- tcp_close(fd): close the socket\nfn rt_tcp_close(fd: int) {\n    if not rt_fd_ok(fd) {\n        return\n    }\n    unsafe {\n")
-    pieces.push("        libc_close(fd as i32)\n    }\n}\n\n-- ============================================================\n-- Threads and mutexes\n-- thread_spawn, thread_join, mutex_new, mutex_lock, mutex_unlock and\n-- mutex_destroy, over libc's pthreads. See runtime/string.dm for how\n-- rt_X functions replace the C runtime.\n--\n-- A thread is its pthread_t and a mutex is the address of its\n-- pthread_mutex_t, both as an int.\n-- ============================================================\n\nextern fn libc_pthread_create(thread: int, attributes: int, start: int, argument: int) -> i32 = \"pthread_create\"\nextern fn libc_pthread_join(thread: int, result: int) -> i32 = \"pthread_join\"\nextern fn libc_pthread_mutex_init(mutex: int, attributes: int) -> i32 = \"pthread_mutex_init\"\nextern fn libc_pthread_mutex_lock(mutex: int) -> i32 = \"pthread_mutex_lock\"\nextern fn libc_pthread_mutex_unlock(mutex: int) -> i32 = \"pthread_mutex_unlock\"\nextern fn libc_pthread_mutex_destroy(mutex: int) -> i32 = \"pthread_mutex_destroy\"\n\n-- thread_spawn(f): run the function value f, which takes nothing and\n-- gives nothing, on a new thread, and give the thread. Panics when the\n-- thread cannot be started.\n--\n-- f is the address of a closure, whose first word is the address of\n-- its function, and the function takes the closure (see FUNCTION\n-- VALUES in ir_gen_expr.dm). That function is the thread's start\n-- routine and the closure is its argument, which is the call\n-- pthreads makes. pthreads also reads a result: on x86-64 a function\n-- that gives nothing leaves the result's register as it is, and\n-- thread_join asks for no result, so that value is never read.\nfn rt_thread_spawn(f: int) -> int {\n    unsafe {\n        let mut thread = 0\n        if libc_pthread_create(addr_of(thread), 0, load_i64(f), f) != 0 {\n            panic(\"thread_spawn: cannot start a thread\")\n        }\n        return thread\n    }\n}\n\n-- thread_join(thread): wait for the thread to end\nfn rt_thread_join(thread: int) {\n    unsafe {\n        libc_pthread_join(thread, 0)\n    }\n}\n\n-- mutex_new(): a new, unlocked mutex\nfn rt_mutex_new() -> int {\n    unsafe {\n        -- A pthread_mutex_t is 40 bytes on x86-64 Linux\n        let mutex = libc_malloc(40)\n        if mutex == 0 {\n            panic(\"out of memory\")\n        }\n        libc_pthread_mutex_init(mutex, 0)\n        return mutex\n    }\n}\n\n-- mutex_lock(mutex): wait until the mutex is unlocked, and lock it\nfn rt_mutex_lock(mutex: int) {\n    unsafe {\n        libc_pthread_mutex_lock(mutex)\n    }\n}\n\n-- mutex_unlock(mutex): unlock the mutex\nfn rt_mutex_unlock(mutex: int) {\n    unsafe {\n        libc_pthread_mutex_unlock(mutex)\n    }\n}\n\n-- mutex_destroy(mutex): free the mutex, which must be unlocked\nfn rt_mutex_destroy(mutex: int) {\n    unsafe {\n        libc_pthread_mutex_destroy(mutex)\n        libc_free(mutex)\n    }\n}\n")
+    pieces.push("-- fs_remove(path): delete the file or the empty directory. Gives 0,\n-- or -1 when it could not be deleted.\nfn rt_fs_remove(path: string) -> int {\n    if len(path) == 0 {\n        return -1\n    }\n    unsafe {\n        return libc_remove(string_data(path)) as int\n    }\n}\n\n-- fs_rename(from, to): move a file or directory. Gives 0, or -1 when\n-- it could not be moved.\nfn rt_fs_rename(from: string, to: string) -> int {\n    if len(from) == 0 or len(to) == 0 {\n        return -1\n    }\n    unsafe {\n        return libc_rename(string_data(from), string_data(to)) as int\n    }\n}\n\n-- fs_getcwd(): the current directory, or \"\" when it cannot be found\nfn rt_fs_getcwd() -> string {\n    unsafe {\n        -- Given no buffer, getcwd allocates one of the size it needs\n        let cwd = libc_getcwd(0, 0)\n        if cwd == 0 {\n            return \"\"\n        }\n        let n = libc_strlen(cwd)\n        return string_from_raw(cwd, n, n + 1)\n    }\n}\n\n-- ---- Environment ----\n\n-- env_get(name): the value of the environment variable, or \"\" when\n-- it is not set\nfn rt_os_getenv(name: string) -> string {\n    if len(name) == 0 {\n        return \"\"\n    }\n    unsafe {\n        let value = libc_getenv(string_data(name))\n        if value == 0 {\n            return \"\"\n        }\n        -- A copy: the environment's own bytes move when a variable is set\n        return rt_string_copy(value, libc_strlen(value))\n    }\n}\n\n-- ---- Command line ----\n-- main stores its argument count in the symbol dm_argc, a C int, and\n-- its argument vector in dm_argv. The compiler defines both in every\n-- program.\n\n-- args_len(): the number of arguments, the program's name included\nfn rt_args_len() -> int {\n    unsafe {\n        return load_i32(symbol_addr(\"dm_argc\"))\n    }\n}\n\n-- args_get(i): argument i, or \"\" when there is no such argument.\n-- Argument 0 is the program's name.\nfn rt_args_get(i: int) -> string {\n    unsafe {\n        if i < 0 or i >= load_i32(symbol_addr(\"dm_argc\")) {\n            return \"\"\n        }\n        -- The argument's bytes stay where the OS put them, which is\n        -- theirs for as long as the program runs\n        let arg = load_i64(load_i64(symbol_addr(\"dm_argv\")) + i * 8)\n        return string_from_raw(arg, libc_strlen(arg), 0)\n    }\n}\n\n-- ---- Processes ----\n\n-- libc's struct rlimit: the limit in force, and the highest value it\n-- may be raised to. Both are unsigned, and all bits set means no limit,\n-- which reads here as -1.\nstruct RtRlimit {\n    current: int,\n    highest: int\n}\n\n-- The compiler calls this first thing in main\nfn rt_start() {\n    rt_raise_stack_limit()\n    rt_catch_stack_overflow()\n}\n\n-- Raise the limit on the stack's size to 64 MB where the limit is\n-- lower: deep recursion needs more than the usual 8 MB. The stack of\n-- a running program may grow up to the limit in force at the time, so\n-- this takes effect at once.\nfn rt_raise_stack_limit() {\n    unsafe {\n        let wanted = 64 * 1024 * 1024\n        let mut limit = RtRlimit { current: 0, highest: 0 }\n        -- 3 is RLIMIT_STACK on Linux\n        if libc_getrlimit(3, addr_of(limit)) != 0 {\n            return\n        }\n        if limit.current < 0 or limit.current >= wanted {\n            return\n        }\n        limit.current = wanted\n        if limit.highest >= 0 and limit.highest < wanted {\n            limit.current = limit.highest\n        }\n        libc_setrlimit(3, addr_of(limit))\n    }\n}\n\n-- ============================================================\n-- STACK OVERFLOW\n-- A program whose calls are nested until the stack is full reads or\n-- writes below the stack, which the system answers with the signal\n-- SIGSEGV. rt_on_fault takes that signal: for a fault at the stack's\n-- end it writes `PANIC: stack overflow` and ends the program with\n-- exit code 1, where the program was otherwise killed by the signal\n-- with no word of why. It runs on a stack of its own, the full one\n-- having no room for it.\n--\n-- It writes out what standard output still holds, unless the stack\n")
+    pieces.push("-- filled up inside a stdio call of the runtime's (rt_in_stdio in\n-- runtime/io.dm): the stream is then half changed, and what it holds\n-- is lost. A program that fills its stack inside a C function it\n-- calls itself, which is writing to standard output, is not known to\n-- be there. The program then ends with _exit, which runs nothing more.\n--\n-- Only the main thread has that second stack. A thread made by\n-- thread_spawn that fills its stack is killed by the signal, as\n-- before.\n-- ============================================================\n\nextern fn libc_signal_function(signal: i32, handler: fn(i32, int, int) -> void) -> int = \"signal\"\nextern fn libc_sigaction(signal: i32, action: int, old: int) -> i32 = \"sigaction\"\nextern fn libc_sigaltstack(stack: int, old: int) -> i32 = \"sigaltstack\"\nextern fn libc_write(fd: i32, data: int, count: int) -> int = \"write\"\nextern fn libc_exit_now(code: i32) = \"_exit\"\n\n-- The signal SIGSEGV on Linux\nfn RT_SIGSEGV() -> i32 { return 11 }\n\n-- What is written when the stack is full: the address and the length\n-- of the text at static_addr(\"dm_stack_overflow_note\", 16), where a\n-- program has put one (the compiler does: its stack is full when the\n-- program it compiles is nested too deeply), or else\n-- `PANIC: stack overflow`.\nfn rt_on_fault(signal: i32, info: int, context: int) {\n    unsafe {\n        -- Where the program read or wrote (siginfo_t.si_addr), and its\n        -- stack pointer at the time (ucontext_t.uc_mcontext.gregs[REG_RSP]),\n        -- at their places on x86-64 Linux\n        let at = load_i64(info + 16)\n        let stack = load_i64(context + 160)\n        -- A function that needs stack moves the stack pointer down by\n        -- what it needs and then uses that memory, and a call writes\n        -- just below the stack pointer: a fault from a full stack is\n        -- near the stack pointer, on either side. An address from\n        -- anywhere else is not.\n        if at > stack - 1048576 and at < stack + 67108864 {\n            let note = static_addr(\"dm_stack_overflow_note\", 16)\n            if load_i64(note) != 0 {\n                libc_write(2, load_i64(note), load_i64(note + 8))\n            } else {\n                let message = \"PANIC: stack overflow\\n\"\n                libc_write(2, string_data(message), len(message))\n            }\n            if load_i64(rt_in_stdio()) == 0 {\n                libc_fflush(rt_stdout())\n            }\n            libc_exit_now(1)\n        }\n        -- Any other fault ends the program as it did before: with this\n        -- function no longer in the way, the instruction faults again\n        libc_signal(RT_SIGSEGV(), 0)\n    }\n}\n\n-- Have rt_on_fault called for SIGSEGV, on a stack of its own\nfn rt_catch_stack_overflow() {\n    unsafe {\n        -- stack_t: the address, flags (an int) and the size\n        let described = static_addr(\"rt_fault_stack_t\", 24)\n        store_i64(described, static_addr(\"rt_fault_stack\", 65536))\n        store_i64(described + 8, 0)\n        store_i64(described + 16, 65536)\n        if libc_sigaltstack(described, 0) != 0 { return }\n        -- signal() takes the function; sigaction() then gives the\n        -- action back as a struct sigaction, in which the flags (an\n        -- int at byte 136, after the handler and the 128 bytes of the\n        -- signal mask) get SA_SIGINFO (4: the function takes the\n        -- fault's details) and SA_ONSTACK (0x08000000: it runs on the\n        -- stack given above)\n        libc_signal_function(RT_SIGSEGV(), rt_on_fault)\n        let action = static_addr(\"rt_fault_action\", 152)\n        if libc_sigaction(RT_SIGSEGV(), 0, action) != 0 { return }\n        store_i32(action + 136, load_i32(action + 136) | 134217732)\n        libc_sigaction(RT_SIGSEGV(), action, 0)\n    }\n}\n\n-- system(command): run a shell command and give its wait status, as\n-- libc's system() does\nfn rt_system(command: string) -> int {\n    if len(command) == 0 {\n        return 0\n    }\n    unsafe {\n")
+    pieces.push("        return libc_system(string_data(command)) as int\n    }\n}\n\n-- ---- Programs ----\n\nextern fn libc_posix_spawnp(pid: int, file: int, file_actions: int, attributes: int, argv: int, envp: int) -> i32 = \"posix_spawnp\"\nextern fn libc_posix_spawn_file_actions_init(actions: int) -> i32 = \"posix_spawn_file_actions_init\"\nextern fn libc_posix_spawn_file_actions_addopen(actions: int, fd: i32, path: int, flags: i32, mode: u32) -> i32 = \"posix_spawn_file_actions_addopen\"\nextern fn libc_posix_spawn_file_actions_destroy(actions: int) -> i32 = \"posix_spawn_file_actions_destroy\"\nextern fn libc_posix_spawnattr_init(attributes: int) -> i32 = \"posix_spawnattr_init\"\nextern fn libc_posix_spawnattr_setsigdefault(attributes: int, signals: int) -> i32 = \"posix_spawnattr_setsigdefault\"\nextern fn libc_posix_spawnattr_setflags(attributes: int, flags: i16) -> i32 = \"posix_spawnattr_setflags\"\nextern fn libc_posix_spawnattr_destroy(attributes: int) -> i32 = \"posix_spawnattr_destroy\"\nextern fn libc_sigemptyset(signals: int) -> i32 = \"sigemptyset\"\nextern fn libc_sigaddset(signals: int, signal: i32) -> i32 = \"sigaddset\"\nextern fn libc_signal(signal: i32, handler: int) -> int = \"signal\"\nextern fn libc_waitpid(pid: i32, status: int, options: i32) -> i32 = \"waitpid\"\nextern fn libc_calloc(count: int, size: int) -> int = \"calloc\"\n\n-- run_command(args) and run_command_io(args, input, output, errors):\n-- run the program args[0] with the arguments args[1..] and wait for\n-- it. No shell takes part: each argument reaches the program as it is.\n-- A name without a slash is looked for on PATH. input, output and\n-- errors are files that stand for the program's standard input, output\n-- and error; \"\" leaves the stream as this program's own. Gives the\n-- program's exit code, 128 plus the signal's number when a signal\n-- ended it, or 127 when it could not be started.\n--\n-- `list` is the address of the List[string]'s header. As libc's\n-- system() does, this program ignores an interrupt (SIGINT, SIGQUIT)\n-- while it waits, so that Ctrl-C ends the program that runs and leaves\n-- this one to see its exit code.\nfn rt_run_command(list: int, input: string, output: string, errors: string) -> int {\n    unsafe {\n        let count = load_i64(list + 8)\n        if count < 1 {\n            return 127\n        }\n        let data = load_i64(list)\n        if load_i64(data + 8) == 0 {\n            return 127\n        }\n        -- argv: the address of each argument's bytes, then a null\n        let argv = libc_malloc((count + 1) * 8)\n        if argv == 0 {\n            panic(\"out of memory\")\n        }\n        let mut i = 0\n        while i < count {\n            store_i64(argv + i * 8, load_i64(data + i * 24))\n            i = i + 1\n        }\n        store_i64(argv + count * 8, 0)\n\n        -- What this program has written so far comes before the\n        -- other program's output\n        libc_fflush(0)\n\n        -- Room for glibc's posix_spawn_file_actions_t (80 bytes),\n        -- posix_spawnattr_t (336 bytes) and sigset_t (128 bytes) on\n        -- x86-64 Linux, each with room to spare\n        let room = libc_calloc(1, 1024)\n        if room == 0 {\n            panic(\"out of memory\")\n        }\n        let actions = room\n        let attributes = room + 256\n        let defaults = room + 768\n        libc_posix_spawn_file_actions_init(actions)\n        -- 0 is O_RDONLY; 577 is O_WRONLY | O_CREAT | O_TRUNC; 420 is mode 0644\n        if len(input) > 0 { libc_posix_spawn_file_actions_addopen(actions, 0, string_data(input), 0, 0) }\n        if len(output) > 0 { libc_posix_spawn_file_actions_addopen(actions, 1, string_data(output), 577, 420) }\n        if len(errors) > 0 { libc_posix_spawn_file_actions_addopen(actions, 2, string_data(errors), 577, 420) }\n\n        -- 2 is SIGINT and 3 is SIGQUIT; the handler 1 is SIG_IGN. The\n        -- program that runs gets back the default for each signal that\n        -- this program did not already ignore.\n        libc_posix_spawnattr_init(attributes)\n")
+    pieces.push("        libc_sigemptyset(defaults)\n        let old_int = libc_signal(2, 1)\n        let old_quit = libc_signal(3, 1)\n        if old_int != 1 { libc_sigaddset(defaults, 2) }\n        if old_quit != 1 { libc_sigaddset(defaults, 3) }\n        libc_posix_spawnattr_setsigdefault(attributes, defaults)\n        -- 4 is POSIX_SPAWN_SETSIGDEF\n        libc_posix_spawnattr_setflags(attributes, 4)\n\n        let mut pid = 0\n        let started = libc_posix_spawnp(addr_of(pid), load_i64(argv), actions, attributes, argv, load_i64(symbol_addr(\"environ\")))\n        libc_posix_spawn_file_actions_destroy(actions)\n        libc_posix_spawnattr_destroy(attributes)\n        libc_free(argv)\n        libc_free(room)\n\n        let mut code = 127\n        if started == 0 {\n            let mut status = 0\n            let mut waited = libc_waitpid(load_i32(addr_of(pid)) as i32, addr_of(status), 0)\n            -- 4 is EINTR: a signal arrived while waiting\n            while waited < 0 and load_i32(libc_errno_location()) == 4 {\n                waited = libc_waitpid(load_i32(addr_of(pid)) as i32, addr_of(status), 0)\n            }\n            if waited >= 0 {\n                let st = load_i32(addr_of(status))\n                let low = st % 128\n                if low == 0 {\n                    code = (st / 256) % 256\n                } else {\n                    code = 128 + low\n                }\n            }\n        }\n        libc_signal(2, old_int)\n        libc_signal(3, old_quit)\n        return code\n    }\n}\n\n-- ---- Time ----\n\n-- libc's struct timespec on x86-64 Linux\nstruct RtTimespec {\n    seconds: int,\n    nanoseconds: int\n}\n\n-- time_ms(): milliseconds on a clock that only moves forward. Its\n-- zero is not a date; only the difference of two readings means\n-- something.\nfn rt_time_ms() -> int {\n    unsafe {\n        let mut now = RtTimespec { seconds: 0, nanoseconds: 0 }\n        -- 1 is CLOCK_MONOTONIC\n        libc_clock_gettime(1, addr_of(now))\n        return now.seconds * 1000 + now.nanoseconds / 1000000\n    }\n}\n\n-- sleep_ms(ms): wait for ms milliseconds. A negative ms does not wait.\nfn rt_sleep_ms(ms: int) {\n    if ms <= 0 {\n        return\n    }\n    unsafe {\n        let mut time = RtTimespec { seconds: ms / 1000, nanoseconds: (ms % 1000) * 1000000 }\n        libc_nanosleep(addr_of(time), 0)\n    }\n}\n\n-- ============================================================\n-- Paths\n-- path_dirname, path_basename, path_extension, path_stem and\n-- path_join. They work on the text of a path and never look at the\n-- file system. See runtime/string.dm for how rt_X functions replace\n-- the C runtime.\n-- ============================================================\n\n-- The index after the last \"/\" in the n bytes at data, or 0 when\n-- there is none\nfn rt_path_name_start(data: int, n: int) -> int {\n    let mut i = n\n    unsafe {\n        -- 47 is \"/\"\n        while i > 0 and load_u8(data + i - 1) != 47 {\n            i = i - 1\n        }\n    }\n    return i\n}\n\n-- path_dirname(path): the part before the last \"/\". A path with no\n-- \"/\" is in \".\", and the directory of a path in \"/\" is \"/\".\nfn rt_path_dirname(path: string) -> string {\n    unsafe {\n        let data = string_data(path)\n        let name_start = rt_path_name_start(data, len(path))\n        if name_start == 0 {\n            return \".\"\n        }\n        if name_start == 1 {\n            return \"/\"\n        }\n        return rt_string_copy(data, name_start - 1)\n    }\n}\n\n-- path_basename(path): the part after the last \"/\"\nfn rt_path_basename(path: string) -> string {\n    let n = len(path)\n    unsafe {\n        let data = string_data(path)\n        let name_start = rt_path_name_start(data, n)\n        if name_start == 0 {\n            return path\n        }\n        return rt_string_copy(data + name_start, n - name_start)\n    }\n}\n\n-- path_extension(path): the name's last \".\" and what follows it, or\n-- \"\" when the name has no \".\"\nfn rt_path_extension(path: string) -> string {\n    let n = len(path)\n    unsafe {\n        let data = string_data(path)\n")
+    pieces.push("        let mut i = n\n        -- 46 is \".\" and 47 is \"/\"\n        while i > 0 and load_u8(data + i - 1) != 46 and load_u8(data + i - 1) != 47 {\n            i = i - 1\n        }\n        if i == 0 or load_u8(data + i - 1) == 47 {\n            return \"\"\n        }\n        return rt_string_copy(data + i - 1, n - i + 1)\n    }\n}\n\n-- path_stem(path): the name without its extension. A name whose only\n-- \".\" is its first byte, such as \".bashrc\", is its own stem.\nfn rt_path_stem(path: string) -> string {\n    let base = rt_path_basename(path)\n    unsafe {\n        let data = string_data(base)\n        let mut i = len(base)\n        while i > 0 and load_u8(data + i - 1) != 46 {\n            i = i - 1\n        }\n        if i <= 1 {\n            return base\n        }\n        return rt_string_copy(data, i - 1)\n    }\n}\n\n-- path_join(a, b): a and b with one \"/\" between them, unless a ends\n-- in one. An empty part gives the other part.\nfn rt_path_join(a: string, b: string) -> string {\n    let na = len(a)\n    let nb = len(b)\n    if na == 0 {\n        return b\n    }\n    if nb == 0 {\n        return a\n    }\n    unsafe {\n        let mut sep = 1\n        if load_u8(string_data(a) + na - 1) == 47 {\n            sep = 0\n        }\n        let n = na + sep + nb\n        let buf = rt_string_buffer(n)\n        libc_memcpy(buf, string_data(a), na)\n        store_u8(buf + na, 47)\n        libc_memcpy(buf + na + sep, string_data(b), nb)\n        return string_from_raw(buf, n, n + 1)\n    }\n}\n\n-- ============================================================\n-- The console\n-- print, println, eprint, eprintln, flush, read_line, read_key,\n-- read_key_nb, term_width, term_height and panic. See\n-- runtime/string.dm for how rt_X functions replace the C runtime.\n--\n-- They use libc's stdio streams, so what a program prints keeps its\n-- order with what C code in the same program prints, and libc writes\n-- out what is still buffered when the program exits. Standard output\n-- is buffered and standard error is not.\n-- ============================================================\n\nextern fn libc_fputc(c: i32, stream: int) -> i32 = \"fputc\"\nextern fn libc_getline(line: int, room: int, stream: int) -> int = \"getline\"\nextern fn libc_fflush(stream: int) -> i32 = \"fflush\"\nextern fn libc_fgetc(stream: int) -> i32 = \"fgetc\"\nextern fn libc_poll(fds: int, count: int, timeout: i32) -> i32 = \"poll\"\nextern fn libc_ioctl(fd: i32, request: int, ...) -> i32 = \"ioctl\"\n\n-- libc's stdin, stdout and stderr are variables that hold a FILE*\n\nfn rt_stdin() -> int {\n    unsafe {\n        return load_i64(symbol_addr(\"stdin\"))\n    }\n}\n\nfn rt_stdout() -> int {\n    unsafe {\n        return load_i64(symbol_addr(\"stdout\"))\n    }\n}\n\nfn rt_stderr() -> int {\n    unsafe {\n        return load_i64(symbol_addr(\"stderr\"))\n    }\n}\n\n-- Whether the program is inside a stdio call on an output stream: a\n-- word that is 1 from before such a call until after it. The function\n-- that ends the program when its stack is full (STACK OVERFLOW in\n-- runtime/os.dm) writes out standard output first, unless the program\n-- was stopped inside such a call, with the stream half changed.\nfn rt_in_stdio() -> int {\n    unsafe {\n        return static_addr(\"rt_in_stdio\", 8)\n    }\n}\n\n-- Write s to a stdio stream\nfn rt_stream_write(stream: int, s: string) {\n    let n = len(s)\n    if n > 0 {\n        unsafe {\n            let busy = rt_in_stdio()\n            store_i64(busy, 1)\n            libc_fwrite(string_data(s), 1, n, stream)\n            store_i64(busy, 0)\n        }\n    }\n}\n\n-- Write s and a newline to a stdio stream\nfn rt_stream_write_line(stream: int, s: string) {\n    rt_stream_write(stream, s)\n    unsafe {\n        let busy = rt_in_stdio()\n        store_i64(busy, 1)\n        libc_fputc(10, stream)\n        store_i64(busy, 0)\n    }\n}\n\nfn rt_print(s: string) {\n    rt_stream_write(rt_stdout(), s)\n}\n\nfn rt_println(s: string) {\n    rt_stream_write_line(rt_stdout(), s)\n}\n\nfn rt_eprint(s: string) {\n    rt_stream_write(rt_stderr(), s)\n}\n\nfn rt_eprintln(s: string) {\n")
+    pieces.push("    rt_stream_write_line(rt_stderr(), s)\n}\n\n-- panic(message): write \"PANIC: <message>\" to standard error and exit\n-- with code 1. Every failed check ends here, the compiler's and the\n-- runtime's own, so nothing here may panic or allocate.\nfn rt_panic(message: string) {\n    let err = rt_stderr()\n    rt_stream_write(err, \"PANIC: \")\n    rt_stream_write_line(err, message)\n    exit(1)\n}\n\n-- assert(cond): panic unless the condition holds\nfn rt_assert(condition: bool) {\n    if condition == false {\n        panic(\"assertion failed\")\n    }\n}\n\n-- assert_eq(a, b): the compiler passes whether a == b\nfn rt_assert_eq_values(equal: bool) {\n    if equal == false {\n        panic(\"assert_eq failed: values not equal\")\n    }\n}\n\nfn rt_assert_eq_strings(equal: bool) {\n    if equal == false {\n        panic(\"assert_eq failed: strings not equal\")\n    }\n}\n\n-- read_line(): the next line of standard input without its newline,\n-- or \"\" at the end of input\nfn rt_read_line() -> string {\n    unsafe {\n        -- getline allocates the line and stores its address and the\n        -- allocation's size in these two\n        let mut line = 0\n        let mut room = 0\n        let mut n = libc_getline(addr_of(line), addr_of(room), rt_stdin())\n        if n > 0 and load_u8(line + n - 1) == 10 {\n            n = n - 1\n        }\n        if n <= 0 {\n            libc_free(line)\n            return \"\"\n        }\n        store_u8(line + n, 0)\n        return string_from_raw(line, n, room)\n    }\n}\n\n-- flush(): write out what standard output still holds\nfn rt_flush() {\n    unsafe {\n        let busy = rt_in_stdio()\n        store_i64(busy, 1)\n        libc_fflush(rt_stdout())\n        store_i64(busy, 0)\n    }\n}\n\n-- read_key(): the next byte of standard input, or -1 at its end. It\n-- waits for a byte.\nfn rt_read_key() -> int {\n    unsafe {\n        return libc_fgetc(rt_stdin()) as int\n    }\n}\n\n-- read_key_nb(): the next byte of standard input, or -1 when none is\n-- waiting or the input has ended. It does not wait.\nfn rt_read_key_nb() -> int {\n    unsafe {\n        -- A struct pollfd is fd (4 bytes), events (2) and revents (2).\n        -- This one is fd 0, standard input, and event 1, POLLIN.\n        let mut pollfd = 0\n        store_u16(addr_of(pollfd) + 4, 1)\n        if libc_poll(addr_of(pollfd), 1, 0) > 0 {\n            return libc_fgetc(rt_stdin()) as int\n        }\n        return -1\n    }\n}\n\n-- The size of the terminal on standard output as the kernel's struct\n-- winsize: rows, columns and two sizes in pixels, 2 bytes each. All\n-- are 0 when standard output is not a terminal.\nfn rt_term_size() -> int {\n    unsafe {\n        let mut size = 0\n        -- 21523 is TIOCGWINSZ on Linux\n        if libc_ioctl(1, 21523, addr_of(size)) != 0 {\n            return 0\n        }\n        return size\n    }\n}\n\n-- term_width(): the terminal's width in columns, or 80 when standard\n-- output is not a terminal\nfn rt_term_width() -> int {\n    unsafe {\n        let mut size = rt_term_size()\n        let columns = load_u16(addr_of(size) + 2)\n        if columns > 0 {\n            return columns\n        }\n        return 80\n    }\n}\n\n-- term_height(): the terminal's height in rows, or 24 when standard\n-- output is not a terminal\nfn rt_term_height() -> int {\n    unsafe {\n        let mut size = rt_term_size()\n        let rows = load_u16(addr_of(size))\n        if rows > 0 {\n            return rows\n        }\n        return 24\n    }\n}\n\n-- ============================================================\n-- TCP sockets\n-- tcp_listen, tcp_accept, tcp_connect, tcp_read, tcp_write and\n-- tcp_close, over libc's sockets. IPv4 only, and no name lookup: an\n-- address is \"HOST:PORT\" with HOST a dotted address, \"localhost\" or\n-- nothing. See runtime/string.dm for how rt_X functions replace the C\n-- runtime.\n--\n-- A socket is its file descriptor. The functions that open one give\n-- -1 when they fail.\n-- ============================================================\n\n")
+    pieces.push("extern fn libc_socket(domain: i32, kind: i32, protocol: i32) -> i32 = \"socket\"\nextern fn libc_setsockopt(fd: i32, level: i32, option: i32, value: int, size: u32) -> i32 = \"setsockopt\"\nextern fn libc_bind(fd: i32, address: int, size: u32) -> i32 = \"bind\"\nextern fn libc_listen(fd: i32, backlog: i32) -> i32 = \"listen\"\nextern fn libc_accept(fd: i32, address: int, size: int) -> i32 = \"accept\"\nextern fn libc_connect(fd: i32, address: int, size: u32) -> i32 = \"connect\"\nextern fn libc_inet_pton(family: i32, text: int, out: int) -> i32 = \"inet_pton\"\nextern fn libc_read(fd: i32, buf: int, n: int) -> int = \"read\"\nextern fn libc_write(fd: i32, buf: int, n: int) -> int = \"write\"\nextern fn libc_close(fd: i32) -> i32 = \"close\"\n\n-- libc's struct sockaddr_in on x86-64 Linux, 16 bytes: the family\n-- (2 bytes), the port (2 bytes, high byte first), the address (4\n-- bytes) and 8 bytes of padding\nstruct RtSockaddr {\n    head: int,\n    padding: int\n}\n\n-- Whether fd can be a file descriptor, which is a C int\nfn rt_fd_ok(fd: int) -> bool {\n    return fd >= 0 and fd <= 2147483647\n}\n\n-- Write the address \"HOST:PORT\" into the struct sockaddr_in at\n-- sockaddr. No HOST means 0.0.0.0, which is every address of this\n-- machine to listen on, and this machine to connect to. False when\n-- the text is not an address.\nfn rt_tcp_address(text: string, sockaddr: int) -> bool {\n    -- 58 is ':'\n    let mut colon = len(text) - 1\n    while colon >= 0 and byte_at(text, colon) != 58 {\n        colon = colon - 1\n    }\n    if colon < 0 {\n        return false\n    }\n    -- The port is the digits after the colon, as C's atoi reads them\n    let mut port = 0\n    let mut i = colon + 1\n    while i < len(text) and byte_at(text, i) >= 48 and byte_at(text, i) <= 57 and port <= 65535 {\n        port = port * 10 + byte_at(text, i) - 48\n        i = i + 1\n    }\n    if port > 65535 {\n        return false\n    }\n    let mut host = substr(text, 0, colon)\n    if rt_string_eq(host, \"\") {\n        host = \"0.0.0.0\"\n    }\n    if rt_string_eq(host, \"localhost\") {\n        host = \"127.0.0.1\"\n    }\n    unsafe {\n        -- 2 is AF_INET\n        store_u16(sockaddr, 2)\n        store_u8(sockaddr + 2, port / 256)\n        store_u8(sockaddr + 3, port % 256)\n        return libc_inet_pton(2, string_data(host), sockaddr + 4) == 1\n    }\n}\n\n-- tcp_listen(address): a socket that listens on \"HOST:PORT\", or -1\nfn rt_tcp_listen(address: string) -> int {\n    unsafe {\n        let mut sockaddr = RtSockaddr { head: 0, padding: 0 }\n        if not rt_tcp_address(address, addr_of(sockaddr)) {\n            return -1\n        }\n        -- AF_INET, SOCK_STREAM\n        let fd = libc_socket(2, 1, 0)\n        if fd < 0 {\n            return -1\n        }\n        -- SOL_SOCKET, SO_REUSEADDR: a server that is started again can\n        -- take its port back at once\n        let mut on = 1\n        libc_setsockopt(fd, 1, 2, addr_of(on), 4)\n        if libc_bind(fd, addr_of(sockaddr), 16) < 0 {\n            libc_close(fd)\n            return -1\n        }\n        if libc_listen(fd, 128) < 0 {\n            libc_close(fd)\n            return -1\n        }\n        return fd as int\n    }\n}\n\n-- tcp_accept(listener): wait for a connection to the listening\n-- socket and give its socket, or -1\nfn rt_tcp_accept(listener: int) -> int {\n    if not rt_fd_ok(listener) {\n        return -1\n    }\n    unsafe {\n        return libc_accept(listener as i32, 0, 0) as int\n    }\n}\n\n-- tcp_connect(address): a socket connected to \"HOST:PORT\", or -1\nfn rt_tcp_connect(address: string) -> int {\n    unsafe {\n        let mut sockaddr = RtSockaddr { head: 0, padding: 0 }\n        if not rt_tcp_address(address, addr_of(sockaddr)) {\n            return -1\n        }\n        let fd = libc_socket(2, 1, 0)\n        if fd < 0 {\n            return -1\n        }\n        if libc_connect(fd, addr_of(sockaddr), 16) < 0 {\n            libc_close(fd)\n            return -1\n        }\n        return fd as int\n    }\n}\n\n-- tcp_read(fd, max_bytes): what the socket has, up to max_bytes\n")
+    pieces.push("-- bytes, waiting for the first of them. \"\" when the other side has\n-- closed the connection, or on an error. A max_bytes of 0 or less\n-- means 4096.\nfn rt_tcp_read(fd: int, max_bytes: int) -> string {\n    if not rt_fd_ok(fd) {\n        return \"\"\n    }\n    let mut room = max_bytes\n    if room <= 0 {\n        room = 4096\n    }\n    unsafe {\n        let buf = rt_string_buffer(room)\n        let n = libc_read(fd as i32, buf, room)\n        if n <= 0 {\n            libc_free(buf)\n            return \"\"\n        }\n        store_u8(buf + n, 0)\n        return string_from_raw(buf, n, room + 1)\n    }\n}\n\n-- tcp_write(fd, data): send data, and give the number of bytes the\n-- socket took, 0 on an error\nfn rt_tcp_write(fd: int, data: string) -> int {\n    if not rt_fd_ok(fd) {\n        return 0\n    }\n    unsafe {\n        let n = libc_write(fd as i32, string_data(data), len(data))\n        if n < 0 {\n            return 0\n        }\n        return n\n    }\n}\n\n-- tcp_close(fd): close the socket\nfn rt_tcp_close(fd: int) {\n    if not rt_fd_ok(fd) {\n        return\n    }\n    unsafe {\n        libc_close(fd as i32)\n    }\n}\n\n-- ============================================================\n-- Threads and mutexes\n-- thread_spawn, thread_join, mutex_new, mutex_lock, mutex_unlock and\n-- mutex_destroy, over libc's pthreads. See runtime/string.dm for how\n-- rt_X functions replace the C runtime.\n--\n-- A thread is its pthread_t and a mutex is the address of its\n-- pthread_mutex_t, both as an int.\n-- ============================================================\n\nextern fn libc_pthread_create(thread: int, attributes: int, start: int, argument: int) -> i32 = \"pthread_create\"\nextern fn libc_pthread_join(thread: int, result: int) -> i32 = \"pthread_join\"\nextern fn libc_pthread_mutex_init(mutex: int, attributes: int) -> i32 = \"pthread_mutex_init\"\nextern fn libc_pthread_mutex_lock(mutex: int) -> i32 = \"pthread_mutex_lock\"\nextern fn libc_pthread_mutex_unlock(mutex: int) -> i32 = \"pthread_mutex_unlock\"\nextern fn libc_pthread_mutex_destroy(mutex: int) -> i32 = \"pthread_mutex_destroy\"\n\n-- thread_spawn(f): run the function value f, which takes nothing and\n-- gives nothing, on a new thread, and give the thread. Panics when the\n-- thread cannot be started.\n--\n-- f is the address of a closure, whose first word is the address of\n-- its function, and the function takes the closure (see FUNCTION\n-- VALUES in ir_gen_expr.dm). That function is the thread's start\n-- routine and the closure is its argument, which is the call\n-- pthreads makes. pthreads also reads a result: on x86-64 a function\n-- that gives nothing leaves the result's register as it is, and\n-- thread_join asks for no result, so that value is never read.\nfn rt_thread_spawn(f: int) -> int {\n    unsafe {\n        let mut thread = 0\n        if libc_pthread_create(addr_of(thread), 0, load_i64(f), f) != 0 {\n            panic(\"thread_spawn: cannot start a thread\")\n        }\n        return thread\n    }\n}\n\n-- thread_join(thread): wait for the thread to end\nfn rt_thread_join(thread: int) {\n    unsafe {\n        libc_pthread_join(thread, 0)\n    }\n}\n\n-- mutex_new(): a new, unlocked mutex\nfn rt_mutex_new() -> int {\n    unsafe {\n        -- A pthread_mutex_t is 40 bytes on x86-64 Linux\n        let mutex = libc_malloc(40)\n        if mutex == 0 {\n            panic(\"out of memory\")\n        }\n        libc_pthread_mutex_init(mutex, 0)\n        return mutex\n    }\n}\n\n-- mutex_lock(mutex): wait until the mutex is unlocked, and lock it\nfn rt_mutex_lock(mutex: int) {\n    unsafe {\n        libc_pthread_mutex_lock(mutex)\n    }\n}\n\n-- mutex_unlock(mutex): unlock the mutex\nfn rt_mutex_unlock(mutex: int) {\n    unsafe {\n        libc_pthread_mutex_unlock(mutex)\n    }\n}\n\n-- mutex_destroy(mutex): free the mutex, which must be unlocked\nfn rt_mutex_destroy(mutex: int) {\n    unsafe {\n        libc_pthread_mutex_destroy(mutex)\n        libc_free(mutex)\n    }\n}\n")
     return join_strings(pieces)
 }
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "0f284c0a4eef698e"
+    return "6baf74b177700561"
 }
 
 
@@ -29602,6 +30737,17 @@ fn compile(cli: CLIArgs) -> int {
 -- ============================================================
 
 fn main() -> int {
+    -- What the compiler says when its stack is full (see STACK
+    -- OVERFLOW in runtime/os.dm): it calls itself once for each level
+    -- that the program's expressions and statements are nested, and
+    -- the parser's limits (NESTING in parser.dm) do not rule out
+    -- every program that is too deep for that
+    let stack_note = "Error: the program is nested too deeply to compile (the compiler's stack is full)\n"
+    unsafe {
+        let note = static_addr("dm_stack_overflow_note", 16)
+        store_i64(note, string_data(stack_note))
+        store_i64(note + 8, len(stack_note))
+    }
     let cli = parse_cli_args()
 
     if cli.show_help {

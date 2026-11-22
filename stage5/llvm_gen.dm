@@ -15,6 +15,9 @@ import llvm
 -- functions, the runtime's included, take strings by value and return
 -- them through a pointer the caller passes first (sret). A C function
 -- declared with `extern fn` takes and returns char*.
+--
+-- Structs, enums, Options and Results are held in memory and passed
+-- by their address: see MEMORY VALUES.
 -- ============================================================
 
 -- ============================================================
@@ -43,8 +46,56 @@ struct LLVMGenerator {
     wrapper_returns_string: Map[string, bool],
     -- Track which functions have wrappers
     has_wrapper: Map[string, bool],
-    -- Track which functions use sret return convention (result/option types)
+    -- The functions that return their result through a pointer they
+    -- take first, and the IR type of that result
     returns_sret: Map[string, bool],
+    sret_types: Map[string, string],
+    -- For each function with a parameter that takes a struct in
+    -- memory: the IR types of those parameters (see mem_param_types)
+    mem_params: Map[string, string],
+    -- MEMORY VALUES, for the function being generated. By the id of
+    -- an instruction: the block and the index it is at, the number of
+    -- its uses, the index of its last use in its block, and whether
+    -- it is used anywhere else (mv_scan)
+    mv_count: int,
+    mv_block: List[int],
+    mv_at: List[int],
+    mv_uses: List[int],
+    mv_last: List[int],
+    mv_far: List[int],
+    -- By id, for a value held in memory: its kind (1 the place it was
+    -- loaded from, 2 storage of its own; 0 for every other value),
+    -- its LLVM type, the pool's storage it is in (-1 for none) with
+    -- the count that storage had when the value got it, and whether
+    -- the storage is the value's alone
+    mv_kind: List[int],
+    mv_ty: List[int],
+    mv_temp: List[int],
+    mv_gen: List[int],
+    mv_owns: List[int],
+    mv_scratch: List[int],
+    -- By parameter: the LLVM type of one held in memory (0 for any
+    -- other), whether its only use is the store that opens the
+    -- function, and the copy made for one that has other uses
+    param_mem_ty: List[int],
+    param_direct: List[int],
+    param_copy: List[int],
+    -- The stores and calls before each instruction of each block
+    -- (mv_scan), and where each block's counts begin
+    clob: List[int],
+    clob_base: List[int],
+    -- The pool of storage for values in memory: the type and the
+    -- alloca of each, whether it is in use (until pool_until, the
+    -- index of an instruction of the block being generated), and how
+    -- many values have had it
+    pool_ty: List[int],
+    pool_alloca: List[int],
+    pool_busy: List[int],
+    pool_until: List[int],
+    pool_gen: List[int],
+    -- The block and the instruction being generated
+    cur_bi: int,
+    cur_ii: int,
     -- The LLVM function of each C symbol declared so far. Extern
     -- functions bound to the same symbol share it; each keeps its own
     -- function type in fn_type_map.
@@ -121,6 +172,32 @@ fn llvm_gen_new(ir_mod: IRModule, module_name: string) -> LLVMGenerator {
             wrapper_returns_string: Map_new(),
             has_wrapper: Map_new(),
             returns_sret: Map_new(),
+            sret_types: Map_new(),
+            mem_params: Map_new(),
+            mv_count: 0,
+            mv_block: [],
+            mv_at: [],
+            mv_uses: [],
+            mv_last: [],
+            mv_far: [],
+            mv_kind: [],
+            mv_ty: [],
+            mv_temp: [],
+            mv_gen: [],
+            mv_owns: [],
+            mv_scratch: [],
+            param_mem_ty: [],
+            param_direct: [],
+            param_copy: [],
+            clob: [],
+            clob_base: [],
+            pool_ty: [],
+            pool_alloca: [],
+            pool_busy: [],
+            pool_until: [],
+            pool_gen: [],
+            cur_bi: 0,
+            cur_ii: 0,
             c_symbols: Map_new(),
             c_symbol_names: Map_new(),
             data_symbols: Map_new(),
@@ -690,6 +767,10 @@ fn bind_runtime_port(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
     g.fn_type_map.insert(c_name, g.fn_type_map.get(func.name))
     if g.returns_sret.contains(func.name) {
         g.returns_sret.insert(c_name, true)
+        g.sret_types.insert(c_name, g.sret_types.get(func.name))
+    }
+    if g.mem_params.contains(func.name) {
+        g.mem_params.insert(c_name, g.mem_params.get(func.name))
     }
     return g
 }
@@ -1122,9 +1203,12 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             g = declare_wrapper(g, func)
             return g
         }
-        -- Regular function declaration
-        -- Check if function returns result/option (needs sret convention)
-        let needs_sret = is_sret_return_type(func.return_type) and func.name != "main"
+        -- Regular function declaration. A dAImond function takes a
+        -- struct in memory by its address and returns one through a
+        -- pointer (see MEMORY VALUES); a C function takes and returns
+        -- it as a value.
+        let in_memory = func.is_extern == false
+        let needs_sret = (is_sret_return_type(func.return_type) or (in_memory and is_mem_type(g, func.return_type))) and func.name != "main"
         let is_main = func.name == "main"
         -- IMPORTANT: Compute return type and collect param types BEFORE using the shared
         -- buffer, because map_ir_type_to_llvm may use dm_llvm_buf internally for struct types
@@ -1141,9 +1225,15 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         if needs_sret {
             param_types.push(dm_llvm_pointer_type(ctx))
         }
+        let mut param_irs: List[string] = []
         let mut i = 0
         while i < func.params.len() {
-            param_types.push(map_ir_type_to_llvm(g, func.params[i].type_id))
+            if in_memory {
+                param_types.push(param_llvm_type(g, func.params[i].type_id))
+                param_irs.push(func.params[i].type_id)
+            } else {
+                param_types.push(map_ir_type_to_llvm(g, func.params[i].type_id))
+            }
             i = i + 1
         }
         if is_main {
@@ -1165,6 +1255,7 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
             g.fn_type_map.insert(func.name, fn_ty)
             if needs_sret {
                 g.returns_sret.insert(func.name, true)
+                g.sret_types.insert(func.name, func.return_type)
             }
             return g
         }
@@ -1174,6 +1265,11 @@ fn lg_declare_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         -- Track sret functions
         if needs_sret {
             g.returns_sret.insert(func.name, true)
+            g.sret_types.insert(func.name, func.return_type)
+        }
+        let taken_in_memory = mem_param_types(g, param_irs)
+        if taken_in_memory != "" {
+            g.mem_params.insert(func.name, taken_in_memory)
         }
         -- Name parameters (offset by 1 for sret functions since param 0 is the sret ptr)
         i = 0
@@ -1225,6 +1321,7 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
         g.value_map = Map_new()
         g.string_ptrs = Map_new()
         g.panic_blocks = Map_new()
+        g = mv_scan(g, func)
         -- ALLOCA HOISTING: Generate all allocas in the entry block first.
         -- This ensures all allocas are available regardless of block processing order.
         -- Standard LLVM practice: all allocas belong in the entry block.
@@ -1260,6 +1357,20 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                         si = si + 1
                     }
                     bi = bi + 1
+                }
+                -- A parameter held in memory that is used anywhere but
+                -- in the store that opens the function: a copy of its
+                -- own, made before anything can change the caller's
+                -- memory
+                let mut pci = 0
+                while pci < g.param_mem_ty.len() {
+                    if g.param_mem_ty[pci] != 0 and g.param_direct[pci] == 0 {
+                        let given = resolve_raw(g, ir_val_param(pci))
+                        let own = dm_llvm_build_alloca(g.builder, g.param_mem_ty[pci], "param.mem")
+                        mem_copy(g, own, given, g.param_mem_ty[pci])
+                        g.param_copy[pci] = own
+                    }
+                    pci = pci + 1
                 }
             }
         }
@@ -1334,17 +1445,33 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
                         let bb = g.block_map.get(block.label)
                         dm_llvm_position_at_end(g.builder, bb)
                         -- Generate non-alloca instructions
+                        g.cur_bi = found_bi
                         let mut ii = 0
                         while ii < block.instructions.len() {
                             if block.instructions[ii].op != OP_ALLOCA() {
+                                g.cur_ii = ii
                                 g = generate_instruction(g, block.instructions[ii])
+                                -- The pool's storage whose value has had
+                                -- its last use is free again
+                                let mut ti = 0
+                                while ti < g.pool_busy.len() {
+                                    if g.pool_busy[ti] == 1 and g.pool_until[ti] <= ii { g.pool_busy[ti] = 0 }
+                                    ti = ti + 1
+                                }
                             }
                             ii = ii + 1
                         }
                         -- Generate terminator
+                        g.cur_ii = block.instructions.len()
                         if block.has_terminator {
                             let term = *block.terminator
                             g = generate_terminator(g, term, func)
+                        }
+                        -- No value in the pool's storage lives past its block
+                        let mut ti = 0
+                        while ti < g.pool_busy.len() {
+                            if g.pool_busy[ti] == 1 { g.pool_busy[ti] = 0 }
+                            ti = ti + 1
                         }
                     }
                 }
@@ -1357,10 +1484,791 @@ fn lg_generate_function(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
 }
 
 -- ============================================================
+-- MEMORY VALUES
+-- A value of a struct type (a struct, an enum, an Option, a
+-- Result, a `dyn` value) is not an LLVM value: it is the address
+-- of memory that holds it, and it is copied with memcpy. LLVM
+-- would otherwise pass each of the struct's scalars as an
+-- argument of its own and keep every value in a stack slot of the
+-- struct's size, which made the compiler's own functions use up
+-- to 1.5 MB of stack each.
+--
+-- Strings and lists are not among them: they have their own
+-- handling (string_ptrs).
+--
+-- A function takes such a parameter as a pointer to memory that
+-- holds the value when the function begins, and returns such a
+-- value through a pointer the caller passes first (sret), as it
+-- returns a string.
+--
+-- The address is one of two kinds (mv_kind):
+--   1  the place the value was loaded from (a variable, a field,
+--      a box). No copy was made. It is the value only until that
+--      place is written to, so a load is of this kind only when
+--      every use of the value is in its block and no store or
+--      call lies between the load and its last use (mv_scan finds
+--      this before the function is generated).
+--   2  storage of the value's own: a temporary, or the memory of a
+--      parameter. A temporary is taken from a pool and goes back
+--      after the value's last use when every use is in the value's
+--      block; a value used in another block keeps an alloca of its
+--      own for the whole function.
+--
+-- resolve_value gives a struct value as the LLVM value, loading
+-- it: every instruction that has no code of its own for a value
+-- in memory gets it that way. The instructions that copy, read a
+-- field of, pass or return such a value take its address
+-- (mem_addr) and never load it.
+-- ============================================================
+
+-- Whether values of the IR type are held in memory
+fn is_mem_type(gen: LLVMGenerator, t: string) -> bool {
+    unsafe {
+        if t == "" or t == "void" or t == "ptr" or t == "bool" or t == "string" or t == "list" { return false }
+        if is_list_ir_type(t) or is_int_type(t) or lg_is_float_type(t) or lg_is_simd_type(t) { return false }
+        let ty = map_ir_type_to_llvm(gen, t)
+        if dm_llvm_get_type_kind(ty) != 10 { return false }
+        return ty != gen.dm_string_type
+    }
+}
+
+-- The LLVM type of a parameter of the IR type: a pointer for a
+-- value held in memory
+fn param_llvm_type(gen: LLVMGenerator, t: string) -> int {
+    unsafe {
+        if is_mem_type(gen, t) { return dm_llvm_pointer_type(gen.context) }
+        return map_ir_type_to_llvm(gen, t)
+    }
+}
+
+-- Whether a function with this result returns it through a pointer
+-- that is passed first
+fn returns_through_pointer(gen: LLVMGenerator, t: string) -> bool {
+    return is_sret_return_type(t) or is_mem_type(gen, t)
+}
+
+-- xs with xs[at] = v, growing the list by one when at is its length
+fn mv_put(xs: List[int], at: int, v: int) -> List[int] {
+    let mut out = xs
+    if at < out.len() {
+        out[at] = v
+    } else {
+        out.push(v)
+    }
+    return out
+}
+
+-- A value an instruction uses, as a number: the id of the
+-- instruction that made it, or -(n + 1) for parameter n
+fn mv_operand(v: IRValue) -> int {
+    if v.kind == VAL_INST_REF() { return v.ref_id }
+    if v.kind == VAL_SIZEOF() and v.str_val == "" { return v.ref_id }
+    if v.kind == VAL_PARAM_REF() { return 0 - (v.ref_id + 1) }
+    return 0
+}
+
+fn mv_is_operand(v: IRValue) -> bool {
+    return v.kind == VAL_INST_REF() or v.kind == VAL_PARAM_REF() or (v.kind == VAL_SIZEOF() and v.str_val == "")
+}
+
+-- The values the instruction uses (see mv_operand), written into
+-- `found` from index 1, with their number at index 0
+fn mv_operands(inst: IRInst, found: List[int]) -> List[int] {
+    let mut out = found
+    if out.len() == 0 { out.push(0) }
+    let mut n = 0
+    if mv_is_operand(inst.lhs) {
+        out = mv_put(out, n + 1, mv_operand(inst.lhs))
+        n = n + 1
+    }
+    if mv_is_operand(inst.rhs) {
+        out = mv_put(out, n + 1, mv_operand(inst.rhs))
+        n = n + 1
+    }
+    if mv_is_operand(inst.operand) {
+        out = mv_put(out, n + 1, mv_operand(inst.operand))
+        n = n + 1
+    }
+    if mv_is_operand(inst.load_ptr) {
+        out = mv_put(out, n + 1, mv_operand(inst.load_ptr))
+        n = n + 1
+    }
+    if mv_is_operand(inst.store_ptr) {
+        out = mv_put(out, n + 1, mv_operand(inst.store_ptr))
+        n = n + 1
+    }
+    if mv_is_operand(inst.store_val) {
+        out = mv_put(out, n + 1, mv_operand(inst.store_val))
+        n = n + 1
+    }
+    if mv_is_operand(inst.gep_base) {
+        out = mv_put(out, n + 1, mv_operand(inst.gep_base))
+        n = n + 1
+    }
+    if mv_is_operand(inst.field_base) {
+        out = mv_put(out, n + 1, mv_operand(inst.field_base))
+        n = n + 1
+    }
+    if mv_is_operand(inst.field_value) {
+        out = mv_put(out, n + 1, mv_operand(inst.field_value))
+        n = n + 1
+    }
+    if mv_is_operand(inst.callee_val) {
+        out = mv_put(out, n + 1, mv_operand(inst.callee_val))
+        n = n + 1
+    }
+    if mv_is_operand(inst.cast_val) {
+        out = mv_put(out, n + 1, mv_operand(inst.cast_val))
+        n = n + 1
+    }
+    if mv_is_operand(inst.simd_scalar) {
+        out = mv_put(out, n + 1, mv_operand(inst.simd_scalar))
+        n = n + 1
+    }
+    if mv_is_operand(inst.simd_vector) {
+        out = mv_put(out, n + 1, mv_operand(inst.simd_vector))
+        n = n + 1
+    }
+    if mv_is_operand(inst.simd_index) {
+        out = mv_put(out, n + 1, mv_operand(inst.simd_index))
+        n = n + 1
+    }
+    let mut i = 0
+    while i < inst.gep_indices.len() {
+        if mv_is_operand(inst.gep_indices[i]) {
+            out = mv_put(out, n + 1, mv_operand(inst.gep_indices[i]))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < inst.call_args.len() {
+        if mv_is_operand(inst.call_args[i]) {
+            out = mv_put(out, n + 1, mv_operand(inst.call_args[i]))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < inst.simd_elements.len() {
+        if mv_is_operand(inst.simd_elements[i]) {
+            out = mv_put(out, n + 1, mv_operand(inst.simd_elements[i]))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < inst.phi_entries.len() {
+        let entry = inst.phi_entries[i]
+        if mv_is_operand(entry.value) {
+            out = mv_put(out, n + 1, mv_operand(entry.value))
+            n = n + 1
+        }
+        i = i + 1
+    }
+    -- The number of operands is kept in front of them
+    out = mv_put(out, 0, n)
+    return out
+}
+
+-- Count the uses that g.mv_scratch holds (see mv_operands), which
+-- are those of instruction ii of block bi. `opening_param` is the
+-- parameter that instruction copies into its variable as the function
+-- begins, or -1: that use is not counted.
+fn mv_count_uses(gen: LLVMGenerator, bi: int, ii: int, opening_param: int) -> LLVMGenerator {
+    let mut g = gen
+    let n = g.mv_scratch[0]
+    let mut oi = 1
+    while oi <= n {
+        let operand = g.mv_scratch[oi]
+        if operand < 0 {
+            -- A parameter used anywhere but in the store that opens
+            -- the function gets a copy of its own (lg_generate_function)
+            let p = 0 - operand - 1
+            if p != opening_param and p < g.param_direct.len() { g.param_direct[p] = 0 }
+        } else if operand < g.mv_count {
+            g.mv_uses[operand] = g.mv_uses[operand] + 1
+            if g.mv_block[operand] == bi and ii > g.mv_at[operand] {
+                if ii > g.mv_last[operand] { g.mv_last[operand] = ii }
+            } else {
+                g.mv_far[operand] = 1
+            }
+        }
+        oi = oi + 1
+    }
+    return g
+}
+
+-- Before a function is generated: where each of its values is made
+-- and used, and which instructions write to memory
+fn mv_scan(gen: LLVMGenerator, func: IRFunction) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        -- Ids are small numbers that begin again in every function
+        let mut top = 0
+        let mut bi = 0
+        while bi < func.blocks.len() {
+            let block = func.blocks[bi]
+            let mut ii = 0
+            while ii < block.instructions.len() {
+                let id = block.instructions[ii].id
+                if id >= top { top = id + 1 }
+                ii = ii + 1
+            }
+            bi = bi + 1
+        }
+        g.mv_count = top
+        let mut k = 0
+        while k < top {
+            g.mv_block = mv_put(g.mv_block, k, -1)
+            g.mv_at = mv_put(g.mv_at, k, 0)
+            g.mv_uses = mv_put(g.mv_uses, k, 0)
+            g.mv_last = mv_put(g.mv_last, k, -1)
+            g.mv_far = mv_put(g.mv_far, k, 0)
+            g.mv_kind = mv_put(g.mv_kind, k, 0)
+            g.mv_ty = mv_put(g.mv_ty, k, 0)
+            g.mv_temp = mv_put(g.mv_temp, k, -1)
+            g.mv_gen = mv_put(g.mv_gen, k, 0)
+            g.mv_owns = mv_put(g.mv_owns, k, 0)
+            k = k + 1
+        }
+        bi = 0
+        while bi < func.blocks.len() {
+            let block = func.blocks[bi]
+            let mut ii = 0
+            while ii < block.instructions.len() {
+                let id = block.instructions[ii].id
+                if id >= 0 and block.instructions[ii].has_result {
+                    g.mv_block[id] = bi
+                    g.mv_at[id] = ii
+                }
+                ii = ii + 1
+            }
+            bi = bi + 1
+        }
+        -- Parameters: the type of each that is held in memory, and
+        -- whether the function only copies it as it begins
+        let mut param_tys: List[int] = []
+        let mut param_direct: List[int] = []
+        let mut param_copy: List[int] = []
+        let mut pi = 0
+        while pi < func.params.len() {
+            if is_mem_type(g, func.params[pi].type_id) {
+                param_tys.push(map_ir_type_to_llvm(g, func.params[pi].type_id))
+            } else {
+                param_tys.push(0)
+            }
+            param_direct.push(1)
+            param_copy.push(0)
+            pi = pi + 1
+        }
+        g.param_mem_ty = param_tys
+        g.param_direct = param_direct
+        g.param_copy = param_copy
+        -- Uses, and the writes of each block: clob[base + i] is the
+        -- number of stores and calls among the block's first i
+        -- instructions
+        let mut bases: List[int] = []
+        let mut cn = 0
+        bi = 0
+        while bi < func.blocks.len() {
+            let block = func.blocks[bi]
+            bases.push(cn)
+            let mut writes = 0
+            -- The function begins with the stores of its parameters
+            -- into their variables
+            let mut opening = bi == 0
+            let mut ii = 0
+            while ii < block.instructions.len() {
+                let inst = block.instructions[ii]
+                g.clob = mv_put(g.clob, cn, writes)
+                cn = cn + 1
+                let mut copied_param = -1
+                if inst.op == OP_STORE() and inst.store_val.kind == VAL_PARAM_REF() {
+                    if opening { copied_param = inst.store_val.ref_id }
+                } else if inst.op != OP_ALLOCA() and inst.op != OP_DEBUG_VAR() {
+                    opening = false
+                }
+                if inst.op == OP_STORE() and inst.store_ptr.kind == VAL_PARAM_REF() { copied_param = -1 }
+                g.mv_scratch = mv_operands(inst, g.mv_scratch)
+                g = mv_count_uses(g, bi, ii, copied_param)
+                if inst.op == OP_STORE() or inst.op == OP_CALL() or inst.op == OP_CALL_PTR() {
+                    writes = writes + 1
+                }
+                ii = ii + 1
+            }
+            g.clob = mv_put(g.clob, cn, writes)
+            cn = cn + 1
+            if block.has_terminator {
+                let term = *block.terminator
+                let at = block.instructions.len()
+                if g.mv_scratch.len() == 0 { g.mv_scratch.push(0) }
+                let mut n = 0
+                if mv_is_operand(term.cond) {
+                    g.mv_scratch = mv_put(g.mv_scratch, n + 1, mv_operand(term.cond))
+                    n = n + 1
+                }
+                if mv_is_operand(term.ret_val) {
+                    g.mv_scratch = mv_put(g.mv_scratch, n + 1, mv_operand(term.ret_val))
+                    n = n + 1
+                }
+                g.mv_scratch[0] = n
+                g = mv_count_uses(g, bi, at, -1)
+            }
+            bi = bi + 1
+        }
+        g.clob_base = bases
+        let no_ints: List[int] = []
+        g.pool_ty = no_ints
+        let no_allocas: List[int] = []
+        g.pool_alloca = no_allocas
+        let no_busy: List[int] = []
+        g.pool_busy = no_busy
+        let no_until: List[int] = []
+        g.pool_until = no_until
+        let no_gen: List[int] = []
+        g.pool_gen = no_gen
+        g.cur_bi = 0
+        g.cur_ii = 0
+        return g
+    }
+}
+
+-- Whether no store and no call lies between instructions `from` and
+-- `to` of the block being generated
+fn mv_window_clear(gen: LLVMGenerator, from: int, to: int) -> bool {
+    if to <= from { return true }
+    if gen.cur_bi >= gen.clob_base.len() { return false }
+    let base = gen.clob_base[gen.cur_bi]
+    return gen.clob[base + to] - gen.clob[base + from + 1] == 0
+}
+
+-- Whether the value is held in memory, by its address
+fn is_mem(gen: LLVMGenerator, val: IRValue) -> bool {
+    if val.kind == VAL_INST_REF() {
+        return val.ref_id >= 0 and val.ref_id < gen.mv_count and gen.mv_kind[val.ref_id] != 0
+    }
+    if val.kind == VAL_PARAM_REF() {
+        return val.ref_id >= 0 and val.ref_id < gen.param_mem_ty.len() and gen.param_mem_ty[val.ref_id] != 0
+    }
+    return false
+}
+
+-- The LLVM struct type of a value held in memory
+fn mem_ty(gen: LLVMGenerator, val: IRValue) -> int {
+    if val.kind == VAL_PARAM_REF() { return gen.param_mem_ty[val.ref_id] }
+    return gen.mv_ty[val.ref_id]
+}
+
+-- The address of a value held in memory. A use that mv_scan did not
+-- see would read memory that is no longer the value's: that is a
+-- mistake in this file, and stops the compiler.
+fn mem_addr(gen: LLVMGenerator, val: IRValue) -> int {
+    if val.kind == VAL_INST_REF() {
+        let id = val.ref_id
+        if gen.mv_kind[id] == 1 {
+            if gen.cur_bi != gen.mv_block[id] or gen.cur_ii > gen.mv_last[id] {
+                panic("internal: value " + int_to_string(id) + " of '" + gen.current_func_name + "' is read after the place it was loaded from may have changed")
+            }
+        } else if gen.mv_temp[id] >= 0 {
+            if gen.pool_gen[gen.mv_temp[id]] != gen.mv_gen[id] or gen.pool_busy[gen.mv_temp[id]] == 0 {
+                panic("internal: value " + int_to_string(id) + " of '" + gen.current_func_name + "' is read after its storage was given to another value")
+            }
+        }
+    }
+    return resolve_raw(gen, val)
+}
+
+-- memcpy of a value of the LLVM type
+fn mem_copy(gen: LLVMGenerator, dst: int, src: int, ty: int) {
+    unsafe {
+        let size = dm_llvm_abi_size_of(gen.llvm_module, ty)
+        dm_llvm_build_memcpy(gen.builder, dst, src, dm_llvm_const_int(dm_llvm_int64_type(gen.context), size, 0))
+    }
+}
+
+-- Storage of its own for value `id` of the LLVM type, which
+-- temp_of(g, id) gives afterwards. When every use of the value is in
+-- this block it is the pool's, until the value's last use; otherwise
+-- it is an alloca that is the value's for the whole function.
+fn take_temp(gen: LLVMGenerator, ty: int, id: int) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        g.mv_kind[id] = 2
+        g.mv_ty[id] = ty
+        g.mv_owns[id] = 1
+        if g.mv_far[id] != 0 {
+            g.mv_temp[id] = -1
+            g.value_map.insert(int_to_string(id), dm_llvm_build_alloca(g.builder, ty, "mem.own"))
+            return g
+        }
+        let mut t = -1
+        let mut i = 0
+        while i < g.pool_ty.len() and t < 0 {
+            if g.pool_busy[i] == 0 and g.pool_ty[i] == ty { t = i }
+            i = i + 1
+        }
+        if t < 0 {
+            let slot = dm_llvm_build_alloca(g.builder, ty, "mem.tmp")
+            g.pool_ty.push(ty)
+            g.pool_alloca.push(slot)
+            g.pool_busy.push(0)
+            g.pool_until.push(0)
+            g.pool_gen.push(0)
+            t = g.pool_ty.len() - 1
+        }
+        g.pool_gen[t] = g.pool_gen[t] + 1
+        g.pool_busy[t] = 1
+        let mut until = g.mv_last[id]
+        if until < g.cur_ii { until = g.cur_ii }
+        g.pool_until[t] = until
+        g.mv_temp[id] = t
+        g.mv_gen[id] = g.pool_gen[t]
+        g.value_map.insert(int_to_string(id), g.pool_alloca[t])
+        return g
+    }
+}
+
+-- The storage take_temp gave value `id`
+fn temp_of(gen: LLVMGenerator, id: int) -> int {
+    return gen.value_map.get(int_to_string(id))
+}
+
+-- Value `id` is at `addr`, inside the storage of value `base`, which
+-- stays as it is for as long as `id` is used: `id` is a value in
+-- memory of the LLVM type
+fn mv_inside(gen: LLVMGenerator, id: int, base: int, addr: int, ty: int) -> LLVMGenerator {
+    let mut g = gen
+    g.mv_kind[id] = g.mv_kind[base]
+    g.mv_ty[id] = ty
+    g.mv_temp[id] = g.mv_temp[base]
+    g.mv_gen[id] = g.mv_gen[base]
+    g.mv_owns[id] = 0
+    let t = g.mv_temp[base]
+    if t >= 0 {
+        if g.mv_last[id] > g.pool_until[t] { g.pool_until[t] = g.mv_last[id] }
+    }
+    g.value_map.insert(int_to_string(id), addr)
+    return g
+}
+
+-- Whether the field of a value in memory can be used where it lies:
+-- `field` is the instruction that reads it from `base`
+fn mv_field_stays(gen: LLVMGenerator, field: int, base: IRValue) -> bool {
+    if base.kind == VAL_PARAM_REF() { return true }
+    let b = base.ref_id
+    if gen.mv_kind[b] == 1 {
+        -- The place the base was loaded from must stay unwritten
+        return gen.mv_far[field] == 0 and mv_window_clear(gen, gen.cur_ii, gen.mv_last[field])
+    }
+    -- Storage that is not the pool's stays for the whole function. A
+    -- value used in another block does not live in the pool's.
+    if gen.mv_temp[b] < 0 { return true }
+    return gen.mv_far[field] == 0
+}
+
+-- A struct value read from memory: `load T, ptr`
+fn generate_mem_load(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let id = inst.id
+        let ty = map_ir_type_to_llvm(g, inst.load_type)
+        let from = resolve_value(g, inst.load_ptr)
+        if g.mv_uses[id] == 0 { return g }
+        if g.mv_far[id] == 0 and mv_window_clear(g, g.cur_ii, g.mv_last[id]) {
+            g.mv_kind[id] = 1
+            g.mv_ty[id] = ty
+            g.mv_temp[id] = -1
+            g.mv_owns[id] = 0
+            g.value_map.insert(int_to_string(id), from)
+            return g
+        }
+        g = take_temp(g, ty, id)
+        mem_copy(g, temp_of(g, id), from, ty)
+        return g
+    }
+}
+
+-- A field read from a value in memory
+fn generate_mem_extract(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id = inst.id
+        let id_key = int_to_string(id)
+        let base_ty = mem_ty(g, inst.field_base)
+        if inst.field_index < 0 or inst.field_index >= dm_llvm_struct_field_count(base_ty) {
+            g.type_errors.push(lg_error(g, "field " + int_to_string(inst.field_index) + " read from a value of type " + llvm_type_name(base_ty) + ", which has no such field"))
+            return g
+        }
+        let base = mem_addr(g, inst.field_base)
+        let addr = dm_llvm_build_struct_gep2(b, base_ty, base, inst.field_index, "field.addr")
+        let field_ty = dm_llvm_struct_element_type(base_ty, inst.field_index)
+        if inst.field_type == "string" {
+            -- A string is held by the address of a copy of its own
+            let str_alloca = dm_llvm_build_alloca(b, g.dm_string_type, "str.extract")
+            dm_llvm_build_store(b, dm_llvm_build_load2(b, field_ty, addr, "field"), str_alloca)
+            g.string_ptrs.insert(id_key, true)
+            if inst.has_result { g.value_map.insert(id_key, str_alloca) }
+            return g
+        }
+        if dm_llvm_get_type_kind(field_ty) == 10 and field_ty != g.dm_string_type {
+            -- A struct in a struct: where it lies, or a copy
+            if g.mv_uses[id] == 0 { return g }
+            if mv_field_stays(g, id, inst.field_base) {
+                if inst.field_base.kind == VAL_PARAM_REF() {
+                    g.mv_kind[id] = 2
+                    g.mv_ty[id] = field_ty
+                    g.mv_temp[id] = -1
+                    g.mv_owns[id] = 0
+                    g.value_map.insert(id_key, addr)
+                    return g
+                }
+                return mv_inside(g, id, inst.field_base.ref_id, addr, field_ty)
+            }
+            g = take_temp(g, field_ty, id)
+            mem_copy(g, temp_of(g, id), addr, field_ty)
+            return g
+        }
+        if inst.has_result { g.value_map.insert(id_key, dm_llvm_build_load2(b, field_ty, addr, "field")) }
+        return g
+    }
+}
+
+-- A value in memory with one field set: the struct `base` with field
+-- field_index = field_value, or a new struct when base is undef
+fn generate_mem_insert(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
+    unsafe {
+        let mut g = gen
+        let b = g.builder
+        let id = inst.id
+        let ty = map_ir_type_to_llvm(g, inst.result_type)
+        let base = inst.field_base
+        if dm_llvm_struct_field_count(ty) == 0 and base.kind == VAL_UNDEF() {
+            -- A struct with no fields (`Empty {}`): the IR makes it
+            -- by setting a field it does not have. Its value is
+            -- storage with nothing in it.
+            if g.mv_uses[id] == 0 { return g }
+            return take_temp(g, ty, id)
+        }
+        if inst.field_index < 0 or inst.field_index >= dm_llvm_struct_field_count(ty) {
+            g.type_errors.push(lg_error(g, "field " + int_to_string(inst.field_index) + " set in a value of type " + llvm_type_name(ty) + ", which has no such field"))
+            return g
+        }
+        let mut dst = 0
+        let mut in_place = false
+        if base.kind == VAL_INST_REF() and is_mem(g, base) {
+            let bid = base.ref_id
+            -- The base's own storage becomes the result's when nothing
+            -- else uses the base and the result may live there: any
+            -- result in storage that is not the pool's, and in the
+            -- pool's one whose uses are all in this block
+            if g.mv_kind[bid] == 2 and g.mv_owns[bid] == 1 and g.mv_uses[bid] == 1 and g.mv_ty[bid] == ty {
+                if g.mv_temp[bid] < 0 or g.mv_far[id] == 0 { in_place = true }
+            }
+        }
+        if in_place {
+            let bid = base.ref_id
+            let t = g.mv_temp[bid]
+            dst = mem_addr(g, base)
+            g.mv_kind[id] = 2
+            g.mv_ty[id] = ty
+            g.mv_temp[id] = t
+            g.mv_gen[id] = g.mv_gen[bid]
+            g.mv_owns[id] = 1
+            if t >= 0 {
+                let mut until = g.mv_last[id]
+                if until < g.cur_ii { until = g.cur_ii }
+                if until > g.pool_until[t] { g.pool_until[t] = until }
+            }
+            g.value_map.insert(int_to_string(id), dst)
+        } else {
+            -- The base is read where it is, and the result gets
+            -- storage that the base is not in
+            let mut base_addr = 0
+            let mut base_val = 0
+            if base.kind != VAL_UNDEF() {
+                if is_mem(g, base) {
+                    base_addr = mem_addr(g, base)
+                } else {
+                    base_val = resolve_value(g, base)
+                    g = resolve_value_with_counter(g, base)
+                }
+            }
+            g = take_temp(g, ty, id)
+            dst = temp_of(g, id)
+            if base_addr != 0 {
+                mem_copy(g, dst, base_addr, ty)
+            } else if base_val != 0 {
+                if dm_llvm_type_of(base_val) != ty {
+                    g.type_errors.push(lg_error(g, "internal: a field is set in a " + llvm_type_name(dm_llvm_type_of(base_val)) + " to make a " + llvm_type_name(ty)))
+                    return g
+                }
+                dm_llvm_build_store(b, base_val, dst)
+            }
+        }
+        let field_addr = dm_llvm_build_struct_gep2(b, ty, dst, inst.field_index, "field.addr")
+        let exp_ty = dm_llvm_struct_element_type(ty, inst.field_index)
+        if is_mem(g, inst.field_value) {
+            if mem_ty(g, inst.field_value) != exp_ty {
+                g.type_errors.push(lg_error(g, "internal: field " + int_to_string(inst.field_index) + " of a " + llvm_type_name(ty) + " is given a " + llvm_type_name(mem_ty(g, inst.field_value))))
+                return g
+            }
+            mem_copy(g, field_addr, mem_addr(g, inst.field_value), exp_ty)
+            return g
+        }
+        let mut val = resolve_value(g, inst.field_value)
+        g = resolve_value_with_counter(g, inst.field_value)
+        val = coerce_field_value(g, inst, val, exp_ty)
+        if dm_llvm_type_of(val) != exp_ty {
+            -- LLVM would have refused the value in the struct
+            g.type_errors.push(lg_error(g, "internal: field " + int_to_string(inst.field_index) + " of a " + llvm_type_name(ty) + " is given a " + llvm_type_name(dm_llvm_type_of(val))))
+            return g
+        }
+        dm_llvm_build_store(b, val, field_addr)
+        return g
+    }
+}
+
+-- The value of an INSERT_FIELD as the field's LLVM type. The IR
+-- gives i64 constants for fields of other types (i32 tags, the
+-- payload that is not used, a box).
+fn coerce_field_value(gen: LLVMGenerator, inst: IRInst, given: int, exp_ty: int) -> int {
+    unsafe {
+        let b = gen.builder
+        let mut val = given
+        let val_ty = dm_llvm_type_of(val)
+        if val_ty != exp_ty {
+            let ek = dm_llvm_get_type_kind(exp_ty)
+            let vk = dm_llvm_get_type_kind(val_ty)
+            if inst.field_value.kind == VAL_UNDEF() {
+                val = dm_llvm_get_undef(exp_ty)
+            } else if inst.field_value.kind == VAL_CONST_INT() {
+                if ek == 8 {
+                    val = dm_llvm_const_int(exp_ty, inst.field_value.int_val, 1)
+                } else if ek == 2 or ek == 3 {
+                    val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+                } else {
+                    val = dm_llvm_const_null(exp_ty)
+                }
+            } else if ek == 8 and vk == 8 {
+                if dm_llvm_get_int_type_width(val_ty) < dm_llvm_get_int_type_width(exp_ty) {
+                    val = dm_llvm_build_sext(b, val, exp_ty, "sext")
+                } else {
+                    val = dm_llvm_build_trunc(b, val, exp_ty, "trunc")
+                }
+            } else if (ek == 2 or ek == 3) and vk == 8 {
+                val = dm_llvm_build_si_to_fp(b, val, exp_ty, "itof")
+            } else if ek == 8 and (vk == 2 or vk == 3) {
+                val = dm_llvm_build_fp_to_si(b, val, exp_ty, "ftoi")
+            } else if ek == 12 and vk == 8 {
+                val = dm_llvm_build_int_to_ptr(b, val, exp_ty, "itop")
+            } else if ek == 8 and vk == 12 {
+                val = dm_llvm_build_ptr_to_int(b, val, exp_ty, "ptoi")
+            }
+        }
+        -- A string or a list that is held by its address
+        if dm_llvm_get_type_kind(exp_ty) == 10 and dm_llvm_get_type_kind(dm_llvm_type_of(val)) == 12 {
+            val = dm_llvm_build_load2(b, exp_ty, val, "field.load")
+        }
+        return val
+    }
+}
+
+-- The IR types of the function's parameters that take a struct in
+-- memory, at their indexes, with "" for every other parameter; empty
+-- when the function has none
+fn mem_params_of(gen: LLVMGenerator, fn_name: string) -> List[string] {
+    if gen.mem_params.contains(fn_name) {
+        return string_split(gen.mem_params.get(fn_name), "|")
+    }
+    let none: List[string] = []
+    return none
+}
+
+-- The IR types of the parameters that take a struct in memory, joined
+-- by "|" with "" for every other parameter; "" when there is none
+fn mem_param_types(gen: LLVMGenerator, types: List[string]) -> string {
+    let mut joined = ""
+    let mut any = false
+    let mut i = 0
+    while i < types.len() {
+        if i > 0 { joined = joined + "|" }
+        if is_mem_type(gen, types[i]) {
+            joined = joined + types[i]
+            any = true
+        }
+        i = i + 1
+    }
+    if any { return joined }
+    return ""
+}
+
+-- An argument for a parameter that takes a struct of the IR type
+-- want_ir in memory must be such a struct: the pointer that is passed
+-- does not say what it points at, so LLVM cannot tell
+fn check_mem_arg(gen: LLVMGenerator, arg: IRValue, want_ir: string, callee_name: string, n: int) -> LLVMGenerator {
+    unsafe {
+        let want = map_ir_type_to_llvm(gen, want_ir)
+        let mut have = dm_llvm_pointer_type(gen.context)
+        if is_mem(gen, arg) {
+            have = mem_ty(gen, arg)
+        } else if arg.kind != VAL_CONST_STRING() {
+            have = dm_llvm_type_of(resolve_raw(gen, arg))
+        }
+        if have == want { return gen }
+        let mut g = gen
+        g.type_errors.push(lg_error(g, "call to '" + callee_name + "' argument " + int_to_string(n + 1) + " has type " + llvm_type_name(have) + ", expected " + llvm_type_name(want)))
+        return g
+    }
+}
+
+-- The argument as it is passed to such a parameter: the address of
+-- memory that holds the struct. A struct that is an LLVM value is put
+-- in memory first. For an argument of another type, which
+-- check_mem_arg has reported, a null pointer.
+fn mem_arg(gen: LLVMGenerator, arg: IRValue, want_ir: string) -> int {
+    unsafe {
+        if is_mem(gen, arg) { return mem_addr(gen, arg) }
+        let want = map_ir_type_to_llvm(gen, want_ir)
+        if arg.kind == VAL_CONST_STRING() { return dm_llvm_const_null(dm_llvm_pointer_type(gen.context)) }
+        let val = resolve_raw(gen, arg)
+        if dm_llvm_type_of(val) != want { return dm_llvm_const_null(dm_llvm_pointer_type(gen.context)) }
+        let slot = dm_llvm_build_alloca(gen.builder, want, "arg.mem")
+        dm_llvm_build_store(gen.builder, val, slot)
+        return slot
+    }
+}
+
+-- The IR type a function returns through the pointer it takes first
+fn sret_type_of(gen: LLVMGenerator, fn_name: string) -> string {
+    if gen.sret_types.contains(fn_name) { return gen.sret_types.get(fn_name) }
+    return find_ir_function(gen, fn_name).return_type
+}
+
+-- ============================================================
 -- VALUE RESOLUTION
 -- ============================================================
 
+-- The LLVM value of an IR value. A struct that is held in memory
+-- (see MEMORY VALUES) is loaded: the instructions that can use its
+-- address take it with mem_addr instead.
 fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
+    unsafe {
+        if val.kind == VAL_SIZEOF() and val.str_val == "" {
+            let sized = ir_val_inst(val.ref_id)
+            if is_mem(gen, sized) { return dm_llvm_sizeof_type(mem_ty(gen, sized)) }
+        }
+        if is_mem(gen, val) {
+            return dm_llvm_build_load2(gen.builder, mem_ty(gen, val), mem_addr(gen, val), "mem.val")
+        }
+        return resolve_raw(gen, val)
+    }
+}
+
+-- The LLVM value that stands for an IR value: for a struct held in
+-- memory, its address
+fn resolve_raw(gen: LLVMGenerator, val: IRValue) -> int {
     unsafe {
         let ctx = gen.context
         if val.kind == VAL_CONST_INT() {
@@ -1388,6 +2296,9 @@ fn resolve_value(gen: LLVMGenerator, val: IRValue) -> int {
             return dm_llvm_const_null(dm_llvm_int64_type(ctx))
         }
         if val.kind == VAL_PARAM_REF() {
+            if val.ref_id >= 0 and val.ref_id < gen.param_copy.len() {
+                if gen.param_copy[val.ref_id] != 0 { return gen.param_copy[val.ref_id] }
+            }
             if gen.function_map.contains(gen.current_func_name) {
                 let llvm_fn = gen.function_map.get(gen.current_func_name)
                 -- For sret functions, LLVM param 0 is the sret pointer, so user params start at index 1
@@ -1888,6 +2799,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 if inst.has_result { g.value_map.insert(id_key, ptr_val) }
                 return g
             }
+            if is_mem_type(g, inst.load_type) {
+                return generate_mem_load(g, inst)
+            }
             let load_ty = map_ir_type_to_llvm(g, inst.load_type)
             let ptr_val = resolve_value(g, inst.load_ptr)
             g = resolve_value_with_counter(g, inst.load_ptr)
@@ -1907,6 +2821,11 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
                 store_borrowed_string(g, dst, raw_ptr, literal_len_const(g, inst.store_val))
                 return g
             }
+            if is_mem(g, inst.store_val) {
+                -- A struct held in memory is copied from where it is
+                mem_copy(g, dst, mem_addr(g, inst.store_val), mem_ty(g, inst.store_val))
+                return g
+            }
             let src = resolve_value(g, inst.store_val)
             g = resolve_value_with_counter(g, inst.store_val)
             if is_string_ptr(g, inst.store_val) {
@@ -1921,6 +2840,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Struct: extract field
         if op == OP_EXTRACT_FIELD() {
+            if is_mem(g, inst.field_base) {
+                return generate_mem_extract(g, inst)
+            }
             let base = resolve_value(g, inst.field_base)
             g = resolve_value_with_counter(g, inst.field_base)
             let base_ty = dm_llvm_type_of(base)
@@ -1972,6 +2894,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
         }
         -- Struct: insert field
         if op == OP_INSERT_FIELD() {
+            if is_mem_type(g, inst.result_type) {
+                return generate_mem_insert(g, inst)
+            }
             let mut base_val = 0
             if inst.field_base.kind == VAL_UNDEF() {
                 -- Create undef of the result type
@@ -2351,6 +3276,19 @@ fn generate_terminator(gen: LLVMGenerator, term: IRTerminator, func: IRFunction)
                 }
             } else if g.returns_sret.contains(func.name) {
                 -- sret convention: store return value to the sret output pointer (param 0), then ret void
+                if is_mem(g, term.ret_val) {
+                    -- A struct held in memory is copied from where it is
+                    let out = dm_llvm_get_param(g.function_map.get(func.name), 0)
+                    if mem_ty(g, term.ret_val) != map_ir_type_to_llvm(g, func.return_type) {
+                        -- The pointer does not say what it points at,
+                        -- so LLVM cannot tell
+                        g.type_errors.push(lg_error(g, "internal: a " + llvm_type_name(mem_ty(g, term.ret_val)) + " is returned from a function that returns " + func.return_type))
+                    } else {
+                        mem_copy(g, out, mem_addr(g, term.ret_val), mem_ty(g, term.ret_val))
+                    }
+                    dm_llvm_build_ret_void(b)
+                    return g
+                }
                 let mut ret_val = resolve_value(g, term.ret_val)
                 g = resolve_value_with_counter(g, term.ret_val)
                 -- If returning a string pointer, load the struct before storing to sret
@@ -2397,6 +3335,14 @@ fn lg_generate_module(gen: LLVMGenerator) -> LLVMGenerator {
     g = get_dm_string_type(g)
     -- Phase 1: Declare struct types
     g = declare_struct_types(g)
+    -- The sizes of the structs that are copied in memory come from the
+    -- module's data layout
+    unsafe {
+        let layout_tm = set_module_target(g, 0)
+        if layout_tm != 0 {
+            dm_llvm_dispose_target_machine(layout_tm)
+        }
+    }
     if g.debug_info {
         g = di_begin(g)
     }

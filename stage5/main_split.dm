@@ -1802,6 +1802,17 @@ fn compile(cli: CLIArgs) -> int {
 -- ============================================================
 
 fn main() -> int {
+    -- What the compiler says when its stack is full (see STACK
+    -- OVERFLOW in runtime/os.dm): it calls itself once for each level
+    -- that the program's expressions and statements are nested, and
+    -- the parser's limits (NESTING in parser.dm) do not rule out
+    -- every program that is too deep for that
+    let stack_note = "Error: the program is nested too deeply to compile (the compiler's stack is full)\n"
+    unsafe {
+        let note = static_addr("dm_stack_overflow_note", 16)
+        store_i64(note, string_data(stack_note))
+        store_i64(note + 8, len(stack_note))
+    }
     let cli = parse_cli_args()
 
     if cli.show_help {

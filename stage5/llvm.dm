@@ -215,6 +215,8 @@ extern fn dm_llvm_is_alloca(val: int) -> int
 extern fn dm_llvm_abi_size_of(mod: int, ty: int) -> int
 extern fn dm_llvm_offset_of_element(mod: int, struct_ty: int, index: int) -> int
 extern fn dm_llvm_struct_field_count(ty: int) -> int
+extern fn dm_llvm_struct_element_type(ty: int, index: int) -> int
+extern fn dm_llvm_build_memcpy(b: int, dst: int, src: int, size: int) -> int
 
 -- ============================================================
 -- Convenience wrapper functions (dAImond-friendly API)

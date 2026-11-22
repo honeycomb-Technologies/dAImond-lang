@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (581 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (590 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 581 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 590 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
@@ -359,7 +359,7 @@ The compiler passes its suite of 581 cases, builds itself to a fixed point, and 
 - Multi-file imports, and the standard library in `stdlib/` (`import std.math`)
 - `extern fn` with C-width integer types, variadic C functions and link names; raw memory inside `unsafe`
 - Files, directories, paths, the environment, processes, time, the terminal, TCP sockets, threads and mutexes
-- Runtime checks: integer overflow, division by zero, shift amounts, list bounds, SIMD lanes, narrowing casts
+- Runtime checks: integer overflow, division by zero, shift amounts, list bounds, SIMD lanes, narrowing casts, a full stack
 - A type checker: mismatched types, undefined names and functions, wrong arguments, changes to what is not `mut`, missing returns, matches that leave a variant out and effects that are not declared are compile errors
 - Tooling: `run`, `check`, `fmt`, `test`, debug info (`-g`), the language server (errors as you type, hover, go to definition, references, outline, completion, signature help, formatting)
 
@@ -371,7 +371,7 @@ The compiler passes its suite of 581 cases, builds itself to a fixed point, and 
 - Strings are never freed, and neither is what a region allocates.
 - A copy of a list shares the elements both lists have: `xs[i] = v` through one is seen through the other. A push never changes another list. A copy of a map has the same rule for the keys both have. [docs/memory-design.md](docs/memory-design.md) has the rules and the design that replaces them.
 - Only x86-64 Linux with glibc is supported.
-- An expression nested several hundred levels deep overflows the compiler's stack.
+- Nesting has limits: 100 levels of expressions, statements or types, 100 calls or fields in a row, 2,000 operators in a row, 200 `else if`s. A program that fills the stack ends with `PANIC: stack overflow`; a thread that does is killed by the system.
 - Debug info has one scope per function, and does not describe `match` bindings or captured variables.
 - There is no package manager.
 

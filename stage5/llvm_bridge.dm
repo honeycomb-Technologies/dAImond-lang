@@ -68,6 +68,8 @@ extern fn LLVMABISizeOfType(target_data: int, ty: int) -> int
 extern fn LLVMOffsetOfElement(target_data: int, struct_ty: int, element: u32) -> int
 extern fn LLVMIsOpaqueStruct(ty: int) -> i32
 extern fn LLVMCountStructElementTypes(ty: int) -> u32
+extern fn LLVMStructGetTypeAtIndex(ty: int, index: u32) -> int
+extern fn LLVMBuildMemCpy(b: int, dst: int, dst_align: u32, src: int, src_align: u32, size: int) -> int
 
 -- Passes
 extern fn LLVMCreatePassBuilderOptions() -> int
@@ -1395,6 +1397,22 @@ fn dm_llvm_abi_size_of(m: int, ty: int) -> int {
 fn dm_llvm_offset_of_element(m: int, struct_ty: int, index: int) -> int {
     unsafe {
         return LLVMOffsetOfElement(LLVMGetModuleDataLayout(m), struct_ty, index as u32)
+    }
+}
+
+-- The type of field `index` of a struct type that has that field
+fn dm_llvm_struct_element_type(ty: int, index: int) -> int {
+    unsafe {
+        return LLVMStructGetTypeAtIndex(ty, index as u32)
+    }
+}
+
+-- Copy `size` bytes (an LLVM value) from src to dst, which do not
+-- overlap unless they are the same address. Nothing is assumed about
+-- where the two lie.
+fn dm_llvm_build_memcpy(b: int, dst: int, src: int, size: int) -> int {
+    unsafe {
+        return LLVMBuildMemCpy(b, dst, 1 as u32, src, 1 as u32, size)
     }
 }
 

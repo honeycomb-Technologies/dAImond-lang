@@ -317,12 +317,17 @@ struct RtRlimit {
     highest: int
 }
 
--- The compiler calls this first thing in main. It raises the limit on
--- the stack's size to 64 MB where the limit is lower: a function's
--- structs are passed and kept by value, so deep recursion needs more
--- than the usual 8 MB. The stack of a running program may grow up to
--- the limit in force at the time, so this takes effect at once.
+-- The compiler calls this first thing in main
 fn rt_start() {
+    rt_raise_stack_limit()
+    rt_catch_stack_overflow()
+}
+
+-- Raise the limit on the stack's size to 64 MB where the limit is
+-- lower: deep recursion needs more than the usual 8 MB. The stack of
+-- a running program may grow up to the limit in force at the time, so
+-- this takes effect at once.
+fn rt_raise_stack_limit() {
     unsafe {
         let wanted = 64 * 1024 * 1024
         let mut limit = RtRlimit { current: 0, highest: 0 }
@@ -338,6 +343,96 @@ fn rt_start() {
             limit.current = limit.highest
         }
         libc_setrlimit(3, addr_of(limit))
+    }
+}
+
+-- ============================================================
+-- STACK OVERFLOW
+-- A program whose calls are nested until the stack is full reads or
+-- writes below the stack, which the system answers with the signal
+-- SIGSEGV. rt_on_fault takes that signal: for a fault at the stack's
+-- end it writes `PANIC: stack overflow` and ends the program with
+-- exit code 1, where the program was otherwise killed by the signal
+-- with no word of why. It runs on a stack of its own, the full one
+-- having no room for it.
+--
+-- It writes out what standard output still holds, unless the stack
+-- filled up inside a stdio call of the runtime's (rt_in_stdio in
+-- runtime/io.dm): the stream is then half changed, and what it holds
+-- is lost. A program that fills its stack inside a C function it
+-- calls itself, which is writing to standard output, is not known to
+-- be there. The program then ends with _exit, which runs nothing more.
+--
+-- Only the main thread has that second stack. A thread made by
+-- thread_spawn that fills its stack is killed by the signal, as
+-- before.
+-- ============================================================
+
+extern fn libc_signal_function(signal: i32, handler: fn(i32, int, int) -> void) -> int = "signal"
+extern fn libc_sigaction(signal: i32, action: int, old: int) -> i32 = "sigaction"
+extern fn libc_sigaltstack(stack: int, old: int) -> i32 = "sigaltstack"
+extern fn libc_write(fd: i32, data: int, count: int) -> int = "write"
+extern fn libc_exit_now(code: i32) = "_exit"
+
+-- The signal SIGSEGV on Linux
+fn RT_SIGSEGV() -> i32 { return 11 }
+
+-- What is written when the stack is full: the address and the length
+-- of the text at static_addr("dm_stack_overflow_note", 16), where a
+-- program has put one (the compiler does: its stack is full when the
+-- program it compiles is nested too deeply), or else
+-- `PANIC: stack overflow`.
+fn rt_on_fault(signal: i32, info: int, context: int) {
+    unsafe {
+        -- Where the program read or wrote (siginfo_t.si_addr), and its
+        -- stack pointer at the time (ucontext_t.uc_mcontext.gregs[REG_RSP]),
+        -- at their places on x86-64 Linux
+        let at = load_i64(info + 16)
+        let stack = load_i64(context + 160)
+        -- A function that needs stack moves the stack pointer down by
+        -- what it needs and then uses that memory, and a call writes
+        -- just below the stack pointer: a fault from a full stack is
+        -- near the stack pointer, on either side. An address from
+        -- anywhere else is not.
+        if at > stack - 1048576 and at < stack + 67108864 {
+            let note = static_addr("dm_stack_overflow_note", 16)
+            if load_i64(note) != 0 {
+                libc_write(2, load_i64(note), load_i64(note + 8))
+            } else {
+                let message = "PANIC: stack overflow\n"
+                libc_write(2, string_data(message), len(message))
+            }
+            if load_i64(rt_in_stdio()) == 0 {
+                libc_fflush(rt_stdout())
+            }
+            libc_exit_now(1)
+        }
+        -- Any other fault ends the program as it did before: with this
+        -- function no longer in the way, the instruction faults again
+        libc_signal(RT_SIGSEGV(), 0)
+    }
+}
+
+-- Have rt_on_fault called for SIGSEGV, on a stack of its own
+fn rt_catch_stack_overflow() {
+    unsafe {
+        -- stack_t: the address, flags (an int) and the size
+        let described = static_addr("rt_fault_stack_t", 24)
+        store_i64(described, static_addr("rt_fault_stack", 65536))
+        store_i64(described + 8, 0)
+        store_i64(described + 16, 65536)
+        if libc_sigaltstack(described, 0) != 0 { return }
+        -- signal() takes the function; sigaction() then gives the
+        -- action back as a struct sigaction, in which the flags (an
+        -- int at byte 136, after the handler and the 128 bytes of the
+        -- signal mask) get SA_SIGINFO (4: the function takes the
+        -- fault's details) and SA_ONSTACK (0x08000000: it runs on the
+        -- stack given above)
+        libc_signal_function(RT_SIGSEGV(), rt_on_fault)
+        let action = static_addr("rt_fault_action", 152)
+        if libc_sigaction(RT_SIGSEGV(), 0, action) != 0 { return }
+        store_i32(action + 136, load_i32(action + 136) | 134217732)
+        libc_sigaction(RT_SIGSEGV(), action, 0)
     }
 }
 

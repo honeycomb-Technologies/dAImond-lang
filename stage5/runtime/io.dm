@@ -39,12 +39,26 @@ fn rt_stderr() -> int {
     }
 }
 
+-- Whether the program is inside a stdio call on an output stream: a
+-- word that is 1 from before such a call until after it. The function
+-- that ends the program when its stack is full (STACK OVERFLOW in
+-- runtime/os.dm) writes out standard output first, unless the program
+-- was stopped inside such a call, with the stream half changed.
+fn rt_in_stdio() -> int {
+    unsafe {
+        return static_addr("rt_in_stdio", 8)
+    }
+}
+
 -- Write s to a stdio stream
 fn rt_stream_write(stream: int, s: string) {
     let n = len(s)
     if n > 0 {
         unsafe {
+            let busy = rt_in_stdio()
+            store_i64(busy, 1)
             libc_fwrite(string_data(s), 1, n, stream)
+            store_i64(busy, 0)
         }
     }
 }
@@ -53,7 +67,10 @@ fn rt_stream_write(stream: int, s: string) {
 fn rt_stream_write_line(stream: int, s: string) {
     rt_stream_write(stream, s)
     unsafe {
+        let busy = rt_in_stdio()
+        store_i64(busy, 1)
         libc_fputc(10, stream)
+        store_i64(busy, 0)
     }
 }
 
@@ -127,7 +144,10 @@ fn rt_read_line() -> string {
 -- flush(): write out what standard output still holds
 fn rt_flush() {
     unsafe {
+        let busy = rt_in_stdio()
+        store_i64(busy, 1)
         libc_fflush(rt_stdout())
+        store_i64(busy, 0)
     }
 }
 
