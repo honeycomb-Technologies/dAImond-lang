@@ -895,9 +895,11 @@ fn ck_note(c: Checker, id: int, t: string) -> Checker {
 }
 
 -- Whether the expression makes a new value whose type its place
--- decides: None, Some(x), Ok(x), Err(x), a new Box or Map, a list literal
+-- decides: None, Some(x), Ok(x), Err(x), a new Box or Map, a list
+-- literal, a struct literal with no type arguments (`Pair { .. }`)
 fn ck_makes_value(e: Expr) -> bool {
     if e.kind == EXPR_ARRAY_LITERAL() { return true }
+    if e.kind == EXPR_STRUCT_LITERAL() { return string_find(e.type_name, "[") < 0 }
     if e.kind == EXPR_IDENTIFIER() { return e.name == "None" }
     if e.kind == EXPR_FUNCTION_CALL() {
         let callee = *e.callee
@@ -980,6 +982,24 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
                 i = i + 1
             }
         }
+        return c
+    }
+    -- The fields of `Pair { first: None, second: [] }`, whose types
+    -- the type arguments of the place give
+    if k == EXPR_STRUCT_LITERAL() {
+        let head = ty_head(want)
+        if e.type_name != head or c.structs.contains(head) == false { return c }
+        if c.structs.get(head).generics.len() == 0 { return c }
+        let mut i = 0
+        while i < e.field_names.len() and i < e.field_values.len() {
+            c = ck_settle(c, e.field_values[i], ck_field_type(c, want, e.field_names[i]))
+            i = i + 1
+        }
+        return c
+    }
+    if k == EXPR_METHOD_CALL() {
+        let static_key = ck_generic_static(c, e)
+        if static_key != "" { return ck_settle_static(c, e, static_key, want) }
         return c
     }
     -- The value inside a Some, an Ok, an Err or a Box
@@ -1267,6 +1287,7 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
     c = first.c
     let mut t = first.t
     let mut t_literal = is_int_literal_expr(cur)
+    let mut t_float_literal = is_float_literal_expr(cur)
     let mut i = ops.len() - 1
     while i >= 0 {
         let mut right = ck_expr(c, rights[i])
@@ -1283,6 +1304,13 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
         if ty_is_int(result_t) and ty_is_int(t) and ty_is_int(right.t) {
             result_t = int_meet_type(t, t_literal, right.t, right_literal)
         }
+        -- And two floats: a literal is an f32 beside an f32
+        let right_float_literal = is_float_literal_expr(rights[i])
+        if ty_is_float(result_t) and ty_is_float(t) and ty_is_float(right.t) {
+            result_t = float_meet_type(ty_alias(t), t_float_literal, ty_alias(right.t), right_float_literal)
+        }
+        let arithmetic = ops[i] == BINOP_ADD() or ops[i] == BINOP_SUB() or ops[i] == BINOP_MUL() or ops[i] == BINOP_DIV()
+        t_float_literal = t_float_literal and right_float_literal and arithmetic
         c = ck_note(result.c, ids[i], result_t)
         t = result_t
         -- is_int_literal_expr of the operator's expression
@@ -1851,7 +1879,7 @@ fn ck_payloads(sig: EnumSig, at: int) -> List[string] {
 
 -- Check the values given to a variant of an enum against the number
 -- and the types of the values the variant carries
-fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: List[string], values: List[Expr], line: int) -> Checker {
+fn ck_variant_values(c0: Checker, enum_name: string, variant: string, enum_args: List[string], types: List[string], values: List[Expr], line: int) -> Checker {
     let mut c = c0
     let sig = c.enums.get(enum_name)
     let at = ck_index_of(sig.variant_names, variant)
@@ -1862,7 +1890,7 @@ fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: Lis
     }
     let mut i = 0
     while i < payloads.len() and i < types.len() {
-        let want = ty_apply(payloads[i], sig.generics, ty_unbound(0))
+        let want = ty_apply(payloads[i], sig.generics, enum_args)
         if ck_fits_value(c, want, types[i], values[i]) == false {
             c = ck_error(c, "type mismatch in value " + int_to_string(i + 1) + " of '" + enum_name + "." + variant + "': expected " + want + ", found " + types[i], values[i].line)
         } else {
@@ -1951,8 +1979,14 @@ fn ck_settle_variant(c0: Checker, e: Expr, name: string, want: string) -> Checke
 
 -- Type.name(args): a constructor of Box, Map or List, a variant of
 -- an enum, or a function of the type's impl block
-fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string]) -> Typed {
+fn ck_static_call(c0: Checker, type_name: string, e: Expr, arg_types: List[string]) -> Typed {
     let method = e.method
+    -- The type arguments of `Stack[int].new()`
+    let explicit = ck_static_type_args(e)
+    let mut c = c0
+    if explicit.len() > 0 {
+        c = ck_type_exists(c, ck_generic_type(type_name, explicit), e.line)
+    }
     if type_name == "Box" and method == "new" {
         if arg_types.len() > 0 {
             if ty_known(arg_types[0]) { return ck_typed(c, "Box[" + arg_types[0] + "]") }
@@ -1965,7 +1999,13 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
     if c.enums.contains(type_name) {
         let sig = c.enums.get(type_name)
         if ck_index_of(sig.variant_names, method) >= 0 {
-            return ck_typed(ck_variant_values(c, type_name, method, arg_types, e.args, e.line), ck_enum_value_type(c, type_name, method, arg_types))
+            let mut made = ck_enum_value_type(c, type_name, method, arg_types)
+            let mut enum_args = ty_unbound(0)
+            if explicit.len() == sig.generics.len() and explicit.len() > 0 {
+                made = ck_norm(c, ck_generic_type(type_name, explicit))
+                enum_args = ty_args(made)
+            }
+            return ck_typed(ck_variant_values(c, type_name, method, enum_args, arg_types, e.args, e.line), made)
         }
         if c.fns.contains(type_name + "_" + method) == false and ck_trait_method(c, type_name, method) == "" {
             return ck_typed(ck_error(c, "enum '" + type_name + "' has no variant or function '" + method + "'", e.line), type_name)
@@ -1978,9 +2018,83 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
         counted = ck_async_call(counted, sig, type_name + "." + method, e.id, e.line)
         counted = ck_effects(counted, type_name + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
         counted = ck_mut_args(counted, sig, type_name + "." + method, 0, e.args)
-        return ck_apply(counted, sig, type_name + "." + method, 0, ty_unbound(sig.generics.len()), arg_types, e.args, e.line)
+        let binds = ck_static_binds(counted, sig, explicit)
+        let applied = ck_apply(counted, sig, type_name + "." + method, 0, binds, arg_types, e.args, e.line)
+        if sig.generics.len() == 0 { return applied }
+        -- What the type parameters stand for, where the arguments say
+        -- it; else the place the value goes to does (ck_settle_static)
+        return ck_typed(ck_note_type_args(applied.c, e.id, ck_binds(sig, 0, binds, arg_types)), applied.t)
     }
     return ck_typed(c, "")
+}
+
+-- The type arguments written in `Stack[int].new()`: those of the
+-- name the function is called on
+fn ck_static_type_args(e: Expr) -> List[string] {
+    let object = *e.object
+    if object.kind != EXPR_IDENTIFIER() {
+        let none: List[string] = []
+        return none
+    }
+    return object.generic_args
+}
+
+-- What the type parameters of the function of a type's impl block
+-- stand for before its arguments are looked at: the type arguments
+-- written at the call for the impl block's, nothing for the rest
+fn ck_static_binds(c: Checker, sig: FnSig, explicit: List[string]) -> List[string] {
+    let mut binds = ty_unbound(sig.generics.len())
+    let mut i = 0
+    while i < explicit.len() and i < binds.len() {
+        binds[i] = ck_norm(c, explicit[i])
+        i = i + 1
+    }
+    return binds
+}
+
+-- "Stack_new" for `Stack.new(...)` and `Stack[int].new(...)`, the call
+-- of a function of the impl block of a generic type; else ""
+fn ck_generic_static(c: Checker, e: Expr) -> string {
+    let object = *e.object
+    if object.kind != EXPR_IDENTIFIER() { return "" }
+    if ck_names_type(c, object.name) == false { return "" }
+    let key = object.name + "_" + e.method
+    if c.fns.contains(key) == false { return "" }
+    let sig = c.fns.get(key)
+    if sig.generics.len() == 0 or sig.has_self { return "" }
+    return key
+}
+
+-- ck_settle for `Stack.new()`, the call of the function `key` of a
+-- generic type's impl block, whose value goes to a place of the type
+-- `want`: the place says what the type parameters stand for where the
+-- call's arguments do not, as in `let s: Stack[int] = Stack.new()`
+fn ck_settle_static(c0: Checker, e: Expr, key: string, want: string) -> Checker {
+    let mut c = c0
+    let sig = c.fns.get(key)
+    let mut binds = ck_static_binds(c, sig, ck_static_type_args(e))
+    binds = ty_bind(sig.ret, want, sig.generics, binds)
+    let mut arg_types: List[string] = []
+    let mut i = 0
+    while i < e.args.len() {
+        let id = e.args[i].id
+        if id >= 0 and id < c.types.len() {
+            arg_types.push(c.types[id])
+        } else {
+            arg_types.push("")
+        }
+        i = i + 1
+    }
+    binds = ck_binds(sig, 0, binds, arg_types)
+    c = ck_note_type_args(c, e.id, binds)
+    let made = ty_apply(sig.ret, sig.generics, binds)
+    if ty_whole(made) { c = ck_note(c, e.id, made) }
+    i = 0
+    while i < e.args.len() and i < sig.params.len() {
+        c = ck_settle(c, e.args[i], ty_apply(sig.params[i], sig.generics, binds))
+        i = i + 1
+    }
+    return c
 }
 
 fn ck_method_arity(c: Checker, recv: string, method: string, want: int, got: int, line: int) -> Checker {
@@ -2025,6 +2139,11 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             type_name = name
         } else if ck_var(c, name) < 0 and (name == "Box" or name == "Map" or name == "List") {
             type_name = name
+        }
+        if type_name == "" and object.generic_args.len() > 0 {
+            let written = ck_generic_type(name, object.generic_args)
+            c = ck_error(c, "'" + name + "' is not a type: '" + written + "." + method + "(...)' calls a function of the type " + written + "; write (" + written + ")." + method + "(...) to call a method of an element", e.line)
+            return ck_typed(c, "")
         }
     }
     let mut recv = ""
@@ -2132,13 +2251,33 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
 
 fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
     let mut c = ck_type_exists(c0, e.type_name, e.line)
-    let t = ck_norm(c, e.type_name)
-    let head = ty_head(t)
+    let written = ck_norm(c, e.type_name)
+    let head = ty_head(written)
     let values = ck_exprs(c, e.field_values)
     c = values.c
     if head == "" or c.structs.contains(head) == false { return ck_typed(c, "") }
     let sig = c.structs.get(head)
     let mut i = 0
+    let mut t = written
+    if sig.generics.len() > 0 and ty_args(written).len() == 0 {
+        -- `Pair { first: 1, second: "one" }` is a Pair[int, string]: the
+        -- values say what the type parameters stand for, and where they
+        -- do not, the place the struct goes to does (ck_settle)
+        let mut binds = ty_unbound(sig.generics.len())
+        while i < e.field_names.len() and i < values.types.len() {
+            let at = ck_index_of(sig.field_names, e.field_names[i])
+            if at >= 0 { binds = ty_bind(sig.field_types[at], values.types[i], sig.generics, binds) }
+            i = i + 1
+        }
+        let mut found: List[string] = []
+        i = 0
+        while i < binds.len() {
+            if binds[i] == "" { found.push("?") } else { found.push(binds[i]) }
+            i = i + 1
+        }
+        t = ck_generic_type(head, found)
+        i = 0
+    }
     while i < e.field_names.len() and i < values.types.len() {
         let field = e.field_names[i]
         if ck_index_of(sig.field_names, field) < 0 {
@@ -2165,13 +2304,23 @@ fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
 
 fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
     let values = ck_exprs(c0, e.payload)
-    let c = values.c
+    let mut c = values.c
     let name = e.enum_name
     if ck_var(c, name) >= 0 { return ck_typed(c, "") }
+    -- The type arguments of `Opt[int].Empty`
+    if e.generic_args.len() > 0 {
+        c = ck_type_exists(c, ck_generic_type(name, e.generic_args), e.line)
+    }
     if c.enums.contains(name) {
         let sig = c.enums.get(name)
         if ck_index_of(sig.variant_names, e.variant_name) >= 0 {
-            return ck_typed(ck_variant_values(c, name, e.variant_name, values.types, e.payload, e.line), ck_enum_value_type(c, name, e.variant_name, values.types))
+            let mut made = ck_enum_value_type(c, name, e.variant_name, values.types)
+            let mut enum_args = ty_unbound(0)
+            if e.generic_args.len() == sig.generics.len() and e.generic_args.len() > 0 {
+                made = ck_norm(c, ck_generic_type(name, e.generic_args))
+                enum_args = ty_args(made)
+            }
+            return ck_typed(ck_variant_values(c, name, e.variant_name, enum_args, values.types, e.payload, e.line), made)
         }
         if c.fns.contains(name + "_" + e.variant_name) == false and ck_trait_method(c, name, e.variant_name) == "" {
             return ck_typed(ck_error(c, "enum '" + name + "' has no variant or function '" + e.variant_name + "'", e.line), name)
@@ -2190,15 +2339,26 @@ fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
 fn ck_array_literal(c0: Checker, e: Expr) -> Typed {
     let values = ck_exprs(c0, e.elements)
     let mut c = values.c
-    -- The first element's type, with what the later ones know of its parts
+    -- The first element's type, with what the later ones know of its
+    -- parts. Numbers meet at one type as the branches of an `if` do:
+    -- a constant takes the type of the others, a narrower one widens.
     let mut elem = "?"
+    let mut elem_literal = false
     let mut i = 0
     while i < values.types.len() {
-        if ty_known(values.types[i]) and values.types[i] != "void" {
+        let t = values.types[i]
+        if ty_known(t) and t != "void" {
+            let literal = is_number_literal_expr(branch_value_expr(e.elements[i]))
             if elem == "?" {
-                elem = values.types[i]
-            } else if ty_fits(elem, values.types[i]) {
-                elem = ty_merge(elem, values.types[i])
+                elem = t
+                elem_literal = literal
+            } else if numbers_meet(ty_alias(elem), ty_alias(t)) {
+                elem = int_meet_type(elem, elem_literal, t, literal)
+                elem_literal = elem_literal and literal
+            } else if ty_kind(elem) != "" and ty_kind(t) != "" and (ty_kind(elem) != ty_kind(t) or ty_is_float(elem) != ty_is_float(t)) {
+                c = ck_error(c, "the elements of this list are " + elem + " and " + t, e.elements[i].line)
+            } else if ty_fits(elem, t) {
+                elem = ty_merge(elem, t)
             }
         }
         i = i + 1
@@ -2260,9 +2420,9 @@ fn ck_if_expr(c0: Checker, e: Expr) -> Typed {
         if t == "" and ty_known(else_value.t) and else_value.t != "void" { t = else_value.t }
         if t != "" and else_value.t != "void" and ck_fits(c, t, else_value.t) == false and ck_fits(c, else_value.t, t) == false {
             c = ck_error(c, "the branches of this 'if' give " + t + " and " + else_value.t, e.line)
-        } else if ty_is_int(t) and ty_is_int(else_value.t) and ty_is_int(then_value.t) {
-            -- Integers of two widths give one value
-            t = int_meet_type(t, is_int_literal_expr(branch_value_expr(*e.then_branch)), else_value.t, is_int_literal_expr(branch_value_expr(*e.else_branch)))
+        } else if numbers_meet(t, else_value.t) and numbers_meet(then_value.t, else_value.t) {
+            -- Integers of two widths give one value, and so do an f32 and a float
+            t = int_meet_type(t, is_number_literal_expr(branch_value_expr(*e.then_branch)), else_value.t, is_number_literal_expr(branch_value_expr(*e.else_branch)))
         } else if t != "" and else_value.t != "void" {
             -- Each branch may know what the other does not: Some(n) and None
             t = ty_merge(t, else_value.t)
@@ -2453,12 +2613,12 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
             let value = ck_expr(c, *arm.body_expr)
             c = value.c
             arm_type = value.t
-            arm_literal = is_int_literal_expr(branch_value_expr(*arm.body_expr))
+            arm_literal = is_number_literal_expr(branch_value_expr(*arm.body_expr))
         } else {
             let value = ck_body_value(c, arm.body, used)
             c = value.c
             arm_type = value.t
-            arm_literal = stmts_value_is_int_literal(arm.body)
+            arm_literal = stmts_value_is_number_literal(arm.body)
         }
         c = ck_unbind(c, mark)
         if t == "" and ty_known(arm_type) and arm_type != "void" {
@@ -2467,8 +2627,8 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
         }
         if used and t != "" and arm_type != "void" and ck_fits(c, t, arm_type) == false and ck_fits(c, arm_type, t) == false {
             c = ck_error(c, "the arms of this match give " + t + " and " + arm_type, e.line)
-        } else if ty_is_int(t) and ty_is_int(arm_type) {
-            -- Integers of two widths give one value
+        } else if numbers_meet(t, arm_type) {
+            -- Integers of two widths give one value, and so do an f32 and a float
             t = int_meet_type(t, t_literal, arm_type, arm_literal)
             t_literal = t_literal and arm_literal
         } else if t != "" and ty_known(arm_type) and arm_type != "void" {
@@ -3376,6 +3536,7 @@ fn instance_types_begin(gen: IRGenerator, fd: FunctionDecl, self_type: string, o
     g.checked_types = c.types
     g.checked_type_args = c.type_args
     g.checked_targets = c.targets
+    g = ensure_checked_instances(g, fd.expr_from, fd.expr_to)
     let mut ei = 0
     while ei < c.errors.len() {
         let text = c.errors[ei] + " (in " + what + ")"

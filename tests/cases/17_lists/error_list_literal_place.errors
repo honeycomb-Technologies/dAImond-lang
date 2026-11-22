@@ -1,0 +1,3 @@
+element 2 of the list has type int, which does not fit in i32; convert it with `as i32` at line 11
+integer literal 3000000000 does not fit in i32 at line 12
+cannot tell which Map type Map_new() creates here; give it one, e.g. let m: Map[string, int] = Map_new() at line 13

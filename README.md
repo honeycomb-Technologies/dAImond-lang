@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (601 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (610 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,22 +341,22 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 601 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 610 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
 - Structs, enums with payloads, `impl` methods with bare `self`, operator overloading through `add`, `sub`, `mul`, `div`, `eq`, `lt` and the other comparison methods; compound assignment with `+=`, `-=`, `*=`, `/=` and `%=`
 - Pattern matching on enums, `Option`, `Result`, strings and numbers, with guards and with literals among a variant's values (`Token.Number(0) =>`); `?` error propagation on `Result` and `Option`
 - `==` and `!=` on structs, enums, `Option`, `Result` and lists compare the values part by part; a type's own `eq` method is used where it has one
-- Generic functions (monomorphized, with type arguments inferred at the call, and trait bounds: `fn f[T: Show + Named]`) generic structs (`struct Table[K, V]`, with type arguments written out) and generic enums (`enum Opt[T]`, with type arguments found from the values or the place)
+- Generic functions (monomorphized, with type arguments inferred at the call, and trait bounds: `fn f[T: Show + Named]`) generic structs (`struct Pair[A, B]`, with type arguments written, as in `Pair[int, string] { ... }` and `Stack[int].new()`, or found from the fields, the arguments or the place the value goes to: `Pair { first: 1, second: "one" }`, `let s: Stack[int] = Stack.new()`) and generic enums (`enum Opt[T]`, with type arguments found from the values or the place)
 - `List[T]`, `Map[K, V]` and `Box[T]`, `for`-in over lists, maps and ranges
 - Traits: methods with bodies that every implementing type gets, impls checked against the trait, and `dyn Trait` values that hold any implementing type and dispatch at run time
 - Lambdas and function values that are closures: a lambda keeps the values of the variables it uses and can be passed, returned and stored. The pipeline operator `|>`, bitwise operators (`&`, `|`, `^`, `<<`, `>>`, `~`)
-- String interpolation (`f"..."`), all numeric types (`i8` to `u64`, `f32`, `f64`) with `as` casts; integers in base 16, 2 and 8 (`0xff`, `0b1010`, `0o17`) and `_` between digits (`1_000_000`)
+- String interpolation (`f"..."`), all numeric types (`i8` to `u64`, `f32`, `f64`) with `as` casts, where a constant takes the type of its place (`let x: f32 = 2.5`, `x / 2.0`), a narrower number widens and a wider one needs `as`; integers in base 16, 2 and 8 (`0xff`, `0b1010`, `0o17`) and `_` between digits (`1_000_000`)
 - Compile-time evaluation (`comptime`, and every `const`): numbers, strings, lists, loops and calls of the program's functions; what cannot be evaluated is a compile error. Compile-time array sizes
 - Regions, `async`/`await`, SIMD vectors
 - Effects (`with [Console, FileSystem]`), also user-defined ones
-- Multi-file imports, and the standard library in `stdlib/` (`import std.math`)
+- Multi-file imports, and the standard library in `stdlib/`: `import std.math` (`sqrt`, `sin`, `pow`, ... with no `unsafe`), `import std.collections` (`Set[T]`, `Queue[T]`, `Stack[T]`), `std.string`, `std.fs`, `std.os`, `std.io`, `std.net`, `std.thread`
 - `extern fn` with C-width integer types, variadic C functions and link names; raw memory inside `unsafe`
 - Files, directories, paths, the environment, processes, time, the terminal, TCP sockets, threads and mutexes
 - Runtime checks: integer overflow, division by zero, shift amounts, list bounds, SIMD lanes, narrowing casts, a full stack

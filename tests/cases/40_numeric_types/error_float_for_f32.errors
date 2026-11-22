@@ -1,0 +1,9 @@
+the return value has type float, which does not fit in f32; convert it with `as f32` at line 6
+the value of 'x' has type float, which does not fit in f32; convert it with `as f32` at line 9
+the assigned value has type float, which does not fit in f32; convert it with `as f32` at line 11
+the value has type float, which does not fit in f32; convert it with `as f32` at line 12
+argument 1 of 'half' has type float, which does not fit in f32; convert it with `as f32` at line 13
+field 'b' of 'Plain' has type float, which does not fit in f32; convert it with `as f32` at line 14
+element 1 of 'xs' has type float, which does not fit in f32; convert it with `as f32` at line 15
+the value of 'Some' has type float, which does not fit in f32; convert it with `as f32` at line 16
+the value of 'z' has type float, which does not fit in f32; convert it with `as f32` at line 17

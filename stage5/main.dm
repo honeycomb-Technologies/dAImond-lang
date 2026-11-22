@@ -4300,19 +4300,6 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             pp = idx.p
             pp = p_expect(pp, TK_RBRACKET())
             left = expr_index_access(left, idx.expr, line, col)
-        } else if kind == TK_AS() {
-            -- Cast: expr as Type
-            let line = p_cur(pp).line
-            let col = p_cur(pp).col
-            pp = p_advance(pp)
-            let cast_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
-            let ty_result = parse_type(pp)
-            pp = ty_result.p
-            let mut e = expr_new(EXPR_CAST(), line, col)
-            e.operand = Box_new(left)
-            e.cast_type = ty_result.type_name
-            e.cast_is_ref = cast_ref
-            left = e
         } else {
             cont = false
         }
@@ -4334,8 +4321,19 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             let op_tok = p_cur(pp)
             let op_kind = p_peek(pp)
 
+            if op_kind == TK_AS() {
+                -- Cast: expr as Type
+                pp = p_advance(pp)
+                let cast_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
+                let ty_result = parse_type(pp)
+                pp = ty_result.p
+                let mut e = expr_new(EXPR_CAST(), op_tok.line, op_tok.col)
+                e.operand = Box_new(left)
+                e.cast_type = ty_result.type_name
+                e.cast_is_ref = cast_ref
+                left = e
             -- Range operator (.. and ..=)
-            if op_kind == TK_DOTDOT() or op_kind == TK_DOTDOTEQ() {
+            } else if op_kind == TK_DOTDOT() or op_kind == TK_DOTDOTEQ() {
                 let range_op = if op_kind == TK_DOTDOTEQ() { BINOP_LE() } else { BINOP_LT() }
                 pp = p_advance(pp)
                 let right_result = parse_expr_pratt(pp, prec + 1)
@@ -4407,12 +4405,16 @@ fn infix_prec(kind: int) -> int {
     if kind == TK_SHL() or kind == TK_SHR() { return 9 }
     if kind == TK_PLUS() or kind == TK_MINUS() { return 10 }
     if kind == TK_STAR() or kind == TK_SLASH() or kind == TK_PERCENT() { return 11 }
+    -- `x as T` binds tighter than any binary operator and looser than
+    -- a prefix operator: `a * i as float` casts i, `-x as u8` casts -x
+    -- and `*b as float` casts what is in the box
+    if kind == TK_AS() { return 12 }
     return -1
 }
 
 -- What a unary operator's operand binds with: tighter than any binary
 -- operator
-fn PREFIX_PREC() -> int { return 12 }
+fn PREFIX_PREC() -> int { return 13 }
 
 -- Whether the token the parser is at is the first of its line
 fn p_starts_line(p: Parser) -> bool {
@@ -4616,6 +4618,66 @@ fn parse_prefix_at(p: Parser) -> ParseExprResult {
 -- PARSE IDENTIFIER / CALL / STRUCT LITERAL / ENUM VARIANT
 -- ============================================================
 
+-- Whether the name is written as a type's is: a capital first, and a
+-- small letter after it unless it is one letter long. `Stack` and `T`
+-- are; `xs`, `TABLE` and `MAX_SIZE` are not.
+fn p_type_like_name(name: string) -> bool {
+    let n = len(name)
+    if n == 0 { return false }
+    let first = byte_at(name, 0)
+    if first < 65 or first > 90 { return false }
+    if n == 1 { return true }
+    let mut i = 1
+    while i < n {
+        let b = byte_at(name, i)
+        if b >= 97 and b <= 122 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+-- Whether the text of a type, as parse_type gives it, is written as a
+-- type is and not as an index: it begins with the name of a builtin
+-- type, or with a name written as a type's (p_type_like_name), or it
+-- is a function's or an array's type. `int`, `List[T]` and `Shape`
+-- are; `i`, `count` and `MAX` are not.
+fn p_type_like(t: string) -> bool {
+    if starts_with(t, "fn(") or starts_with(t, "[") { return true }
+    let n = len(t)
+    let mut end = 0
+    while end < n and byte_at(t, end) != 91 {
+        end = end + 1
+    }
+    let word = substr(t, 0, end)
+    if word == "int" or word == "float" or word == "bool" or word == "string" or word == "void" { return true }
+    if word == "i8" or word == "i16" or word == "i32" or word == "i64" { return true }
+    if word == "u8" or word == "u16" or word == "u32" or word == "u64" { return true }
+    if word == "f32" or word == "f64" { return true }
+    if word == "f32x4" or word == "f32x8" or word == "f64x2" or word == "f64x4" { return true }
+    if word == "i32x4" or word == "i32x8" or word == "i64x2" or word == "i64x4" { return true }
+    return p_type_like_name(word)
+}
+
+fn p_types_like(types: List[string]) -> bool {
+    let mut i = 0
+    while i < types.len() {
+        if p_type_like(types[i]) == false { return false }
+        i = i + 1
+    }
+    return true
+}
+
+-- Whether the parser is at `.name(` or at `.Name`: the call of a
+-- function, or a variant of an enum
+fn p_call_follows_dot(p: Parser) -> bool {
+    if p_peek(p) != TK_DOT() { return false }
+    let at_name = p_advance(p)
+    if p_peek(at_name) != TK_IDENT() { return false }
+    let first = byte_at(p_cur(at_name).value, 0)
+    if first >= 65 and first <= 90 { return true }
+    return p_peek(p_advance(at_name)) == TK_LPAREN()
+}
+
 fn parse_ident_expr(p: Parser) -> ParseExprResult {
     let mut pp = p
     let tok = p_cur(pp)
@@ -4650,6 +4712,14 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             let after_args = p_peek(p_skip_newlines(pp))
             let mut is_generic = after_args == TK_LPAREN()
             if after_args == TK_LBRACE() and len(name) > 0 and char_at(name, 0) >= "A" and char_at(name, 0) <= "Z" {
+                is_generic = true
+            }
+            -- `Stack[int].new()` calls a function of the type Stack[int],
+            -- and `Opt[int].Empty` is a variant of Opt[int], where
+            -- `Grid[i].len()` is a method call on an element: the name
+            -- and what is in the brackets are a type's when they are
+            -- written as one (p_type_like_name, p_type_like)
+            if p_peek(pp) == TK_DOT() and p_type_like_name(name) and p_types_like(generics) and p_call_follows_dot(pp) {
                 is_generic = true
             }
             if not is_generic {
@@ -4776,6 +4846,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             e.enum_name = name
             e.variant_name = variant_tok.value
             e.payload = payload_args
+            e.generic_args = generics
             return ParseExprResult { p: pp, expr: e }
         } else {
             -- Not an enum variant, restore
@@ -6986,10 +7057,54 @@ fn type_bit_width(name: string) -> int {
 -- this and code generation converts the values by it.
 fn int_meet_type(a: string, a_literal: bool, b: string, b_literal: bool) -> string {
     if a == b { return a }
+    if is_float_name(a) and is_float_name(b) { return float_meet_type(a, a_literal, b, b_literal) }
     if b_literal and a_literal == false { return a }
     if a_literal and b_literal == false { return b }
     if type_bit_width(b) > type_bit_width(a) { return b }
     return a
+}
+
+-- The type two floats of different types meet at, in a binary
+-- operator: a literal takes the other operand's type, as in `x / 2.0`
+-- with x: f32; otherwise the f32 widens. For the names of the IR
+-- ("f64") and of the checker ("float").
+fn float_meet_type(a: string, a_literal: bool, b: string, b_literal: bool) -> string {
+    if a == b { return a }
+    if b_literal and a_literal == false { return a }
+    if a_literal and b_literal == false { return b }
+    if a == "f32" { return b }
+    return a
+}
+
+-- A float type by its name in the IR or in the checker
+fn is_float_name(t: string) -> bool {
+    return t == "f32" or t == "f64" or t == "float"
+}
+
+-- Whether the two types are both integers or both floats, by their
+-- names in the IR or in the checker: numbers that meet at one type
+-- (int_meet_type)
+fn numbers_meet(a: string, b: string) -> bool {
+    if is_float_name(a) { return is_float_name(b) }
+    if is_float_name(b) { return false }
+    return (a == "int" or is_integer_type(a)) and (b == "int" or is_integer_type(b))
+}
+
+-- An integer or a float constant (is_int_literal_expr, is_float_literal_expr)
+fn is_number_literal_expr(e: Expr) -> bool {
+    return is_int_literal_expr(e) or is_float_literal_expr(e)
+}
+
+-- Whether the expression is a float constant: a literal, one negated
+-- or in parentheses, or the sum, difference, product or quotient of two
+fn is_float_literal_expr(e: Expr) -> bool {
+    if e.kind == EXPR_LITERAL_FLOAT() { return true }
+    if e.kind == EXPR_GROUPED() { return is_float_literal_expr(*e.operand) }
+    if e.kind == EXPR_UNARY() and e.op == UNOP_NEG() { return is_float_literal_expr(*e.operand) }
+    if e.kind == EXPR_BINARY() and (e.op == BINOP_ADD() or e.op == BINOP_SUB() or e.op == BINOP_MUL() or e.op == BINOP_DIV()) {
+        return is_float_literal_expr(*e.left) and is_float_literal_expr(*e.right)
+    }
+    return false
 }
 
 fn is_simd_type(name: string) -> bool {
@@ -7712,6 +7827,9 @@ fn generate_module(gen: IRGenerator, parsed: SourceFile) -> IRGenerator {
     -- Phase 3: Declare runtime builtin functions
     g = declare_runtime_functions(g)
 
+    -- The generic instances among the types of the program's expressions
+    g = ensure_checked_instances(g, 0, g.checked_types.len())
+
     -- Phase 4: Generate IR for all declarations
     i = 0
     while i < source.declarations.len() {
@@ -7802,6 +7920,29 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
 -- Register every generic struct instance a source type names,
 -- including instances nested in its type arguments and fields.
 -- line locates errors in the type.
+-- Register the instances of the generic structs and enums among the
+-- types the checker recorded for the expressions `from` up to `to`.
+-- An instance is otherwise registered where its type is written or
+-- its value is made, which may be after an expression whose type
+-- names it is looked at: the receiver of `wrap(5).top()` is a
+-- Stack[int] that the call of wrap makes.
+fn ensure_checked_instances(gen: IRGenerator, from: int, to: int) -> IRGenerator {
+    let mut g = gen
+    let mut seen: Map[string, bool] = Map_new()
+    let mut id = from
+    while id < to and id < g.checked_types.len() {
+        let t = g.checked_types[id]
+        if string_find(t, "[") > 0 and string_contains(t, "?") == false {
+            if seen.contains(t) == false {
+                seen.insert(t, true)
+                g = ensure_type_instances(g, t, 0)
+            }
+        }
+        id = id + 1
+    }
+    return g
+}
+
 fn ensure_type_instances(gen: IRGenerator, t: string, line: int) -> IRGenerator {
     let mut g = gen
     if g.type_substitutions.contains(t) {
@@ -8989,6 +9130,15 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
 
+    -- `let xs = [a, b]` is `let xs: List[T] = [a, b]`, with T the type
+    -- of the literal's elements (array_literal_elem_type)
+    if len(type_str) == 0 {
+        let literal = *stmt.let_value
+        if literal.kind == EXPR_ARRAY_LITERAL() and literal.elements.len() > 0 {
+            type_str = "List[" + array_literal_elem_type(g, literal) + "]"
+        }
+    }
+
     -- Generic struct instances and type parameters in the annotation
     if len(type_str) > 0 {
         g = ensure_type_instances(g, type_str, stmt.line)
@@ -9063,7 +9213,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             else { "dm_list_generic_push" }
             let mut ei = 0
             while ei < init_expr.elements.len() {
-                let mut elem_result = generate_expr(g, b, init_expr.elements[ei])
+                let mut elem_result = generate_expr(g, b, map_ctor_as(g, init_expr.elements[ei], canon_type(g, inner)))
                 -- An integer becomes the elements' integer type
                 elem_result = convert_list_elem(elem_result.gen, elem_result.block, elem_result.val_id, init_expr.elements[ei], elem_kind, inner, "element " + int_to_string(ei + 1) + " of '" + var_name + "'")
                 g = elem_result.gen
@@ -9157,32 +9307,6 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
 
-    -- Early handling: array literal [elem1, elem2, ...] without type annotation
-    -- Treat as List[T] where T is inferred from the first element
-    if infer_val.kind == EXPR_ARRAY_LITERAL() and infer_val.elements.len() > 0 {
-        let arr_elem_type = infer_expr_type(g, infer_val.elements[0])
-        let arr_elem_kind = if arr_elem_type == "i64" or arr_elem_type == "int" { LIST_ELEM_INT() }
-            else if arr_elem_type == "f64" or arr_elem_type == "float" { LIST_ELEM_FLOAT() }
-            else if arr_elem_type == "string" { LIST_ELEM_STRING() }
-            else { LIST_ELEM_OTHER() }
-        let result = generate_expr(g, b, infer_val)
-        g = result.gen
-        b = result.block
-        g.list_elem_kinds.insert(var_name, arr_elem_kind)
-        if arr_elem_kind == LIST_ELEM_OTHER() and (g.struct_defs.contains(arr_elem_type) or g.enum_defs.contains(arr_elem_type)) {
-            g.list_elem_types.insert(var_name, arr_elem_type)
-        }
-        -- A list of lists
-        let arr_nested = nested_list_elem_type(g, infer_val)
-        if arr_nested != "" {
-            g.list_elem_kinds.insert(var_name, LIST_ELEM_OTHER())
-            g.list_elem_types.insert(var_name, arr_nested)
-        }
-        g.variable_map.insert(var_name, result.val_id)
-        g.variable_types.insert(var_name, "list")
-        return gen_result(g, b)
-    }
-
     let mut ir_type = "i64"
     if len(type_str) > 0 {
         ir_type = map_type_name(type_str)
@@ -9227,8 +9351,9 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         -- This handles cases like `let x: i32 = 42` where the literal is i64
         let expr_type = infer_expr_type(g, val_expr)
         let mut store_val_id = result.val_id
-        if expr_type != ir_type and is_integer_type(ir_type) and is_integer_type(expr_type) {
-            -- A wider integer needs `as`, as it does in an assignment
+        if expr_type != ir_type and ((is_integer_type(ir_type) and is_integer_type(expr_type)) or (is_float_type(ir_type) and is_float_type(expr_type))) {
+            -- A wider integer needs `as`, as it does in an assignment,
+            -- and so does a float for an f32
             let conv = convert_int_value(g, b, result.val_id, val_expr, expr_type, ir_type, "the value of '" + var_name + "'")
             g = conv.gen
             b = conv.block
@@ -9255,7 +9380,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
 
         -- Track struct type
         if val_expr.kind == EXPR_STRUCT_LITERAL() {
-            g.var_struct_types.insert(var_name, canon_type(g, val_expr.type_name))
+            g.var_struct_types.insert(var_name, canon_type(g, struct_literal_type(g, val_expr)))
         }
         -- Track struct type from index access on a list of structs
         if val_expr.kind == EXPR_INDEX_ACCESS() {
@@ -9651,11 +9776,11 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.variable_types.insert(var_name, elem_type)
     let loop_list_src = static_type(g, iter_expr)
     if starts_with(loop_list_src, "List[") {
-        let loop_elem_src = extract_inner_type(loop_list_src, "List[")
-        g.var_src_types.insert(var_name, loop_elem_src)
-        if g.struct_defs.contains(loop_elem_src) {
-            g.var_struct_types.insert(var_name, loop_elem_src)
-        }
+        -- The variable has the element's type with all that follows
+        -- from it, as a `let` of that type has: `for row in rows` over
+        -- a List[List[i16]] gives a row whose elements are i16
+        g = track_bound_variable(g, var_name, extract_inner_type(loop_list_src, "List["))
+        g.variable_types.insert(var_name, elem_type)
     } else if g.var_src_types.contains(var_name) {
         -- Not the type of an earlier variable of this name
         g.var_src_types.remove(var_name)
@@ -10203,6 +10328,10 @@ fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRVal
     let whole = expr_binary(binop, target, value_expr, value_expr.line, value_expr.col)
     let val_type = infer_expr_type(g, value_expr)
 
+    -- Nor does a float fit an f32
+    if ty == "f32" and val_type == "f64" and is_float_literal_expr(branch_value_expr(value_expr)) == false {
+        g = ir_type_error(g, "the value has type float, which does not fit in f32; convert it with `as f32`", value_expr.line)
+    }
     -- A wider integer does not fit the place
     if is_integer_type(ty) and is_integer_type(val_type) and is_int_literal_expr(branch_value_expr(value_expr)) == false and type_bit_width(val_type) > type_bit_width(ty) {
         g = ir_type_error(g, "the value has type " + builtin_src_type(val_type) + ", which does not fit in " + ty + "; convert it with `as " + ty + "`", value_expr.line)
@@ -10226,6 +10355,11 @@ fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRVal
     let met = common_int_type(whole, ty, val_type)
     if met != "" and met != ty {
         return emit_ir_cast(combined.gen, combined.block, ir_val_inst(combined.val_id), met, ty)
+    }
+    -- And an f32 that a float was added to
+    let met_float = common_float_type(whole, ty, val_type)
+    if met_float != "" and met_float != ty {
+        return emit_ir_cast(combined.gen, combined.block, ir_val_inst(combined.val_id), met_float, ty)
     }
     return combined
 }
@@ -10654,6 +10788,10 @@ fn generate_expr_plain(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         let static_target = static_call_target(gen, expr)
         if static_target != "" {
             return generate_function_call(gen, block, static_call_expr(expr, static_target))
+        }
+        let generic_static = generic_static_type(gen, expr)
+        if generic_static != "" {
+            return generate_generic_static_call(gen, block, expr, generic_static)
         }
         return generate_method_call(gen, block, expr)
     }
@@ -11209,6 +11347,100 @@ fn static_call_expr(expr: Expr, target: string) -> Expr {
     return expr_call(expr_ident(target, expr.line, expr.col), expr.args, expr.line, expr.col)
 }
 
+-- "Stack[string]" for `Stack.new()` and `Stack[string].new()`, the
+-- call of a function of the impl block of a generic struct or enum:
+-- the type whose function is called, with the type arguments the
+-- checker found, from those written, the call's arguments and the
+-- place its value goes to. Inside the impl block itself, "Stack" where
+-- the checker found none: the type the block is compiled for. "?"
+-- where nothing says, and "" for any other call.
+fn generic_static_type(gen: IRGenerator, expr: Expr) -> string {
+    let obj = *expr.object
+    if obj.kind != EXPR_IDENTIFIER() { return "" }
+    if gen.variable_map.contains(obj.name) { return "" }
+    if gen.generic_struct_params.contains(obj.name) == false { return "" }
+    let key = obj.name + "_" + expr.method
+    if gen.generic_fn_decls.contains(key) == false { return "" }
+    let decl = gen.declarations[gen.generic_fn_decls.get(key)]
+    if decl.kind != DECL_FUNCTION() { return "" }
+    let fd = *decl.func_decl
+    if fd.params.len() > 0 {
+        if fd.params[0].name == "self" { return "" }
+    }
+    let params = string_split(gen.generic_struct_params.get(obj.name), "|")
+    let args = checked_type_args(gen, expr)
+    if args.len() < params.len() {
+        if gen.type_substitutions.contains(obj.name) { return obj.name }
+        return "?"
+    }
+    let mut t = obj.name + "["
+    let mut i = 0
+    while i < params.len() {
+        if i > 0 { t = t + ", " }
+        t = t + args[i]
+        i = i + 1
+    }
+    return t + "]"
+}
+
+-- What the call of a function of a generic type's impl block returns,
+-- as a source type: `called` is the type it is called for
+-- (generic_static_type). "" for nothing.
+fn generic_static_return(gen: IRGenerator, expr: Expr, called: string) -> string {
+    let obj = *expr.object
+    let base_key = obj.name + "_" + expr.method
+    if called == "?" or gen.fn_src_return_types.contains(base_key) == false { return "" }
+    let ret = gen.fn_src_return_types.get(base_key)
+    if ret == "" { return "" }
+    let instance = canon_type(gen, called)
+    let bracket = string_find(called, "[")
+    if bracket <= 0 { return instance_type(gen, instance, ret) }
+    -- The instance may not be registered yet: substitute by hand
+    let params = string_split(gen.generic_struct_params.get(obj.name), "|")
+    let args = split_type_args(substr(called, bracket + 1, len(called) - bracket - 2))
+    let mut subs: Map[string, string] = Map_new()
+    let mut i = 0
+    while i < params.len() and i < args.len() {
+        subs.insert(params[i], canon_type(gen, args[i]))
+        i = i + 1
+    }
+    subs.insert("Self", instance)
+    subs.insert(obj.name, instance)
+    let mut g = gen
+    g.type_substitutions = subs
+    return canon_type(g, ret)
+}
+
+-- `Stack.new()` or `Stack[string].new()`: the call of the function of
+-- the instance `called` names, which is compiled for it here
+fn generate_generic_static_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr, called: string) -> ExprResult {
+    let mut g = gen
+    let obj = *expr.object
+    if called == "?" {
+        let shown = obj.name + "." + expr.method + "(...)"
+        g = ir_type_error(g, "cannot tell what the type parameters of '" + obj.name + "' stand for in '" + shown + "': write them, as in " + obj.name + "[int]." + expr.method + "(...), or give the place the value goes to a type", expr.line)
+        return generate_expr(g, block, expr_int(0, expr.line, expr.col))
+    }
+    g = ensure_type_instances(g, called, expr.line)
+    let instance = canon_type(g, called)
+    g = ensure_instance_method(g, instance, expr.method)
+    return generate_function_call(g, block, static_call_expr(expr, instance + "_" + expr.method))
+}
+
+-- The type of a struct literal as a source type: the one written,
+-- and for `Pair { first: 1, second: "one" }` of a generic struct, the
+-- type with the type arguments the checker found from the values and
+-- from the place the struct goes to. Where it found none, the name
+-- alone, which inside the struct's own impl block is the type the
+-- block is compiled for.
+fn struct_literal_type(gen: IRGenerator, expr: Expr) -> string {
+    if gen.generic_struct_params.contains(expr.type_name) and expr.id >= 0 and expr.id < gen.checked_types.len() {
+        let checked = gen.checked_types[expr.id]
+        if starts_with(checked, expr.type_name + "[") and string_contains(checked, "?") == false { return checked }
+    }
+    return expr.type_name
+}
+
 -- Map_new() or Map.new()
 fn is_map_ctor(e: Expr) -> bool {
     if e.kind == EXPR_FUNCTION_CALL() and e.args.len() == 0 {
@@ -11244,6 +11476,24 @@ fn map_ctor_as(gen: IRGenerator, e: Expr, dest: string) -> Expr {
     lit.field_names = names
     lit.field_values = vals
     return lit
+}
+
+-- Map_new() or Map.new() (`shown`) wherever it is written: an empty
+-- map of the type the checker found for it from the place the map
+-- goes to, which may be a typed let, an assignment, a field, a return,
+-- an argument, an element of a list or the value of a Some
+fn generate_map_ctor(gen: IRGenerator, block: IRBasicBlock, expr: Expr, shown: string) -> ExprResult {
+    let mut g = gen
+    if expr.id >= 0 and expr.id < g.checked_types.len() {
+        let found = g.checked_types[expr.id]
+        if found != "" and string_contains(found, "?") == false {
+            g = ensure_type_instances(g, found, expr.line)
+            let literal = map_ctor_as(g, expr, canon_type(g, found))
+            if is_map_ctor(literal) == false { return generate_expr(g, block, literal) }
+        }
+    }
+    g = ir_type_error(g, "cannot tell which Map type " + shown + " creates here; give it one, e.g. let m: Map[string, int] = " + shown, expr.line)
+    return expr_result(g, block, 0)
 }
 
 -- byte_at(s, i): the byte at index i of s as an int, 0 to 255
@@ -11328,6 +11578,12 @@ fn emit_ir_cast(gen: IRGenerator, block: IRBasicBlock, val: IRValue, from: strin
     b.instructions.push(inst)
     g.builder.next_id = id + 1
     return expr_result(g, b, id)
+}
+
+-- The float value as a `float`: an f32 is widened, any other is as it is
+fn emit_float_widened(gen: IRGenerator, block: IRBasicBlock, val_id: int, from: string) -> ExprResult {
+    if from != "f32" { return expr_result(gen, block, val_id) }
+    return emit_ir_cast(gen, block, ir_val_inst(val_id), "f32", "f64")
 }
 
 -- Emit a store of `val` through `ptr`
@@ -11615,7 +11871,7 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_FLOAT() { return "float" }
     if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
     if k == EXPR_LITERAL_BOOL() { return "bool" }
-    if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
+    if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, struct_literal_type(gen, expr)) }
     if k == EXPR_LAMBDA() { return lambda_value_type(gen, expr) }
     if k == EXPR_ENUM_LITERAL() {
         if is_generic_enum(gen, expr.enum_name) {
@@ -11624,9 +11880,7 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return expr.enum_name
     }
     if k == EXPR_ARRAY_LITERAL() {
-        -- A list of its first element's type
-        if expr.elements.len() == 0 { return "" }
-        let elem_t = static_type(gen, expr.elements[0])
+        let elem_t = array_literal_elem_type(gen, expr)
         if elem_t == "" { return "" }
         return "List[" + elem_t + "]"
     }
@@ -11682,6 +11936,8 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         if static_target != "" {
             return static_type(gen, static_call_expr(expr, static_target))
         }
+        let generic_static = generic_static_type(gen, expr)
+        if generic_static != "" { return generic_static_return(gen, expr, generic_static) }
         -- Enum.Variant(values) is a value of the enum
         let call_object = *expr.object
         if call_object.kind == EXPR_IDENTIFIER() and gen.enum_defs.contains(call_object.name) and gen.variable_map.contains(call_object.name) == false {
@@ -12255,7 +12511,7 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         if value_type != "" { return map_type_name(value_type) }
     }
     if expr.kind == EXPR_STRUCT_LITERAL() {
-        return canon_type(gen, expr.type_name)
+        return canon_type(gen, struct_literal_type(gen, expr))
     }
     if expr.kind == EXPR_ENUM_LITERAL() {
         if is_generic_enum(gen, expr.enum_name) {
@@ -12271,8 +12527,8 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         let else_t = infer_expr_type(gen, *expr.else_branch)
         if then_t == "void" { return else_t }
         -- Integers of different widths meet at one type
-        if is_integer_type(then_t) and is_integer_type(else_t) {
-            return int_meet_type(then_t, is_int_literal_expr(branch_value_expr(*expr.then_branch)), else_t, is_int_literal_expr(branch_value_expr(*expr.else_branch)))
+        if numbers_meet(then_t, else_t) {
+            return int_meet_type(then_t, is_number_literal_expr(branch_value_expr(*expr.then_branch)), else_t, is_number_literal_expr(branch_value_expr(*expr.else_branch)))
         }
         return then_t
     }
@@ -12399,6 +12655,12 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         let static_target = static_call_target(gen, expr)
         if static_target != "" {
             return infer_expr_type(gen, static_call_expr(expr, static_target))
+        }
+        let generic_static = generic_static_type(gen, expr)
+        if generic_static != "" {
+            let made = generic_static_return(gen, expr, generic_static)
+            if made == "" { return "void" }
+            return map_type_name(made)
         }
         let method = expr.method
         -- Methods of generic struct instances have exact signatures
@@ -12803,6 +13065,8 @@ fn binary_ir_type(expr: Expr, lt: string, rt: string) -> string {
     if is_bool_binop(expr.op) { return "bool" }
     let common_t = common_int_type(expr, lt, rt)
     if common_t != "" { return common_t }
+    let common_f = common_float_type(expr, lt, rt)
+    if common_f != "" { return common_f }
     return lt
 }
 
@@ -13220,13 +13484,31 @@ fn emit_binary_op(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_val_id:
         }
     }
     let int_operand_t = if is_integer_type(lhs_type) and lhs_type == rhs_type { lhs_type } else { "" }
+    -- And so do floats of different types (see float_meet_type)
+    let common_f = common_float_type(expr, lhs_type, rhs_type)
+    if common_f != "" {
+        if lhs_type != common_f {
+            let lc = emit_ir_cast(g, b, ir_val_inst(lhs_id), lhs_type, common_f)
+            g = lc.gen
+            b = lc.block
+            lhs_id = lc.val_id
+            lhs_type = common_f
+        }
+        if rhs_type != common_f {
+            let rc = emit_ir_cast(g, b, ir_val_inst(rhs_id), rhs_type, common_f)
+            g = rc.gen
+            b = rc.block
+            rhs_id = rc.val_id
+            rhs_type = common_f
+        }
+    }
 
     -- Determine if either operand is float or string
     let is_string = lhs_type == "string" or rhs_type == "string"
     let is_float = is_float_type(lhs_type) or is_float_type(rhs_type)
 
     -- Determine the arithmetic result type
-    let arith_type = if is_float { "f64" } else { "i64" }
+    let arith_type = if is_float_type(lhs_type) and lhs_type == rhs_type { lhs_type } else if is_float { "f64" } else { "i64" }
 
     -- --------------------------------------------------------
     -- STRING OPERATIONS
@@ -13713,7 +13995,7 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
             if type_bit_width(operand_type) < 64 { fit_type = operand_type }
             return emit_checked_int_arith(g, b, "dm_checked_sub_i64", ir_val_int(0), "i64", ir_val_inst(operand_id), operand_type, fit_type)
         }
-        let result_type = if is_float_type(operand_type) { "f64" } else { "i64" }
+        let result_type = if is_float_type(operand_type) { operand_type } else { "i64" }
 
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_NEG())
@@ -13959,11 +14241,9 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return generate_err_call(g, b, expr)
     }
 
-    -- Map_new() takes its type from where the map goes (a typed let,
-    -- an assignment, a struct field, a return); see map_ctor_as
+    -- Map_new() takes its type from where the map goes; see map_ctor_as
     if fn_name == "Map_new" {
-        g = ir_type_error(g, "cannot tell which Map type Map_new() creates here; give it one, e.g. let m: Map[string, int] = Map_new()", expr.line)
-        return expr_result(g, b, 0)
+        return generate_map_ctor(g, b, expr, "Map_new()")
     }
 
     -- byte_at(s, i): the byte at index i of s, 0 to 255
@@ -14733,8 +15013,7 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let args = expr.args
 
     if is_map_ctor(expr) {
-        g = ir_type_error(g, "cannot tell which Map type Map.new() creates here; give it one, e.g. let m: Map[string, int] = Map.new()", expr.line)
-        return expr_result(g, b, 0)
+        return generate_map_ctor(g, b, expr, "Map.new()")
     }
 
     -- x.f(a) where the type of x has no method f is the call f(x, a),
@@ -15917,18 +16196,18 @@ fn is_int_literal_expr(e: Expr) -> bool {
     return false
 }
 
--- Whether the statements of a branch give an integer constant as
+-- Whether the statements of a branch give a number constant as
 -- their value
-fn stmts_value_is_int_literal(stmts: List[Stmt]) -> bool {
+fn stmts_value_is_number_literal(stmts: List[Stmt]) -> bool {
     if stmts.len() == 0 { return false }
     let last = stmts[stmts.len() - 1]
     if last.kind != STMT_EXPRESSION() { return false }
-    return is_int_literal_expr(branch_value_expr(*last.expr))
+    return is_number_literal_expr(branch_value_expr(*last.expr))
 }
 
-fn arm_value_is_int_literal(arm: MatchArm) -> bool {
-    if arm.is_expr_body { return is_int_literal_expr(branch_value_expr(*arm.body_expr)) }
-    return stmts_value_is_int_literal(arm.body)
+fn arm_value_is_number_literal(arm: MatchArm) -> bool {
+    if arm.is_expr_body { return is_number_literal_expr(branch_value_expr(*arm.body_expr)) }
+    return stmts_value_is_number_literal(arm.body)
 }
 
 -- The type the arms of a match give together, as far as it can be
@@ -15936,9 +16215,9 @@ fn arm_value_is_int_literal(arm: MatchArm) -> bool {
 -- arm gives `first`: integers of different widths meet at one type
 -- (int_meet_type); for any other type it is the first arm's
 fn arms_meet_type(gen: IRGenerator, arms: List[MatchArm], first: string) -> string {
-    if is_integer_type(first) == false or arms.len() == 0 { return first }
+    if (is_integer_type(first) == false and is_float_type(first) == false) or arms.len() == 0 { return first }
     let mut t = first
-    let mut t_literal = arm_value_is_int_literal(arms[0])
+    let mut t_literal = arm_value_is_number_literal(arms[0])
     let mut i = 1
     while i < arms.len() {
         let arm = arms[i]
@@ -15949,8 +16228,8 @@ fn arms_meet_type(gen: IRGenerator, arms: List[MatchArm], first: string) -> stri
             let last = arm.body[arm.body.len() - 1]
             if last.kind == STMT_EXPRESSION() { arm_type = infer_expr_type(gen, *last.expr) }
         }
-        if is_integer_type(arm_type) {
-            let arm_literal = arm_value_is_int_literal(arm)
+        if numbers_meet(t, arm_type) {
+            let arm_literal = arm_value_is_number_literal(arm)
             t = int_meet_type(t, t_literal, arm_type, arm_literal)
             t_literal = t_literal and arm_literal
         }
@@ -16039,8 +16318,21 @@ fn int_literal_value(e: Expr) -> int {
 -- finds one that does not fit. An `if` or a `match` whose branches all
 -- give constants is no narrowing: each constant is checked where its
 -- branch stores it.
+-- A float goes the same way: a constant takes the type of its place,
+-- an f32 widens to a float, and a float that is no constant needs
+-- `as f32` to go where an f32 is expected.
 fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, from: string, to: string, what: string) -> ExprResult {
     let mut g = gen
+    if is_float_type(from) and is_float_type(to) and from != to {
+        let mut fvalue = branch_value_expr(e)
+        if fvalue.kind == EXPR_COMPTIME() { fvalue = branch_value_expr(*fvalue.operand) }
+        if to == "f32" and is_float_literal_expr(fvalue) == false and branches_give_float_literals(fvalue) == false {
+            if map_type_name(checked_type(g, e)) != "f32" {
+                g = ir_type_error(g, what + " has type float, which does not fit in f32; convert it with `as f32`", e.line)
+            }
+        }
+        return emit_ir_cast(g, block, ir_val_inst(val_id), from, to)
+    }
     if is_integer_type(from) == false or is_integer_type(to) == false or from == to {
         return expr_result(g, block, val_id)
     }
@@ -16063,8 +16355,34 @@ fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr
 -- is not an integer's leaves the value as it is.
 fn convert_int_to_place(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, to: string, what: string) -> ExprResult {
     let to_ir = map_type_name(canon_type(gen, to))
-    if is_integer_type(to_ir) == false { return expr_result(gen, block, val_id) }
+    if is_integer_type(to_ir) == false and is_float_type(to_ir) == false { return expr_result(gen, block, val_id) }
     return convert_int_value(gen, block, val_id, e, infer_expr_type(gen, e), to_ir, what)
+}
+
+-- Whether the expression is an `if` or a `match` whose every branch
+-- that gives a value gives a float constant
+fn branches_give_float_literals(e: Expr) -> bool {
+    let mut any = false
+    if e.kind == EXPR_IF() {
+        if e.has_else == false { return false }
+        let then_e = branch_value_expr(*e.then_branch)
+        let else_e = branch_value_expr(*e.else_branch)
+        return (is_float_literal_expr(then_e) or branches_give_float_literals(then_e)) and (is_float_literal_expr(else_e) or branches_give_float_literals(else_e))
+    }
+    if e.kind == EXPR_MATCH() {
+        let mut ai = 0
+        while ai < e.match_arms.len() {
+            let arm = e.match_arms[ai]
+            if arm.is_expr_body == false { return false }
+            let body = branch_value_expr(*arm.body_expr)
+            if ck_diverges(body) == false {
+                if is_float_literal_expr(body) == false and branches_give_float_literals(body) == false { return false }
+                any = true
+            }
+            ai = ai + 1
+        }
+    }
+    return any
 }
 
 -- convert_int_value for an element that a list of integers stores:
@@ -16072,6 +16390,7 @@ fn convert_int_to_place(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: E
 -- type holds elements of that type
 fn convert_list_elem(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, elem_kind: int, elem_type: string, what: string) -> ExprResult {
     if elem_kind == LIST_ELEM_INT() { return convert_int_to_place(gen, block, val_id, e, "i64", what) }
+    if elem_kind == LIST_ELEM_FLOAT() { return convert_int_to_place(gen, block, val_id, e, "f64", what) }
     if elem_kind == LIST_ELEM_OTHER() { return convert_int_to_place(gen, block, val_id, e, elem_type, what) }
     return expr_result(gen, block, val_id)
 }
@@ -16089,6 +16408,14 @@ fn is_bool_binop(op: int) -> bool {
     if op == BINOP_EQ() or op == BINOP_NE() { return true }
     if op == BINOP_LT() or op == BINOP_LE() or op == BINOP_GT() or op == BINOP_GE() { return true }
     return op == BINOP_AND() or op == BINOP_OR()
+}
+
+-- The float type the operands of a binary operator take when they are
+-- floats of different types (float_meet_type); "" when they need no
+-- conversion
+fn common_float_type(expr: Expr, lt: string, rt: string) -> string {
+    if is_float_type(lt) == false or is_float_type(rt) == false or lt == rt { return "" }
+    return float_meet_type(lt, is_float_literal_expr(*expr.left), rt, is_float_literal_expr(*expr.right))
 }
 
 -- binary_int_type for operands whose types, lt and rt, are known
@@ -16841,10 +17168,11 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
     let mut b = block
 
     -- Resolve type parameters and generic struct instances
-    g = ensure_type_instances(g, expr.type_name, expr.line)
-    let type_name = canon_type(g, expr.type_name)
+    let written = struct_literal_type(g, expr)
+    g = ensure_type_instances(g, written, expr.line)
+    let type_name = canon_type(g, written)
     if g.generic_struct_params.contains(type_name) {
-        g = ir_type_error(g, "generic struct '" + type_name + "' needs type arguments, e.g. " + type_name + "[int] { ... }", expr.line)
+        g = ir_type_error(g, "cannot tell what the type parameters of the generic struct '" + type_name + "' stand for here: write them, as in " + type_name + "[int] { ... }, or give the place the value goes to a type", expr.line)
     }
 
     -- Look up the struct definition
@@ -17204,6 +17532,23 @@ fn is_list_ctor(e: Expr) -> bool {
     return false
 }
 
+-- The type of the elements of a non-empty list literal, as a source
+-- type: the one the checker found for the literal, from all its
+-- elements and from the place the list goes to ([1, 2] passed as a
+-- List[i32] is a list of i32, [a, 2] with a: u8 a list of u8, [None,
+-- Some(3)] a list of Option[int]). Where the checker recorded none,
+-- the first element's type. Every list is stored by this type: a
+-- variable the literal is bound to, a parameter it is passed to and a
+-- loop over it read the elements as the literal wrote them.
+fn array_literal_elem_type(gen: IRGenerator, lit: Expr) -> string {
+    if lit.elements.len() == 0 { return "" }
+    let checked = checked_type(gen, lit)
+    if starts_with(checked, "List[") { return extract_inner_type(checked, "List[") }
+    let first = static_type(gen, lit.elements[0])
+    if first != "" { return first }
+    return infer_expr_type(gen, lit.elements[0])
+}
+
 fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -17222,43 +17567,35 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return expr_result(g, b, id)
     }
 
-    -- Generate all element expressions first to determine types
+    -- How the list stores its elements (see array_literal_elem_type)
+    let elem_src = array_literal_elem_type(g, expr)
+    g = ensure_type_instances(g, elem_src, expr.line)
+    let elem_kind = classify_list_elem(elem_src)
+    let mut new_fn = "dm_list_generic_new"
+    let mut push_fn = "dm_list_generic_push"
+    if elem_kind == LIST_ELEM_INT() {
+        new_fn = "dm_list_int64_new"
+        push_fn = "dm_list_int64_push"
+    } else if elem_kind == LIST_ELEM_FLOAT() {
+        new_fn = "dm_list_double_new"
+        push_fn = "dm_list_double_push"
+    } else if elem_kind == LIST_ELEM_STRING() {
+        new_fn = "dm_list_string_new"
+        push_fn = "dm_list_string_push"
+    }
+
+    -- Generate the elements first: one may make a list of its own. A
+    -- number becomes the elements' type.
     let mut elem_ids: List[int] = []
     let mut i = 0
     while i < num_elements {
-        let elem_result = generate_expr(g, b, elements[i])
+        -- Map_new() as an element is an empty map of the elements' type
+        let mut elem_result = generate_expr(g, b, map_ctor_as(g, elements[i], canon_type(g, elem_src)))
+        elem_result = convert_list_elem(elem_result.gen, elem_result.block, elem_result.val_id, elements[i], elem_kind, elem_src, "element " + int_to_string(i + 1) + " of the list")
         g = elem_result.gen
         b = elem_result.block
         elem_ids.push(elem_result.val_id)
         i = i + 1
-    }
-
-    -- Infer element type from the first element
-    let mut elem_ir_type = infer_expr_type(g, elements[0])
-    let nested = nested_list_elem_type(g, expr)
-    if nested != "" { elem_ir_type = nested }
-    -- An Option or a Result is stored whole; the first element may be
-    -- a None, so its type is the one the checker found for the list
-    let mut whole_elem = false
-    let lit_src = checked_type(g, expr)
-    if starts_with(lit_src, "List[Option[") or starts_with(lit_src, "List[Result[") {
-        elem_ir_type = map_type_name(substr(lit_src, 5, len(lit_src) - 6))
-        whole_elem = true
-    }
-
-    -- Determine which list new/push functions to use
-    let mut new_fn = "dm_list_int64_new"
-    let mut push_fn = "dm_list_int64_push"
-    if elem_ir_type == "f64" or elem_ir_type == "float" {
-        new_fn = "dm_list_double_new"
-        push_fn = "dm_list_double_push"
-    } else if elem_ir_type == "string" {
-        new_fn = "dm_list_string_new"
-        push_fn = "dm_list_string_push"
-    } else if g.struct_defs.contains(elem_ir_type) or g.enum_defs.contains(elem_ir_type) or nested != "" or whole_elem {
-        -- Structs, enum values and lists are stored whole
-        new_fn = "dm_list_generic_new"
-        push_fn = "dm_list_generic_push"
     }
 
     -- Create list alloca and call new function (sret pattern)
@@ -17280,17 +17617,17 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     b.instructions.push(call_new)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Push each element into the list
+    -- Push each element into the list; what is no int, float or
+    -- string is stored whole
     let mut pi = 0
-    if push_fn == "dm_list_generic_push" {
-        while pi < num_elements {
-            let pushed = push_whole_value(g, b, alloca_id, elem_ids[pi], elem_ir_type)
+    while pi < num_elements {
+        if elem_kind == LIST_ELEM_OTHER() {
+            let pushed = push_whole_value(g, b, alloca_id, elem_ids[pi], map_type_name(canon_type(g, elem_src)))
             g = pushed.gen
             b = pushed.block
             pi = pi + 1
+            continue
         }
-    }
-    while pi < num_elements {
         let mut push_call = ir_inst_new(g.builder.next_id, OP_CALL())
         push_call.callee = push_fn
         let mut push_args: List[IRValue] = []
@@ -18945,11 +19282,14 @@ fn generate_string_interp(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
                 str_val_id = conv.val_id
             } else if part_type == "f64" or part_type == "f32" or part_type == "float" {
                 -- Convert float to string via float_to_string
+                let wide = emit_float_widened(g, b, part_val_id, part_type)
+                g = wide.gen
+                b = wide.block
                 let conv_id = g.builder.next_id
                 let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
                 conv_inst.callee = "dm_float_to_string"
                 let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(part_val_id))
+                conv_args.push(ir_val_inst(wide.val_id))
                 conv_inst.call_args = conv_args
                 conv_inst.result_type = "string"
                 conv_inst.has_result = true
@@ -19090,7 +19430,7 @@ fn store_branch_value(gen: IRGenerator, block: IRBasicBlock, slot_id: int, slot_
             b = conv.block
             store_id = conv.val_id
         } else if is_float_type(from) and is_float_type(slot_type) {
-            let conv = emit_ir_cast(g, b, ir_val_inst(val_id), from, slot_type)
+            let conv = convert_int_value(g, b, val_id, branch_value_expr(value), from, slot_type, "the value of this branch")
             g = conv.gen
             b = conv.block
             store_id = conv.val_id
@@ -19564,12 +19904,15 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
                 b = conv.block
                 call_args.push(ir_val_inst(conv.val_id))
             } else if arg_type == "f64" or arg_type == "f32" or arg_type == "float" {
-                -- Wrap with float_to_string
+                -- Wrap with float_to_string, which takes a float
+                let wide = emit_float_widened(g, b, arg_result.val_id, arg_type)
+                g = wide.gen
+                b = wide.block
                 let conv_id = g.builder.next_id
                 let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
                 conv_inst.callee = "dm_float_to_string"
                 let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_args.push(ir_val_inst(wide.val_id))
                 conv_inst.call_args = conv_args
                 conv_inst.result_type = "string"
                 conv_inst.has_result = true
@@ -19604,6 +19947,12 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
             } else {
                 call_args.push(ir_val_inst(arg_result.val_id))
             }
+        } else if i < param_kinds.len() and param_kinds[i] == "float" {
+            -- An f32 widens to the float the builtin takes
+            let wide = emit_float_widened(g, b, arg_result.val_id, infer_expr_type(g, args[i]))
+            g = wide.gen
+            b = wide.block
+            call_args.push(ir_val_inst(wide.val_id))
         } else {
             call_args.push(ir_val_inst(arg_result.val_id))
         }
@@ -21855,9 +22204,11 @@ fn ck_note(c: Checker, id: int, t: string) -> Checker {
 }
 
 -- Whether the expression makes a new value whose type its place
--- decides: None, Some(x), Ok(x), Err(x), a new Box or Map, a list literal
+-- decides: None, Some(x), Ok(x), Err(x), a new Box or Map, a list
+-- literal, a struct literal with no type arguments (`Pair { .. }`)
 fn ck_makes_value(e: Expr) -> bool {
     if e.kind == EXPR_ARRAY_LITERAL() { return true }
+    if e.kind == EXPR_STRUCT_LITERAL() { return string_find(e.type_name, "[") < 0 }
     if e.kind == EXPR_IDENTIFIER() { return e.name == "None" }
     if e.kind == EXPR_FUNCTION_CALL() {
         let callee = *e.callee
@@ -21940,6 +22291,24 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
                 i = i + 1
             }
         }
+        return c
+    }
+    -- The fields of `Pair { first: None, second: [] }`, whose types
+    -- the type arguments of the place give
+    if k == EXPR_STRUCT_LITERAL() {
+        let head = ty_head(want)
+        if e.type_name != head or c.structs.contains(head) == false { return c }
+        if c.structs.get(head).generics.len() == 0 { return c }
+        let mut i = 0
+        while i < e.field_names.len() and i < e.field_values.len() {
+            c = ck_settle(c, e.field_values[i], ck_field_type(c, want, e.field_names[i]))
+            i = i + 1
+        }
+        return c
+    }
+    if k == EXPR_METHOD_CALL() {
+        let static_key = ck_generic_static(c, e)
+        if static_key != "" { return ck_settle_static(c, e, static_key, want) }
         return c
     }
     -- The value inside a Some, an Ok, an Err or a Box
@@ -22227,6 +22596,7 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
     c = first.c
     let mut t = first.t
     let mut t_literal = is_int_literal_expr(cur)
+    let mut t_float_literal = is_float_literal_expr(cur)
     let mut i = ops.len() - 1
     while i >= 0 {
         let mut right = ck_expr(c, rights[i])
@@ -22243,6 +22613,13 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
         if ty_is_int(result_t) and ty_is_int(t) and ty_is_int(right.t) {
             result_t = int_meet_type(t, t_literal, right.t, right_literal)
         }
+        -- And two floats: a literal is an f32 beside an f32
+        let right_float_literal = is_float_literal_expr(rights[i])
+        if ty_is_float(result_t) and ty_is_float(t) and ty_is_float(right.t) {
+            result_t = float_meet_type(ty_alias(t), t_float_literal, ty_alias(right.t), right_float_literal)
+        }
+        let arithmetic = ops[i] == BINOP_ADD() or ops[i] == BINOP_SUB() or ops[i] == BINOP_MUL() or ops[i] == BINOP_DIV()
+        t_float_literal = t_float_literal and right_float_literal and arithmetic
         c = ck_note(result.c, ids[i], result_t)
         t = result_t
         -- is_int_literal_expr of the operator's expression
@@ -22811,7 +23188,7 @@ fn ck_payloads(sig: EnumSig, at: int) -> List[string] {
 
 -- Check the values given to a variant of an enum against the number
 -- and the types of the values the variant carries
-fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: List[string], values: List[Expr], line: int) -> Checker {
+fn ck_variant_values(c0: Checker, enum_name: string, variant: string, enum_args: List[string], types: List[string], values: List[Expr], line: int) -> Checker {
     let mut c = c0
     let sig = c.enums.get(enum_name)
     let at = ck_index_of(sig.variant_names, variant)
@@ -22822,7 +23199,7 @@ fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: Lis
     }
     let mut i = 0
     while i < payloads.len() and i < types.len() {
-        let want = ty_apply(payloads[i], sig.generics, ty_unbound(0))
+        let want = ty_apply(payloads[i], sig.generics, enum_args)
         if ck_fits_value(c, want, types[i], values[i]) == false {
             c = ck_error(c, "type mismatch in value " + int_to_string(i + 1) + " of '" + enum_name + "." + variant + "': expected " + want + ", found " + types[i], values[i].line)
         } else {
@@ -22911,8 +23288,14 @@ fn ck_settle_variant(c0: Checker, e: Expr, name: string, want: string) -> Checke
 
 -- Type.name(args): a constructor of Box, Map or List, a variant of
 -- an enum, or a function of the type's impl block
-fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string]) -> Typed {
+fn ck_static_call(c0: Checker, type_name: string, e: Expr, arg_types: List[string]) -> Typed {
     let method = e.method
+    -- The type arguments of `Stack[int].new()`
+    let explicit = ck_static_type_args(e)
+    let mut c = c0
+    if explicit.len() > 0 {
+        c = ck_type_exists(c, ck_generic_type(type_name, explicit), e.line)
+    }
     if type_name == "Box" and method == "new" {
         if arg_types.len() > 0 {
             if ty_known(arg_types[0]) { return ck_typed(c, "Box[" + arg_types[0] + "]") }
@@ -22925,7 +23308,13 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
     if c.enums.contains(type_name) {
         let sig = c.enums.get(type_name)
         if ck_index_of(sig.variant_names, method) >= 0 {
-            return ck_typed(ck_variant_values(c, type_name, method, arg_types, e.args, e.line), ck_enum_value_type(c, type_name, method, arg_types))
+            let mut made = ck_enum_value_type(c, type_name, method, arg_types)
+            let mut enum_args = ty_unbound(0)
+            if explicit.len() == sig.generics.len() and explicit.len() > 0 {
+                made = ck_norm(c, ck_generic_type(type_name, explicit))
+                enum_args = ty_args(made)
+            }
+            return ck_typed(ck_variant_values(c, type_name, method, enum_args, arg_types, e.args, e.line), made)
         }
         if c.fns.contains(type_name + "_" + method) == false and ck_trait_method(c, type_name, method) == "" {
             return ck_typed(ck_error(c, "enum '" + type_name + "' has no variant or function '" + method + "'", e.line), type_name)
@@ -22938,9 +23327,83 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
         counted = ck_async_call(counted, sig, type_name + "." + method, e.id, e.line)
         counted = ck_effects(counted, type_name + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
         counted = ck_mut_args(counted, sig, type_name + "." + method, 0, e.args)
-        return ck_apply(counted, sig, type_name + "." + method, 0, ty_unbound(sig.generics.len()), arg_types, e.args, e.line)
+        let binds = ck_static_binds(counted, sig, explicit)
+        let applied = ck_apply(counted, sig, type_name + "." + method, 0, binds, arg_types, e.args, e.line)
+        if sig.generics.len() == 0 { return applied }
+        -- What the type parameters stand for, where the arguments say
+        -- it; else the place the value goes to does (ck_settle_static)
+        return ck_typed(ck_note_type_args(applied.c, e.id, ck_binds(sig, 0, binds, arg_types)), applied.t)
     }
     return ck_typed(c, "")
+}
+
+-- The type arguments written in `Stack[int].new()`: those of the
+-- name the function is called on
+fn ck_static_type_args(e: Expr) -> List[string] {
+    let object = *e.object
+    if object.kind != EXPR_IDENTIFIER() {
+        let none: List[string] = []
+        return none
+    }
+    return object.generic_args
+}
+
+-- What the type parameters of the function of a type's impl block
+-- stand for before its arguments are looked at: the type arguments
+-- written at the call for the impl block's, nothing for the rest
+fn ck_static_binds(c: Checker, sig: FnSig, explicit: List[string]) -> List[string] {
+    let mut binds = ty_unbound(sig.generics.len())
+    let mut i = 0
+    while i < explicit.len() and i < binds.len() {
+        binds[i] = ck_norm(c, explicit[i])
+        i = i + 1
+    }
+    return binds
+}
+
+-- "Stack_new" for `Stack.new(...)` and `Stack[int].new(...)`, the call
+-- of a function of the impl block of a generic type; else ""
+fn ck_generic_static(c: Checker, e: Expr) -> string {
+    let object = *e.object
+    if object.kind != EXPR_IDENTIFIER() { return "" }
+    if ck_names_type(c, object.name) == false { return "" }
+    let key = object.name + "_" + e.method
+    if c.fns.contains(key) == false { return "" }
+    let sig = c.fns.get(key)
+    if sig.generics.len() == 0 or sig.has_self { return "" }
+    return key
+}
+
+-- ck_settle for `Stack.new()`, the call of the function `key` of a
+-- generic type's impl block, whose value goes to a place of the type
+-- `want`: the place says what the type parameters stand for where the
+-- call's arguments do not, as in `let s: Stack[int] = Stack.new()`
+fn ck_settle_static(c0: Checker, e: Expr, key: string, want: string) -> Checker {
+    let mut c = c0
+    let sig = c.fns.get(key)
+    let mut binds = ck_static_binds(c, sig, ck_static_type_args(e))
+    binds = ty_bind(sig.ret, want, sig.generics, binds)
+    let mut arg_types: List[string] = []
+    let mut i = 0
+    while i < e.args.len() {
+        let id = e.args[i].id
+        if id >= 0 and id < c.types.len() {
+            arg_types.push(c.types[id])
+        } else {
+            arg_types.push("")
+        }
+        i = i + 1
+    }
+    binds = ck_binds(sig, 0, binds, arg_types)
+    c = ck_note_type_args(c, e.id, binds)
+    let made = ty_apply(sig.ret, sig.generics, binds)
+    if ty_whole(made) { c = ck_note(c, e.id, made) }
+    i = 0
+    while i < e.args.len() and i < sig.params.len() {
+        c = ck_settle(c, e.args[i], ty_apply(sig.params[i], sig.generics, binds))
+        i = i + 1
+    }
+    return c
 }
 
 fn ck_method_arity(c: Checker, recv: string, method: string, want: int, got: int, line: int) -> Checker {
@@ -22985,6 +23448,11 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             type_name = name
         } else if ck_var(c, name) < 0 and (name == "Box" or name == "Map" or name == "List") {
             type_name = name
+        }
+        if type_name == "" and object.generic_args.len() > 0 {
+            let written = ck_generic_type(name, object.generic_args)
+            c = ck_error(c, "'" + name + "' is not a type: '" + written + "." + method + "(...)' calls a function of the type " + written + "; write (" + written + ")." + method + "(...) to call a method of an element", e.line)
+            return ck_typed(c, "")
         }
     }
     let mut recv = ""
@@ -23092,13 +23560,33 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
 
 fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
     let mut c = ck_type_exists(c0, e.type_name, e.line)
-    let t = ck_norm(c, e.type_name)
-    let head = ty_head(t)
+    let written = ck_norm(c, e.type_name)
+    let head = ty_head(written)
     let values = ck_exprs(c, e.field_values)
     c = values.c
     if head == "" or c.structs.contains(head) == false { return ck_typed(c, "") }
     let sig = c.structs.get(head)
     let mut i = 0
+    let mut t = written
+    if sig.generics.len() > 0 and ty_args(written).len() == 0 {
+        -- `Pair { first: 1, second: "one" }` is a Pair[int, string]: the
+        -- values say what the type parameters stand for, and where they
+        -- do not, the place the struct goes to does (ck_settle)
+        let mut binds = ty_unbound(sig.generics.len())
+        while i < e.field_names.len() and i < values.types.len() {
+            let at = ck_index_of(sig.field_names, e.field_names[i])
+            if at >= 0 { binds = ty_bind(sig.field_types[at], values.types[i], sig.generics, binds) }
+            i = i + 1
+        }
+        let mut found: List[string] = []
+        i = 0
+        while i < binds.len() {
+            if binds[i] == "" { found.push("?") } else { found.push(binds[i]) }
+            i = i + 1
+        }
+        t = ck_generic_type(head, found)
+        i = 0
+    }
     while i < e.field_names.len() and i < values.types.len() {
         let field = e.field_names[i]
         if ck_index_of(sig.field_names, field) < 0 {
@@ -23125,13 +23613,23 @@ fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
 
 fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
     let values = ck_exprs(c0, e.payload)
-    let c = values.c
+    let mut c = values.c
     let name = e.enum_name
     if ck_var(c, name) >= 0 { return ck_typed(c, "") }
+    -- The type arguments of `Opt[int].Empty`
+    if e.generic_args.len() > 0 {
+        c = ck_type_exists(c, ck_generic_type(name, e.generic_args), e.line)
+    }
     if c.enums.contains(name) {
         let sig = c.enums.get(name)
         if ck_index_of(sig.variant_names, e.variant_name) >= 0 {
-            return ck_typed(ck_variant_values(c, name, e.variant_name, values.types, e.payload, e.line), ck_enum_value_type(c, name, e.variant_name, values.types))
+            let mut made = ck_enum_value_type(c, name, e.variant_name, values.types)
+            let mut enum_args = ty_unbound(0)
+            if e.generic_args.len() == sig.generics.len() and e.generic_args.len() > 0 {
+                made = ck_norm(c, ck_generic_type(name, e.generic_args))
+                enum_args = ty_args(made)
+            }
+            return ck_typed(ck_variant_values(c, name, e.variant_name, enum_args, values.types, e.payload, e.line), made)
         }
         if c.fns.contains(name + "_" + e.variant_name) == false and ck_trait_method(c, name, e.variant_name) == "" {
             return ck_typed(ck_error(c, "enum '" + name + "' has no variant or function '" + e.variant_name + "'", e.line), name)
@@ -23150,15 +23648,26 @@ fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
 fn ck_array_literal(c0: Checker, e: Expr) -> Typed {
     let values = ck_exprs(c0, e.elements)
     let mut c = values.c
-    -- The first element's type, with what the later ones know of its parts
+    -- The first element's type, with what the later ones know of its
+    -- parts. Numbers meet at one type as the branches of an `if` do:
+    -- a constant takes the type of the others, a narrower one widens.
     let mut elem = "?"
+    let mut elem_literal = false
     let mut i = 0
     while i < values.types.len() {
-        if ty_known(values.types[i]) and values.types[i] != "void" {
+        let t = values.types[i]
+        if ty_known(t) and t != "void" {
+            let literal = is_number_literal_expr(branch_value_expr(e.elements[i]))
             if elem == "?" {
-                elem = values.types[i]
-            } else if ty_fits(elem, values.types[i]) {
-                elem = ty_merge(elem, values.types[i])
+                elem = t
+                elem_literal = literal
+            } else if numbers_meet(ty_alias(elem), ty_alias(t)) {
+                elem = int_meet_type(elem, elem_literal, t, literal)
+                elem_literal = elem_literal and literal
+            } else if ty_kind(elem) != "" and ty_kind(t) != "" and (ty_kind(elem) != ty_kind(t) or ty_is_float(elem) != ty_is_float(t)) {
+                c = ck_error(c, "the elements of this list are " + elem + " and " + t, e.elements[i].line)
+            } else if ty_fits(elem, t) {
+                elem = ty_merge(elem, t)
             }
         }
         i = i + 1
@@ -23220,9 +23729,9 @@ fn ck_if_expr(c0: Checker, e: Expr) -> Typed {
         if t == "" and ty_known(else_value.t) and else_value.t != "void" { t = else_value.t }
         if t != "" and else_value.t != "void" and ck_fits(c, t, else_value.t) == false and ck_fits(c, else_value.t, t) == false {
             c = ck_error(c, "the branches of this 'if' give " + t + " and " + else_value.t, e.line)
-        } else if ty_is_int(t) and ty_is_int(else_value.t) and ty_is_int(then_value.t) {
-            -- Integers of two widths give one value
-            t = int_meet_type(t, is_int_literal_expr(branch_value_expr(*e.then_branch)), else_value.t, is_int_literal_expr(branch_value_expr(*e.else_branch)))
+        } else if numbers_meet(t, else_value.t) and numbers_meet(then_value.t, else_value.t) {
+            -- Integers of two widths give one value, and so do an f32 and a float
+            t = int_meet_type(t, is_number_literal_expr(branch_value_expr(*e.then_branch)), else_value.t, is_number_literal_expr(branch_value_expr(*e.else_branch)))
         } else if t != "" and else_value.t != "void" {
             -- Each branch may know what the other does not: Some(n) and None
             t = ty_merge(t, else_value.t)
@@ -23413,12 +23922,12 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
             let value = ck_expr(c, *arm.body_expr)
             c = value.c
             arm_type = value.t
-            arm_literal = is_int_literal_expr(branch_value_expr(*arm.body_expr))
+            arm_literal = is_number_literal_expr(branch_value_expr(*arm.body_expr))
         } else {
             let value = ck_body_value(c, arm.body, used)
             c = value.c
             arm_type = value.t
-            arm_literal = stmts_value_is_int_literal(arm.body)
+            arm_literal = stmts_value_is_number_literal(arm.body)
         }
         c = ck_unbind(c, mark)
         if t == "" and ty_known(arm_type) and arm_type != "void" {
@@ -23427,8 +23936,8 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
         }
         if used and t != "" and arm_type != "void" and ck_fits(c, t, arm_type) == false and ck_fits(c, arm_type, t) == false {
             c = ck_error(c, "the arms of this match give " + t + " and " + arm_type, e.line)
-        } else if ty_is_int(t) and ty_is_int(arm_type) {
-            -- Integers of two widths give one value
+        } else if numbers_meet(t, arm_type) {
+            -- Integers of two widths give one value, and so do an f32 and a float
             t = int_meet_type(t, t_literal, arm_type, arm_literal)
             t_literal = t_literal and arm_literal
         } else if t != "" and ty_known(arm_type) and arm_type != "void" {
@@ -24336,6 +24845,7 @@ fn instance_types_begin(gen: IRGenerator, fd: FunctionDecl, self_type: string, o
     g.checked_types = c.types
     g.checked_type_args = c.type_args
     g.checked_targets = c.targets
+    g = ensure_checked_instances(g, fd.expr_from, fd.expr_to)
     let mut ei = 0
     while ei < c.errors.len() {
         let text = c.errors[ei] + " (in " + what + ")"
@@ -26972,6 +27482,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let mut fr = rhs
             if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
             if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
+            -- An f32 beside a double: the test of an f32 divisor against 0.0
+            if lhs_kind_f == 2 and rhs_kind_f == 3 { fl = dm_llvm_build_fp_cast(b, lhs, dm_llvm_type_of(rhs), "fwide") }
+            if lhs_kind_f == 3 and rhs_kind_f == 2 { fr = dm_llvm_build_fp_cast(b, rhs, dm_llvm_type_of(lhs), "fwide") }
             let mut result = 0
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), fl, fr, "feq")
@@ -29174,7 +29687,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "1cb053da739fed91"
+    return "731b524711f15712"
 }
 
 

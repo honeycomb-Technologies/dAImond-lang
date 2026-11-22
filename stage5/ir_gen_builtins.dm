@@ -387,12 +387,15 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
                 b = conv.block
                 call_args.push(ir_val_inst(conv.val_id))
             } else if arg_type == "f64" or arg_type == "f32" or arg_type == "float" {
-                -- Wrap with float_to_string
+                -- Wrap with float_to_string, which takes a float
+                let wide = emit_float_widened(g, b, arg_result.val_id, arg_type)
+                g = wide.gen
+                b = wide.block
                 let conv_id = g.builder.next_id
                 let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
                 conv_inst.callee = "dm_float_to_string"
                 let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(arg_result.val_id))
+                conv_args.push(ir_val_inst(wide.val_id))
                 conv_inst.call_args = conv_args
                 conv_inst.result_type = "string"
                 conv_inst.has_result = true
@@ -427,6 +430,12 @@ fn generate_builtin_call(gen: IRGenerator, block: IRBasicBlock, fn_name: string,
             } else {
                 call_args.push(ir_val_inst(arg_result.val_id))
             }
+        } else if i < param_kinds.len() and param_kinds[i] == "float" {
+            -- An f32 widens to the float the builtin takes
+            let wide = emit_float_widened(g, b, arg_result.val_id, infer_expr_type(g, args[i]))
+            g = wide.gen
+            b = wide.block
+            call_args.push(ir_val_inst(wide.val_id))
         } else {
             call_args.push(ir_val_inst(arg_result.val_id))
         }

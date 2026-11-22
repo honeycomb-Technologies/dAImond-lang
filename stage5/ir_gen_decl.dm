@@ -57,6 +57,29 @@ fn register_struct(gen: IRGenerator, sd: StructDecl) -> IRGenerator {
 -- Register every generic struct instance a source type names,
 -- including instances nested in its type arguments and fields.
 -- line locates errors in the type.
+-- Register the instances of the generic structs and enums among the
+-- types the checker recorded for the expressions `from` up to `to`.
+-- An instance is otherwise registered where its type is written or
+-- its value is made, which may be after an expression whose type
+-- names it is looked at: the receiver of `wrap(5).top()` is a
+-- Stack[int] that the call of wrap makes.
+fn ensure_checked_instances(gen: IRGenerator, from: int, to: int) -> IRGenerator {
+    let mut g = gen
+    let mut seen: Map[string, bool] = Map_new()
+    let mut id = from
+    while id < to and id < g.checked_types.len() {
+        let t = g.checked_types[id]
+        if string_find(t, "[") > 0 and string_contains(t, "?") == false {
+            if seen.contains(t) == false {
+                seen.insert(t, true)
+                g = ensure_type_instances(g, t, 0)
+            }
+        }
+        id = id + 1
+    }
+    return g
+}
+
 fn ensure_type_instances(gen: IRGenerator, t: string, line: int) -> IRGenerator {
     let mut g = gen
     if g.type_substitutions.contains(t) {

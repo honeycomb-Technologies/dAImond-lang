@@ -1,0 +1,3 @@
+cannot tell what the type parameters of the generic struct 'Pair' stand for here: write them, as in Pair[int] { ... }, or give the place the value goes to a type at line 11
+cannot tell what the type parameters of 'Stack' stand for in 'Stack.new(...)': write them, as in Stack[int].new(...), or give the place the value goes to a type at line 12
+cannot tell what the type parameters of 'Stack' stand for in 'Stack.zero(...)': write them, as in Stack[int].zero(...), or give the place the value goes to a type at line 13

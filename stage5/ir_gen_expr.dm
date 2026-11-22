@@ -136,6 +136,10 @@ fn generate_expr_plain(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Exp
         if static_target != "" {
             return generate_function_call(gen, block, static_call_expr(expr, static_target))
         }
+        let generic_static = generic_static_type(gen, expr)
+        if generic_static != "" {
+            return generate_generic_static_call(gen, block, expr, generic_static)
+        }
         return generate_method_call(gen, block, expr)
     }
     if expr.kind == EXPR_FIELD_ACCESS() {
@@ -690,6 +694,100 @@ fn static_call_expr(expr: Expr, target: string) -> Expr {
     return expr_call(expr_ident(target, expr.line, expr.col), expr.args, expr.line, expr.col)
 }
 
+-- "Stack[string]" for `Stack.new()` and `Stack[string].new()`, the
+-- call of a function of the impl block of a generic struct or enum:
+-- the type whose function is called, with the type arguments the
+-- checker found, from those written, the call's arguments and the
+-- place its value goes to. Inside the impl block itself, "Stack" where
+-- the checker found none: the type the block is compiled for. "?"
+-- where nothing says, and "" for any other call.
+fn generic_static_type(gen: IRGenerator, expr: Expr) -> string {
+    let obj = *expr.object
+    if obj.kind != EXPR_IDENTIFIER() { return "" }
+    if gen.variable_map.contains(obj.name) { return "" }
+    if gen.generic_struct_params.contains(obj.name) == false { return "" }
+    let key = obj.name + "_" + expr.method
+    if gen.generic_fn_decls.contains(key) == false { return "" }
+    let decl = gen.declarations[gen.generic_fn_decls.get(key)]
+    if decl.kind != DECL_FUNCTION() { return "" }
+    let fd = *decl.func_decl
+    if fd.params.len() > 0 {
+        if fd.params[0].name == "self" { return "" }
+    }
+    let params = string_split(gen.generic_struct_params.get(obj.name), "|")
+    let args = checked_type_args(gen, expr)
+    if args.len() < params.len() {
+        if gen.type_substitutions.contains(obj.name) { return obj.name }
+        return "?"
+    }
+    let mut t = obj.name + "["
+    let mut i = 0
+    while i < params.len() {
+        if i > 0 { t = t + ", " }
+        t = t + args[i]
+        i = i + 1
+    }
+    return t + "]"
+}
+
+-- What the call of a function of a generic type's impl block returns,
+-- as a source type: `called` is the type it is called for
+-- (generic_static_type). "" for nothing.
+fn generic_static_return(gen: IRGenerator, expr: Expr, called: string) -> string {
+    let obj = *expr.object
+    let base_key = obj.name + "_" + expr.method
+    if called == "?" or gen.fn_src_return_types.contains(base_key) == false { return "" }
+    let ret = gen.fn_src_return_types.get(base_key)
+    if ret == "" { return "" }
+    let instance = canon_type(gen, called)
+    let bracket = string_find(called, "[")
+    if bracket <= 0 { return instance_type(gen, instance, ret) }
+    -- The instance may not be registered yet: substitute by hand
+    let params = string_split(gen.generic_struct_params.get(obj.name), "|")
+    let args = split_type_args(substr(called, bracket + 1, len(called) - bracket - 2))
+    let mut subs: Map[string, string] = Map_new()
+    let mut i = 0
+    while i < params.len() and i < args.len() {
+        subs.insert(params[i], canon_type(gen, args[i]))
+        i = i + 1
+    }
+    subs.insert("Self", instance)
+    subs.insert(obj.name, instance)
+    let mut g = gen
+    g.type_substitutions = subs
+    return canon_type(g, ret)
+}
+
+-- `Stack.new()` or `Stack[string].new()`: the call of the function of
+-- the instance `called` names, which is compiled for it here
+fn generate_generic_static_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr, called: string) -> ExprResult {
+    let mut g = gen
+    let obj = *expr.object
+    if called == "?" {
+        let shown = obj.name + "." + expr.method + "(...)"
+        g = ir_type_error(g, "cannot tell what the type parameters of '" + obj.name + "' stand for in '" + shown + "': write them, as in " + obj.name + "[int]." + expr.method + "(...), or give the place the value goes to a type", expr.line)
+        return generate_expr(g, block, expr_int(0, expr.line, expr.col))
+    }
+    g = ensure_type_instances(g, called, expr.line)
+    let instance = canon_type(g, called)
+    g = ensure_instance_method(g, instance, expr.method)
+    return generate_function_call(g, block, static_call_expr(expr, instance + "_" + expr.method))
+}
+
+-- The type of a struct literal as a source type: the one written,
+-- and for `Pair { first: 1, second: "one" }` of a generic struct, the
+-- type with the type arguments the checker found from the values and
+-- from the place the struct goes to. Where it found none, the name
+-- alone, which inside the struct's own impl block is the type the
+-- block is compiled for.
+fn struct_literal_type(gen: IRGenerator, expr: Expr) -> string {
+    if gen.generic_struct_params.contains(expr.type_name) and expr.id >= 0 and expr.id < gen.checked_types.len() {
+        let checked = gen.checked_types[expr.id]
+        if starts_with(checked, expr.type_name + "[") and string_contains(checked, "?") == false { return checked }
+    }
+    return expr.type_name
+}
+
 -- Map_new() or Map.new()
 fn is_map_ctor(e: Expr) -> bool {
     if e.kind == EXPR_FUNCTION_CALL() and e.args.len() == 0 {
@@ -725,6 +823,24 @@ fn map_ctor_as(gen: IRGenerator, e: Expr, dest: string) -> Expr {
     lit.field_names = names
     lit.field_values = vals
     return lit
+}
+
+-- Map_new() or Map.new() (`shown`) wherever it is written: an empty
+-- map of the type the checker found for it from the place the map
+-- goes to, which may be a typed let, an assignment, a field, a return,
+-- an argument, an element of a list or the value of a Some
+fn generate_map_ctor(gen: IRGenerator, block: IRBasicBlock, expr: Expr, shown: string) -> ExprResult {
+    let mut g = gen
+    if expr.id >= 0 and expr.id < g.checked_types.len() {
+        let found = g.checked_types[expr.id]
+        if found != "" and string_contains(found, "?") == false {
+            g = ensure_type_instances(g, found, expr.line)
+            let literal = map_ctor_as(g, expr, canon_type(g, found))
+            if is_map_ctor(literal) == false { return generate_expr(g, block, literal) }
+        }
+    }
+    g = ir_type_error(g, "cannot tell which Map type " + shown + " creates here; give it one, e.g. let m: Map[string, int] = " + shown, expr.line)
+    return expr_result(g, block, 0)
 }
 
 -- byte_at(s, i): the byte at index i of s as an int, 0 to 255
@@ -809,6 +925,12 @@ fn emit_ir_cast(gen: IRGenerator, block: IRBasicBlock, val: IRValue, from: strin
     b.instructions.push(inst)
     g.builder.next_id = id + 1
     return expr_result(g, b, id)
+}
+
+-- The float value as a `float`: an f32 is widened, any other is as it is
+fn emit_float_widened(gen: IRGenerator, block: IRBasicBlock, val_id: int, from: string) -> ExprResult {
+    if from != "f32" { return expr_result(gen, block, val_id) }
+    return emit_ir_cast(gen, block, ir_val_inst(val_id), "f32", "f64")
 }
 
 -- Emit a store of `val` through `ptr`
@@ -1096,7 +1218,7 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
     if k == EXPR_LITERAL_FLOAT() { return "float" }
     if k == EXPR_LITERAL_STRING() or k == EXPR_STRING_INTERP() { return "string" }
     if k == EXPR_LITERAL_BOOL() { return "bool" }
-    if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, expr.type_name) }
+    if k == EXPR_STRUCT_LITERAL() { return canon_type(gen, struct_literal_type(gen, expr)) }
     if k == EXPR_LAMBDA() { return lambda_value_type(gen, expr) }
     if k == EXPR_ENUM_LITERAL() {
         if is_generic_enum(gen, expr.enum_name) {
@@ -1105,9 +1227,7 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         return expr.enum_name
     }
     if k == EXPR_ARRAY_LITERAL() {
-        -- A list of its first element's type
-        if expr.elements.len() == 0 { return "" }
-        let elem_t = static_type(gen, expr.elements[0])
+        let elem_t = array_literal_elem_type(gen, expr)
         if elem_t == "" { return "" }
         return "List[" + elem_t + "]"
     }
@@ -1163,6 +1283,8 @@ fn static_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         if static_target != "" {
             return static_type(gen, static_call_expr(expr, static_target))
         }
+        let generic_static = generic_static_type(gen, expr)
+        if generic_static != "" { return generic_static_return(gen, expr, generic_static) }
         -- Enum.Variant(values) is a value of the enum
         let call_object = *expr.object
         if call_object.kind == EXPR_IDENTIFIER() and gen.enum_defs.contains(call_object.name) and gen.variable_map.contains(call_object.name) == false {
@@ -1736,7 +1858,7 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         if value_type != "" { return map_type_name(value_type) }
     }
     if expr.kind == EXPR_STRUCT_LITERAL() {
-        return canon_type(gen, expr.type_name)
+        return canon_type(gen, struct_literal_type(gen, expr))
     }
     if expr.kind == EXPR_ENUM_LITERAL() {
         if is_generic_enum(gen, expr.enum_name) {
@@ -1752,8 +1874,8 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         let else_t = infer_expr_type(gen, *expr.else_branch)
         if then_t == "void" { return else_t }
         -- Integers of different widths meet at one type
-        if is_integer_type(then_t) and is_integer_type(else_t) {
-            return int_meet_type(then_t, is_int_literal_expr(branch_value_expr(*expr.then_branch)), else_t, is_int_literal_expr(branch_value_expr(*expr.else_branch)))
+        if numbers_meet(then_t, else_t) {
+            return int_meet_type(then_t, is_number_literal_expr(branch_value_expr(*expr.then_branch)), else_t, is_number_literal_expr(branch_value_expr(*expr.else_branch)))
         }
         return then_t
     }
@@ -1880,6 +2002,12 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
         let static_target = static_call_target(gen, expr)
         if static_target != "" {
             return infer_expr_type(gen, static_call_expr(expr, static_target))
+        }
+        let generic_static = generic_static_type(gen, expr)
+        if generic_static != "" {
+            let made = generic_static_return(gen, expr, generic_static)
+            if made == "" { return "void" }
+            return map_type_name(made)
         }
         let method = expr.method
         -- Methods of generic struct instances have exact signatures
@@ -2284,6 +2412,8 @@ fn binary_ir_type(expr: Expr, lt: string, rt: string) -> string {
     if is_bool_binop(expr.op) { return "bool" }
     let common_t = common_int_type(expr, lt, rt)
     if common_t != "" { return common_t }
+    let common_f = common_float_type(expr, lt, rt)
+    if common_f != "" { return common_f }
     return lt
 }
 
@@ -2701,13 +2831,31 @@ fn emit_binary_op(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_val_id:
         }
     }
     let int_operand_t = if is_integer_type(lhs_type) and lhs_type == rhs_type { lhs_type } else { "" }
+    -- And so do floats of different types (see float_meet_type)
+    let common_f = common_float_type(expr, lhs_type, rhs_type)
+    if common_f != "" {
+        if lhs_type != common_f {
+            let lc = emit_ir_cast(g, b, ir_val_inst(lhs_id), lhs_type, common_f)
+            g = lc.gen
+            b = lc.block
+            lhs_id = lc.val_id
+            lhs_type = common_f
+        }
+        if rhs_type != common_f {
+            let rc = emit_ir_cast(g, b, ir_val_inst(rhs_id), rhs_type, common_f)
+            g = rc.gen
+            b = rc.block
+            rhs_id = rc.val_id
+            rhs_type = common_f
+        }
+    }
 
     -- Determine if either operand is float or string
     let is_string = lhs_type == "string" or rhs_type == "string"
     let is_float = is_float_type(lhs_type) or is_float_type(rhs_type)
 
     -- Determine the arithmetic result type
-    let arith_type = if is_float { "f64" } else { "i64" }
+    let arith_type = if is_float_type(lhs_type) and lhs_type == rhs_type { lhs_type } else if is_float { "f64" } else { "i64" }
 
     -- --------------------------------------------------------
     -- STRING OPERATIONS
@@ -3194,7 +3342,7 @@ fn generate_unary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResu
             if type_bit_width(operand_type) < 64 { fit_type = operand_type }
             return emit_checked_int_arith(g, b, "dm_checked_sub_i64", ir_val_int(0), "i64", ir_val_inst(operand_id), operand_type, fit_type)
         }
-        let result_type = if is_float_type(operand_type) { "f64" } else { "i64" }
+        let result_type = if is_float_type(operand_type) { operand_type } else { "i64" }
 
         let id = g.builder.next_id
         let mut inst = ir_inst_new(id, OP_NEG())
@@ -3440,11 +3588,9 @@ fn generate_function_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return generate_err_call(g, b, expr)
     }
 
-    -- Map_new() takes its type from where the map goes (a typed let,
-    -- an assignment, a struct field, a return); see map_ctor_as
+    -- Map_new() takes its type from where the map goes; see map_ctor_as
     if fn_name == "Map_new" {
-        g = ir_type_error(g, "cannot tell which Map type Map_new() creates here; give it one, e.g. let m: Map[string, int] = Map_new()", expr.line)
-        return expr_result(g, b, 0)
+        return generate_map_ctor(g, b, expr, "Map_new()")
     }
 
     -- byte_at(s, i): the byte at index i of s, 0 to 255
@@ -4214,8 +4360,7 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
     let args = expr.args
 
     if is_map_ctor(expr) {
-        g = ir_type_error(g, "cannot tell which Map type Map.new() creates here; give it one, e.g. let m: Map[string, int] = Map.new()", expr.line)
-        return expr_result(g, b, 0)
+        return generate_map_ctor(g, b, expr, "Map.new()")
     }
 
     -- x.f(a) where the type of x has no method f is the call f(x, a),
@@ -5398,18 +5543,18 @@ fn is_int_literal_expr(e: Expr) -> bool {
     return false
 }
 
--- Whether the statements of a branch give an integer constant as
+-- Whether the statements of a branch give a number constant as
 -- their value
-fn stmts_value_is_int_literal(stmts: List[Stmt]) -> bool {
+fn stmts_value_is_number_literal(stmts: List[Stmt]) -> bool {
     if stmts.len() == 0 { return false }
     let last = stmts[stmts.len() - 1]
     if last.kind != STMT_EXPRESSION() { return false }
-    return is_int_literal_expr(branch_value_expr(*last.expr))
+    return is_number_literal_expr(branch_value_expr(*last.expr))
 }
 
-fn arm_value_is_int_literal(arm: MatchArm) -> bool {
-    if arm.is_expr_body { return is_int_literal_expr(branch_value_expr(*arm.body_expr)) }
-    return stmts_value_is_int_literal(arm.body)
+fn arm_value_is_number_literal(arm: MatchArm) -> bool {
+    if arm.is_expr_body { return is_number_literal_expr(branch_value_expr(*arm.body_expr)) }
+    return stmts_value_is_number_literal(arm.body)
 }
 
 -- The type the arms of a match give together, as far as it can be
@@ -5417,9 +5562,9 @@ fn arm_value_is_int_literal(arm: MatchArm) -> bool {
 -- arm gives `first`: integers of different widths meet at one type
 -- (int_meet_type); for any other type it is the first arm's
 fn arms_meet_type(gen: IRGenerator, arms: List[MatchArm], first: string) -> string {
-    if is_integer_type(first) == false or arms.len() == 0 { return first }
+    if (is_integer_type(first) == false and is_float_type(first) == false) or arms.len() == 0 { return first }
     let mut t = first
-    let mut t_literal = arm_value_is_int_literal(arms[0])
+    let mut t_literal = arm_value_is_number_literal(arms[0])
     let mut i = 1
     while i < arms.len() {
         let arm = arms[i]
@@ -5430,8 +5575,8 @@ fn arms_meet_type(gen: IRGenerator, arms: List[MatchArm], first: string) -> stri
             let last = arm.body[arm.body.len() - 1]
             if last.kind == STMT_EXPRESSION() { arm_type = infer_expr_type(gen, *last.expr) }
         }
-        if is_integer_type(arm_type) {
-            let arm_literal = arm_value_is_int_literal(arm)
+        if numbers_meet(t, arm_type) {
+            let arm_literal = arm_value_is_number_literal(arm)
             t = int_meet_type(t, t_literal, arm_type, arm_literal)
             t_literal = t_literal and arm_literal
         }
@@ -5520,8 +5665,21 @@ fn int_literal_value(e: Expr) -> int {
 -- finds one that does not fit. An `if` or a `match` whose branches all
 -- give constants is no narrowing: each constant is checked where its
 -- branch stores it.
+-- A float goes the same way: a constant takes the type of its place,
+-- an f32 widens to a float, and a float that is no constant needs
+-- `as f32` to go where an f32 is expected.
 fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, from: string, to: string, what: string) -> ExprResult {
     let mut g = gen
+    if is_float_type(from) and is_float_type(to) and from != to {
+        let mut fvalue = branch_value_expr(e)
+        if fvalue.kind == EXPR_COMPTIME() { fvalue = branch_value_expr(*fvalue.operand) }
+        if to == "f32" and is_float_literal_expr(fvalue) == false and branches_give_float_literals(fvalue) == false {
+            if map_type_name(checked_type(g, e)) != "f32" {
+                g = ir_type_error(g, what + " has type float, which does not fit in f32; convert it with `as f32`", e.line)
+            }
+        }
+        return emit_ir_cast(g, block, ir_val_inst(val_id), from, to)
+    }
     if is_integer_type(from) == false or is_integer_type(to) == false or from == to {
         return expr_result(g, block, val_id)
     }
@@ -5544,8 +5702,34 @@ fn convert_int_value(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr
 -- is not an integer's leaves the value as it is.
 fn convert_int_to_place(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, to: string, what: string) -> ExprResult {
     let to_ir = map_type_name(canon_type(gen, to))
-    if is_integer_type(to_ir) == false { return expr_result(gen, block, val_id) }
+    if is_integer_type(to_ir) == false and is_float_type(to_ir) == false { return expr_result(gen, block, val_id) }
     return convert_int_value(gen, block, val_id, e, infer_expr_type(gen, e), to_ir, what)
+}
+
+-- Whether the expression is an `if` or a `match` whose every branch
+-- that gives a value gives a float constant
+fn branches_give_float_literals(e: Expr) -> bool {
+    let mut any = false
+    if e.kind == EXPR_IF() {
+        if e.has_else == false { return false }
+        let then_e = branch_value_expr(*e.then_branch)
+        let else_e = branch_value_expr(*e.else_branch)
+        return (is_float_literal_expr(then_e) or branches_give_float_literals(then_e)) and (is_float_literal_expr(else_e) or branches_give_float_literals(else_e))
+    }
+    if e.kind == EXPR_MATCH() {
+        let mut ai = 0
+        while ai < e.match_arms.len() {
+            let arm = e.match_arms[ai]
+            if arm.is_expr_body == false { return false }
+            let body = branch_value_expr(*arm.body_expr)
+            if ck_diverges(body) == false {
+                if is_float_literal_expr(body) == false and branches_give_float_literals(body) == false { return false }
+                any = true
+            }
+            ai = ai + 1
+        }
+    }
+    return any
 }
 
 -- convert_int_value for an element that a list of integers stores:
@@ -5553,6 +5737,7 @@ fn convert_int_to_place(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: E
 -- type holds elements of that type
 fn convert_list_elem(gen: IRGenerator, block: IRBasicBlock, val_id: int, e: Expr, elem_kind: int, elem_type: string, what: string) -> ExprResult {
     if elem_kind == LIST_ELEM_INT() { return convert_int_to_place(gen, block, val_id, e, "i64", what) }
+    if elem_kind == LIST_ELEM_FLOAT() { return convert_int_to_place(gen, block, val_id, e, "f64", what) }
     if elem_kind == LIST_ELEM_OTHER() { return convert_int_to_place(gen, block, val_id, e, elem_type, what) }
     return expr_result(gen, block, val_id)
 }
@@ -5570,6 +5755,14 @@ fn is_bool_binop(op: int) -> bool {
     if op == BINOP_EQ() or op == BINOP_NE() { return true }
     if op == BINOP_LT() or op == BINOP_LE() or op == BINOP_GT() or op == BINOP_GE() { return true }
     return op == BINOP_AND() or op == BINOP_OR()
+}
+
+-- The float type the operands of a binary operator take when they are
+-- floats of different types (float_meet_type); "" when they need no
+-- conversion
+fn common_float_type(expr: Expr, lt: string, rt: string) -> string {
+    if is_float_type(lt) == false or is_float_type(rt) == false or lt == rt { return "" }
+    return float_meet_type(lt, is_float_literal_expr(*expr.left), rt, is_float_literal_expr(*expr.right))
 }
 
 -- binary_int_type for operands whose types, lt and rt, are known
@@ -6322,10 +6515,11 @@ fn generate_struct_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) ->
     let mut b = block
 
     -- Resolve type parameters and generic struct instances
-    g = ensure_type_instances(g, expr.type_name, expr.line)
-    let type_name = canon_type(g, expr.type_name)
+    let written = struct_literal_type(g, expr)
+    g = ensure_type_instances(g, written, expr.line)
+    let type_name = canon_type(g, written)
     if g.generic_struct_params.contains(type_name) {
-        g = ir_type_error(g, "generic struct '" + type_name + "' needs type arguments, e.g. " + type_name + "[int] { ... }", expr.line)
+        g = ir_type_error(g, "cannot tell what the type parameters of the generic struct '" + type_name + "' stand for here: write them, as in " + type_name + "[int] { ... }, or give the place the value goes to a type", expr.line)
     }
 
     -- Look up the struct definition
@@ -6685,6 +6879,23 @@ fn is_list_ctor(e: Expr) -> bool {
     return false
 }
 
+-- The type of the elements of a non-empty list literal, as a source
+-- type: the one the checker found for the literal, from all its
+-- elements and from the place the list goes to ([1, 2] passed as a
+-- List[i32] is a list of i32, [a, 2] with a: u8 a list of u8, [None,
+-- Some(3)] a list of Option[int]). Where the checker recorded none,
+-- the first element's type. Every list is stored by this type: a
+-- variable the literal is bound to, a parameter it is passed to and a
+-- loop over it read the elements as the literal wrote them.
+fn array_literal_elem_type(gen: IRGenerator, lit: Expr) -> string {
+    if lit.elements.len() == 0 { return "" }
+    let checked = checked_type(gen, lit)
+    if starts_with(checked, "List[") { return extract_inner_type(checked, "List[") }
+    let first = static_type(gen, lit.elements[0])
+    if first != "" { return first }
+    return infer_expr_type(gen, lit.elements[0])
+}
+
 fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     let mut g = gen
     let mut b = block
@@ -6703,43 +6914,35 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
         return expr_result(g, b, id)
     }
 
-    -- Generate all element expressions first to determine types
+    -- How the list stores its elements (see array_literal_elem_type)
+    let elem_src = array_literal_elem_type(g, expr)
+    g = ensure_type_instances(g, elem_src, expr.line)
+    let elem_kind = classify_list_elem(elem_src)
+    let mut new_fn = "dm_list_generic_new"
+    let mut push_fn = "dm_list_generic_push"
+    if elem_kind == LIST_ELEM_INT() {
+        new_fn = "dm_list_int64_new"
+        push_fn = "dm_list_int64_push"
+    } else if elem_kind == LIST_ELEM_FLOAT() {
+        new_fn = "dm_list_double_new"
+        push_fn = "dm_list_double_push"
+    } else if elem_kind == LIST_ELEM_STRING() {
+        new_fn = "dm_list_string_new"
+        push_fn = "dm_list_string_push"
+    }
+
+    -- Generate the elements first: one may make a list of its own. A
+    -- number becomes the elements' type.
     let mut elem_ids: List[int] = []
     let mut i = 0
     while i < num_elements {
-        let elem_result = generate_expr(g, b, elements[i])
+        -- Map_new() as an element is an empty map of the elements' type
+        let mut elem_result = generate_expr(g, b, map_ctor_as(g, elements[i], canon_type(g, elem_src)))
+        elem_result = convert_list_elem(elem_result.gen, elem_result.block, elem_result.val_id, elements[i], elem_kind, elem_src, "element " + int_to_string(i + 1) + " of the list")
         g = elem_result.gen
         b = elem_result.block
         elem_ids.push(elem_result.val_id)
         i = i + 1
-    }
-
-    -- Infer element type from the first element
-    let mut elem_ir_type = infer_expr_type(g, elements[0])
-    let nested = nested_list_elem_type(g, expr)
-    if nested != "" { elem_ir_type = nested }
-    -- An Option or a Result is stored whole; the first element may be
-    -- a None, so its type is the one the checker found for the list
-    let mut whole_elem = false
-    let lit_src = checked_type(g, expr)
-    if starts_with(lit_src, "List[Option[") or starts_with(lit_src, "List[Result[") {
-        elem_ir_type = map_type_name(substr(lit_src, 5, len(lit_src) - 6))
-        whole_elem = true
-    }
-
-    -- Determine which list new/push functions to use
-    let mut new_fn = "dm_list_int64_new"
-    let mut push_fn = "dm_list_int64_push"
-    if elem_ir_type == "f64" or elem_ir_type == "float" {
-        new_fn = "dm_list_double_new"
-        push_fn = "dm_list_double_push"
-    } else if elem_ir_type == "string" {
-        new_fn = "dm_list_string_new"
-        push_fn = "dm_list_string_push"
-    } else if g.struct_defs.contains(elem_ir_type) or g.enum_defs.contains(elem_ir_type) or nested != "" or whole_elem {
-        -- Structs, enum values and lists are stored whole
-        new_fn = "dm_list_generic_new"
-        push_fn = "dm_list_generic_push"
     }
 
     -- Create list alloca and call new function (sret pattern)
@@ -6761,17 +6964,17 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     b.instructions.push(call_new)
     g.builder.next_id = g.builder.next_id + 1
 
-    -- Push each element into the list
+    -- Push each element into the list; what is no int, float or
+    -- string is stored whole
     let mut pi = 0
-    if push_fn == "dm_list_generic_push" {
-        while pi < num_elements {
-            let pushed = push_whole_value(g, b, alloca_id, elem_ids[pi], elem_ir_type)
+    while pi < num_elements {
+        if elem_kind == LIST_ELEM_OTHER() {
+            let pushed = push_whole_value(g, b, alloca_id, elem_ids[pi], map_type_name(canon_type(g, elem_src)))
             g = pushed.gen
             b = pushed.block
             pi = pi + 1
+            continue
         }
-    }
-    while pi < num_elements {
         let mut push_call = ir_inst_new(g.builder.next_id, OP_CALL())
         push_call.callee = push_fn
         let mut push_args: List[IRValue] = []
@@ -8426,11 +8629,14 @@ fn generate_string_interp(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
                 str_val_id = conv.val_id
             } else if part_type == "f64" or part_type == "f32" or part_type == "float" {
                 -- Convert float to string via float_to_string
+                let wide = emit_float_widened(g, b, part_val_id, part_type)
+                g = wide.gen
+                b = wide.block
                 let conv_id = g.builder.next_id
                 let mut conv_inst = ir_inst_new(conv_id, OP_CALL())
                 conv_inst.callee = "dm_float_to_string"
                 let mut conv_args: List[IRValue] = []
-                conv_args.push(ir_val_inst(part_val_id))
+                conv_args.push(ir_val_inst(wide.val_id))
                 conv_inst.call_args = conv_args
                 conv_inst.result_type = "string"
                 conv_inst.has_result = true
@@ -8571,7 +8777,7 @@ fn store_branch_value(gen: IRGenerator, block: IRBasicBlock, slot_id: int, slot_
             b = conv.block
             store_id = conv.val_id
         } else if is_float_type(from) and is_float_type(slot_type) {
-            let conv = emit_ir_cast(g, b, ir_val_inst(val_id), from, slot_type)
+            let conv = convert_int_value(g, b, val_id, branch_value_expr(value), from, slot_type, "the value of this branch")
             g = conv.gen
             b = conv.block
             store_id = conv.val_id

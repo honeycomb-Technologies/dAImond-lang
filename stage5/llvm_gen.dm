@@ -2604,6 +2604,9 @@ fn generate_instruction(gen: LLVMGenerator, inst: IRInst) -> LLVMGenerator {
             let mut fr = rhs
             if is_float_cmp and lhs_kind_f == 8 { fl = dm_llvm_build_si_to_fp(b, lhs, dm_llvm_type_of(rhs), "itof") }
             if is_float_cmp and rhs_kind_f == 8 { fr = dm_llvm_build_si_to_fp(b, rhs, dm_llvm_type_of(lhs), "itof") }
+            -- An f32 beside a double: the test of an f32 divisor against 0.0
+            if lhs_kind_f == 2 and rhs_kind_f == 3 { fl = dm_llvm_build_fp_cast(b, lhs, dm_llvm_type_of(rhs), "fwide") }
+            if lhs_kind_f == 3 and rhs_kind_f == 2 { fr = dm_llvm_build_fp_cast(b, rhs, dm_llvm_type_of(lhs), "fwide") }
             let mut result = 0
             if is_float_cmp {
                 result = dm_llvm_build_fcmp(b, dm_llvm_real_oeq(), fl, fr, "feq")

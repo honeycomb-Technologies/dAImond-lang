@@ -1,25 +1,197 @@
 module collections
 
 -- Standard Collections Module
--- Provides collection types built on top of List[T] and Map[K,V].
+-- Set[T], Queue[T] and Stack[T], generic structs over Map[K, V] and
+-- List[T]:
 --
--- NOTE: Due to the current type system, the following collections are
--- type-specialized rather than generic:
---   - Set: backed by Map[string, bool] (string keys only)
---   - Queue: backed by List[int] (int elements only)
---   - Stack: backed by List[int] (int elements only)
--- For other types, use List[T] and Map[K,V] directly.
+--   import std.collections
+--
+--   let mut seen: Set[string] = Set.new()
+--   seen.add("a")
+--   if seen.contains("a") { ... }
+--
+--   let mut jobs = Queue[int].new()
+--   jobs.push(1)
+--   match jobs.pop() { Some(job) => ..., None => ... }
+--
+--   let mut undo = Stack.of("first")
+--   undo.push("second")
+--
+-- A copy of one shares its storage with the original, as a copy of a
+-- list or a map does. Below them are functions over plain lists and
+-- maps, from before the language had generic structs.
 
 -- ============================================================================
--- Set[T] - Unique element collection (backed by Map[T, bool])
+-- Set[T]: values without repeats, in the order they were first added.
+-- T is a string or an integer type, as a Map's keys are.
 -- ============================================================================
--- Usage:
---   let mut s: Map[string, bool] = Map_new()
---   s = set_add(s, "hello")
---   s = set_add(s, "world")
---   set_has(s, "hello")    -- true
---   set_size(s)            -- 2
---   s = set_remove(s, "hello")
+
+struct Set[T] {
+    items: Map[T, bool]
+}
+
+impl Set[T] {
+    fn new() -> Set[T] {
+        return Set { items: Map_new() }
+    }
+
+    -- The set of a list's values
+    fn from(values: List[T]) -> Set[T] {
+        let mut s: Set[T] = Set.new()
+        for v in values { s.add(v) }
+        return s
+    }
+
+    fn add(mut self, item: T) {
+        self.items.insert(item, true)
+    }
+
+    fn contains(self, item: T) -> bool {
+        return self.items.contains(item)
+    }
+
+    -- Take the item out; whether it was in the set
+    fn remove(mut self, item: T) -> bool {
+        if self.items.contains(item) == false { return false }
+        self.items.remove(item)
+        return true
+    }
+
+    fn len(self) -> int {
+        return self.items.len()
+    }
+
+    fn is_empty(self) -> bool {
+        return self.items.len() == 0
+    }
+
+    -- The items, in the order they were added
+    fn to_list(self) -> List[T] {
+        return self.items.keys()
+    }
+
+    -- The items of this set and of the other
+    fn union(self, other: Set[T]) -> Set[T] {
+        let mut out: Set[T] = Set.new()
+        for a in self.items.keys() { out.add(a) }
+        for b in other.items.keys() { out.add(b) }
+        return out
+    }
+
+    -- The items that are in both sets
+    fn intersection(self, other: Set[T]) -> Set[T] {
+        let mut out: Set[T] = Set.new()
+        for a in self.items.keys() {
+            if other.contains(a) { out.add(a) }
+        }
+        return out
+    }
+}
+
+-- ============================================================================
+-- Queue[T]: first in, first out
+-- ============================================================================
+
+struct Queue[T] {
+    items: List[T],
+    -- The index of the front item; the items before it have left
+    head: int
+}
+
+impl Queue[T] {
+    fn new() -> Queue[T] {
+        return Queue { items: [], head: 0 }
+    }
+
+    -- Add an item at the back
+    fn push(mut self, item: T) {
+        self.items.push(item)
+    }
+
+    -- Take the front item; None when the queue is empty
+    fn pop(mut self) -> Option[T] {
+        if self.head >= self.items.len() { return None }
+        let item = self.items[self.head]
+        self.head = self.head + 1
+        -- Drop the items that have left once they are half of the list
+        if self.head * 2 >= self.items.len() and self.head >= 16 {
+            let mut rest: List[T] = []
+            let mut i = self.head
+            while i < self.items.len() {
+                rest.push(self.items[i])
+                i = i + 1
+            }
+            self.items = rest
+            self.head = 0
+        }
+        return Some(item)
+    }
+
+    -- The front item without taking it
+    fn peek(self) -> Option[T] {
+        if self.head >= self.items.len() { return None }
+        return Some(self.items[self.head])
+    }
+
+    fn len(self) -> int {
+        return self.items.len() - self.head
+    }
+
+    fn is_empty(self) -> bool {
+        return self.head >= self.items.len()
+    }
+}
+
+-- ============================================================================
+-- Stack[T]: last in, first out
+-- ============================================================================
+
+struct Stack[T] {
+    items: List[T]
+}
+
+impl Stack[T] {
+    fn new() -> Stack[T] {
+        return Stack { items: [] }
+    }
+
+    -- A stack that holds the one item
+    fn of(item: T) -> Stack[T] {
+        let mut s: Stack[T] = Stack.new()
+        s.push(item)
+        return s
+    }
+
+    fn push(mut self, item: T) {
+        self.items.push(item)
+    }
+
+    -- Take the top item; None when the stack is empty
+    fn pop(mut self) -> Option[T] {
+        if self.items.len() == 0 { return None }
+        return Some(self.items.pop())
+    }
+
+    -- The top item without taking it
+    fn peek(self) -> Option[T] {
+        if self.items.len() == 0 { return None }
+        return Some(self.items[self.items.len() - 1])
+    }
+
+    fn len(self) -> int {
+        return self.items.len()
+    }
+
+    fn is_empty(self) -> bool {
+        return self.items.len() == 0
+    }
+}
+
+-- ============================================================================
+-- Functions over plain lists and maps
+-- ============================================================================
+
+-- A set of strings as a Map[string, bool]
 
 -- Add an element to a set (Map[T, bool])
 fn set_add_str(mut s: Map[string, bool], item: string) -> Map[string, bool] {
@@ -48,15 +220,7 @@ fn set_items_str(s: Map[string, bool]) -> List[string] {
     return s.keys()
 }
 
--- ============================================================================
--- Queue[T] - FIFO queue (backed by List[T] with front index)
--- ============================================================================
--- Usage:
---   let mut q: List[string] = []
---   q.push("first")
---   q.push("second")
---   let front = q[0]       -- peek front
---   queue_size(q)           -- 2
+-- A queue of ints as a List[int]
 
 -- Get the size of a queue
 fn queue_size_int(q: List[int]) -> int {
@@ -68,15 +232,7 @@ fn queue_empty_int(q: List[int]) -> bool {
     return q.len() == 0
 }
 
--- ============================================================================
--- Stack[T] - LIFO stack (List[T] with push/pop)
--- ============================================================================
--- Usage:
---   let mut stack: List[int] = []
---   stack.push(1)
---   stack.push(2)
---   let top = stack[stack.len() - 1]   -- peek top
---   stack.pop()                         -- pop
+-- A stack of ints as a List[int]
 
 -- Peek at the top of a stack without removing it
 fn stack_peek_int(stack: List[int]) -> int {

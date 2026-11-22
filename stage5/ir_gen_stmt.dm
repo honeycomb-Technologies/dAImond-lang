@@ -298,6 +298,15 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
 
+    -- `let xs = [a, b]` is `let xs: List[T] = [a, b]`, with T the type
+    -- of the literal's elements (array_literal_elem_type)
+    if len(type_str) == 0 {
+        let literal = *stmt.let_value
+        if literal.kind == EXPR_ARRAY_LITERAL() and literal.elements.len() > 0 {
+            type_str = "List[" + array_literal_elem_type(g, literal) + "]"
+        }
+    }
+
     -- Generic struct instances and type parameters in the annotation
     if len(type_str) > 0 {
         g = ensure_type_instances(g, type_str, stmt.line)
@@ -372,7 +381,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
             else { "dm_list_generic_push" }
             let mut ei = 0
             while ei < init_expr.elements.len() {
-                let mut elem_result = generate_expr(g, b, init_expr.elements[ei])
+                let mut elem_result = generate_expr(g, b, map_ctor_as(g, init_expr.elements[ei], canon_type(g, inner)))
                 -- An integer becomes the elements' integer type
                 elem_result = convert_list_elem(elem_result.gen, elem_result.block, elem_result.val_id, init_expr.elements[ei], elem_kind, inner, "element " + int_to_string(ei + 1) + " of '" + var_name + "'")
                 g = elem_result.gen
@@ -466,32 +475,6 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         }
     }
 
-    -- Early handling: array literal [elem1, elem2, ...] without type annotation
-    -- Treat as List[T] where T is inferred from the first element
-    if infer_val.kind == EXPR_ARRAY_LITERAL() and infer_val.elements.len() > 0 {
-        let arr_elem_type = infer_expr_type(g, infer_val.elements[0])
-        let arr_elem_kind = if arr_elem_type == "i64" or arr_elem_type == "int" { LIST_ELEM_INT() }
-            else if arr_elem_type == "f64" or arr_elem_type == "float" { LIST_ELEM_FLOAT() }
-            else if arr_elem_type == "string" { LIST_ELEM_STRING() }
-            else { LIST_ELEM_OTHER() }
-        let result = generate_expr(g, b, infer_val)
-        g = result.gen
-        b = result.block
-        g.list_elem_kinds.insert(var_name, arr_elem_kind)
-        if arr_elem_kind == LIST_ELEM_OTHER() and (g.struct_defs.contains(arr_elem_type) or g.enum_defs.contains(arr_elem_type)) {
-            g.list_elem_types.insert(var_name, arr_elem_type)
-        }
-        -- A list of lists
-        let arr_nested = nested_list_elem_type(g, infer_val)
-        if arr_nested != "" {
-            g.list_elem_kinds.insert(var_name, LIST_ELEM_OTHER())
-            g.list_elem_types.insert(var_name, arr_nested)
-        }
-        g.variable_map.insert(var_name, result.val_id)
-        g.variable_types.insert(var_name, "list")
-        return gen_result(g, b)
-    }
-
     let mut ir_type = "i64"
     if len(type_str) > 0 {
         ir_type = map_type_name(type_str)
@@ -536,8 +519,9 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         -- This handles cases like `let x: i32 = 42` where the literal is i64
         let expr_type = infer_expr_type(g, val_expr)
         let mut store_val_id = result.val_id
-        if expr_type != ir_type and is_integer_type(ir_type) and is_integer_type(expr_type) {
-            -- A wider integer needs `as`, as it does in an assignment
+        if expr_type != ir_type and ((is_integer_type(ir_type) and is_integer_type(expr_type)) or (is_float_type(ir_type) and is_float_type(expr_type))) {
+            -- A wider integer needs `as`, as it does in an assignment,
+            -- and so does a float for an f32
             let conv = convert_int_value(g, b, result.val_id, val_expr, expr_type, ir_type, "the value of '" + var_name + "'")
             g = conv.gen
             b = conv.block
@@ -564,7 +548,7 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
 
         -- Track struct type
         if val_expr.kind == EXPR_STRUCT_LITERAL() {
-            g.var_struct_types.insert(var_name, canon_type(g, val_expr.type_name))
+            g.var_struct_types.insert(var_name, canon_type(g, struct_literal_type(g, val_expr)))
         }
         -- Track struct type from index access on a list of structs
         if val_expr.kind == EXPR_INDEX_ACCESS() {
@@ -960,11 +944,11 @@ fn generate_for_loop(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> GenRe
     g.variable_types.insert(var_name, elem_type)
     let loop_list_src = static_type(g, iter_expr)
     if starts_with(loop_list_src, "List[") {
-        let loop_elem_src = extract_inner_type(loop_list_src, "List[")
-        g.var_src_types.insert(var_name, loop_elem_src)
-        if g.struct_defs.contains(loop_elem_src) {
-            g.var_struct_types.insert(var_name, loop_elem_src)
-        }
+        -- The variable has the element's type with all that follows
+        -- from it, as a `let` of that type has: `for row in rows` over
+        -- a List[List[i16]] gives a row whose elements are i16
+        g = track_bound_variable(g, var_name, extract_inner_type(loop_list_src, "List["))
+        g.variable_types.insert(var_name, elem_type)
     } else if g.var_src_types.contains(var_name) {
         -- Not the type of an earlier variable of this name
         g.var_src_types.remove(var_name)
@@ -1512,6 +1496,10 @@ fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRVal
     let whole = expr_binary(binop, target, value_expr, value_expr.line, value_expr.col)
     let val_type = infer_expr_type(g, value_expr)
 
+    -- Nor does a float fit an f32
+    if ty == "f32" and val_type == "f64" and is_float_literal_expr(branch_value_expr(value_expr)) == false {
+        g = ir_type_error(g, "the value has type float, which does not fit in f32; convert it with `as f32`", value_expr.line)
+    }
     -- A wider integer does not fit the place
     if is_integer_type(ty) and is_integer_type(val_type) and is_int_literal_expr(branch_value_expr(value_expr)) == false and type_bit_width(val_type) > type_bit_width(ty) {
         g = ir_type_error(g, "the value has type " + builtin_src_type(val_type) + ", which does not fit in " + ty + "; convert it with `as " + ty + "`", value_expr.line)
@@ -1535,6 +1523,11 @@ fn generate_compound_value(gen: IRGenerator, block: IRBasicBlock, ptr_val: IRVal
     let met = common_int_type(whole, ty, val_type)
     if met != "" and met != ty {
         return emit_ir_cast(combined.gen, combined.block, ir_val_inst(combined.val_id), met, ty)
+    }
+    -- And an f32 that a float was added to
+    let met_float = common_float_type(whole, ty, val_type)
+    if met_float != "" and met_float != ty {
+        return emit_ir_cast(combined.gen, combined.block, ir_val_inst(combined.val_id), met_float, ty)
     }
     return combined
 }

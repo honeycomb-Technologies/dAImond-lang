@@ -639,10 +639,54 @@ fn type_bit_width(name: string) -> int {
 -- this and code generation converts the values by it.
 fn int_meet_type(a: string, a_literal: bool, b: string, b_literal: bool) -> string {
     if a == b { return a }
+    if is_float_name(a) and is_float_name(b) { return float_meet_type(a, a_literal, b, b_literal) }
     if b_literal and a_literal == false { return a }
     if a_literal and b_literal == false { return b }
     if type_bit_width(b) > type_bit_width(a) { return b }
     return a
+}
+
+-- The type two floats of different types meet at, in a binary
+-- operator: a literal takes the other operand's type, as in `x / 2.0`
+-- with x: f32; otherwise the f32 widens. For the names of the IR
+-- ("f64") and of the checker ("float").
+fn float_meet_type(a: string, a_literal: bool, b: string, b_literal: bool) -> string {
+    if a == b { return a }
+    if b_literal and a_literal == false { return a }
+    if a_literal and b_literal == false { return b }
+    if a == "f32" { return b }
+    return a
+}
+
+-- A float type by its name in the IR or in the checker
+fn is_float_name(t: string) -> bool {
+    return t == "f32" or t == "f64" or t == "float"
+}
+
+-- Whether the two types are both integers or both floats, by their
+-- names in the IR or in the checker: numbers that meet at one type
+-- (int_meet_type)
+fn numbers_meet(a: string, b: string) -> bool {
+    if is_float_name(a) { return is_float_name(b) }
+    if is_float_name(b) { return false }
+    return (a == "int" or is_integer_type(a)) and (b == "int" or is_integer_type(b))
+}
+
+-- An integer or a float constant (is_int_literal_expr, is_float_literal_expr)
+fn is_number_literal_expr(e: Expr) -> bool {
+    return is_int_literal_expr(e) or is_float_literal_expr(e)
+}
+
+-- Whether the expression is a float constant: a literal, one negated
+-- or in parentheses, or the sum, difference, product or quotient of two
+fn is_float_literal_expr(e: Expr) -> bool {
+    if e.kind == EXPR_LITERAL_FLOAT() { return true }
+    if e.kind == EXPR_GROUPED() { return is_float_literal_expr(*e.operand) }
+    if e.kind == EXPR_UNARY() and e.op == UNOP_NEG() { return is_float_literal_expr(*e.operand) }
+    if e.kind == EXPR_BINARY() and (e.op == BINOP_ADD() or e.op == BINOP_SUB() or e.op == BINOP_MUL() or e.op == BINOP_DIV()) {
+        return is_float_literal_expr(*e.left) and is_float_literal_expr(*e.right)
+    }
+    return false
 }
 
 fn is_simd_type(name: string) -> bool {
@@ -1364,6 +1408,9 @@ fn generate_module(gen: IRGenerator, parsed: SourceFile) -> IRGenerator {
 
     -- Phase 3: Declare runtime builtin functions
     g = declare_runtime_functions(g)
+
+    -- The generic instances among the types of the program's expressions
+    g = ensure_checked_instances(g, 0, g.checked_types.len())
 
     -- Phase 4: Generate IR for all declarations
     i = 0

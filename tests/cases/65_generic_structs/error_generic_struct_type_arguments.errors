@@ -1,0 +1,7 @@
+'Pair' takes 2 type arguments, got 1 in 'Pair[int]' at line 10
+type mismatch in the value of 'r': expected Pair[int, string], found Pair[int, int] at line 11
+type mismatch in the value of 't': expected Pair[string, string], found Pair[int, string] at line 12
+type mismatch in argument 1 of 'Pair.new': expected int, found string at line 13
+type mismatch in value 1 of 'Opt.Has': expected int, found string at line 14
+'Opt' takes 1 type arguments, got 2 in 'Opt[int, int]' at line 15
+'Rows' is not a type: 'Rows[Idx].len(...)' calls a function of the type Rows[Idx]; write (Rows[Idx]).len(...) to call a method of an element at line 18

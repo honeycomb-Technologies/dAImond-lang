@@ -451,19 +451,6 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             pp = idx.p
             pp = p_expect(pp, TK_RBRACKET())
             left = expr_index_access(left, idx.expr, line, col)
-        } else if kind == TK_AS() {
-            -- Cast: expr as Type
-            let line = p_cur(pp).line
-            let col = p_cur(pp).col
-            pp = p_advance(pp)
-            let cast_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
-            let ty_result = parse_type(pp)
-            pp = ty_result.p
-            let mut e = expr_new(EXPR_CAST(), line, col)
-            e.operand = Box_new(left)
-            e.cast_type = ty_result.type_name
-            e.cast_is_ref = cast_ref
-            left = e
         } else {
             cont = false
         }
@@ -485,8 +472,19 @@ fn parse_expr_pratt(p: Parser, min_prec: int) -> ParseExprResult {
             let op_tok = p_cur(pp)
             let op_kind = p_peek(pp)
 
+            if op_kind == TK_AS() {
+                -- Cast: expr as Type
+                pp = p_advance(pp)
+                let cast_ref = p_peek(p_skip_newlines(pp)) == TK_AMP()
+                let ty_result = parse_type(pp)
+                pp = ty_result.p
+                let mut e = expr_new(EXPR_CAST(), op_tok.line, op_tok.col)
+                e.operand = Box_new(left)
+                e.cast_type = ty_result.type_name
+                e.cast_is_ref = cast_ref
+                left = e
             -- Range operator (.. and ..=)
-            if op_kind == TK_DOTDOT() or op_kind == TK_DOTDOTEQ() {
+            } else if op_kind == TK_DOTDOT() or op_kind == TK_DOTDOTEQ() {
                 let range_op = if op_kind == TK_DOTDOTEQ() { BINOP_LE() } else { BINOP_LT() }
                 pp = p_advance(pp)
                 let right_result = parse_expr_pratt(pp, prec + 1)
@@ -558,12 +556,16 @@ fn infix_prec(kind: int) -> int {
     if kind == TK_SHL() or kind == TK_SHR() { return 9 }
     if kind == TK_PLUS() or kind == TK_MINUS() { return 10 }
     if kind == TK_STAR() or kind == TK_SLASH() or kind == TK_PERCENT() { return 11 }
+    -- `x as T` binds tighter than any binary operator and looser than
+    -- a prefix operator: `a * i as float` casts i, `-x as u8` casts -x
+    -- and `*b as float` casts what is in the box
+    if kind == TK_AS() { return 12 }
     return -1
 }
 
 -- What a unary operator's operand binds with: tighter than any binary
 -- operator
-fn PREFIX_PREC() -> int { return 12 }
+fn PREFIX_PREC() -> int { return 13 }
 
 -- Whether the token the parser is at is the first of its line
 fn p_starts_line(p: Parser) -> bool {
@@ -767,6 +769,66 @@ fn parse_prefix_at(p: Parser) -> ParseExprResult {
 -- PARSE IDENTIFIER / CALL / STRUCT LITERAL / ENUM VARIANT
 -- ============================================================
 
+-- Whether the name is written as a type's is: a capital first, and a
+-- small letter after it unless it is one letter long. `Stack` and `T`
+-- are; `xs`, `TABLE` and `MAX_SIZE` are not.
+fn p_type_like_name(name: string) -> bool {
+    let n = len(name)
+    if n == 0 { return false }
+    let first = byte_at(name, 0)
+    if first < 65 or first > 90 { return false }
+    if n == 1 { return true }
+    let mut i = 1
+    while i < n {
+        let b = byte_at(name, i)
+        if b >= 97 and b <= 122 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+-- Whether the text of a type, as parse_type gives it, is written as a
+-- type is and not as an index: it begins with the name of a builtin
+-- type, or with a name written as a type's (p_type_like_name), or it
+-- is a function's or an array's type. `int`, `List[T]` and `Shape`
+-- are; `i`, `count` and `MAX` are not.
+fn p_type_like(t: string) -> bool {
+    if starts_with(t, "fn(") or starts_with(t, "[") { return true }
+    let n = len(t)
+    let mut end = 0
+    while end < n and byte_at(t, end) != 91 {
+        end = end + 1
+    }
+    let word = substr(t, 0, end)
+    if word == "int" or word == "float" or word == "bool" or word == "string" or word == "void" { return true }
+    if word == "i8" or word == "i16" or word == "i32" or word == "i64" { return true }
+    if word == "u8" or word == "u16" or word == "u32" or word == "u64" { return true }
+    if word == "f32" or word == "f64" { return true }
+    if word == "f32x4" or word == "f32x8" or word == "f64x2" or word == "f64x4" { return true }
+    if word == "i32x4" or word == "i32x8" or word == "i64x2" or word == "i64x4" { return true }
+    return p_type_like_name(word)
+}
+
+fn p_types_like(types: List[string]) -> bool {
+    let mut i = 0
+    while i < types.len() {
+        if p_type_like(types[i]) == false { return false }
+        i = i + 1
+    }
+    return true
+}
+
+-- Whether the parser is at `.name(` or at `.Name`: the call of a
+-- function, or a variant of an enum
+fn p_call_follows_dot(p: Parser) -> bool {
+    if p_peek(p) != TK_DOT() { return false }
+    let at_name = p_advance(p)
+    if p_peek(at_name) != TK_IDENT() { return false }
+    let first = byte_at(p_cur(at_name).value, 0)
+    if first >= 65 and first <= 90 { return true }
+    return p_peek(p_advance(at_name)) == TK_LPAREN()
+}
+
 fn parse_ident_expr(p: Parser) -> ParseExprResult {
     let mut pp = p
     let tok = p_cur(pp)
@@ -801,6 +863,14 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             let after_args = p_peek(p_skip_newlines(pp))
             let mut is_generic = after_args == TK_LPAREN()
             if after_args == TK_LBRACE() and len(name) > 0 and char_at(name, 0) >= "A" and char_at(name, 0) <= "Z" {
+                is_generic = true
+            }
+            -- `Stack[int].new()` calls a function of the type Stack[int],
+            -- and `Opt[int].Empty` is a variant of Opt[int], where
+            -- `Grid[i].len()` is a method call on an element: the name
+            -- and what is in the brackets are a type's when they are
+            -- written as one (p_type_like_name, p_type_like)
+            if p_peek(pp) == TK_DOT() and p_type_like_name(name) and p_types_like(generics) and p_call_follows_dot(pp) {
                 is_generic = true
             }
             if not is_generic {
@@ -927,6 +997,7 @@ fn parse_ident_expr(p: Parser) -> ParseExprResult {
             e.enum_name = name
             e.variant_name = variant_tok.value
             e.payload = payload_args
+            e.generic_args = generics
             return ParseExprResult { p: pp, expr: e }
         } else {
             -- Not an enum variant, restore
