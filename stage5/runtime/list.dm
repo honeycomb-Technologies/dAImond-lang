@@ -20,44 +20,90 @@ module list
 -- writes the element itself. The get functions here serve for-in,
 -- which reads each element with a checked call.
 --
--- A list that outgrows its allocation moves to a new one and leaves
--- the old one as it is. A copy of a list is a copy of its header, so
--- the copy goes on reading the allocation it was made with.
+-- The word before the elements, which data does not point at, is the
+-- allocation's count: the number of elements the allocation
+-- holds, counted over every list that uses it. A copy of a list is a
+-- copy of its header, so the copy and the original use one allocation
+-- and see each other's `xs[i] = v`. A push writes into the allocation
+-- only when the list is as long as that count, which says that no
+-- other list has an element where the new one goes. Otherwise the
+-- list moves to an allocation of its own first, as a list that has
+-- outgrown its allocation does, and leaves the old one as it is.
 -- ============================================================
 
--- Make room for one more element of elem_size bytes
-fn rt_list_grow(list: int, elem_size: int) {
-    unsafe {
-        let count = load_i64(list + 8)
-        let capacity = load_i64(list + 16)
-        if count < capacity {
-            return
-        }
-        let mut new_capacity = 8
-        if capacity > 0 {
-            new_capacity = capacity * 2
-        }
-        let new_data = libc_malloc(new_capacity * elem_size)
-        if new_data == 0 {
-            panic("list push: out of memory")
-        }
-        let data = load_i64(list)
-        if count > 0 {
-            libc_memcpy(new_data, data, count * elem_size)
-        }
-        store_i64(list, new_data)
-        store_i64(list + 16, new_capacity)
+extern fn libc_aligned_alloc(alignment: int, size: int) -> int = "aligned_alloc"
+
+-- The bytes of an allocation that come before its elements, of
+-- elem_size bytes each. The last 8 of them are the count. malloc gives
+-- memory at a multiple of 16; a type that must lie at a multiple of 16
+-- or 32 has a size that is one, so the elements of such a size begin
+-- at a multiple of it.
+fn rt_list_lead(elem_size: int) -> int {
+    if elem_size % 32 == 0 {
+        return 32
     }
+    if elem_size % 16 == 0 {
+        return 16
+    }
+    return 8
 }
 
 -- The address of a new last element of elem_size bytes, which the
 -- caller fills
 fn rt_list_append(list: int, elem_size: int) -> int {
-    rt_list_grow(list, elem_size)
     unsafe {
+        let data = load_i64(list)
         let count = load_i64(list + 8)
+        let capacity = load_i64(list + 16)
+        if count < capacity {
+            if load_i64(data - 8) == count {
+                store_i64(data - 8, count + 1)
+                store_i64(list + 8, count + 1)
+                return data + count * elem_size
+            }
+        }
+        -- Full, or another list has an element in the next place
+        let mut new_capacity = capacity
+        if count >= capacity {
+            new_capacity = 8
+            if capacity > 0 {
+                new_capacity = capacity * 2
+            }
+        }
+        -- The elements begin where the strictest of them may: a SIMD
+        -- vector of 16 or 32 bytes lies at a multiple of its size
+        let lead = rt_list_lead(elem_size)
+        let mut block = 0
+        if lead == 32 {
+            block = libc_aligned_alloc(32, 32 + new_capacity * elem_size)
+        } else {
+            block = libc_malloc(lead + new_capacity * elem_size)
+        }
+        if block == 0 {
+            panic("list push: out of memory")
+        }
+        let new_data = block + lead
+        if count > 0 {
+            libc_memcpy(new_data, data, count * elem_size)
+        }
+        store_i64(new_data - 8, count + 1)
+        store_i64(list, new_data)
         store_i64(list + 8, count + 1)
-        return load_i64(list) + count * elem_size
+        store_i64(list + 16, new_capacity)
+        return new_data + count * elem_size
+    }
+}
+
+-- Whether the list's allocation holds another number of elements than
+-- the list has: a copy of the list has pushed or popped since the two
+-- were the same
+fn rt_list_apart(list: int) -> bool {
+    unsafe {
+        let data = load_i64(list)
+        if data == 0 {
+            return false
+        }
+        return load_i64(data - 8) != load_i64(list + 8)
     }
 }
 
@@ -74,16 +120,22 @@ fn rt_list_slot(list: int, index: int, elem_size: int) -> int {
 }
 
 -- Remove the last element, of elem_size bytes, and give its address.
--- The bytes stay where they are until the next push. Panics on an
--- empty list.
+-- The bytes stay where they are until the next push. The allocation
+-- holds one element fewer when this list was as long as any that uses
+-- it, so that a push after a pop writes in place. Panics on an empty
+-- list.
 fn rt_list_remove_last(list: int, elem_size: int) -> int {
     unsafe {
         let count = load_i64(list + 8)
         if count <= 0 {
             panic("list pop: empty list")
         }
+        let data = load_i64(list)
+        if load_i64(data - 8) == count {
+            store_i64(data - 8, count - 1)
+        }
         store_i64(list + 8, count - 1)
-        return load_i64(list) + (count - 1) * elem_size
+        return data + (count - 1) * elem_size
     }
 }
 

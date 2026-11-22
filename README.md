@@ -41,7 +41,7 @@ build/daimond lsp/main.dm -o build/daimond-lsp
 
 ```bash
 build/daimond tests/harness.dm -o build/harness
-build/harness build/daimond              # every case in tests/cases (572 cases, about a minute)
+build/harness build/daimond              # every case in tests/cases (576 cases, about a minute)
 build/harness build/daimond tests/cases 17_lists/
 ```
 
@@ -341,7 +341,7 @@ What a build depends on: the dAImond source in this repository, LLVM (`llc`, `ld
 
 ## Status
 
-The compiler passes its suite of 572 cases, builds itself to a fixed point, and builds the examples in `examples/`.
+The compiler passes its suite of 576 cases, builds itself to a fixed point, and builds the examples in `examples/`.
 
 ### What works (each has cases in `tests/cases/`)
 
@@ -369,6 +369,7 @@ The compiler passes its suite of 572 cases, builds itself to a fixed point, and 
 - A lambda has copies of the variables it uses: it cannot change the originals, and does not see later changes to them.
 - `async fn` and `await` are synchronous: `await f()` runs `f` to its end.
 - Strings are never freed, and neither is what a region allocates.
+- A copy of a list shares the elements both lists have: `xs[i] = v` through one is seen through the other. A push never changes another list. A copy of a map has the same rule for the keys both have. [docs/memory-design.md](docs/memory-design.md) has the rules and the design that replaces them.
 - Only x86-64 Linux with glibc is supported.
 - An expression nested several hundred levels deep overflows the compiler's stack.
 - Debug info has one scope per function, and does not describe `match` bindings or captured variables.

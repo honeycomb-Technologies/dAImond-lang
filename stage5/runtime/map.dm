@@ -15,9 +15,13 @@ module map
 -- drops it.
 --
 -- Copying a map copies its list headers, so a copy shares the
--- slot table with the original until either one rebuilds. A slot
--- that names an entry past this map's own entries was written by
--- another copy; lookups skip it and inserts may take it.
+-- entries and the slot table with the original. A slot that names
+-- an entry past this map's own entries was written by a copy that
+-- has added a key; lookups skip it. A map whose copy has added a
+-- key rebuilds before it changes anything (see moved_apart), and
+-- from then on the two share nothing. Until one of them adds a key,
+-- an insert for a key they both have and a remove change the entry
+-- for both.
 -- ============================================================
 
 struct Map[K, V] {
@@ -30,6 +34,9 @@ struct Map[K, V] {
 
 impl Map[K, V] {
     fn insert(mut self, k: K, v: V) {
+        if self.moved_apart() {
+            self.rebuild()
+        }
         let h = hash_key(k)
         let s = self.find_slot(k, h)
         if s >= 0 {
@@ -71,6 +78,9 @@ impl Map[K, V] {
     }
 
     fn remove(mut self, k: K) {
+        if self.moved_apart() {
+            self.rebuild()
+        }
         let s = self.find_slot(k, hash_key(k))
         if s < 0 {
             return
@@ -108,6 +118,15 @@ impl Map[K, V] {
         return out
     }
 
+    -- Whether a copy of this map has added a key since the two were
+    -- the same: the entries' allocation then holds entries that are
+    -- not this map's, and the slot table names them
+    fn moved_apart(self) -> bool {
+        unsafe {
+            return rt_list_apart(addr_of(self.entry_keys))
+        }
+    }
+
     -- Slot holding k, whose hash is h, or -1
     fn find_slot(self, k: K, h: int) -> int {
         let cap = self.slots.len()
@@ -131,12 +150,9 @@ impl Map[K, V] {
         return -1
     }
 
-    -- Drop removed entries and size the table for twice the live ones
+    -- Drop removed entries, size the table for twice the live ones,
+    -- and move to lists that no other map uses
     fn rebuild(mut self) {
-        let mut cap = 8
-        while cap < (self.count + 1) * 2 {
-            cap = cap * 2
-        }
         let mut new_keys: List[K] = []
         let mut new_vals: List[V] = []
         let mut new_hashes: List[int] = []
@@ -148,6 +164,13 @@ impl Map[K, V] {
                 new_hashes.push(self.entry_hashes[e])
             }
             e = e + 1
+        }
+        -- Counted again: a copy of this map may have removed entries
+        -- the two had in common
+        self.count = new_keys.len()
+        let mut cap = 8
+        while cap < (self.count + 1) * 2 {
+            cap = cap * 2
         }
         let mut new_slots: List[int] = []
         while new_slots.len() < cap {

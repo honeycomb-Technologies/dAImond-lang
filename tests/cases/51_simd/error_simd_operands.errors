@@ -1,0 +1,2 @@
+Error: the arguments of a SIMD operation must be SIMD vectors, such as f32x4 at line 4
+Error: the first argument of simd_extract must be a SIMD vector, such as f32x4 at line 5

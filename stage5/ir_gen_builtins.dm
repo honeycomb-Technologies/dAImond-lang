@@ -218,9 +218,12 @@ fn generate_simd_binary(gen: IRGenerator, block: IRBasicBlock, op: int, args: Li
     g = rhs_result.gen
     b = rhs_result.block
 
-    -- Infer the vector type from the first argument
-    -- If the first arg is an identifier with a known SIMD variable type, use it
-    let vec_type = infer_simd_arg_type(g, args[0])
+    -- The vector type is the first argument's
+    let mut vec_type = infer_simd_arg_type(g, args[0])
+    if vec_type == "" {
+        g = ir_type_error(g, "the arguments of a SIMD operation must be SIMD vectors, such as f32x4", args[0].line)
+        vec_type = "f32x4"
+    }
 
     -- Emit the SIMD binary instruction
     let id = g.builder.next_id
@@ -259,8 +262,12 @@ fn generate_simd_extract(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
     g = idx_result.gen
     b = idx_result.block
 
-    -- Infer the vector type from the first argument
-    let vec_type = infer_simd_arg_type(g, args[0])
+    -- The vector type is the first argument's
+    let mut vec_type = infer_simd_arg_type(g, args[0])
+    if vec_type == "" {
+        g = ir_type_error(g, "the first argument of simd_extract must be a SIMD vector, such as f32x4", args[0].line)
+        vec_type = "f32x4"
+    }
     -- Use dAImond-native types (f64 for float vectors, i64 for int vectors)
     let scalar_type = if is_simd_float_type(vec_type) { "f64" } else { "i64" }
 
@@ -282,30 +289,14 @@ fn generate_simd_extract(gen: IRGenerator, block: IRBasicBlock, args: List[Expr]
 -- SIMD TYPE INFERENCE HELPERS
 -- ============================================================
 
--- Infer the SIMD vector type of an expression argument.
--- If the argument is an identifier whose type is tracked in variable_types,
--- use that. Otherwise fall back to "f32x4" as a default.
+-- The SIMD vector type of an argument: "i32x8" for a variable, a call,
+-- an element or a field of that type. "" when it is no vector.
 fn infer_simd_arg_type(gen: IRGenerator, arg: Expr) -> string {
-    if arg.kind == EXPR_IDENTIFIER() {
-        if gen.variable_types.contains(arg.name) {
-            let ty = gen.variable_types.get(arg.name)
-            if is_simd_type(ty) {
-                return ty
-            }
-        }
+    let found = infer_expr_type(gen, arg)
+    if is_simd_type(found) {
+        return found
     }
-    -- If it's a function call (e.g. simd_splat_f32x4(...)), try to extract type from name
-    if arg.kind == EXPR_FUNCTION_CALL() {
-        let callee = *arg.callee
-        if callee.kind == EXPR_IDENTIFIER() {
-            let callee_name = callee.name
-            if starts_with(callee_name, "simd_splat_") or starts_with(callee_name, "simd_set_") {
-                return parse_simd_type_from_name(callee_name)
-            }
-        }
-    }
-    -- Default to f32x4 if type cannot be inferred
-    return "f32x4"
+    return ""
 }
 
 -- ============================================================

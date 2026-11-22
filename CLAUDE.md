@@ -40,6 +40,7 @@ dAImond-lang/
 ├── tools/                 # Editor and debugger helpers (VS Code tasks, gdb pretty-printers)
 ├── docs/                  # Design documents
 │   ├── ir-spec.md         # dAImond IR specification (SSA-based, typed)
+│   ├── memory-design.md   # What copies share and what is freed today, and the design for ownership and releases
 │   └── stage-history.md   # The deleted compilers (Stage 0, 1, 3 and 4) and how this one differs from them
 ├── stage5/                # The compiler, written in dAImond
 │   ├── main.dm            # Generated: the modules as one file (~26K lines), which bootstrap.sh compiles
@@ -157,7 +158,7 @@ build/daimond run stage5/gen_bootstrap.dm -- --check    # writes nothing; exits 
 # Compile the compiler with a compiler you already have (--link-llvm adds llvm_bridge.dm and links libLLVM)
 cd stage5 && ../build/daimond main.dm -o /tmp/daimond_new --link-llvm
 
-# Run the integration suite against a compiler (572 cases, about a minute)
+# Run the integration suite against a compiler (576 cases, about a minute)
 build/daimond tests/harness.dm -o build/harness
 build/harness build/daimond                              # every case in tests/cases
 build/harness build/daimond tests/cases 17_lists/        # only the cases whose "suite/name" contains the text
@@ -165,7 +166,7 @@ build/harness build/daimond tests/cases 17_lists/        # only the cases whose 
 
 ## Testing Strategy
 
-1. **The suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. The harness starts the compiler and each program itself (`run_command_io`), with no shell. A case with `X.cmd` runs that shell command (`sh -c`, the suite's only use of a shell) instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 572 pass, 0 fail. The suite began as the cases of the Zig compiler's test runner. It also holds the 19 memory-safety probes (`74_memory_safety_probes`), and programs that were once loose files in `tests/`, with the README's examples (`86_programs`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory.
+1. **The suite** (`build/harness <compiler>`): `tests/harness.dm`, a dAImond program, compiles every case in `tests/cases/` with the compiler it is given, runs the program and compares stdout, the exit code and, where the case has an `X.stderr`, stderr. A case with `X.errors` must fail to compile with each line of that file in the compiler's output. A case that is a directory `X/` has its program in `X/main.dm`, next to the files it imports. The harness starts the compiler and each program itself (`run_command_io`), with no shell. A case with `X.cmd` runs that shell command (`sh -c`, the suite's only use of a shell) instead of compiling and running the program, and its output and exit code are compared the same way; in it `{compiler}`, `{source}` and `{work}` stand for the compiler, the case's program and an empty directory (`81_commands` tests `run`, `check`, `fmt` and `test` this way). Currently 576 pass, 0 fail. The suite began as the cases of the Zig compiler's test runner. It also holds the 19 memory-safety probes (`74_memory_safety_probes`), and programs that were once loose files in `tests/`, with the README's examples (`86_programs`). To add a case, add `X.dm` and `X.stdout` (or `X.errors`) to a suite directory.
 
 2. **dAImond test framework** (`daimond test <file.dm>`): runs each `test_*` function of the file in its own process, so a panic ends only that test. Tests use `assert(cond)` and `assert_eq(actual, expected)`.
 
@@ -203,7 +204,7 @@ build/harness build/daimond tests/cases 17_lists/        # only the cases whose 
 
 3. **No C**: the runtime is dAImond code that calls libc through `extern fn`, and the compiler calls LLVM's C API the same way. No C source is compiled when the compiler or a program is built.
 
-4. **No garbage collector**: memory is meant to be managed by regions. Today the compiler enforces that a region's values do not leave it, and the runtime frees nothing: strings and what a region allocates stay allocated until the program ends.
+4. **No garbage collector**: memory is meant to be managed by regions. Today the compiler enforces that a region's values do not leave it, and the runtime frees nothing: strings and what a region allocates stay allocated until the program ends. `docs/memory-design.md` records what copies share today and the design (ownership inference) that makes them values and releases memory.
 
 5. **One target**: x86-64 Linux with glibc. The OS constants and struct layouts in `runtime/*.dm` and the seed are for that target.
 
@@ -280,13 +281,14 @@ Environment: `DAIMOND_CACHE_DIR` (where the precompiled runtime object is kept),
 
 **Standard library** (`stdlib/`): io, math, collections, string, os, fs, net, thread, test. `import std.X` with no `std/X.dm` next to the importing file is `X.dm` in the library: the directory `$DAIMOND_STDLIB`, else `stdlib/` beside the compiler's directory, else `stdlib/` in the compiler's directory, else `stdlib/` in the current directory (`stdlib_file` in `main_split.dm`)
 
-**The compiler**: 572/572 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. `bootstrap.sh` builds it from the seed and checks that it reproduces itself; with LLVM 19 and with LLVM 23.
+**The compiler**: 576/576 cases (the 19 memory-safety probes among them), run by a harness written in dAImond. `bootstrap.sh` builds it from the seed and checks that it reproduces itself; with LLVM 19 and with LLVM 23.
 
 ### Not Yet Implemented
 - In the type checker: it reports a mismatch only when it knows both types. What depends on the type arguments of a generic function is reported for each instance the program uses (see Instances below), and so not at all for a generic function that is never called
 - IR generation takes from the checker only what it cannot find itself (see the Type checker note under Design Decisions). It still finds the types of numbers itself, except the one an `if` or a `match` gives. The functions the compiler writes itself (`eq$...` for `==`, `contains$...`) are not checked: their types come from the expressions' parts
 - Effects of a call through a function value are those of the function, checked where it is named (`each(store, x)` uses `store`), not where the value is called
 - Freeing memory: strings are never freed, and `mem_mark`/`mem_sweep` (regions) free nothing
+- Copies of lists and maps that share nothing. A copy shares the elements both lists have (`xs[i] = v` through one is seen through the other; a push never is), and a map shares its entries until the map whose copy added a key changes. `docs/memory-design.md` has the rules and the design that replaces them
 - Targets other than x86-64 Linux with glibc
 - In debug info: one scope for all of a function's variables, no bindings of `match` arms or captured variables, and no fields for `Result` and `Option`
 - A package manager (the Zig compiler had one; it was not ported)
@@ -430,7 +432,7 @@ Where TYPE is one of: `f32x4`, `f32x8`, `f64x2`, `f64x4`, `i32x4`, `i32x8`, `i64
 - `m[key]` — index access (alias for get)
 - `m[key] = val` — index assignment (alias for insert)
 
-`Map[K, V]` is the generic struct in `stage5/runtime/map.dm`. Keys must be strings or integers, `keys()`/`values()` and `for k in m` follow insertion order, and `Map_new()` needs a destination type (a typed `let`, a struct field, an assignment target or a return). Copying a map copies its list headers, so the copy shares storage with the original, as lists do. There is also the builtin `byte_at(s, i) -> int` (the byte at index `i`, bounds-checked).
+`Map[K, V]` is the generic struct in `stage5/runtime/map.dm`. Keys must be strings or integers, `keys()`/`values()` and `for k in m` follow insertion order, and `Map_new()` needs a destination type (a typed `let`, a struct field, an assignment target or a return). Copying a map copies its list headers, so the copy has the original's entries without copying them. A key added to one is not in the other, and a map whose copy has added a key is rebuilt into lists of its own before it inserts or removes (`moved_apart`); until then an insert for a key both have, and a remove, change the entry for both. There is also the builtin `byte_at(s, i) -> int` (the byte at index `i`, bounds-checked).
 
 ### Runtime Primitives
 
@@ -463,7 +465,7 @@ The runtime of every program is dAImond code in `stage5/runtime/*.dm`, which `ge
 - The IR names a runtime function `dm_X`, and the dAImond function `rt_X` is what runs: the compiler binds every call to `dm_X` to `rt_X` (see RUNTIME FUNCTIONS in `llvm_gen.dm`). `rt_X` must keep the signature `dm_X` is declared with in `ir_gen_decl.dm`, except that it takes an `int`, the address, where `dm_X` takes a pointer; a mismatch is a compile error.
 - To add a runtime function: declare `dm_X` in `ir_gen_decl.dm`, write `rt_X` in a runtime file, and run `gen_bootstrap.dm`. A new runtime file also needs a line in `gen_bootstrap.dm`. A `dm_X` with no `rt_X` fails to link.
 - The runtime's functions: `string_concat`, `string_eq`, `string_cmp`, `char_at`, `substr`, `string_contains`, `string_find`, `starts_with`, `ends_with`, `string_trim`, `string_replace`, `string_to_upper`, `string_to_lower`, `string_split`, `is_alpha`, `is_digit`, `is_whitespace`, `is_alnum`, `char_to_string` (`runtime/string.dm`); `int_to_string`, `uint_to_string` (what `print`, an f-string and `int_to_string` make of a `u64`), `float_to_string`, `bool_to_string`, `parse_int`, `parse_float` (`runtime/convert.dm`); the list operations push, pop and contains for int, float, string and other elements, and the element read `for x in xs` makes (`runtime/list.dm`); `file_read`, `file_write`, `file_append`, `file_exists`, `fs_mkdir`, `fs_readdir`, `fs_remove`, `fs_rename`, `fs_getcwd`, `env_get`, `args_len`, `args_get`, `system`, `run_command` (`runtime/os.dm`); `path_dirname`, `path_basename`, `path_extension`, `path_stem`, `path_join` (`runtime/path.dm`); `print`, `println`, `eprint`, `eprintln`, `flush`, `read_line`, `read_key`, `read_key_nb`, `term_width`, `term_height`, `panic` (`runtime/io.dm`); `time_ms`, `sleep_ms` (`runtime/os.dm`); `chr` (`runtime/convert.dm`); `mem_mark`, `mem_sweep` (`runtime/string.dm`); `tcp_listen`, `tcp_accept`, `tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close` (`runtime/net.dm`); `thread_spawn`, `thread_join`, `mutex_new`, `mutex_lock`, `mutex_unlock`, `mutex_destroy` (`runtime/thread.dm`). Floats go through libc's `snprintf("%g")` and `strtod`; integers are formatted and parsed in dAImond.
-- A list is `{ data, len, capacity }` and is passed to the runtime as the address of that header.
+- A list is `{ data, len, capacity }` and is passed to the runtime as the address of that header. The word before the elements (`data - 8`) counts the elements the allocation holds, over every list that uses it. A copy of a list is a copy of its header, so the two use one allocation: `xs[i] = v` through one is seen through the other. A push writes in place only when the list is as long as that count; otherwise it moves the list to an allocation of its own first (`rt_list_append`), so a push never changes an element of another list. A pop lowers the count when the list is as long as it, so a list used as a stack does not copy. The elements begin 8 bytes into the allocation, or 16 or 32 when their size is a multiple of that (`rt_list_lead`), so that a SIMD vector, or a struct that holds one, lies where its type must. Until 2026-11-22 a push wrote in place whenever there was room: after `let mut b = a`, `b.push(1)` and `a.push(2)`, the last element of `b` was 2.
 - Inline, with no function behind them: `len(s)`, string literals, `xs.len()`, the creation of an empty list, `xs[i]` and `xs[i] = v` (one bounds check, then a load or store at the element's address), and the overflow and range checks on signed arithmetic and narrowing casts (`dm_checked_*`, `dm_cast_check_*`), which lower to LLVM's overflow intrinsics and a branch to a panic block.
 - **Console**: output and `read_line` go through libc's `stdout`, `stderr` and `stdin` streams, reached with `symbol_addr`, so they keep their order with C code that uses the same streams. `read_line` gives a whole line however long it is.
 - **Program start**: `main` begins with a call of `dm_start` (`rt_start` in `runtime/os.dm`), which raises the limit on the stack's size to 64 MB where it is lower, or to the highest value allowed when that is below 64 MB. A C constructor did this before `main`. The stack of a running program grows up to the limit in force, so the raise takes effect at once.
@@ -579,7 +581,7 @@ llc + ld.lld turn seed/daimond.bc into            → seed compiler
 seed compiler compiles stage5/main.dm             → gen1
 gen1 compiles stage5/main.dm                      → gen2 (same file as gen1 when the seed is current ✓)
 gen2 compiles stage5/main.dm                      → gen3 (same file as gen2 ✓, when the seed is older)
-the compiler compiles tests/harness.dm            → the harness, which runs tests/cases (572/572 cases pass)
+the compiler compiles tests/harness.dm            → the harness, which runs tests/cases (576/576 cases pass)
 ```
 
 ## Important Notes
