@@ -169,7 +169,8 @@ fn ty_ident_byte(b: int) -> bool {
     if b >= 97 and b <= 122 { return true }
     if b >= 65 and b <= 90 { return true }
     if b >= 48 and b <= 57 { return true }
-    return b == 95
+    -- 36 is the $ of Dyn$Trait
+    return b == 95 or b == 36
 }
 
 -- One name for the types that have two
@@ -258,9 +259,9 @@ fn ty_kind(t: string) -> string {
 }
 
 -- The name of a type without its arguments: "Map" for
--- "Map[string, int]". "" for function, array and dyn types.
+-- "Map[string, int]". "" for function and array types.
 fn ty_head(t: string) -> string {
-    if starts_with(t, "fn(") or starts_with(t, "[") or starts_with(t, "dyn ") { return "" }
+    if starts_with(t, "fn(") or starts_with(t, "[") { return "" }
     let at = string_find(t, "[")
     if at < 0 { return t }
     return substr(t, 0, at)
@@ -269,7 +270,7 @@ fn ty_head(t: string) -> string {
 -- The arguments of a type: "string" and "int" for "Map[string, int]"
 fn ty_args(t: string) -> List[string] {
     let none: List[string] = []
-    if starts_with(t, "fn(") or starts_with(t, "[") or starts_with(t, "dyn ") { return none }
+    if starts_with(t, "fn(") or starts_with(t, "[") { return none }
     let at = string_find(t, "[")
     if at < 0 or ends_with(t, "]") == false { return none }
     return split_type_args(substr(t, at + 1, len(t) - at - 2))
@@ -350,7 +351,6 @@ fn ty_same(a: string, b: string) -> bool {
     if ty_known(a) == false or ty_known(b) == false { return true }
     if starts_with(a, "fn(") and starts_with(b, "fn(") { return ty_fn_agrees(a, b) }
     if starts_with(a, "fn(") or starts_with(b, "fn(") { return false }
-    if starts_with(a, "dyn ") or starts_with(b, "dyn ") { return true }
     if starts_with(a, "[") or starts_with(b, "[") { return true }
     if ty_head(a) != ty_head(b) { return false }
     let a_args = ty_args(a)
@@ -382,14 +382,13 @@ fn ty_fn_agrees(a: string, b: string) -> bool {
 -- Whether a value of type `got` can go where `want` is expected.
 -- Unknown types fit anything. Integers of every width fit each other
 -- (code generation checks the narrowing), and so do the float types.
--- Two function types must agree (ty_fn_agrees). Array and dyn types
--- are not compared.
+-- Two function types must agree (ty_fn_agrees). Array types are not
+-- compared.
 fn ty_fits(want: string, got: string) -> bool {
     if want == got { return true }
     if ty_known(want) == false or ty_known(got) == false { return true }
     if ty_is_int(want) and ty_is_int(got) { return true }
     if ty_is_float(want) and ty_is_float(got) { return true }
-    if starts_with(want, "dyn ") or starts_with(got, "dyn ") { return true }
     if starts_with(want, "fn(") and starts_with(got, "fn(") { return ty_fn_agrees(want, got) }
     if starts_with(want, "fn(") or starts_with(got, "fn(") { return false }
     if starts_with(want, "[") or starts_with(got, "[") { return true }
@@ -535,20 +534,87 @@ fn ck_var(c: Checker, name: string) -> int {
 }
 
 -- Whether a value of type `got` can go where `want` is expected:
--- ty_fits, and a struct or an enum that goes where a `dyn Trait` is
--- expected must implement the trait
+-- ty_fits, and a value of a type that implements the trait can go
+-- where a `dyn Trait` is expected (it is put in the dyn's variant
+-- there, see ck_settle)
 fn ck_fits(c: Checker, want: string, got: string) -> bool {
-    if starts_with(want, "dyn ") and ty_known(got) {
-        let head = ty_head(got)
-        let mut trait_name = substr(want, 4, len(want) - 4)
-        let bracket = string_find(trait_name, "[")
-        if bracket >= 0 { trait_name = substr(trait_name, 0, bracket) }
-        if head != "" and c.traits.contains(trait_name) and (c.structs.contains(head) or c.enums.contains(head)) {
-            if c.type_traits.contains(head) == false { return false }
-            return string_contains(c.type_traits.get(head), "|" + trait_name + "|")
-        }
+    if starts_with(want, DYN_PREFIX()) and ty_known(got) and got != want {
+        -- A `dyn` of no trait, or of a trait that no type implements,
+        -- is reported where it is written
+        if c.enums.contains(want) == false { return true }
+        if ty_head(got) != got { return false }
+        return ck_implements(c, got, substr(want, len(DYN_PREFIX()), len(want) - len(DYN_PREFIX())))
     }
     return ty_fits(want, got)
+}
+
+-- Whether the value of the expression `e`, of type `got`, can go
+-- where `want` is expected: ck_fits, and a value that is made there
+-- can be made of the type of its place. Some(circle) is an
+-- Option[Circle], which is no Option[dyn Shape]; but written where an
+-- Option[dyn Shape] is expected it makes one, with the circle put in
+-- the dyn (ck_settle goes the same way down the expression).
+fn ck_fits_value(c: Checker, want: string, got: string, e0: Expr) -> bool {
+    if ck_fits(c, want, got) { return true }
+    if string_contains(want, DYN_PREFIX()) == false { return false }
+    let mut e = e0
+    while e.kind == EXPR_GROUPED() {
+        e = *e.operand
+    }
+    let head = ty_head(want)
+    if ty_head(got) != head { return false }
+    let k = e.kind
+    if k == EXPR_FUNCTION_CALL() and e.args.len() == 1 {
+        let callee = *e.callee
+        if callee.kind != EXPR_IDENTIFIER() { return false }
+        if (callee.name == "Some" and head == "Option") or (callee.name == "Box_new" and head == "Box") {
+            return ck_fits_value(c, ty_arg(want, 0), ty_arg(got, 0), e.args[0])
+        }
+        if callee.name == "Ok" and head == "Result" {
+            return ck_fits(c, ty_arg(want, 1), ty_arg(got, 1)) and ck_fits_value(c, ty_arg(want, 0), ty_arg(got, 0), e.args[0])
+        }
+        if callee.name == "Err" and head == "Result" {
+            return ck_fits(c, ty_arg(want, 0), ty_arg(got, 0)) and ck_fits_value(c, ty_arg(want, 1), ty_arg(got, 1), e.args[0])
+        }
+        return false
+    }
+    if k == EXPR_ARRAY_LITERAL() and head == "List" {
+        let mut i = 0
+        while i < e.elements.len() {
+            if ck_fits_value(c, ty_arg(want, 0), ty_arg(got, 0), e.elements[i]) == false { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if k == EXPR_IF() and e.has_else {
+        return ck_fits_value(c, want, got, *e.then_branch) and ck_fits_value(c, want, got, *e.else_branch)
+    }
+    if k == EXPR_BLOCK() {
+        if e.has_result { return ck_fits_value(c, want, got, *e.result) }
+        return ck_fits_last(c, want, got, e.stmts)
+    }
+    if k == EXPR_MATCH() {
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            if arm.is_expr_body {
+                if ck_fits_value(c, want, got, *arm.body_expr) == false { return false }
+            } else if ck_fits_last(c, want, got, arm.body) == false {
+                return false
+            }
+            i = i + 1
+        }
+        return e.match_arms.len() > 0
+    }
+    return false
+}
+
+-- ck_fits_value for the value of a body: that of its last statement
+fn ck_fits_last(c: Checker, want: string, got: string, stmts: List[Stmt]) -> bool {
+    if stmts.len() == 0 { return false }
+    let last = stmts[stmts.len() - 1]
+    if stmt_gives_value(last) == false { return false }
+    return ck_fits_value(c, want, got, stmt_value_expr(last))
 }
 
 -- A type as written in the source, in the checker's form
@@ -565,7 +631,7 @@ fn ck_builtin_type_name(name: string) -> bool {
     if name == "List" or name == "Map" or name == "Box" or name == "Option" or name == "Result" { return true }
     if name == "f32x4" or name == "f32x8" or name == "f64x2" or name == "f64x4" { return true }
     if name == "i32x4" or name == "i32x8" or name == "i64x2" or name == "i64x4" { return true }
-    return name == "Self" or name == "dyn" or name == "fn" or name == "Future"
+    return name == "Self" or name == "fn" or name == "Future"
 }
 
 -- Report the first name in the type that is no type
@@ -589,8 +655,20 @@ fn ck_type_exists(c: Checker, t: string, line: int) -> Checker {
         if in_size or (b >= 48 and b <= 57) { continue }
         let word = substr(t, start, i - start)
         if ck_builtin_type_name(word) { continue }
-        if c.structs.contains(word) or c.enums.contains(word) or c.traits.contains(word) { continue }
+        if c.structs.contains(word) or c.enums.contains(word) { continue }
         if ck_index_of(c.norm_names, word) >= 0 { continue }
+        -- `dyn Trait` is the enum Dyn$Trait, which there is when a type
+        -- implements the trait (see TRAITS in main_split.dm)
+        if starts_with(word, DYN_PREFIX()) {
+            let trait_name = substr(word, len(DYN_PREFIX()), len(word) - len(DYN_PREFIX()))
+            if c.traits.contains(trait_name) {
+                return ck_error(c, "no type implements the trait '" + trait_name + "', so there is no value a '" + word + "' could hold", line)
+            }
+            return ck_error(c, "undefined trait '" + trait_name + "'", line)
+        }
+        if c.traits.contains(word) {
+            return ck_error(c, "'" + word + "' is a trait, not a type: a value of any type that implements it is a '" + DYN_PREFIX() + word + "'", line)
+        }
         return ck_error(c, "undefined type '" + word + "'", line)
     }
     return ck_type_arity(c, t, t, line)
@@ -821,11 +899,26 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
         return ck_settle_variant(c, e, variant_of, want)
     }
     let have = c.types[e.id]
+    -- A value of a type that implements the trait, where a `dyn Trait`
+    -- is expected: code generation puts it in the dyn's variant there
+    if starts_with(want, DYN_PREFIX()) {
+        if ty_known(have) and have != want and starts_with(have, DYN_PREFIX()) == false and ck_fits(c, want, have) {
+            if string_contains(c.targets[e.id], "dyn:") == false {
+                let mut marks = c.targets[e.id]
+                if marks != "" { marks = marks + ";" }
+                c.targets[e.id] = marks + "dyn:" + want + "|" + have
+            }
+        }
+        return c
+    }
     -- A type the checker does not know at all stays unknown, and so
     -- does a whole type that differs, such as an i32 that goes where an
     -- int is expected: the value is converted there. What makes a new
     -- value (ck_makes_value) makes it of the type of its place.
     if ty_known(have) and have != want and ty_fits(want, have) and (ty_whole(have) == false or ck_makes_value(e)) {
+        c = ck_note(c, e.id, want)
+    } else if ty_known(have) and have != want and ty_fits(want, have) == false and ck_fits_value(c, want, have, e) {
+        -- A value made here with a `dyn Trait` in it (ck_fits_value)
         c = ck_note(c, e.id, want)
     } else if have != want and ty_is_int(have) and ty_is_int(want) and branches_give_int_literals(e) {
         -- An `if` or a `match` of integer constants is an integer of
@@ -1023,7 +1116,15 @@ fn ck_cast(c0: Checker, e: Expr) -> Typed {
     -- `as &T`: the checker has no reference types. IR generation
     -- decides whether the cast is one that is allowed.
     if e.cast_is_ref { return ck_typed(c, "") }
-    return ck_typed(c, ck_norm(c, e.cast_type))
+    let to = ck_norm(c, e.cast_type)
+    if starts_with(to, DYN_PREFIX()) and ty_known(operand.t) {
+        -- `x as dyn Trait` puts x in the dyn's variant
+        if ck_fits(c, to, operand.t) == false {
+            return ck_typed(ck_error(c, "cannot cast " + operand.t + " to " + to + ": it does not implement the trait", e.line), to)
+        }
+        return ck_typed(ck_settle(c, *e.operand, to), to)
+    }
+    return ck_typed(c, to)
 }
 
 -- The result of `left op right` for operands of the types, with an
@@ -1432,7 +1533,7 @@ fn ck_builtin_call(c0: Checker, name: string, arg_types: List[string], args: Lis
                 c = ck_error(c, "type mismatch in argument 1 of '" + name + "': expected a string, a number or a bool, found " + got, args[i].line)
             }
         } else if params[i] != "*" {
-            if ck_fits(c, params[i], got) == false {
+            if ck_fits_value(c, params[i], got, args[i]) == false {
                 c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + name + "': expected " + params[i] + ", found " + got, args[i].line)
             } else {
                 c = ck_settle(c, args[i], params[i])
@@ -1508,7 +1609,7 @@ fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[str
     let mut i = 0
     while i < arg_types.len() and first + i < sig.params.len() {
         let want = ty_apply(sig.params[first + i], sig.generics, binds)
-        if ck_fits(c, want, arg_types[i]) == false {
+        if ck_fits_value(c, want, arg_types[i], args[i]) == false {
             c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + shown + "': expected " + want + ", found " + arg_types[i], args[i].line)
         } else {
             c = ck_settle(c, args[i], want)
@@ -1536,7 +1637,7 @@ fn ck_call_value(c0: Checker, held: string, shown: string, arg_types: List[strin
     }
     let mut i = 0
     while i < params.len() {
-        if ck_fits(c, params[i], arg_types[i]) == false {
+        if ck_fits_value(c, params[i], arg_types[i], args[i]) == false {
             c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + shown + "': expected " + params[i] + ", found " + arg_types[i], args[i].line)
         } else {
             c = ck_settle(c, args[i], params[i])
@@ -1649,7 +1750,7 @@ fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: Lis
     let mut i = 0
     while i < payloads.len() and i < types.len() {
         let want = ty_apply(payloads[i], sig.generics, ty_unbound(0))
-        if ck_fits(c, want, types[i]) == false {
+        if ck_fits_value(c, want, types[i], values[i]) == false {
             c = ck_error(c, "type mismatch in value " + int_to_string(i + 1) + " of '" + enum_name + "." + variant + "': expected " + want + ", found " + types[i], values[i].line)
         } else {
             c = ck_settle(c, values[i], want)
@@ -1824,19 +1925,6 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
     let arg_types = found_args.types
     if type_name != "" { return ck_static_call(c, type_name, e, arg_types) }
 
-    if starts_with(recv, "dyn ") {
-        let trait_name = substr(recv, 4, len(recv) - 4)
-        let key = trait_name + "_" + method
-        if c.fns.contains(key) {
-            let sig = c.fns.get(key)
-            c = ck_effects(c, trait_name + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
-            return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_unbound(0)))
-        }
-        if c.traits.contains(trait_name) {
-            return ck_typed(ck_error(c, "trait '" + trait_name + "' has no method '" + method + "'", e.line), "")
-        }
-        return ck_typed(c, "")
-    }
     let head = ty_head(recv)
     if ty_known(head) == false { return ck_typed(c, "") }
     if c.fns.contains(head + "_" + method) {
@@ -1866,7 +1954,7 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             c = ck_method_arity(c, recv, method, 1, arg_types.len(), e.line)
             c = ck_changes(c, object, "'push'", e.line)
             if arg_types.len() == 1 {
-                if ck_fits(c, elem, arg_types[0]) == false {
+                if ck_fits_value(c, elem, arg_types[0], e.args[0]) == false {
                     c = ck_error(c, "type mismatch in the value pushed to a " + recv + ": expected " + elem + ", found " + arg_types[0], e.line)
                 } else {
                     c = ck_settle(c, e.args[0], elem)
@@ -1915,8 +2003,17 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             c = ck_effects(c, from_trait + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
             return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_unbound(0)))
         }
+        if starts_with(head, DYN_PREFIX()) {
+            -- A method of the trait that its `dyn` does not have
+            let trait_name = substr(head, len(DYN_PREFIX()), len(head) - len(DYN_PREFIX()))
+            if c.fns.contains(trait_name + "_" + method) {
+                return ck_no_method(c, e, recv, arg_types, "the method '" + method + "' of the trait '" + trait_name + "' cannot be called on a '" + head + "': a 'dyn' has the methods that take 'self', have no type parameters and do not name 'Self' elsewhere")
+            }
+        }
         return ck_no_method(c, e, recv, arg_types, "type '" + head + "' has no method '" + method + "'")
     }
+    -- A `dyn` that is reported where it is written
+    if starts_with(recv, DYN_PREFIX()) { return ck_typed(c, "") }
     return ck_no_method(c, e, recv, arg_types, "type '" + recv + "' has no method '" + method + "'")
 }
 
@@ -1935,7 +2032,7 @@ fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
             c = ck_error(c, "struct '" + head + "' has no field '" + field + "'", e.field_values[i].line)
         } else {
             let want = ck_field_type(c, t, field)
-            if ck_fits(c, want, values.types[i]) == false {
+            if ck_fits_value(c, want, values.types[i], e.field_values[i]) == false {
                 c = ck_error(c, "type mismatch in field '" + field + "' of '" + head + "': expected " + want + ", found " + values.types[i], e.field_values[i].line)
             } else {
                 c = ck_settle(c, e.field_values[i], want)
@@ -2314,7 +2411,7 @@ fn ck_lambda(c0: Checker, e: Expr) -> Typed {
     if body.kind != EXPR_BLOCK() {
         if ret == "" {
             if ty_known(value.t) and value.t != "void" { ret = value.t }
-        } else if value.t != "void" and ck_fits(c, ret, value.t) == false {
+        } else if value.t != "void" and ck_fits_value(c, ret, value.t, body) == false {
             c = ck_error(c, "type mismatch in the lambda's value: expected " + ret + ", found " + value.t, body.line)
         } else {
             c = ck_settle(c, body, ret)
@@ -2396,7 +2493,7 @@ fn ck_let(c0: Checker, s: Stmt) -> Checker {
     if s.let_type != "" {
         c = ck_type_exists(c, s.let_type, s.line)
         let want = ck_norm(c, s.let_type)
-        if ck_fits(c, want, t) == false {
+        if ck_fits_value(c, want, t, value) == false {
             c = ck_error(c, "type mismatch in the value of '" + s.let_name + "': expected " + want + ", found " + t, value.line)
         } else {
             c = ck_settle(c, value, want)
@@ -2432,7 +2529,7 @@ fn ck_return(c0: Checker, s: Stmt) -> Checker {
         }
         return c
     }
-    if ck_fits(c, want, found.t) == false {
+    if ck_fits_value(c, want, found.t, value) == false {
         return ck_error(c, "type mismatch in the return value: expected " + want + ", found " + found.t, value.line)
     }
     return ck_settle(c, value, want)
@@ -2470,11 +2567,6 @@ fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
         if at >= 0 {
             if c.var_flags[at] == 0 {
                 c = ck_error(c, "cannot assign to '" + target.name + "', which is not declared 'mut'", s.line)
-            } else if starts_with(c.var_types[at], "dyn ") {
-                -- Which type a dyn variable holds is settled where it is
-                -- declared (see the dyn Trait annotation in ir_gen_stmt.dm):
-                -- its methods would still be those of its first value
-                c = ck_error(c, "cannot assign to '" + target.name + "': a '" + c.var_types[at] + "' variable keeps the value it is declared with", s.line)
             }
         } else if c.consts.contains(target.name) {
             c = ck_error(c, "cannot assign to the constant '" + target.name + "'", s.line)
@@ -2487,7 +2579,7 @@ fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
         return ck_error(c, "the assignment" + shown + " takes the result of a call that returns no value", s.line)
     }
     if s.assign_op == ASSIGN_EQ() {
-        if ck_fits(c, to.t, value.t) == false {
+        if ck_fits_value(c, to.t, value.t, *s.assign_value) == false {
             c = ck_error(c, "type mismatch in the assignment" + shown + ": expected " + to.t + ", found " + value.t, s.line)
         } else {
             c = ck_settle(c, *s.assign_value, to.t)
@@ -2815,7 +2907,7 @@ fn ck_const_decl(c0: Checker, cd: ConstDecl) -> Checker {
     }
     c = ck_type_exists(c, cd.type_name, cd.line)
     let want = c.consts.get(cd.name)
-    if ck_fits(c, want, found.t) == false {
+    if ck_fits_value(c, want, found.t, value) == false {
         c = ck_error(c, "type mismatch in the value of '" + cd.name + "': expected " + want + ", found " + found.t, value.line)
     } else {
         c = ck_settle(c, value, want)
@@ -2828,10 +2920,76 @@ fn ck_impl(c0: Checker, ib: ImplBlock) -> Checker {
     -- Inside the block its type parameters stand for any type
     let self_type = ty_apply(ck_generic_type(ib.target_type, ib.generic_params), ib.generic_params, ty_unbound(0))
     let no_binds: List[string] = []
+    let errors_before = c.errors.len()
     let mut i = 0
     while i < ib.methods.len() {
         c = ck_function(c, ib.methods[i], self_type, ib.generic_params, no_binds, false)
         i = i + 1
+    }
+    -- The methods of a `dyn Trait` are written by the compiler (TRAITS
+    -- in main_split.dm): what is wrong in one is wrong in an impl of
+    -- the trait, and is reported there
+    if starts_with(ib.target_type, DYN_PREFIX()) {
+        while c.errors.len() > errors_before {
+            c.errors.pop()
+        }
+        return c
+    }
+    if ib.trait_name != "" { c = ck_impl_of_trait(c, ib) }
+    return c
+}
+
+-- An impl of a trait is of a trait there is, and has each of the
+-- trait's methods, with the parameters and the result the trait gives
+-- it (a method the trait has a body for is in the impl already, see
+-- TRAITS in main_split.dm)
+fn ck_impl_of_trait(c0: Checker, ib: ImplBlock) -> Checker {
+    let mut c = c0
+    if c.traits.contains(ib.trait_name) == false {
+        return ck_error(c, "undefined trait '" + ib.trait_name + "'", ib.line)
+    }
+    let shown = "the impl of '" + ib.trait_name + "' for '" + ib.target_type + "'"
+    let names = string_split(c.traits.get(ib.trait_name), "|")
+    let mut i = 0
+    while i < names.len() {
+        let name = names[i]
+        i = i + 1
+        if name == "" { continue }
+        let mut found = -1
+        let mut mi = 0
+        while mi < ib.methods.len() {
+            if ib.methods[mi].name == name { found = mi }
+            mi = mi + 1
+        }
+        if found < 0 {
+            c = ck_error(c, shown + " has no method '" + name + "', which the trait declares without a body", ib.line)
+            continue
+        }
+        let line = ib.methods[found].line
+        let want = c.fns.get(ib.trait_name + "_" + name)
+        let have = c.fns.get(ib.target_type + "_" + name)
+        if want.params.len() != have.params.len() or want.has_self != have.has_self {
+            c = ck_error(c, "the method '" + name + "' of " + shown + " does not take the parameters the trait gives it", line)
+            continue
+        }
+        let mut pi = 0
+        if want.has_self { pi = 1 }
+        while pi < want.params.len() {
+            if ty_same(want.params[pi], have.params[pi]) == false {
+                c = ck_error(c, "parameter " + int_to_string(pi + 1) + " of the method '" + name + "' of " + shown + " has the type " + have.params[pi] + ", and the trait gives it the type " + want.params[pi], line)
+            } else if want.changes[pi] != have.changes[pi] {
+                c = ck_error(c, "parameter " + int_to_string(pi + 1) + " of the method '" + name + "' of " + shown + " is 'mut' in one of the trait and the impl and not in the other", line)
+            }
+            pi = pi + 1
+        }
+        if want.has_self and want.changes.len() > 0 and have.changes.len() > 0 {
+            if want.changes[0] != have.changes[0] {
+                c = ck_error(c, "the method '" + name + "' of " + shown + " takes 'mut self' in one of the trait and the impl and 'self' in the other", line)
+            }
+        }
+        if ty_same(want.ret, have.ret) == false {
+            c = ck_error(c, "the method '" + name + "' of " + shown + " returns " + have.ret + ", and the trait says it returns " + want.ret, line)
+        }
     }
     return c
 }

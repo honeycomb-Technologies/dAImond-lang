@@ -455,58 +455,6 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         return gen_result(g, b)
     }
 
-    -- Detect dyn Trait type annotation
-    if starts_with(type_str, "dyn ") {
-        let trait_name = substr(type_str, 4, len(type_str) - 4)
-
-        let val_expr = *stmt.let_value
-        -- Infer concrete type from value expression
-        let mut concrete = ""
-        if val_expr.kind == EXPR_IDENTIFIER() {
-            if g.var_struct_types.contains(val_expr.name) {
-                concrete = g.var_struct_types.get(val_expr.name)
-            }
-        } else if val_expr.kind == EXPR_STRUCT_LITERAL() {
-            concrete = canon_type(g, val_expr.type_name)
-        }
-
-        -- Use concrete struct type for alloca so the struct is stored directly
-        let alloc_type = if len(concrete) > 0 { concrete } else { "ptr" }
-        let alloca_id = g.builder.next_id
-        let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
-        alloca_inst.alloc_type = alloc_type
-        alloca_inst.result_type = "ptr(" + alloc_type + ")"
-        alloca_inst.has_result = true
-        b.instructions.push(alloca_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        if val_expr.kind != EXPR_LITERAL_NULL() {
-            let result = generate_expr(g, b, val_expr)
-            g = result.gen
-            b = result.block
-
-            if len(concrete) > 0 {
-                g.dyn_var_concrete.insert(var_name, concrete)
-                g.dyn_var_traits.insert(var_name, trait_name)
-            }
-
-            let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_inst.store_ptr = ir_val_inst(alloca_id)
-            store_inst.store_val = ir_val_inst(result.val_id)
-            store_inst.has_result = false
-            b.instructions.push(store_inst)
-            g.builder.next_id = g.builder.next_id + 1
-        }
-
-        g.variable_map.insert(var_name, alloca_id)
-        if len(concrete) > 0 {
-            g.variable_types.insert(var_name, concrete)
-            g.var_struct_types.insert(var_name, concrete)
-        } else {
-            g.variable_types.insert(var_name, "ptr")
-        }
-        return gen_result(g, b)
-    }
 
     -- Regular let binding: infer type from annotation or value expression
     let infer_val = *stmt.let_value

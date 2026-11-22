@@ -604,22 +604,6 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
             p.type_name
         }
         ptype_str = canon_type(g, ptype_str)
-        -- Resolve dyn Trait to concrete implementor type
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        ptype_str = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-        }
         let ptype = map_type_name(ptype_str)
 
         let actual_type = if p.is_mut {
@@ -768,22 +752,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             p.type_name
         }
         ptype_str = canon_type(g, ptype_str)
-        -- Resolve dyn Trait to concrete implementor type
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        ptype_str = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-        }
         let ptype = map_type_name(ptype_str)
 
         if p.is_mut {
@@ -815,29 +783,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             g.variable_types.insert(pname, ptype)
         }
 
-        -- Track dyn Trait parameters: resolve to concrete implementor
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait_name = substr(ptype_str, 4, len(ptype_str) - 4)
-            -- Find a concrete type that implements this trait
-            let mut concrete_found = ""
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait_name) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        concrete_found = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-            if len(concrete_found) > 0 {
-                g.dyn_var_concrete.insert(pname, concrete_found)
-                g.dyn_var_traits.insert(pname, dyn_trait_name)
-                g.var_struct_types.insert(pname, concrete_found)
-            }
-        }
 
         -- Track function-pointer-typed parameters for indirect calls
         if starts_with(ptype_str, "fn(") {

@@ -1,0 +1,7 @@
+Error: the impl of 'Greeter' for 'Person' has no method 'name', which the trait declares without a body at line 22
+Error: parameter 2 of the method 'rank' of the impl of 'Greeter' for 'Person' has the type string, and the trait gives it the type int at line 23
+Error: the method 'rank' of the impl of 'Greeter' for 'Person' returns string, and the trait says it returns int at line 23
+Error: the method 'rename' of the impl of 'Greeter' for 'Person' takes 'mut self' in one of the trait and the impl and 'self' in the other at line 26
+Error: the method 'rank' of the impl of 'Greeter' for 'Robot' does not take the parameters the trait gives it at line 34
+Error: undefined trait 'Missing' at line 41
+Error: 'Greeter' is a trait, not a type: a value of any type that implements it is a 'dyn Greeter' at line 47

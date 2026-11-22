@@ -149,7 +149,7 @@ fn parse_type(p: Parser) -> ParseTypeResult {
         pp = p_advance(pp)
         pp = p_skip_newlines(pp)
         let inner = parse_type(pp)
-        return ParseTypeResult { p: inner.p, type_name: "dyn " + inner.type_name }
+        return ParseTypeResult { p: inner.p, type_name: DYN_PREFIX() + inner.type_name }
     }
 
     -- Check for fn type

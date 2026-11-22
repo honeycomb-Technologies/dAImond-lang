@@ -143,10 +143,6 @@ struct IRGenerator {
     var_enum_types: Map[string, string],
     -- Variable name -> box inner type name
     box_inner_types: Map[string, string],
-    -- Variable name -> concrete struct type for dyn Trait
-    dyn_var_concrete: Map[string, string],
-    -- Variable name -> trait name for dyn Trait
-    dyn_var_traits: Map[string, string],
     -- "StructName:TraitName" -> pipe-delimited method list
     trait_impl_methods: Map[string, string],
     -- User extern function names
@@ -266,8 +262,6 @@ fn ir_generator_new() -> IRGenerator {
         enum_defs: Map_new(),
         var_enum_types: Map_new(),
         box_inner_types: Map_new(),
-        dyn_var_concrete: Map_new(),
-        dyn_var_traits: Map_new(),
         trait_impl_methods: Map_new(),
         user_extern_fns: Map_new(),
         fn_return_types: Map_new(),
@@ -562,7 +556,22 @@ fn checked_type_args(gen: IRGenerator, call: Expr) -> List[string] {
 -- method: "call:f" for x.f(a), which is f(x, a). "" for a method.
 fn checked_target(gen: IRGenerator, call: Expr) -> string {
     if call.id < 0 or call.id >= gen.checked_targets.len() { return "" }
-    return gen.checked_targets[call.id]
+    let marks = gen.checked_targets[call.id]
+    if starts_with(marks, "call:") == false { return "" }
+    let end = string_find(marks, ";")
+    if end < 0 { return marks }
+    return substr(marks, 0, end)
+}
+
+-- "Dyn$Shape|Circle" for an expression whose value, a Circle, goes
+-- where a `dyn Shape` is expected, as the checker found (ck_settle);
+-- "" for any other expression
+fn checked_dyn(gen: IRGenerator, e: Expr) -> string {
+    if e.id < 0 or e.id >= gen.checked_targets.len() { return "" }
+    let marks = gen.checked_targets[e.id]
+    let at = string_find(marks, "dyn:")
+    if at < 0 { return "" }
+    return substr(marks, at + 4, len(marks) - at - 4)
 }
 
 -- The IR type of the expression's value as the checker found it. ""
@@ -570,7 +579,7 @@ fn checked_target(gen: IRGenerator, call: Expr) -> string {
 -- types that have another form in the IR than their name.
 fn checked_ir_type(gen: IRGenerator, e: Expr) -> string {
     let t = checked_type(gen, e)
-    if t == "" or t == "void" or starts_with(t, "dyn ") or starts_with(t, "[") or starts_with(t, "Future[") { return "" }
+    if t == "" or t == "void" or starts_with(t, "[") or starts_with(t, "Future[") { return "" }
     let ir_type = map_type_name(t)
     if is_integer_type(ir_type) or is_float_type(ir_type) { return "" }
     return ir_type
@@ -692,9 +701,6 @@ fn parse_type_to_ir(type_str: string) -> string {
     if starts_with(type_str, "Future[") {
         return "future"
     }
-    if starts_with(type_str, "dyn ") {
-        return "dyn"
-    }
     return map_type_name(type_str)
 }
 
@@ -758,13 +764,13 @@ fn safety_display_name(t: string) -> string {
 }
 
 -- Cast legality, mirroring Stage 0 inferCast: same-type casts and
--- numeric <-> numeric casts are legal, `as dyn Trait` keeps its
--- legacy meaning, and every other combination is a compile error.
+-- numeric <-> numeric casts are legal, `as dyn Trait` is what the
+-- checker allowed, and every other combination is a compile error.
 -- Reference/Box identity is judged on the tracked inner types;
 -- a Box erased to a bare "ptr" with unknown inner type is
 -- unprovable and passes, as do "void" inference gaps.
 fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_type: string, cast_is_ref: bool, line: int) {
-    if starts_with(cast_type, "dyn ") { return }
+    if starts_with(cast_type, DYN_PREFIX()) { return }
 
     -- Source provenance for plain-variable operands
     let mut src_box_inner = ""

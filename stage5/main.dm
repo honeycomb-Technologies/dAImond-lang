@@ -164,11 +164,17 @@ fn error_at(files: List[string], msg: string, line: int) -> string {
     return file_prefix(files, line) + "Error: " + source_name(msg) + " at line " + int_to_string(line_in_file(line))
 }
 
+-- What the name of the type `dyn Trait` begins with: Dyn$Trait, a name
+-- no source can write (see TRAITS in main_split.dm)
+fn DYN_PREFIX() -> string { return "Dyn$" }
+
 -- The text with each variable's name as it is in the source: without
 -- the `$N` that a variable which shadows another has by the time IR
 -- is generated (see SHADOWED NAMES in ast.dm)
-fn source_name(text: string) -> string {
-    if string_contains(text, "$") == false { return text }
+fn source_name(text0: string) -> string {
+    if string_contains(text0, "$") == false { return text0 }
+    -- Dyn$Shape is the type the source writes `dyn Shape`
+    let text = string_replace(text0, DYN_PREFIX(), "dyn ")
     let n = len(text)
     let mut out = ""
     let mut from = 0
@@ -3882,7 +3888,7 @@ fn parse_type(p: Parser) -> ParseTypeResult {
         pp = p_advance(pp)
         pp = p_skip_newlines(pp)
         let inner = parse_type(pp)
-        return ParseTypeResult { p: inner.p, type_name: "dyn " + inner.type_name }
+        return ParseTypeResult { p: inner.p, type_name: DYN_PREFIX() + inner.type_name }
     }
 
     -- Check for fn type
@@ -6196,10 +6202,6 @@ struct IRGenerator {
     var_enum_types: Map[string, string],
     -- Variable name -> box inner type name
     box_inner_types: Map[string, string],
-    -- Variable name -> concrete struct type for dyn Trait
-    dyn_var_concrete: Map[string, string],
-    -- Variable name -> trait name for dyn Trait
-    dyn_var_traits: Map[string, string],
     -- "StructName:TraitName" -> pipe-delimited method list
     trait_impl_methods: Map[string, string],
     -- User extern function names
@@ -6319,8 +6321,6 @@ fn ir_generator_new() -> IRGenerator {
         enum_defs: Map_new(),
         var_enum_types: Map_new(),
         box_inner_types: Map_new(),
-        dyn_var_concrete: Map_new(),
-        dyn_var_traits: Map_new(),
         trait_impl_methods: Map_new(),
         user_extern_fns: Map_new(),
         fn_return_types: Map_new(),
@@ -6615,7 +6615,22 @@ fn checked_type_args(gen: IRGenerator, call: Expr) -> List[string] {
 -- method: "call:f" for x.f(a), which is f(x, a). "" for a method.
 fn checked_target(gen: IRGenerator, call: Expr) -> string {
     if call.id < 0 or call.id >= gen.checked_targets.len() { return "" }
-    return gen.checked_targets[call.id]
+    let marks = gen.checked_targets[call.id]
+    if starts_with(marks, "call:") == false { return "" }
+    let end = string_find(marks, ";")
+    if end < 0 { return marks }
+    return substr(marks, 0, end)
+}
+
+-- "Dyn$Shape|Circle" for an expression whose value, a Circle, goes
+-- where a `dyn Shape` is expected, as the checker found (ck_settle);
+-- "" for any other expression
+fn checked_dyn(gen: IRGenerator, e: Expr) -> string {
+    if e.id < 0 or e.id >= gen.checked_targets.len() { return "" }
+    let marks = gen.checked_targets[e.id]
+    let at = string_find(marks, "dyn:")
+    if at < 0 { return "" }
+    return substr(marks, at + 4, len(marks) - at - 4)
 }
 
 -- The IR type of the expression's value as the checker found it. ""
@@ -6623,7 +6638,7 @@ fn checked_target(gen: IRGenerator, call: Expr) -> string {
 -- types that have another form in the IR than their name.
 fn checked_ir_type(gen: IRGenerator, e: Expr) -> string {
     let t = checked_type(gen, e)
-    if t == "" or t == "void" or starts_with(t, "dyn ") or starts_with(t, "[") or starts_with(t, "Future[") { return "" }
+    if t == "" or t == "void" or starts_with(t, "[") or starts_with(t, "Future[") { return "" }
     let ir_type = map_type_name(t)
     if is_integer_type(ir_type) or is_float_type(ir_type) { return "" }
     return ir_type
@@ -6745,9 +6760,6 @@ fn parse_type_to_ir(type_str: string) -> string {
     if starts_with(type_str, "Future[") {
         return "future"
     }
-    if starts_with(type_str, "dyn ") {
-        return "dyn"
-    }
     return map_type_name(type_str)
 }
 
@@ -6811,13 +6823,13 @@ fn safety_display_name(t: string) -> string {
 }
 
 -- Cast legality, mirroring Stage 0 inferCast: same-type casts and
--- numeric <-> numeric casts are legal, `as dyn Trait` keeps its
--- legacy meaning, and every other combination is a compile error.
+-- numeric <-> numeric casts are legal, `as dyn Trait` is what the
+-- checker allowed, and every other combination is a compile error.
 -- Reference/Box identity is judged on the tracked inner types;
 -- a Box erased to a bare "ptr" with unknown inner type is
 -- unprovable and passes, as do "void" inference gaps.
 fn check_cast_legal(gen: IRGenerator, operand: Expr, from_type: string, cast_type: string, cast_is_ref: bool, line: int) {
-    if starts_with(cast_type, "dyn ") { return }
+    if starts_with(cast_type, DYN_PREFIX()) { return }
 
     -- Source provenance for plain-variable operands
     let mut src_box_inner = ""
@@ -8051,22 +8063,6 @@ fn declare_function(gen: IRGenerator, fd: FunctionDecl, name: string) -> IRGener
             p.type_name
         }
         ptype_str = canon_type(g, ptype_str)
-        -- Resolve dyn Trait to concrete implementor type
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        ptype_str = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-        }
         let ptype = map_type_name(ptype_str)
 
         let actual_type = if p.is_mut {
@@ -8215,22 +8211,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             p.type_name
         }
         ptype_str = canon_type(g, ptype_str)
-        -- Resolve dyn Trait to concrete implementor type
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait = substr(ptype_str, 4, len(ptype_str) - 4)
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        ptype_str = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-        }
         let ptype = map_type_name(ptype_str)
 
         if p.is_mut {
@@ -8262,29 +8242,6 @@ fn generate_function_body(gen: IRGenerator, fd: FunctionDecl, name: string) -> I
             g.variable_types.insert(pname, ptype)
         }
 
-        -- Track dyn Trait parameters: resolve to concrete implementor
-        if starts_with(ptype_str, "dyn ") {
-            let dyn_trait_name = substr(ptype_str, 4, len(ptype_str) - 4)
-            -- Find a concrete type that implements this trait
-            let mut concrete_found = ""
-            let impl_keys = g.trait_impl_methods.keys()
-            let mut ki = 0
-            while ki < impl_keys.len() {
-                let impl_key = impl_keys[ki]
-                if ends_with(impl_key, ":" + dyn_trait_name) {
-                    let colon_pos = string_find(impl_key, ":")
-                    if colon_pos > 0 {
-                        concrete_found = substr(impl_key, 0, colon_pos)
-                    }
-                }
-                ki = ki + 1
-            }
-            if len(concrete_found) > 0 {
-                g.dyn_var_concrete.insert(pname, concrete_found)
-                g.dyn_var_traits.insert(pname, dyn_trait_name)
-                g.var_struct_types.insert(pname, concrete_found)
-            }
-        }
 
         -- Track function-pointer-typed parameters for indirect calls
         if starts_with(ptype_str, "fn(") {
@@ -8911,58 +8868,6 @@ fn generate_let_binding(gen: IRGenerator, block: IRBasicBlock, stmt: Stmt) -> Ge
         return gen_result(g, b)
     }
 
-    -- Detect dyn Trait type annotation
-    if starts_with(type_str, "dyn ") {
-        let trait_name = substr(type_str, 4, len(type_str) - 4)
-
-        let val_expr = *stmt.let_value
-        -- Infer concrete type from value expression
-        let mut concrete = ""
-        if val_expr.kind == EXPR_IDENTIFIER() {
-            if g.var_struct_types.contains(val_expr.name) {
-                concrete = g.var_struct_types.get(val_expr.name)
-            }
-        } else if val_expr.kind == EXPR_STRUCT_LITERAL() {
-            concrete = canon_type(g, val_expr.type_name)
-        }
-
-        -- Use concrete struct type for alloca so the struct is stored directly
-        let alloc_type = if len(concrete) > 0 { concrete } else { "ptr" }
-        let alloca_id = g.builder.next_id
-        let mut alloca_inst = ir_inst_new(alloca_id, OP_ALLOCA())
-        alloca_inst.alloc_type = alloc_type
-        alloca_inst.result_type = "ptr(" + alloc_type + ")"
-        alloca_inst.has_result = true
-        b.instructions.push(alloca_inst)
-        g.builder.next_id = g.builder.next_id + 1
-
-        if val_expr.kind != EXPR_LITERAL_NULL() {
-            let result = generate_expr(g, b, val_expr)
-            g = result.gen
-            b = result.block
-
-            if len(concrete) > 0 {
-                g.dyn_var_concrete.insert(var_name, concrete)
-                g.dyn_var_traits.insert(var_name, trait_name)
-            }
-
-            let mut store_inst = ir_inst_new(g.builder.next_id, OP_STORE())
-            store_inst.store_ptr = ir_val_inst(alloca_id)
-            store_inst.store_val = ir_val_inst(result.val_id)
-            store_inst.has_result = false
-            b.instructions.push(store_inst)
-            g.builder.next_id = g.builder.next_id + 1
-        }
-
-        g.variable_map.insert(var_name, alloca_id)
-        if len(concrete) > 0 {
-            g.variable_types.insert(var_name, concrete)
-            g.var_struct_types.insert(var_name, concrete)
-        } else {
-            g.variable_types.insert(var_name, "ptr")
-        }
-        return gen_result(g, b)
-    }
 
     -- Regular let binding: infer type from annotation or value expression
     let infer_val = *stmt.let_value
@@ -10473,7 +10378,29 @@ fn get_scrutinee_type_annotation(gen: IRGenerator, scrut_expr: Expr) -> string {
     return ""
 }
 
+-- The value of an expression. One that the checker marked as going
+-- where a `dyn Trait` is expected (checked_dyn) is put in a box, in
+-- the variant of the trait's enum that is its type's: Circle { .. }
+-- becomes Dyn$Shape.V_Circle(Box_new(Circle { .. })) (see TRAITS in
+-- main_split.dm).
 fn generate_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
+    let mark = checked_dyn(gen, expr)
+    if mark == "" { return generate_expr_plain(gen, block, expr) }
+    let bar = string_find(mark, "|")
+    let dyn_enum = substr(mark, 0, bar)
+    let held_type = substr(mark, bar + 1, len(mark) - bar - 1)
+    let value = generate_expr_plain(gen, block, expr)
+    if value.gen.enum_defs.contains(dyn_enum) == false { return value }
+    let held = bind_hidden_value(value.gen, value.block, "%dyn.value", value.val_id, map_type_name(held_type), held_type)
+    let mut box_args: List[Expr] = []
+    box_args.push(expr_ident("%dyn.value", expr.line, expr.col))
+    let mut variant_args: List[Expr] = []
+    variant_args.push(expr_call(expr_ident("Box_new", expr.line, expr.col), box_args, expr.line, expr.col))
+    let made = generate_enum_method_construct(held.gen, held.block, dyn_enum, "V_" + held_type, variant_args, expr.line)
+    return expr_result(unbind_hidden_value(made.gen, "%dyn.value"), made.block, made.val_id)
+}
+
+fn generate_expr_plain(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     if expr.kind == EXPR_LITERAL_INT() {
         return generate_literal_int(gen, block, expr)
     }
@@ -12496,7 +12423,7 @@ fn eq_by_function(g: IRGenerator, t: string) -> bool {
 -- for a type that contains itself.
 fn eq_unsupported(g: IRGenerator, t0: string, seen: List[string]) -> string {
     let t = eq_type(t0)
-    if starts_with(t, "Map[") or is_map_type(g, t) or starts_with(t, "dyn ") or is_simd_type_name(t) { return t }
+    if starts_with(t, "Map[") or is_map_type(g, t) or starts_with(t, DYN_PREFIX()) or is_simd_type_name(t) { return t }
     if starts_with(t, "Box[") or starts_with(t, "fn(") { return "" }
     if eq_by_function(g, t) == false { return "" }
     let mut si = 0
@@ -13682,6 +13609,10 @@ fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
     b = operand_result.block
     let operand_id = operand_result.val_id
 
+    -- x as dyn Trait: the operand is in the dyn's variant already
+    -- (see generate_expr)
+    if starts_with(expr.cast_type, DYN_PREFIX()) { return operand_result }
+
     -- Determine source type by inference
     let from_type = infer_expr_type(g, *expr.operand)
 
@@ -14734,15 +14665,6 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         }
     }
 
-    -- --------------------------------------------------------
-    -- Check if this is a dyn Trait method call
-    -- --------------------------------------------------------
-    if obj_expr.kind == EXPR_IDENTIFIER() {
-        let obj_name = obj_expr.name
-        if g.dyn_var_concrete.contains(obj_name) {
-            return generate_dyn_dispatch_call(g, b, obj_name, method_name, args)
-        }
-    }
 
     -- --------------------------------------------------------
     -- Get object variable name for type dispatch
@@ -14939,19 +14861,10 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
         return expr_result(g, b, 0)
     }
 
-    -- Build the enum struct with tag and optional payload
-    let base_id = g.builder.next_id
-    let mut base_inst = ir_inst_new(base_id, OP_ALLOCA())
-    base_inst.alloc_type = enum_name
-    base_inst.result_type = "ptr(" + enum_name + ")"
-    base_inst.has_result = true
-    b.instructions.push(base_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Insert tag at field index 0
+    -- The enum value: its tag at field index 0, then the values
     let tag_insert_id = g.builder.next_id
     let mut tag_insert = ir_inst_new(tag_insert_id, OP_INSERT_FIELD())
-    tag_insert.field_base = ir_val_inst(base_id)
+    tag_insert.field_base = ir_val_undef()
     tag_insert.field_value = ir_val_int(tag)
     tag_insert.field_index = 0
     tag_insert.result_type = enum_name
@@ -14992,78 +14905,6 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
     return expr_result(g, b, last_id)
 }
 
--- ============================================================
--- DYNAMIC TRAIT DISPATCH
--- Looks up the concrete type for a dyn Trait variable and
--- calls ConcreteType_method(data_ptr, args...)
--- ============================================================
-
-fn generate_dyn_dispatch_call(gen: IRGenerator, block: IRBasicBlock, obj_name: string, method_name: string, args: List[Expr]) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    let concrete_type = g.dyn_var_concrete.get(obj_name)
-    let mangled = concrete_type + "_" + method_name
-
-    let alloca_id = g.variable_map.get(obj_name)
-
-    -- Determine if this is a direct struct param or an indirect let-binding
-    -- For function params, the alloca holds the struct directly (load as struct type)
-    -- For let-bindings, the alloca holds a ptr to heap data (load as ptr)
-    let is_direct_struct = g.var_struct_types.contains(obj_name) and g.variable_types.contains(obj_name) and g.variable_types.get(obj_name) != "ptr"
-
-    let mut self_val_id = 0
-    if is_direct_struct {
-        -- Load the struct value directly from the alloca
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(alloca_id)
-        load_inst.load_type = concrete_type
-        load_inst.result_type = concrete_type
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
-        g.builder.next_id = g.builder.next_id + 1
-        self_val_id = load_id
-    } else {
-        -- Load the data pointer from the dyn variable's alloca (indirect)
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(alloca_id)
-        load_inst.load_type = "ptr"
-        load_inst.result_type = "ptr"
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
-        g.builder.next_id = g.builder.next_id + 1
-        self_val_id = load_id
-    }
-
-    -- Build args: self value, then method arguments
-    let mut call_args: List[IRValue] = []
-    call_args.push(ir_val_inst(self_val_id))
-
-    let mut i = 0
-    while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
-        g = arg_result.gen
-        b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
-        i = i + 1
-    }
-
-    let ret_type = infer_call_return_type(g, mangled)
-    let has_result = ret_type != "void"
-
-    let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL())
-    inst.callee = mangled
-    inst.call_args = call_args
-    inst.result_type = ret_type
-    inst.has_result = has_result
-    b.instructions.push(inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, b, id)
-}
 
 -- ============================================================
 -- LIST METHOD CALL
@@ -21071,7 +20912,8 @@ fn ty_ident_byte(b: int) -> bool {
     if b >= 97 and b <= 122 { return true }
     if b >= 65 and b <= 90 { return true }
     if b >= 48 and b <= 57 { return true }
-    return b == 95
+    -- 36 is the $ of Dyn$Trait
+    return b == 95 or b == 36
 }
 
 -- One name for the types that have two
@@ -21160,9 +21002,9 @@ fn ty_kind(t: string) -> string {
 }
 
 -- The name of a type without its arguments: "Map" for
--- "Map[string, int]". "" for function, array and dyn types.
+-- "Map[string, int]". "" for function and array types.
 fn ty_head(t: string) -> string {
-    if starts_with(t, "fn(") or starts_with(t, "[") or starts_with(t, "dyn ") { return "" }
+    if starts_with(t, "fn(") or starts_with(t, "[") { return "" }
     let at = string_find(t, "[")
     if at < 0 { return t }
     return substr(t, 0, at)
@@ -21171,7 +21013,7 @@ fn ty_head(t: string) -> string {
 -- The arguments of a type: "string" and "int" for "Map[string, int]"
 fn ty_args(t: string) -> List[string] {
     let none: List[string] = []
-    if starts_with(t, "fn(") or starts_with(t, "[") or starts_with(t, "dyn ") { return none }
+    if starts_with(t, "fn(") or starts_with(t, "[") { return none }
     let at = string_find(t, "[")
     if at < 0 or ends_with(t, "]") == false { return none }
     return split_type_args(substr(t, at + 1, len(t) - at - 2))
@@ -21252,7 +21094,6 @@ fn ty_same(a: string, b: string) -> bool {
     if ty_known(a) == false or ty_known(b) == false { return true }
     if starts_with(a, "fn(") and starts_with(b, "fn(") { return ty_fn_agrees(a, b) }
     if starts_with(a, "fn(") or starts_with(b, "fn(") { return false }
-    if starts_with(a, "dyn ") or starts_with(b, "dyn ") { return true }
     if starts_with(a, "[") or starts_with(b, "[") { return true }
     if ty_head(a) != ty_head(b) { return false }
     let a_args = ty_args(a)
@@ -21284,14 +21125,13 @@ fn ty_fn_agrees(a: string, b: string) -> bool {
 -- Whether a value of type `got` can go where `want` is expected.
 -- Unknown types fit anything. Integers of every width fit each other
 -- (code generation checks the narrowing), and so do the float types.
--- Two function types must agree (ty_fn_agrees). Array and dyn types
--- are not compared.
+-- Two function types must agree (ty_fn_agrees). Array types are not
+-- compared.
 fn ty_fits(want: string, got: string) -> bool {
     if want == got { return true }
     if ty_known(want) == false or ty_known(got) == false { return true }
     if ty_is_int(want) and ty_is_int(got) { return true }
     if ty_is_float(want) and ty_is_float(got) { return true }
-    if starts_with(want, "dyn ") or starts_with(got, "dyn ") { return true }
     if starts_with(want, "fn(") and starts_with(got, "fn(") { return ty_fn_agrees(want, got) }
     if starts_with(want, "fn(") or starts_with(got, "fn(") { return false }
     if starts_with(want, "[") or starts_with(got, "[") { return true }
@@ -21437,20 +21277,87 @@ fn ck_var(c: Checker, name: string) -> int {
 }
 
 -- Whether a value of type `got` can go where `want` is expected:
--- ty_fits, and a struct or an enum that goes where a `dyn Trait` is
--- expected must implement the trait
+-- ty_fits, and a value of a type that implements the trait can go
+-- where a `dyn Trait` is expected (it is put in the dyn's variant
+-- there, see ck_settle)
 fn ck_fits(c: Checker, want: string, got: string) -> bool {
-    if starts_with(want, "dyn ") and ty_known(got) {
-        let head = ty_head(got)
-        let mut trait_name = substr(want, 4, len(want) - 4)
-        let bracket = string_find(trait_name, "[")
-        if bracket >= 0 { trait_name = substr(trait_name, 0, bracket) }
-        if head != "" and c.traits.contains(trait_name) and (c.structs.contains(head) or c.enums.contains(head)) {
-            if c.type_traits.contains(head) == false { return false }
-            return string_contains(c.type_traits.get(head), "|" + trait_name + "|")
-        }
+    if starts_with(want, DYN_PREFIX()) and ty_known(got) and got != want {
+        -- A `dyn` of no trait, or of a trait that no type implements,
+        -- is reported where it is written
+        if c.enums.contains(want) == false { return true }
+        if ty_head(got) != got { return false }
+        return ck_implements(c, got, substr(want, len(DYN_PREFIX()), len(want) - len(DYN_PREFIX())))
     }
     return ty_fits(want, got)
+}
+
+-- Whether the value of the expression `e`, of type `got`, can go
+-- where `want` is expected: ck_fits, and a value that is made there
+-- can be made of the type of its place. Some(circle) is an
+-- Option[Circle], which is no Option[dyn Shape]; but written where an
+-- Option[dyn Shape] is expected it makes one, with the circle put in
+-- the dyn (ck_settle goes the same way down the expression).
+fn ck_fits_value(c: Checker, want: string, got: string, e0: Expr) -> bool {
+    if ck_fits(c, want, got) { return true }
+    if string_contains(want, DYN_PREFIX()) == false { return false }
+    let mut e = e0
+    while e.kind == EXPR_GROUPED() {
+        e = *e.operand
+    }
+    let head = ty_head(want)
+    if ty_head(got) != head { return false }
+    let k = e.kind
+    if k == EXPR_FUNCTION_CALL() and e.args.len() == 1 {
+        let callee = *e.callee
+        if callee.kind != EXPR_IDENTIFIER() { return false }
+        if (callee.name == "Some" and head == "Option") or (callee.name == "Box_new" and head == "Box") {
+            return ck_fits_value(c, ty_arg(want, 0), ty_arg(got, 0), e.args[0])
+        }
+        if callee.name == "Ok" and head == "Result" {
+            return ck_fits(c, ty_arg(want, 1), ty_arg(got, 1)) and ck_fits_value(c, ty_arg(want, 0), ty_arg(got, 0), e.args[0])
+        }
+        if callee.name == "Err" and head == "Result" {
+            return ck_fits(c, ty_arg(want, 0), ty_arg(got, 0)) and ck_fits_value(c, ty_arg(want, 1), ty_arg(got, 1), e.args[0])
+        }
+        return false
+    }
+    if k == EXPR_ARRAY_LITERAL() and head == "List" {
+        let mut i = 0
+        while i < e.elements.len() {
+            if ck_fits_value(c, ty_arg(want, 0), ty_arg(got, 0), e.elements[i]) == false { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if k == EXPR_IF() and e.has_else {
+        return ck_fits_value(c, want, got, *e.then_branch) and ck_fits_value(c, want, got, *e.else_branch)
+    }
+    if k == EXPR_BLOCK() {
+        if e.has_result { return ck_fits_value(c, want, got, *e.result) }
+        return ck_fits_last(c, want, got, e.stmts)
+    }
+    if k == EXPR_MATCH() {
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let arm = e.match_arms[i]
+            if arm.is_expr_body {
+                if ck_fits_value(c, want, got, *arm.body_expr) == false { return false }
+            } else if ck_fits_last(c, want, got, arm.body) == false {
+                return false
+            }
+            i = i + 1
+        }
+        return e.match_arms.len() > 0
+    }
+    return false
+}
+
+-- ck_fits_value for the value of a body: that of its last statement
+fn ck_fits_last(c: Checker, want: string, got: string, stmts: List[Stmt]) -> bool {
+    if stmts.len() == 0 { return false }
+    let last = stmts[stmts.len() - 1]
+    if stmt_gives_value(last) == false { return false }
+    return ck_fits_value(c, want, got, stmt_value_expr(last))
 }
 
 -- A type as written in the source, in the checker's form
@@ -21467,7 +21374,7 @@ fn ck_builtin_type_name(name: string) -> bool {
     if name == "List" or name == "Map" or name == "Box" or name == "Option" or name == "Result" { return true }
     if name == "f32x4" or name == "f32x8" or name == "f64x2" or name == "f64x4" { return true }
     if name == "i32x4" or name == "i32x8" or name == "i64x2" or name == "i64x4" { return true }
-    return name == "Self" or name == "dyn" or name == "fn" or name == "Future"
+    return name == "Self" or name == "fn" or name == "Future"
 }
 
 -- Report the first name in the type that is no type
@@ -21491,8 +21398,20 @@ fn ck_type_exists(c: Checker, t: string, line: int) -> Checker {
         if in_size or (b >= 48 and b <= 57) { continue }
         let word = substr(t, start, i - start)
         if ck_builtin_type_name(word) { continue }
-        if c.structs.contains(word) or c.enums.contains(word) or c.traits.contains(word) { continue }
+        if c.structs.contains(word) or c.enums.contains(word) { continue }
         if ck_index_of(c.norm_names, word) >= 0 { continue }
+        -- `dyn Trait` is the enum Dyn$Trait, which there is when a type
+        -- implements the trait (see TRAITS in main_split.dm)
+        if starts_with(word, DYN_PREFIX()) {
+            let trait_name = substr(word, len(DYN_PREFIX()), len(word) - len(DYN_PREFIX()))
+            if c.traits.contains(trait_name) {
+                return ck_error(c, "no type implements the trait '" + trait_name + "', so there is no value a '" + word + "' could hold", line)
+            }
+            return ck_error(c, "undefined trait '" + trait_name + "'", line)
+        }
+        if c.traits.contains(word) {
+            return ck_error(c, "'" + word + "' is a trait, not a type: a value of any type that implements it is a '" + DYN_PREFIX() + word + "'", line)
+        }
         return ck_error(c, "undefined type '" + word + "'", line)
     }
     return ck_type_arity(c, t, t, line)
@@ -21723,11 +21642,26 @@ fn ck_settle(c0: Checker, e: Expr, want: string) -> Checker {
         return ck_settle_variant(c, e, variant_of, want)
     }
     let have = c.types[e.id]
+    -- A value of a type that implements the trait, where a `dyn Trait`
+    -- is expected: code generation puts it in the dyn's variant there
+    if starts_with(want, DYN_PREFIX()) {
+        if ty_known(have) and have != want and starts_with(have, DYN_PREFIX()) == false and ck_fits(c, want, have) {
+            if string_contains(c.targets[e.id], "dyn:") == false {
+                let mut marks = c.targets[e.id]
+                if marks != "" { marks = marks + ";" }
+                c.targets[e.id] = marks + "dyn:" + want + "|" + have
+            }
+        }
+        return c
+    }
     -- A type the checker does not know at all stays unknown, and so
     -- does a whole type that differs, such as an i32 that goes where an
     -- int is expected: the value is converted there. What makes a new
     -- value (ck_makes_value) makes it of the type of its place.
     if ty_known(have) and have != want and ty_fits(want, have) and (ty_whole(have) == false or ck_makes_value(e)) {
+        c = ck_note(c, e.id, want)
+    } else if ty_known(have) and have != want and ty_fits(want, have) == false and ck_fits_value(c, want, have, e) {
+        -- A value made here with a `dyn Trait` in it (ck_fits_value)
         c = ck_note(c, e.id, want)
     } else if have != want and ty_is_int(have) and ty_is_int(want) and branches_give_int_literals(e) {
         -- An `if` or a `match` of integer constants is an integer of
@@ -21925,7 +21859,15 @@ fn ck_cast(c0: Checker, e: Expr) -> Typed {
     -- `as &T`: the checker has no reference types. IR generation
     -- decides whether the cast is one that is allowed.
     if e.cast_is_ref { return ck_typed(c, "") }
-    return ck_typed(c, ck_norm(c, e.cast_type))
+    let to = ck_norm(c, e.cast_type)
+    if starts_with(to, DYN_PREFIX()) and ty_known(operand.t) {
+        -- `x as dyn Trait` puts x in the dyn's variant
+        if ck_fits(c, to, operand.t) == false {
+            return ck_typed(ck_error(c, "cannot cast " + operand.t + " to " + to + ": it does not implement the trait", e.line), to)
+        }
+        return ck_typed(ck_settle(c, *e.operand, to), to)
+    }
+    return ck_typed(c, to)
 }
 
 -- The result of `left op right` for operands of the types, with an
@@ -22334,7 +22276,7 @@ fn ck_builtin_call(c0: Checker, name: string, arg_types: List[string], args: Lis
                 c = ck_error(c, "type mismatch in argument 1 of '" + name + "': expected a string, a number or a bool, found " + got, args[i].line)
             }
         } else if params[i] != "*" {
-            if ck_fits(c, params[i], got) == false {
+            if ck_fits_value(c, params[i], got, args[i]) == false {
                 c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + name + "': expected " + params[i] + ", found " + got, args[i].line)
             } else {
                 c = ck_settle(c, args[i], params[i])
@@ -22410,7 +22352,7 @@ fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[str
     let mut i = 0
     while i < arg_types.len() and first + i < sig.params.len() {
         let want = ty_apply(sig.params[first + i], sig.generics, binds)
-        if ck_fits(c, want, arg_types[i]) == false {
+        if ck_fits_value(c, want, arg_types[i], args[i]) == false {
             c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + shown + "': expected " + want + ", found " + arg_types[i], args[i].line)
         } else {
             c = ck_settle(c, args[i], want)
@@ -22438,7 +22380,7 @@ fn ck_call_value(c0: Checker, held: string, shown: string, arg_types: List[strin
     }
     let mut i = 0
     while i < params.len() {
-        if ck_fits(c, params[i], arg_types[i]) == false {
+        if ck_fits_value(c, params[i], arg_types[i], args[i]) == false {
             c = ck_error(c, "type mismatch in argument " + int_to_string(i + 1) + " of '" + shown + "': expected " + params[i] + ", found " + arg_types[i], args[i].line)
         } else {
             c = ck_settle(c, args[i], params[i])
@@ -22551,7 +22493,7 @@ fn ck_variant_values(c0: Checker, enum_name: string, variant: string, types: Lis
     let mut i = 0
     while i < payloads.len() and i < types.len() {
         let want = ty_apply(payloads[i], sig.generics, ty_unbound(0))
-        if ck_fits(c, want, types[i]) == false {
+        if ck_fits_value(c, want, types[i], values[i]) == false {
             c = ck_error(c, "type mismatch in value " + int_to_string(i + 1) + " of '" + enum_name + "." + variant + "': expected " + want + ", found " + types[i], values[i].line)
         } else {
             c = ck_settle(c, values[i], want)
@@ -22726,19 +22668,6 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
     let arg_types = found_args.types
     if type_name != "" { return ck_static_call(c, type_name, e, arg_types) }
 
-    if starts_with(recv, "dyn ") {
-        let trait_name = substr(recv, 4, len(recv) - 4)
-        let key = trait_name + "_" + method
-        if c.fns.contains(key) {
-            let sig = c.fns.get(key)
-            c = ck_effects(c, trait_name + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
-            return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_unbound(0)))
-        }
-        if c.traits.contains(trait_name) {
-            return ck_typed(ck_error(c, "trait '" + trait_name + "' has no method '" + method + "'", e.line), "")
-        }
-        return ck_typed(c, "")
-    }
     let head = ty_head(recv)
     if ty_known(head) == false { return ck_typed(c, "") }
     if c.fns.contains(head + "_" + method) {
@@ -22768,7 +22697,7 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             c = ck_method_arity(c, recv, method, 1, arg_types.len(), e.line)
             c = ck_changes(c, object, "'push'", e.line)
             if arg_types.len() == 1 {
-                if ck_fits(c, elem, arg_types[0]) == false {
+                if ck_fits_value(c, elem, arg_types[0], e.args[0]) == false {
                     c = ck_error(c, "type mismatch in the value pushed to a " + recv + ": expected " + elem + ", found " + arg_types[0], e.line)
                 } else {
                     c = ck_settle(c, e.args[0], elem)
@@ -22817,8 +22746,17 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
             c = ck_effects(c, from_trait + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
             return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_unbound(0)))
         }
+        if starts_with(head, DYN_PREFIX()) {
+            -- A method of the trait that its `dyn` does not have
+            let trait_name = substr(head, len(DYN_PREFIX()), len(head) - len(DYN_PREFIX()))
+            if c.fns.contains(trait_name + "_" + method) {
+                return ck_no_method(c, e, recv, arg_types, "the method '" + method + "' of the trait '" + trait_name + "' cannot be called on a '" + head + "': a 'dyn' has the methods that take 'self', have no type parameters and do not name 'Self' elsewhere")
+            }
+        }
         return ck_no_method(c, e, recv, arg_types, "type '" + head + "' has no method '" + method + "'")
     }
+    -- A `dyn` that is reported where it is written
+    if starts_with(recv, DYN_PREFIX()) { return ck_typed(c, "") }
     return ck_no_method(c, e, recv, arg_types, "type '" + recv + "' has no method '" + method + "'")
 }
 
@@ -22837,7 +22775,7 @@ fn ck_struct_literal(c0: Checker, e: Expr) -> Typed {
             c = ck_error(c, "struct '" + head + "' has no field '" + field + "'", e.field_values[i].line)
         } else {
             let want = ck_field_type(c, t, field)
-            if ck_fits(c, want, values.types[i]) == false {
+            if ck_fits_value(c, want, values.types[i], e.field_values[i]) == false {
                 c = ck_error(c, "type mismatch in field '" + field + "' of '" + head + "': expected " + want + ", found " + values.types[i], e.field_values[i].line)
             } else {
                 c = ck_settle(c, e.field_values[i], want)
@@ -23216,7 +23154,7 @@ fn ck_lambda(c0: Checker, e: Expr) -> Typed {
     if body.kind != EXPR_BLOCK() {
         if ret == "" {
             if ty_known(value.t) and value.t != "void" { ret = value.t }
-        } else if value.t != "void" and ck_fits(c, ret, value.t) == false {
+        } else if value.t != "void" and ck_fits_value(c, ret, value.t, body) == false {
             c = ck_error(c, "type mismatch in the lambda's value: expected " + ret + ", found " + value.t, body.line)
         } else {
             c = ck_settle(c, body, ret)
@@ -23298,7 +23236,7 @@ fn ck_let(c0: Checker, s: Stmt) -> Checker {
     if s.let_type != "" {
         c = ck_type_exists(c, s.let_type, s.line)
         let want = ck_norm(c, s.let_type)
-        if ck_fits(c, want, t) == false {
+        if ck_fits_value(c, want, t, value) == false {
             c = ck_error(c, "type mismatch in the value of '" + s.let_name + "': expected " + want + ", found " + t, value.line)
         } else {
             c = ck_settle(c, value, want)
@@ -23334,7 +23272,7 @@ fn ck_return(c0: Checker, s: Stmt) -> Checker {
         }
         return c
     }
-    if ck_fits(c, want, found.t) == false {
+    if ck_fits_value(c, want, found.t, value) == false {
         return ck_error(c, "type mismatch in the return value: expected " + want + ", found " + found.t, value.line)
     }
     return ck_settle(c, value, want)
@@ -23372,11 +23310,6 @@ fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
         if at >= 0 {
             if c.var_flags[at] == 0 {
                 c = ck_error(c, "cannot assign to '" + target.name + "', which is not declared 'mut'", s.line)
-            } else if starts_with(c.var_types[at], "dyn ") {
-                -- Which type a dyn variable holds is settled where it is
-                -- declared (see the dyn Trait annotation in ir_gen_stmt.dm):
-                -- its methods would still be those of its first value
-                c = ck_error(c, "cannot assign to '" + target.name + "': a '" + c.var_types[at] + "' variable keeps the value it is declared with", s.line)
             }
         } else if c.consts.contains(target.name) {
             c = ck_error(c, "cannot assign to the constant '" + target.name + "'", s.line)
@@ -23389,7 +23322,7 @@ fn ck_assignment(c0: Checker, s: Stmt) -> Checker {
         return ck_error(c, "the assignment" + shown + " takes the result of a call that returns no value", s.line)
     }
     if s.assign_op == ASSIGN_EQ() {
-        if ck_fits(c, to.t, value.t) == false {
+        if ck_fits_value(c, to.t, value.t, *s.assign_value) == false {
             c = ck_error(c, "type mismatch in the assignment" + shown + ": expected " + to.t + ", found " + value.t, s.line)
         } else {
             c = ck_settle(c, *s.assign_value, to.t)
@@ -23717,7 +23650,7 @@ fn ck_const_decl(c0: Checker, cd: ConstDecl) -> Checker {
     }
     c = ck_type_exists(c, cd.type_name, cd.line)
     let want = c.consts.get(cd.name)
-    if ck_fits(c, want, found.t) == false {
+    if ck_fits_value(c, want, found.t, value) == false {
         c = ck_error(c, "type mismatch in the value of '" + cd.name + "': expected " + want + ", found " + found.t, value.line)
     } else {
         c = ck_settle(c, value, want)
@@ -23730,10 +23663,76 @@ fn ck_impl(c0: Checker, ib: ImplBlock) -> Checker {
     -- Inside the block its type parameters stand for any type
     let self_type = ty_apply(ck_generic_type(ib.target_type, ib.generic_params), ib.generic_params, ty_unbound(0))
     let no_binds: List[string] = []
+    let errors_before = c.errors.len()
     let mut i = 0
     while i < ib.methods.len() {
         c = ck_function(c, ib.methods[i], self_type, ib.generic_params, no_binds, false)
         i = i + 1
+    }
+    -- The methods of a `dyn Trait` are written by the compiler (TRAITS
+    -- in main_split.dm): what is wrong in one is wrong in an impl of
+    -- the trait, and is reported there
+    if starts_with(ib.target_type, DYN_PREFIX()) {
+        while c.errors.len() > errors_before {
+            c.errors.pop()
+        }
+        return c
+    }
+    if ib.trait_name != "" { c = ck_impl_of_trait(c, ib) }
+    return c
+}
+
+-- An impl of a trait is of a trait there is, and has each of the
+-- trait's methods, with the parameters and the result the trait gives
+-- it (a method the trait has a body for is in the impl already, see
+-- TRAITS in main_split.dm)
+fn ck_impl_of_trait(c0: Checker, ib: ImplBlock) -> Checker {
+    let mut c = c0
+    if c.traits.contains(ib.trait_name) == false {
+        return ck_error(c, "undefined trait '" + ib.trait_name + "'", ib.line)
+    }
+    let shown = "the impl of '" + ib.trait_name + "' for '" + ib.target_type + "'"
+    let names = string_split(c.traits.get(ib.trait_name), "|")
+    let mut i = 0
+    while i < names.len() {
+        let name = names[i]
+        i = i + 1
+        if name == "" { continue }
+        let mut found = -1
+        let mut mi = 0
+        while mi < ib.methods.len() {
+            if ib.methods[mi].name == name { found = mi }
+            mi = mi + 1
+        }
+        if found < 0 {
+            c = ck_error(c, shown + " has no method '" + name + "', which the trait declares without a body", ib.line)
+            continue
+        }
+        let line = ib.methods[found].line
+        let want = c.fns.get(ib.trait_name + "_" + name)
+        let have = c.fns.get(ib.target_type + "_" + name)
+        if want.params.len() != have.params.len() or want.has_self != have.has_self {
+            c = ck_error(c, "the method '" + name + "' of " + shown + " does not take the parameters the trait gives it", line)
+            continue
+        }
+        let mut pi = 0
+        if want.has_self { pi = 1 }
+        while pi < want.params.len() {
+            if ty_same(want.params[pi], have.params[pi]) == false {
+                c = ck_error(c, "parameter " + int_to_string(pi + 1) + " of the method '" + name + "' of " + shown + " has the type " + have.params[pi] + ", and the trait gives it the type " + want.params[pi], line)
+            } else if want.changes[pi] != have.changes[pi] {
+                c = ck_error(c, "parameter " + int_to_string(pi + 1) + " of the method '" + name + "' of " + shown + " is 'mut' in one of the trait and the impl and not in the other", line)
+            }
+            pi = pi + 1
+        }
+        if want.has_self and want.changes.len() > 0 and have.changes.len() > 0 {
+            if want.changes[0] != have.changes[0] {
+                c = ck_error(c, "the method '" + name + "' of " + shown + " takes 'mut self' in one of the trait and the impl and 'self' in the other", line)
+            }
+        }
+        if ty_same(want.ret, have.ret) == false {
+            c = ck_error(c, "the method '" + name + "' of " + shown + " returns " + have.ret + ", and the trait says it returns " + want.ret, line)
+        }
     }
     return c
 }
@@ -27728,7 +27727,7 @@ fn prelude_source() -> string {
 
 -- A hash of the compiler's and the runtime's source
 fn runtime_build_id() -> string {
-    return "499d2fd37658f783"
+    return "7c53526e32a3eaeb"
 }
 
 
@@ -28094,6 +28093,245 @@ fn parse_llvm_bridge(path: string, file: int) -> SourceFile {
         exit(1)
     }
     return bridge_sf
+}
+
+-- ============================================================
+-- TRAITS
+-- Before the program is checked, complete_traits adds to it what its
+-- traits stand for:
+--
+-- 1. A trait's method that has a body is the method of every type
+--    that implements the trait and does not define the method itself.
+--    Each such impl gets a copy of the method with expressions of its
+--    own (fresh_function in ast.dm), which is then checked and
+--    generated as any method of the type is.
+--
+-- 2. `dyn Trait` is the type of a value of any type that implements
+--    the trait. It is an enum the compiler writes, named Dyn$Trait
+--    (parse_type gives `dyn Trait` this name; no source can write it),
+--    with one variant for each type that implements the trait,
+--    V_Type(Box[Type]), and with the trait's methods: each matches the
+--    variant and calls the method of the type in the box. A value of
+--    an implementing type that goes where a `dyn Trait` is expected is
+--    put in its variant (the checker marks the place, ck_settle;
+--    generate_expr does it). So a `dyn Trait` is passed, returned,
+--    kept in a field or a list and assigned as any enum value is, and
+--    a method call on it reaches the method of the type it holds.
+--    The enum has the methods that take `self` and do not name
+--    `Self` elsewhere; a `mut self` method changes the value in the
+--    box, which every copy of the `dyn Trait` shares.
+--    A generic type that implements a trait is not among the types
+--    of its `dyn`, and a trait that no type implements has no `dyn`.
+-- ============================================================
+
+-- The trait of the name, or one with no name
+fn trait_named(sf: SourceFile, name: string) -> TraitDecl {
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_TRAIT() {
+            let td = *decl.trait_decl
+            if td.name == name { return td }
+        }
+        i = i + 1
+    }
+    return trait_decl_new("", 0, 0)
+}
+
+fn has_method_named(methods: List[FunctionDecl], name: string) -> bool {
+    let mut i = 0
+    while i < methods.len() {
+        if methods[i].name == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+-- A type as source text: `dyn Shape` for Dyn$Shape
+fn type_source_text(t: string) -> string {
+    return string_replace(t, DYN_PREFIX(), "dyn ")
+}
+
+-- Whether a `dyn Trait` has the method: it takes `self`, has no type
+-- parameters of its own and names `Self` nowhere else
+fn dyn_takes_method(m: FunctionDecl) -> bool {
+    if m.params.len() == 0 or m.generic_params.len() > 0 { return false }
+    if m.params[0].name != "self" { return false }
+    if type_names_self(m.return_type) { return false }
+    let mut i = 1
+    while i < m.params.len() {
+        if type_names_self(m.params[i].type_name) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+-- Whether the type has the word Self in it
+fn type_names_self(t: string) -> bool {
+    let n = len(t)
+    let mut i = 0
+    while i < n {
+        if ty_ident_byte(byte_at(t, i)) == false {
+            i = i + 1
+            continue
+        }
+        let start = i
+        while i < n and ty_ident_byte(byte_at(t, i)) {
+            i = i + 1
+        }
+        if substr(t, start, i - start) == "Self" { return true }
+    }
+    return false
+}
+
+-- The enum that is `dyn Trait` and its methods, as source. The enum is
+-- called DynEnum here; complete_traits gives it its name.
+fn dyn_enum_source(td: TraitDecl, types: List[string]) -> string {
+    let mut src = "module dyn\nenum DynEnum {\n"
+    let mut ti = 0
+    while ti < types.len() {
+        if ti > 0 { src = src + ",\n" }
+        src = src + "    V_" + types[ti] + "(Box[" + types[ti] + "])"
+        ti = ti + 1
+    }
+    src = src + "\n}\nimpl DynEnum {\n"
+    let mut mi = 0
+    while mi < td.methods.len() {
+        let m = td.methods[mi]
+        if dyn_takes_method(m) {
+            let mut params = ""
+            let mut args = ""
+            let mut pi = 1
+            while pi < m.params.len() {
+                let p = m.params[pi]
+                params = params + ", "
+                if p.is_mut { params = params + "mut " }
+                params = params + p.name + ": " + type_source_text(p.type_name)
+                if pi > 1 { args = args + ", " }
+                args = args + p.name
+                pi = pi + 1
+            }
+            let returns = m.return_type != "" and m.return_type != "void"
+            src = src + "    fn " + m.name + "(self" + params + ")"
+            if returns { src = src + " -> " + type_source_text(m.return_type) }
+            if m.effects.len() > 0 {
+                src = src + " with ["
+                let mut ei = 0
+                while ei < m.effects.len() {
+                    if ei > 0 { src = src + ", " }
+                    src = src + m.effects[ei]
+                    ei = ei + 1
+                }
+                src = src + "]"
+            }
+            src = src + " {\n        match self {\n"
+            ti = 0
+            while ti < types.len() {
+                src = src + "            DynEnum.V_" + types[ti] + "(held__) => {\n"
+                if m.params[0].is_mut {
+                    -- The method changes the value, which goes back in the box
+                    src = src + "                let mut value__ = *held__\n"
+                    if returns {
+                        src = src + "                let result__ = value__." + m.name + "(" + args + ")\n"
+                        src = src + "                *held__ = value__\n"
+                        src = src + "                return result__\n"
+                    } else {
+                        src = src + "                value__." + m.name + "(" + args + ")\n"
+                        src = src + "                *held__ = value__\n"
+                    }
+                } else {
+                    src = src + "                let value__ = *held__\n"
+                    if returns {
+                        src = src + "                return value__." + m.name + "(" + args + ")\n"
+                    } else {
+                        src = src + "                value__." + m.name + "(" + args + ")\n"
+                    }
+                }
+                src = src + "            }\n"
+                ti = ti + 1
+            }
+            src = src + "        }\n    }\n"
+        }
+        mi = mi + 1
+    }
+    return src + "}\n"
+}
+
+fn complete_traits(sf0: SourceFile) -> SourceFile {
+    let mut sf = sf0
+    -- 1. The methods a trait gives the types that implement it
+    let mut decls: List[Declaration] = []
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let mut decl = sf.declarations[i]
+        if decl.kind == DECL_IMPL() {
+            let mut ib = *decl.impl_block
+            if ib.trait_name != "" {
+                let td = trait_named(sf, ib.trait_name)
+                let mut mi = 0
+                while mi < td.methods.len() {
+                    let m = td.methods[mi]
+                    if m.body.len() > 0 and has_method_named(ib.methods, m.name) == false {
+                        ib.methods.push(fresh_function(m))
+                    }
+                    mi = mi + 1
+                }
+                decl.impl_block = Box_new(ib)
+            }
+        }
+        decls.push(decl)
+        i = i + 1
+    }
+
+    -- 2. dyn Trait, for each trait that a type implements
+    i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_TRAIT() {
+            let td = *decl.trait_decl
+            let mut types: List[string] = []
+            if td.generic_params.len() == 0 {
+                let mut di = 0
+                while di < sf.declarations.len() {
+                    let other = sf.declarations[di]
+                    if other.kind == DECL_IMPL() {
+                        let ib = *other.impl_block
+                        if ib.trait_name == td.name and ib.generic_params.len() == 0 and string_contains(ib.target_type, "[") == false {
+                            let mut have = false
+                            let mut hi = 0
+                            while hi < types.len() {
+                                if types[hi] == ib.target_type { have = true }
+                                hi = hi + 1
+                            }
+                            if have == false { types.push(ib.target_type) }
+                        }
+                    }
+                    di = di + 1
+                }
+            }
+            if types.len() > 0 {
+                -- The declarations are at the trait's line, in its file
+                let lexed = tokenize(dyn_enum_source(td, types))
+                let mut tokens: List[Token] = []
+                let mut ti = 0
+                while ti < lexed.len() {
+                    let mut text = lexed[ti].value
+                    if lexed[ti].kind == TK_IDENT() and text == "DynEnum" { text = DYN_PREFIX() + td.name }
+                    tokens.push(token_new(lexed[ti].kind, text, td.line, td.col))
+                    ti = ti + 1
+                }
+                let made = parse_source_file(parser_new(tokens))
+                let mut mi = 0
+                while mi < made.declarations.len() {
+                    decls.push(made.declarations[mi])
+                    mi = mi + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    sf.declarations = decls
+    return sf
 }
 
 -- Add the LLVM bridge to the compiler's declarations. The compiler
@@ -28811,7 +29049,7 @@ fn print_symbol(kind: string, name: string, at: Token, end_line: int, container:
     if kind != "import" and (at.kind != TK_IDENT() or at.value != name) {
         return
     }
-    println(kind + "\t" + name + "\t" + int_to_string(at.line) + "\t" + int_to_string(at.col) + "\t" + int_to_string(end_line) + "\t" + container + "\t" + detail)
+    println(kind + "\t" + name + "\t" + int_to_string(at.line) + "\t" + int_to_string(at.col) + "\t" + int_to_string(end_line) + "\t" + container + "\t" + source_name(detail))
 }
 
 -- Print the function whose `fn` is at token `start`
@@ -29004,6 +29242,8 @@ fn compile(cli: CLIArgs) -> int {
         }
         exit(1)
     }
+    -- What the program's traits stand for (see TRAITS)
+    sf = complete_traits(sf)
     -- --link-llvm: the program is the compiler, which needs the LLVM bridge
     if cli.link_llvm {
         let bridge_file = find_bridge_file(dirname(input_file))

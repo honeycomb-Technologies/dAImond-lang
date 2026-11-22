@@ -81,7 +81,29 @@ fn get_scrutinee_type_annotation(gen: IRGenerator, scrut_expr: Expr) -> string {
     return ""
 }
 
+-- The value of an expression. One that the checker marked as going
+-- where a `dyn Trait` is expected (checked_dyn) is put in a box, in
+-- the variant of the trait's enum that is its type's: Circle { .. }
+-- becomes Dyn$Shape.V_Circle(Box_new(Circle { .. })) (see TRAITS in
+-- main_split.dm).
 fn generate_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
+    let mark = checked_dyn(gen, expr)
+    if mark == "" { return generate_expr_plain(gen, block, expr) }
+    let bar = string_find(mark, "|")
+    let dyn_enum = substr(mark, 0, bar)
+    let held_type = substr(mark, bar + 1, len(mark) - bar - 1)
+    let value = generate_expr_plain(gen, block, expr)
+    if value.gen.enum_defs.contains(dyn_enum) == false { return value }
+    let held = bind_hidden_value(value.gen, value.block, "%dyn.value", value.val_id, map_type_name(held_type), held_type)
+    let mut box_args: List[Expr] = []
+    box_args.push(expr_ident("%dyn.value", expr.line, expr.col))
+    let mut variant_args: List[Expr] = []
+    variant_args.push(expr_call(expr_ident("Box_new", expr.line, expr.col), box_args, expr.line, expr.col))
+    let made = generate_enum_method_construct(held.gen, held.block, dyn_enum, "V_" + held_type, variant_args, expr.line)
+    return expr_result(unbind_hidden_value(made.gen, "%dyn.value"), made.block, made.val_id)
+}
+
+fn generate_expr_plain(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     if expr.kind == EXPR_LITERAL_INT() {
         return generate_literal_int(gen, block, expr)
     }
@@ -2104,7 +2126,7 @@ fn eq_by_function(g: IRGenerator, t: string) -> bool {
 -- for a type that contains itself.
 fn eq_unsupported(g: IRGenerator, t0: string, seen: List[string]) -> string {
     let t = eq_type(t0)
-    if starts_with(t, "Map[") or is_map_type(g, t) or starts_with(t, "dyn ") or is_simd_type_name(t) { return t }
+    if starts_with(t, "Map[") or is_map_type(g, t) or starts_with(t, DYN_PREFIX()) or is_simd_type_name(t) { return t }
     if starts_with(t, "Box[") or starts_with(t, "fn(") { return "" }
     if eq_by_function(g, t) == false { return "" }
     let mut si = 0
@@ -3290,6 +3312,10 @@ fn generate_cast_expr(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Expr
     b = operand_result.block
     let operand_id = operand_result.val_id
 
+    -- x as dyn Trait: the operand is in the dyn's variant already
+    -- (see generate_expr)
+    if starts_with(expr.cast_type, DYN_PREFIX()) { return operand_result }
+
     -- Determine source type by inference
     let from_type = infer_expr_type(g, *expr.operand)
 
@@ -4342,15 +4368,6 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         }
     }
 
-    -- --------------------------------------------------------
-    -- Check if this is a dyn Trait method call
-    -- --------------------------------------------------------
-    if obj_expr.kind == EXPR_IDENTIFIER() {
-        let obj_name = obj_expr.name
-        if g.dyn_var_concrete.contains(obj_name) {
-            return generate_dyn_dispatch_call(g, b, obj_name, method_name, args)
-        }
-    }
 
     -- --------------------------------------------------------
     -- Get object variable name for type dispatch
@@ -4547,19 +4564,10 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
         return expr_result(g, b, 0)
     }
 
-    -- Build the enum struct with tag and optional payload
-    let base_id = g.builder.next_id
-    let mut base_inst = ir_inst_new(base_id, OP_ALLOCA())
-    base_inst.alloc_type = enum_name
-    base_inst.result_type = "ptr(" + enum_name + ")"
-    base_inst.has_result = true
-    b.instructions.push(base_inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    -- Insert tag at field index 0
+    -- The enum value: its tag at field index 0, then the values
     let tag_insert_id = g.builder.next_id
     let mut tag_insert = ir_inst_new(tag_insert_id, OP_INSERT_FIELD())
-    tag_insert.field_base = ir_val_inst(base_id)
+    tag_insert.field_base = ir_val_undef()
     tag_insert.field_value = ir_val_int(tag)
     tag_insert.field_index = 0
     tag_insert.result_type = enum_name
@@ -4600,78 +4608,6 @@ fn generate_enum_method_construct(gen: IRGenerator, block: IRBasicBlock, enum_na
     return expr_result(g, b, last_id)
 }
 
--- ============================================================
--- DYNAMIC TRAIT DISPATCH
--- Looks up the concrete type for a dyn Trait variable and
--- calls ConcreteType_method(data_ptr, args...)
--- ============================================================
-
-fn generate_dyn_dispatch_call(gen: IRGenerator, block: IRBasicBlock, obj_name: string, method_name: string, args: List[Expr]) -> ExprResult {
-    let mut g = gen
-    let mut b = block
-
-    let concrete_type = g.dyn_var_concrete.get(obj_name)
-    let mangled = concrete_type + "_" + method_name
-
-    let alloca_id = g.variable_map.get(obj_name)
-
-    -- Determine if this is a direct struct param or an indirect let-binding
-    -- For function params, the alloca holds the struct directly (load as struct type)
-    -- For let-bindings, the alloca holds a ptr to heap data (load as ptr)
-    let is_direct_struct = g.var_struct_types.contains(obj_name) and g.variable_types.contains(obj_name) and g.variable_types.get(obj_name) != "ptr"
-
-    let mut self_val_id = 0
-    if is_direct_struct {
-        -- Load the struct value directly from the alloca
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(alloca_id)
-        load_inst.load_type = concrete_type
-        load_inst.result_type = concrete_type
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
-        g.builder.next_id = g.builder.next_id + 1
-        self_val_id = load_id
-    } else {
-        -- Load the data pointer from the dyn variable's alloca (indirect)
-        let load_id = g.builder.next_id
-        let mut load_inst = ir_inst_new(load_id, OP_LOAD())
-        load_inst.load_ptr = ir_val_inst(alloca_id)
-        load_inst.load_type = "ptr"
-        load_inst.result_type = "ptr"
-        load_inst.has_result = true
-        b.instructions.push(load_inst)
-        g.builder.next_id = g.builder.next_id + 1
-        self_val_id = load_id
-    }
-
-    -- Build args: self value, then method arguments
-    let mut call_args: List[IRValue] = []
-    call_args.push(ir_val_inst(self_val_id))
-
-    let mut i = 0
-    while i < args.len() {
-        let arg_result = generate_expr(g, b, args[i])
-        g = arg_result.gen
-        b = arg_result.block
-        call_args.push(ir_val_inst(arg_result.val_id))
-        i = i + 1
-    }
-
-    let ret_type = infer_call_return_type(g, mangled)
-    let has_result = ret_type != "void"
-
-    let id = g.builder.next_id
-    let mut inst = ir_inst_new(id, OP_CALL())
-    inst.callee = mangled
-    inst.call_args = call_args
-    inst.result_type = ret_type
-    inst.has_result = has_result
-    b.instructions.push(inst)
-    g.builder.next_id = g.builder.next_id + 1
-
-    return expr_result(g, b, id)
-}
 
 -- ============================================================
 -- LIST METHOD CALL

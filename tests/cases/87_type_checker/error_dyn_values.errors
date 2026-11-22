@@ -1,3 +1,9 @@
-Error: type mismatch in the value of 'b': expected dyn Shape, found Label at line 20
-Error: cannot assign to 'c': a 'dyn Shape' variable keeps the value it is declared with at line 23
-Error: 2 type errors
+Error: no type implements the trait 'Unused', so there is no value a 'dyn Unused' could hold at line 34
+Error: undefined trait 'Nothing' at line 38
+Error: the method 'copy' of the trait 'Copier' cannot be called on a 'dyn Copier': a 'dyn' has the methods that take 'self', have no type parameters and do not name 'Self' elsewhere at line 43
+Error: type mismatch in the value of 'b': expected dyn Shape, found Label at line 51
+Error: cannot cast Label to dyn Shape: it does not implement the trait at line 52
+Error: type mismatch in argument 1 of 'show': expected dyn Shape, found Label at line 53
+Error: type 'dyn Shape' has no method 'perimeter' at line 54
+Error: type mismatch in the value of 'shapes': expected List[dyn Shape], found List[Square] at line 56
+Error: 8 type errors

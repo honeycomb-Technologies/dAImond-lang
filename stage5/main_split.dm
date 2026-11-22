@@ -383,6 +383,245 @@ fn parse_llvm_bridge(path: string, file: int) -> SourceFile {
     return bridge_sf
 }
 
+-- ============================================================
+-- TRAITS
+-- Before the program is checked, complete_traits adds to it what its
+-- traits stand for:
+--
+-- 1. A trait's method that has a body is the method of every type
+--    that implements the trait and does not define the method itself.
+--    Each such impl gets a copy of the method with expressions of its
+--    own (fresh_function in ast.dm), which is then checked and
+--    generated as any method of the type is.
+--
+-- 2. `dyn Trait` is the type of a value of any type that implements
+--    the trait. It is an enum the compiler writes, named Dyn$Trait
+--    (parse_type gives `dyn Trait` this name; no source can write it),
+--    with one variant for each type that implements the trait,
+--    V_Type(Box[Type]), and with the trait's methods: each matches the
+--    variant and calls the method of the type in the box. A value of
+--    an implementing type that goes where a `dyn Trait` is expected is
+--    put in its variant (the checker marks the place, ck_settle;
+--    generate_expr does it). So a `dyn Trait` is passed, returned,
+--    kept in a field or a list and assigned as any enum value is, and
+--    a method call on it reaches the method of the type it holds.
+--    The enum has the methods that take `self` and do not name
+--    `Self` elsewhere; a `mut self` method changes the value in the
+--    box, which every copy of the `dyn Trait` shares.
+--    A generic type that implements a trait is not among the types
+--    of its `dyn`, and a trait that no type implements has no `dyn`.
+-- ============================================================
+
+-- The trait of the name, or one with no name
+fn trait_named(sf: SourceFile, name: string) -> TraitDecl {
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_TRAIT() {
+            let td = *decl.trait_decl
+            if td.name == name { return td }
+        }
+        i = i + 1
+    }
+    return trait_decl_new("", 0, 0)
+}
+
+fn has_method_named(methods: List[FunctionDecl], name: string) -> bool {
+    let mut i = 0
+    while i < methods.len() {
+        if methods[i].name == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+-- A type as source text: `dyn Shape` for Dyn$Shape
+fn type_source_text(t: string) -> string {
+    return string_replace(t, DYN_PREFIX(), "dyn ")
+}
+
+-- Whether a `dyn Trait` has the method: it takes `self`, has no type
+-- parameters of its own and names `Self` nowhere else
+fn dyn_takes_method(m: FunctionDecl) -> bool {
+    if m.params.len() == 0 or m.generic_params.len() > 0 { return false }
+    if m.params[0].name != "self" { return false }
+    if type_names_self(m.return_type) { return false }
+    let mut i = 1
+    while i < m.params.len() {
+        if type_names_self(m.params[i].type_name) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+-- Whether the type has the word Self in it
+fn type_names_self(t: string) -> bool {
+    let n = len(t)
+    let mut i = 0
+    while i < n {
+        if ty_ident_byte(byte_at(t, i)) == false {
+            i = i + 1
+            continue
+        }
+        let start = i
+        while i < n and ty_ident_byte(byte_at(t, i)) {
+            i = i + 1
+        }
+        if substr(t, start, i - start) == "Self" { return true }
+    }
+    return false
+}
+
+-- The enum that is `dyn Trait` and its methods, as source. The enum is
+-- called DynEnum here; complete_traits gives it its name.
+fn dyn_enum_source(td: TraitDecl, types: List[string]) -> string {
+    let mut src = "module dyn\nenum DynEnum {\n"
+    let mut ti = 0
+    while ti < types.len() {
+        if ti > 0 { src = src + ",\n" }
+        src = src + "    V_" + types[ti] + "(Box[" + types[ti] + "])"
+        ti = ti + 1
+    }
+    src = src + "\n}\nimpl DynEnum {\n"
+    let mut mi = 0
+    while mi < td.methods.len() {
+        let m = td.methods[mi]
+        if dyn_takes_method(m) {
+            let mut params = ""
+            let mut args = ""
+            let mut pi = 1
+            while pi < m.params.len() {
+                let p = m.params[pi]
+                params = params + ", "
+                if p.is_mut { params = params + "mut " }
+                params = params + p.name + ": " + type_source_text(p.type_name)
+                if pi > 1 { args = args + ", " }
+                args = args + p.name
+                pi = pi + 1
+            }
+            let returns = m.return_type != "" and m.return_type != "void"
+            src = src + "    fn " + m.name + "(self" + params + ")"
+            if returns { src = src + " -> " + type_source_text(m.return_type) }
+            if m.effects.len() > 0 {
+                src = src + " with ["
+                let mut ei = 0
+                while ei < m.effects.len() {
+                    if ei > 0 { src = src + ", " }
+                    src = src + m.effects[ei]
+                    ei = ei + 1
+                }
+                src = src + "]"
+            }
+            src = src + " {\n        match self {\n"
+            ti = 0
+            while ti < types.len() {
+                src = src + "            DynEnum.V_" + types[ti] + "(held__) => {\n"
+                if m.params[0].is_mut {
+                    -- The method changes the value, which goes back in the box
+                    src = src + "                let mut value__ = *held__\n"
+                    if returns {
+                        src = src + "                let result__ = value__." + m.name + "(" + args + ")\n"
+                        src = src + "                *held__ = value__\n"
+                        src = src + "                return result__\n"
+                    } else {
+                        src = src + "                value__." + m.name + "(" + args + ")\n"
+                        src = src + "                *held__ = value__\n"
+                    }
+                } else {
+                    src = src + "                let value__ = *held__\n"
+                    if returns {
+                        src = src + "                return value__." + m.name + "(" + args + ")\n"
+                    } else {
+                        src = src + "                value__." + m.name + "(" + args + ")\n"
+                    }
+                }
+                src = src + "            }\n"
+                ti = ti + 1
+            }
+            src = src + "        }\n    }\n"
+        }
+        mi = mi + 1
+    }
+    return src + "}\n"
+}
+
+fn complete_traits(sf0: SourceFile) -> SourceFile {
+    let mut sf = sf0
+    -- 1. The methods a trait gives the types that implement it
+    let mut decls: List[Declaration] = []
+    let mut i = 0
+    while i < sf.declarations.len() {
+        let mut decl = sf.declarations[i]
+        if decl.kind == DECL_IMPL() {
+            let mut ib = *decl.impl_block
+            if ib.trait_name != "" {
+                let td = trait_named(sf, ib.trait_name)
+                let mut mi = 0
+                while mi < td.methods.len() {
+                    let m = td.methods[mi]
+                    if m.body.len() > 0 and has_method_named(ib.methods, m.name) == false {
+                        ib.methods.push(fresh_function(m))
+                    }
+                    mi = mi + 1
+                }
+                decl.impl_block = Box_new(ib)
+            }
+        }
+        decls.push(decl)
+        i = i + 1
+    }
+
+    -- 2. dyn Trait, for each trait that a type implements
+    i = 0
+    while i < sf.declarations.len() {
+        let decl = sf.declarations[i]
+        if decl.kind == DECL_TRAIT() {
+            let td = *decl.trait_decl
+            let mut types: List[string] = []
+            if td.generic_params.len() == 0 {
+                let mut di = 0
+                while di < sf.declarations.len() {
+                    let other = sf.declarations[di]
+                    if other.kind == DECL_IMPL() {
+                        let ib = *other.impl_block
+                        if ib.trait_name == td.name and ib.generic_params.len() == 0 and string_contains(ib.target_type, "[") == false {
+                            let mut have = false
+                            let mut hi = 0
+                            while hi < types.len() {
+                                if types[hi] == ib.target_type { have = true }
+                                hi = hi + 1
+                            }
+                            if have == false { types.push(ib.target_type) }
+                        }
+                    }
+                    di = di + 1
+                }
+            }
+            if types.len() > 0 {
+                -- The declarations are at the trait's line, in its file
+                let lexed = tokenize(dyn_enum_source(td, types))
+                let mut tokens: List[Token] = []
+                let mut ti = 0
+                while ti < lexed.len() {
+                    let mut text = lexed[ti].value
+                    if lexed[ti].kind == TK_IDENT() and text == "DynEnum" { text = DYN_PREFIX() + td.name }
+                    tokens.push(token_new(lexed[ti].kind, text, td.line, td.col))
+                    ti = ti + 1
+                }
+                let made = parse_source_file(parser_new(tokens))
+                let mut mi = 0
+                while mi < made.declarations.len() {
+                    decls.push(made.declarations[mi])
+                    mi = mi + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    sf.declarations = decls
+    return sf
+}
+
 -- Add the LLVM bridge to the compiler's declarations. The compiler
 -- declares each bridge function as an extern fn (llvm.dm). The
 -- bridge's own function of that name takes the declaration's place.
@@ -1098,7 +1337,7 @@ fn print_symbol(kind: string, name: string, at: Token, end_line: int, container:
     if kind != "import" and (at.kind != TK_IDENT() or at.value != name) {
         return
     }
-    println(kind + "\t" + name + "\t" + int_to_string(at.line) + "\t" + int_to_string(at.col) + "\t" + int_to_string(end_line) + "\t" + container + "\t" + detail)
+    println(kind + "\t" + name + "\t" + int_to_string(at.line) + "\t" + int_to_string(at.col) + "\t" + int_to_string(end_line) + "\t" + container + "\t" + source_name(detail))
 }
 
 -- Print the function whose `fn` is at token `start`
@@ -1291,6 +1530,8 @@ fn compile(cli: CLIArgs) -> int {
         }
         exit(1)
     }
+    -- What the program's traits stand for (see TRAITS)
+    sf = complete_traits(sf)
     -- --link-llvm: the program is the compiler, which needs the LLVM bridge
     if cli.link_llvm {
         let bridge_file = find_bridge_file(dirname(input_file))

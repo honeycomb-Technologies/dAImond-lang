@@ -164,11 +164,17 @@ fn error_at(files: List[string], msg: string, line: int) -> string {
     return file_prefix(files, line) + "Error: " + source_name(msg) + " at line " + int_to_string(line_in_file(line))
 }
 
+-- What the name of the type `dyn Trait` begins with: Dyn$Trait, a name
+-- no source can write (see TRAITS in main_split.dm)
+fn DYN_PREFIX() -> string { return "Dyn$" }
+
 -- The text with each variable's name as it is in the source: without
 -- the `$N` that a variable which shadows another has by the time IR
 -- is generated (see SHADOWED NAMES in ast.dm)
-fn source_name(text: string) -> string {
-    if string_contains(text, "$") == false { return text }
+fn source_name(text0: string) -> string {
+    if string_contains(text0, "$") == false { return text0 }
+    -- Dyn$Shape is the type the source writes `dyn Shape`
+    let text = string_replace(text0, DYN_PREFIX(), "dyn ")
     let n = len(text)
     let mut out = ""
     let mut from = 0
