@@ -1,0 +1,4 @@
+a string has no method 'upper': it has len, trim, to_upper, to_lower, contains, find, starts_with, ends_with, replace, split, substr, char_at and byte_at at line 4
+string_trim() takes 1 argument, not 2 at line 5
+type mismatch in argument 2 of 'string_find': expected string, found int at line 6
+type mismatch in the value of 'n': expected int, found string at line 7

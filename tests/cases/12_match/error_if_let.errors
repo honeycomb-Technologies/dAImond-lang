@@ -1,0 +1,5 @@
+Error: this 'if let' is used as a value, and has no 'else' to give one at line 4
+Error: the pattern 'Some' is a variant of Option, but the matched value is int at line 5
+Error: enum 'Shape' has no variant 'Square' at line 6
+Error: undefined variable 'q' at line 7
+Error: the pattern 'Ok' is a variant of Result, but the matched value is Option[int] at line 8

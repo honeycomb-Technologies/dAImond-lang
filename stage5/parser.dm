@@ -1120,6 +1120,9 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
     -- begins its own count
     let before = pp.else_ifs
     pp.else_ifs = 0
+    if p_peek(pp) == TK_LET() {
+        return parse_if_let(pp, tok, before)
+    }
     let cond = parse_expr(pp)
     pp = cond.p
     pp = p_expect(pp, TK_LBRACE())
@@ -1147,6 +1150,11 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
             let else_if = parse_if_expr(pp)
             pp = else_if.p
             e.else_branch = Box_new(else_if.expr)
+            if else_if.expr.kind == EXPR_MATCH() {
+                -- else if let: the match is the one statement of the
+                -- else block
+                e.else_branch = Box_new(block_of_match(else_if.expr))
+            }
             e.has_else = true
         } else {
             pp = p_expect(pp, TK_LBRACE())
@@ -1160,6 +1168,87 @@ fn parse_if_expr(p: Parser) -> ParseExprResult {
         }
     }
 
+    pp.else_ifs = before
+    return ParseExprResult { p: pp, expr: e }
+}
+
+-- A block whose one statement is a match
+fn block_of_match(m: Expr) -> Expr {
+    let mut s = stmt_new(STMT_MATCH(), m.line, m.col)
+    s.match_expr = Box_new(m)
+    let mut stmts: List[Stmt] = []
+    stmts.push(s)
+    let mut block = expr_new(EXPR_BLOCK(), m.line, m.col)
+    block.stmts = stmts
+    return block
+}
+
+-- if let PATTERN = value { A } else { B }, from the `let` on. It is
+-- the match
+--     match value { PATTERN => { A }, _ => { B } }
+-- and is parsed as that match: the checker and code generation see no
+-- other form. Without an `else` the second arm does nothing. `tok` is
+-- the `if`, and `before` the `else if`s before it.
+fn parse_if_let(p: Parser, tok: Token, before: int) -> ParseExprResult {
+    let mut pp = p_advance(p) -- skip 'let'
+    let pat = parse_pattern(pp)
+    pp = pat.p
+    pp = p_expect(pp, TK_EQ())
+    let value = parse_expr(pp)
+    pp = value.p
+    pp = p_expect(pp, TK_LBRACE())
+    let then_block = parse_block_body(pp)
+    pp = then_block.p
+    pp = p_expect(pp, TK_RBRACE())
+
+    let mut found = match_arm_new(pat.pattern)
+    -- The literals among a variant pattern's values are tests (see
+    -- parse_match_arm)
+    let tests = found.pattern.tests
+    if tests.len() > 0 {
+        let mut cond = tests[0]
+        let mut ti = 1
+        while ti < tests.len() {
+            cond = expr_binary(BINOP_AND(), cond, tests[ti], cond.line, cond.col)
+            ti = ti + 1
+        }
+        found.guard = Box_new(cond)
+        found.has_guard = true
+    }
+    found.body = then_block.stmts
+    let mut other = match_arm_new(pattern_wildcard())
+
+    pp = p_skip_newlines(pp)
+    if p_peek(pp) == TK_ELSE() {
+        pp = p_advance(pp)
+        pp = p_skip_newlines(pp)
+        if p_peek(pp) == TK_IF() {
+            -- else if, and else if let
+            pp.else_ifs = before + 1
+            if pp.else_ifs == MAX_ELSE_IFS() + 1 {
+                pp = p_past_limit(pp, "more than " + int_to_string(MAX_ELSE_IFS()) + " `else if`s follow this `if` (a `match`, or `if`s that return, take any number)")
+            }
+            let else_if = parse_if_expr(pp)
+            pp = else_if.p
+            other.body_expr = Box_new(else_if.expr)
+            other.is_expr_body = true
+        } else {
+            pp = p_expect(pp, TK_LBRACE())
+            let else_block = parse_block_body(pp)
+            pp = else_block.p
+            pp = p_expect(pp, TK_RBRACE())
+            other.body = else_block.stmts
+        }
+    } else {
+        other.no_else = true
+    }
+
+    let mut e = expr_new(EXPR_MATCH(), tok.line, tok.col)
+    e.scrutinee = Box_new(value.expr)
+    let mut arms: List[MatchArm] = []
+    arms.push(found)
+    arms.push(other)
+    e.match_arms = arms
     pp.else_ifs = before
     return ParseExprResult { p: pp, expr: e }
 }
@@ -1774,6 +1863,12 @@ fn parse_return_stmt(p: Parser) -> ParseStmtResult {
 -- the block it ends is used as a value (if_stmt_of in ast.dm)
 fn parse_if_stmt(p: Parser) -> ParseStmtResult {
     let parsed = parse_if_expr(p)
+    if parsed.expr.kind == EXPR_MATCH() {
+        -- if let (see parse_if_let)
+        let mut s = stmt_new(STMT_MATCH(), parsed.expr.line, parsed.expr.col)
+        s.match_expr = Box_new(parsed.expr)
+        return ParseStmtResult { p: parsed.p, stmt: s }
+    }
     return ParseStmtResult { p: parsed.p, stmt: if_stmt_of(parsed.expr) }
 }
 

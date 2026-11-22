@@ -415,7 +415,10 @@ struct MatchArm {
     body_expr: Box[Expr],
     is_expr_body: bool,
     guard: Box[Expr],
-    has_guard: bool
+    has_guard: bool,
+    -- The arm is what an `if let` without an `else` does when the
+    -- pattern is not matched: nothing (parse_if_let)
+    no_else: bool
 }
 
 fn match_arm_new(pattern: Pattern) -> MatchArm {
@@ -425,7 +428,8 @@ fn match_arm_new(pattern: Pattern) -> MatchArm {
         body_expr: Box_null(),
         is_expr_body: false,
         guard: Box_null(),
-        has_guard: false
+        has_guard: false,
+        no_else: false
     }
 }
 

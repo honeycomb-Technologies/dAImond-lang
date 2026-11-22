@@ -2,7 +2,7 @@ Error: undefined function 'missing' at line 20
 Error: a List[int] has no method 'first': a list has push, pop, len and contains at line 22
 Error: 'len' of a List takes no arguments, not 1 at line 23
 Error: type mismatch in the value looked for in a List[int]: expected int, found string at line 24
-Error: a string has no method 'upper': it has len, and the string functions take it as an argument at line 26
+Error: a string has no method 'upper': it has len, trim, to_upper, to_lower, contains, find, starts_with, ends_with, replace, split, substr, char_at and byte_at at line 26
 Error: 'e' is a value of type int, which cannot be called at line 28
 Error: type mismatch in argument 1 of 'Button.on_click': expected int, found string at line 30
 Error: call to 'Button.on_click' passes 2 arguments, expected 1 at line 31

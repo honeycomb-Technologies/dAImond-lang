@@ -149,7 +149,7 @@ fn member_owner(text: string, start: int) -> string {
 
 -- Whether the name of `count` bytes at offset `at` declares a variable
 -- there: 0 when it does not, 1 for a `let`, the variable of a `for` or
--- a name bound by a match arm, 2 for a parameter. `body_start` is
+-- a name bound by a match arm or an `if let`, 2 for a parameter. `body_start` is
 -- where the body of the function around it starts.
 fn declaration_kind(text: string, at: int, count: int, body_start: int) -> int {
     let prev = before_blanks(text, at, false)
@@ -160,6 +160,11 @@ fn declaration_kind(text: string, at: int, count: int, body_start: int) -> int {
     let mut_prev = before_blanks(text, prev - 2, true)
 
     if before == "let" {
+        -- In `if let Some(n) = ...` and `if let Tint.Dark(n) = ...`
+        -- the name after `let` is the pattern's variant or its enum
+        if next == 40 or next == 46 {
+            return 0
+        }
         return 1
     }
     if before == "mut" and word_ending_at(text, mut_prev) == "let" {
@@ -179,13 +184,26 @@ fn declaration_kind(text: string, at: int, count: int, body_start: int) -> int {
         }
         return 0
     }
+    let opener = byte_or_zero(text, prev)
+    -- A name bound by the pattern of an `if let` is between the `let`
+    -- and the `=`
+    if (opener == 40 or opener == 44) and (next == 41 or next == 44) {
+        let mut from = at
+        while from > 0 and byte_at(text, from - 1) != 10 {
+            from = from - 1
+        }
+        let head = view(text, from, at - from)
+        let pattern_at = find_last(head, "if let ")
+        if pattern_at >= 0 and string_find(view(head, pattern_at, len(head) - pattern_at), "=") < 0 {
+            return 1
+        }
+    }
     -- A name bound by a match arm is before the arm's `=>`
     let end = line_end(text, at)
     let arrow = string_find(view(text, at + count, end - at - count), "=>")
     if arrow < 0 {
         return 0
     }
-    let opener = byte_or_zero(text, prev)
     -- Variant(name) => ... and Variant(a, name) => ...
     if (opener == 40 or opener == 44) and (next == 41 or next == 44) {
         return 1

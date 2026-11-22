@@ -2431,6 +2431,11 @@ fn struct_has_method(g: IRGenerator, struct_name: string, method: string) -> boo
         fci = fci + 1
     }
     if g.generic_fn_decls.contains(mangled) { return true }
+    -- An instance of a generic struct or enum has the methods of the
+    -- generic impl block: Vec2_i64 has Vec2's `add`
+    if g.generic_instances.contains(struct_name) {
+        if g.generic_fn_decls.contains(g.generic_instances.get(struct_name) + "_" + method) { return true }
+    }
     -- A method that is declared further down the file
     let mut dci = 0
     while dci < g.declarations.len() {

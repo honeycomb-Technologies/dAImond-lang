@@ -1,0 +1,20 @@
+{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}
+open main.dm
+# 1: hover on head, bound by an if let
+ask hover main.dm 16 24
+# 2: definition of head, from its use
+ask definition main.dm 16 24
+# 3: references of depth, the second name of a pattern
+ask references main.dm 19 32
+# 4: definition of level
+ask definition main.dm 19 24
+# 5: of other, bound by an else if let
+ask definition main.dm 21 16
+# 6: Some after `let` is no variable, and has no definition
+ask definition main.dm 15 12
+# 7: first, in the value of the if let, is the function
+ask definition main.dm 15 26
+# 8: total inside the value of the else if let is the local
+ask definition main.dm 20 39
+{"jsonrpc":"2.0","id":99,"method":"shutdown"}
+{"jsonrpc":"2.0","method":"exit"}

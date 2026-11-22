@@ -152,6 +152,13 @@ fn main() {
         None => println("no even number"),
     }
 
+    -- One pattern, and what to do without it
+    if let Some(n) = first_even([1, 7]) {
+        println(f"first even: {n}")
+    } else {
+        println("only odd numbers")
+    }
+
     -- Error handling
     match parse_config("17") {
         Ok(config) => println(f"config value {config.value}"),

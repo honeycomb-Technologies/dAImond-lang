@@ -1199,7 +1199,10 @@ fn ck_operator(c0: Checker, op: int, left: string, right: string, line: int) -> 
     let left_head = ty_head(left)
     if method != "" and left_head != "" and c.fns.contains(left_head + "_" + method) {
         let sig = c.fns.get(left_head + "_" + method)
-        return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_unbound(0)))
+        -- The left operand's type arguments are the impl block's type
+        -- parameters: Vec2[int] + Vec2[int] is the Vec2[T] that add
+        -- returns, for T = int
+        return ck_typed(c, ty_apply(sig.ret, sig.generics, ty_args(left)))
     }
     let lk = ty_kind(left)
     let rk = ty_kind(right)
@@ -2097,6 +2100,21 @@ fn ck_settle_static(c0: Checker, e: Expr, key: string, want: string) -> Checker 
     return c
 }
 
+-- The builtin function that a method of a string is: s.trim() is
+-- string_trim(s), s.split(",") is string_split(s, ","). "" for a name
+-- that is no method of a string.
+fn string_method_builtin(method: string) -> string {
+    if method == "trim" { return "string_trim" }
+    if method == "to_upper" { return "string_to_upper" }
+    if method == "to_lower" { return "string_to_lower" }
+    if method == "contains" { return "string_contains" }
+    if method == "find" { return "string_find" }
+    if method == "replace" { return "string_replace" }
+    if method == "split" { return "string_split" }
+    if method == "starts_with" or method == "ends_with" or method == "substr" or method == "char_at" or method == "byte_at" { return method }
+    return ""
+}
+
 fn ck_method_arity(c: Checker, recv: string, method: string, want: int, got: int, line: int) -> Checker {
     if want == got { return c }
     return ck_error(c, "'" + method + "' of a " + ty_head(recv) + " takes " + arguments_text(want) + ", not " + int_to_string(got), line)
@@ -2214,7 +2232,28 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
     }
     if recv == "string" {
         if method == "len" { return ck_typed(ck_method_arity(c, recv, method, 0, arg_types.len(), e.line), "int") }
-        return ck_no_method(c, e, recv, arg_types, "a string has no method '" + method + "': it has len, and the string functions take it as an argument")
+        -- A program's own function of the name is called with the
+        -- string first, as for any type; else the string's method is
+        -- the builtin function that takes the string first
+        let builtin = string_method_builtin(method)
+        if builtin != "" and (c.fns.contains(method) == false or is_builtin_fn(method)) and ck_var(c, method) < 0 {
+            let mut types: List[string] = []
+            types.push(recv)
+            let mut args: List[Expr] = []
+            args.push(object)
+            let mut ai = 0
+            while ai < e.args.len() {
+                types.push(arg_types[ai])
+                args.push(e.args[ai])
+                ai = ai + 1
+            }
+            if c.record and e.id >= 0 and e.id < c.targets.len() {
+                c.targets[e.id] = "call:" + builtin
+            }
+            let none: List[string] = []
+            return ck_call_named(c, builtin, none, types, args, e.line, e.id)
+        }
+        return ck_no_method(c, e, recv, arg_types, "a string has no method '" + method + "': it has len, trim, to_upper, to_lower, contains, find, starts_with, ends_with, replace, split, substr, char_at and byte_at")
     }
     if c.structs.contains(head) or c.enums.contains(head) {
         -- A field that holds a function is called like a method
@@ -2583,6 +2622,42 @@ fn ck_variant_pattern(c: Checker, p: Pattern, t: string, line: int) -> Checker {
     return c
 }
 
+-- Whether the checker knows what sort of type `t` is: a number, a
+-- string, a bool, an Option, a Result, a List, a Map, a Box, a struct
+-- or an enum. (Not a type parameter, a function or a `dyn`.)
+fn ck_sort_known(c: Checker, t: string) -> bool {
+    if ty_known(t) == false { return false }
+    if ty_kind(t) != "" { return true }
+    let head = ty_head(t)
+    if head == "Option" or head == "Result" or head == "List" or head == "Map" or head == "Box" { return true }
+    return c.enums.contains(head) or c.structs.contains(head)
+}
+
+-- A pattern that is a variant must be a variant of the matched
+-- value's type: `Some` and `None` of an Option, `Ok` and `Err` of a
+-- Result, `Color.Red` of a Color. (That the enum has the variant is
+-- ck_variant_pattern's.)
+fn ck_variant_of(c: Checker, p: Pattern, t: string, line: int) -> Checker {
+    if p.kind != PAT_ENUM_VARIANT() or ck_sort_known(c, t) == false { return c }
+    let head = ty_head(t)
+    let mut of = ty_head(p.enum_type)
+    if of == "" {
+        -- A variant of the value's own enum
+        if c.enums.contains(head) { return c }
+        if p.variant == "Some" or p.variant == "None" {
+            of = "Option"
+        } else if p.variant == "Ok" or p.variant == "Err" {
+            of = "Result"
+        } else {
+            return ck_error(c, "the pattern '" + p.variant + "' is a variant, but the matched value is " + t, line)
+        }
+    } else if c.enums.contains(of) == false {
+        return c
+    }
+    if of == head { return c }
+    return ck_error(c, "the pattern '" + p.variant + "' is a variant of " + of + ", but the matched value is " + t, line)
+}
+
 -- A match. `used` says that its value goes somewhere.
 fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
     let scrutinee = ck_expr(c0, *e.scrutinee)
@@ -2596,10 +2671,11 @@ fn ck_match(c0: Checker, e: Expr, used: bool) -> Typed {
         let arm = e.match_arms[i]
         let mark = c.var_names.len()
         let pattern_kind = ck_literal_kind(arm.pattern)
-        if pattern_kind != "" and scrutinee_kind != "" and pattern_kind != scrutinee_kind {
+        if pattern_kind != "" and pattern_kind != scrutinee_kind and (scrutinee_kind != "" or ck_sort_known(c, scrutinee.t)) {
             let lit = *arm.pattern.literal_expr
             c = ck_error(c, "a pattern is a " + pattern_kind + ", but the matched value is " + scrutinee.t, lit.line)
         }
+        c = ck_variant_of(c, arm.pattern, scrutinee.t, e.line)
         c = ck_variant_pattern(c, arm.pattern, scrutinee.t, e.line)
         c = ck_bind_pattern(c, arm.pattern, scrutinee.t)
         if arm.has_guard {
@@ -3024,7 +3100,9 @@ fn ck_needs_value(c: Checker, e: Expr, inner: bool) -> Checker {
         let mut i = 0
         while i < e.match_arms.len() {
             let arm = e.match_arms[i]
-            if arm.is_expr_body {
+            if arm.no_else {
+                out = ck_error(out, "this 'if let' is used as a value, and has no 'else' to give one", e.line)
+            } else if arm.is_expr_body {
                 out = ck_needs_value(out, *arm.body_expr, true)
             } else {
                 out = ck_block_needs_value(out, arm.body, e.line)

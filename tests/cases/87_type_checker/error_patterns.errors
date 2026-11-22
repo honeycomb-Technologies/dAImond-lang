@@ -1,0 +1,10 @@
+Error: the pattern 'Some' is a variant of Option, but the matched value is int at line 5
+Error: the pattern 'Ok' is a variant of Result, but the matched value is Option[int] at line 6
+Error: the pattern 'Some' is a variant of Option, but the matched value is Result[int, string] at line 7
+Error: the pattern 'Red' is a variant of Color, but the matched value is Shape at line 8
+Error: enum 'Shape' has no variant 'Some' at line 9
+Error: the pattern 'Empty' is a variant of Shape, but the matched value is Option[int] at line 10
+Error: a pattern is a number, but the matched value is string at line 11
+Error: a pattern is a string, but the matched value is int at line 12
+Error: a pattern is a number, but the matched value is Option[int] at line 13
+Error: a pattern is a bool, but the matched value is Shape at line 14

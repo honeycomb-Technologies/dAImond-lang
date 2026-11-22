@@ -519,12 +519,22 @@ fn instance_subs(gen: IRGenerator, instance: string) -> Map[string, string] {
 -- the value goes to, the type of an `if` or a `match` from all
 -- its branches, the result of a call of a generic function.
 --
--- It records nothing in the body of a generic function, which
--- is compiled once for each set of type arguments, nor for an
--- expression made here, during code generation. And it does not
--- keep the widths of numbers apart: every integer type fits
--- every other. So the type of a number is worked out here
--- (infer_expr_type), and checked_ir_type gives none.
+-- The body of a generic function, and of a method of a generic
+-- struct or enum, is compiled once for each set of type
+-- arguments: the checker checks it again for each, just before
+-- the instance is generated, and its types are in force while
+-- the instance is (INSTANCES in check.dm). It records nothing
+-- for an expression made here, during code generation, which has
+-- an id it never saw. And it does not keep the widths of numbers
+-- apart where a value goes to a place: every integer type fits
+-- every other, and so do f32 and float. So the type of a number
+-- is worked out here (infer_expr_type), where a value is
+-- converted to the type of its place (convert_int_value), and
+-- checked_ir_type gives none for one. The types of a list
+-- literal's elements, of a struct literal of a generic struct
+-- and of the function of a generic type that is called on the
+-- type are read from the checker alone (array_literal_elem_type,
+-- struct_literal_type, generic_static_type in ir_gen_expr.dm).
 -- ============================================================
 
 -- The type the checker found for the expression, in source form
