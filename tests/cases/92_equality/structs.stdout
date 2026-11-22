@@ -1,0 +1,17 @@
+a == b: true
+a == c: false
+a != b: false
+a != c: true
+a call and a literal: true
+a literal and a variable: true
+n1 == n2: true
+another list: false
+another point: false
+another float: false
+another bool: false
+fields: true
+fields that differ: true
+no fields: true
+both
+a == b == true: true
+done

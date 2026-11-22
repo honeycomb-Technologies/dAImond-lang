@@ -979,6 +979,22 @@ fn parse_match_arm(p: Parser) -> ParseArmResult {
         arm.guard = Box_new(guard.expr)
         arm.has_guard = true
     }
+    -- The literals among a variant pattern's values are tests that come
+    -- before the guard (see parse_variant_value)
+    let tests = arm.pattern.tests
+    if tests.len() > 0 {
+        let mut cond = tests[0]
+        let mut ti = 1
+        while ti < tests.len() {
+            cond = expr_binary(BINOP_AND(), cond, tests[ti], cond.line, cond.col)
+            ti = ti + 1
+        }
+        if arm.has_guard {
+            cond = expr_binary(BINOP_AND(), cond, *arm.guard, cond.line, cond.col)
+        }
+        arm.guard = Box_new(cond)
+        arm.has_guard = true
+    }
 
     pp = p_expect(pp, TK_FAT_ARROW())
     pp = p_skip_newlines(pp)
@@ -1084,6 +1100,47 @@ struct ParsePatternResult {
     pattern: Pattern
 }
 
+-- One value of a variant's pattern, as in Color.Rgb(r, _, 0): a name
+-- binds the value, `_` leaves it, and a literal must equal it. The
+-- value a literal stands at is bound to a name of its own, and
+-- `name == literal` is added to the pattern's tests.
+fn parse_variant_value(p: Parser, into: Pattern) -> ParsePatternResult {
+    let mut pp = p
+    let mut pat = into
+    let tok = p_cur(pp)
+    if tok.kind == TK_IDENT() or tok.kind == TK_UNDERSCORE() {
+        pp = p_advance(pp)
+        if tok.kind == TK_UNDERSCORE() {
+            pat.bindings.push("_")
+        } else {
+            pat.bindings.push(tok.value)
+        }
+        return ParsePatternResult { p: pp, pattern: pat }
+    }
+    let mut literal = expr_int(0, tok.line, tok.col)
+    if tok.kind == TK_INTEGER() {
+        literal = expr_int(parse_int(tok.value), tok.line, tok.col)
+    } else if tok.kind == TK_MINUS() and p_cur(p_advance(pp)).kind == TK_INTEGER() {
+        pp = p_advance(pp)
+        literal = expr_int(0 - parse_int(p_cur(pp).value), tok.line, tok.col)
+    } else if tok.kind == TK_STRING() {
+        literal = expr_string(tok.value, tok.line, tok.col)
+    } else if tok.kind == TK_TRUE() or tok.kind == TK_FALSE() {
+        literal = expr_bool(tok.kind == TK_TRUE(), tok.line, tok.col)
+    } else {
+        pp = p_error(pp, "expected a name, '_', an integer, a string or a bool for a value of the variant but got " + token_kind_name(tok.kind))
+        pp = p_advance(pp)
+        pat.bindings.push("_")
+        return ParsePatternResult { p: pp, pattern: pat }
+    }
+    pp = p_advance(pp)
+    -- No name in a program has a `$`
+    let name = "$lit_" + int_to_string(tok.line) + "_" + int_to_string(tok.col)
+    pat.bindings.push(name)
+    pat.tests.push(expr_binary(BINOP_EQ(), expr_ident(name, tok.line, tok.col), literal, tok.line, tok.col))
+    return ParsePatternResult { p: pp, pattern: pat }
+}
+
 fn parse_pattern(p: Parser) -> ParsePatternResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
@@ -1099,6 +1156,13 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
         pp = p_advance(pp)
         let mut pat = pattern_new(PAT_LITERAL())
         pat.literal_expr = Box_new(expr_int(parse_int(tok.value), tok.line, tok.col))
+        return ParsePatternResult { p: pp, pattern: pat }
+    }
+    if tok.kind == TK_MINUS() and p_cur(p_advance(pp)).kind == TK_INTEGER() {
+        pp = p_advance(pp)
+        let mut pat = pattern_new(PAT_LITERAL())
+        pat.literal_expr = Box_new(expr_int(0 - parse_int(p_cur(pp).value), tok.line, tok.col))
+        pp = p_advance(pp)
         return ParsePatternResult { p: pp, pattern: pat }
     }
 
@@ -1133,7 +1197,8 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
         if p_peek(pp) == TK_LPAREN() {
             -- Enum variant with payload: Some(x), Ok(v), Err(e)
             pp = p_advance(pp)
-            let mut bindings: List[string] = []
+            let no_bindings: List[string] = []
+            let mut variant_pat = pattern_enum_variant("", name, no_bindings)
             let mut turn7 = -1
             while p_peek(p_skip_newlines(pp)) != TK_RPAREN() and p_peek(p_skip_newlines(pp)) != TK_EOF() {
                 if pp.pos == turn7 {
@@ -1143,13 +1208,13 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
                 }
                 turn7 = pp.pos
                 pp = p_skip_newlines(pp)
-                let bind_tok = p_cur(pp)
-                pp = p_advance(pp)
-                bindings.push(bind_tok.value)
+                let value = parse_variant_value(pp, variant_pat)
+                pp = value.p
+                variant_pat = value.pattern
                 pp = p_comma_or(pp, TK_RPAREN())
             }
             pp = p_expect(pp, TK_RPAREN())
-            return ParsePatternResult { p: pp, pattern: pattern_enum_variant("", name, bindings) }
+            return ParsePatternResult { p: pp, pattern: variant_pat }
         }
 
         if p_peek(pp) == TK_DOT() or p_peek(pp) == TK_COLONCOLON() {
@@ -1158,7 +1223,8 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
             pp = p_need_name(pp, "a variant name")
             let variant_tok = p_cur(pp)
             pp = p_advance(pp)
-            let mut bindings: List[string] = []
+            let no_bindings: List[string] = []
+            let mut variant_pat = pattern_enum_variant(name, variant_tok.value, no_bindings)
             if p_peek(pp) == TK_LPAREN() {
                 pp = p_advance(pp)
                 let mut turn8 = -1
@@ -1170,14 +1236,14 @@ fn parse_pattern(p: Parser) -> ParsePatternResult {
                     }
                     turn8 = pp.pos
                     pp = p_skip_newlines(pp)
-                    let bind_tok = p_cur(pp)
-                    pp = p_advance(pp)
-                    bindings.push(bind_tok.value)
+                    let value = parse_variant_value(pp, variant_pat)
+                    pp = value.p
+                    variant_pat = value.pattern
                     pp = p_comma_or(pp, TK_RPAREN())
                 }
                 pp = p_expect(pp, TK_RPAREN())
             }
-            return ParsePatternResult { p: pp, pattern: pattern_enum_variant(name, variant_tok.value, bindings) }
+            return ParsePatternResult { p: pp, pattern: variant_pat }
         }
 
         -- Check if uppercase first letter -> bare variant (None, Point, etc.)
@@ -1646,6 +1712,18 @@ fn parse_declaration(p: Parser) -> ParseDeclResult {
 }
 
 fn parse_fn_decl(p: Parser) -> ParseDeclResult {
+    let from = expr_id_count()
+    let mut parsed = parse_fn_decl_parts(p)
+    if parsed.decl.kind == DECL_FUNCTION() {
+        let mut fd = *parsed.decl.func_decl
+        fd.expr_from = from
+        fd.expr_to = expr_id_count()
+        parsed.decl.func_decl = Box_new(fd)
+    }
+    return parsed
+}
+
+fn parse_fn_decl_parts(p: Parser) -> ParseDeclResult {
     let mut pp = p_skip_newlines(p)
     let tok = p_cur(pp)
     let mut is_async = false

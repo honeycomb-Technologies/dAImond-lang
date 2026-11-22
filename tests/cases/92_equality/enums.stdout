@@ -1,0 +1,22 @@
+same values: true
+another second value: false
+another first value: false
+another variant: false
+floats: true
+strings: true
+other strings: false
+no values: true
+no values and some: false
+!=: true
+calls: true
+variables: false
+a variable and itself: true
+colors: false
+a color and a variant: true
+colors differ: true
+pixels: false
+a pixel and one like it: true
+trees: true
+other trees: false
+leaves: false
+done

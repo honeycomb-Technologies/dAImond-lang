@@ -1,0 +1,15 @@
+ints: true
+strings: true
+structs: true
+other structs: false
+lists: true
+other lists: true
+options: true
+2
+2
+pairs: true
+other pairs: false
+pairs through T: true
+generic enums: true
+other generic enums: false
+generic enums differ: true

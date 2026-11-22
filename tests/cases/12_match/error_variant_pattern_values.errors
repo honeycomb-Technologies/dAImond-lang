@@ -1,0 +1,2 @@
+Error: cannot compare int with string ('==') at line 11
+Error: this match has no arm for Token.Flag at line 10

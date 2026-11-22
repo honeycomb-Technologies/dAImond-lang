@@ -475,15 +475,15 @@ fn declare_struct_types(gen: LLVMGenerator) -> LLVMGenerator {
                         field_types.push(map_ir_type_to_llvm(g, field.type_id))
                         fi = fi + 1
                     }
-                    if field_types.len() > 0 {
-                        dm_llvm_buf_clear()
-                        fi = 0
-                        while fi < field_types.len() {
-                            dm_llvm_buf_push(field_types[fi])
-                            fi = fi + 1
-                        }
-                        dm_llvm_struct_set_body_buf(llvm_struct, 0)
+                    -- A struct without fields has a body too, an empty
+                    -- one: a type without a body has no size
+                    dm_llvm_buf_clear()
+                    fi = 0
+                    while fi < field_types.len() {
+                        dm_llvm_buf_push(field_types[fi])
+                        fi = fi + 1
                     }
+                    dm_llvm_struct_set_body_buf(llvm_struct, 0)
                 }
             }
             i = i + 1

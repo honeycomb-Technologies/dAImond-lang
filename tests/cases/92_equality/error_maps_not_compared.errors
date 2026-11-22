@@ -1,0 +1,4 @@
+cannot compare Map[string, int] with '==' at line 15
+cannot compare Index with '!=': it holds a Map[string, int] at line 18
+contains() cannot look for a value in a List[Index]: '==' does not compare Map[string, int] at line 19
+cannot compare Map[string, int] with '==' at line 9

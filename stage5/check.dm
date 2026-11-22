@@ -1037,6 +1037,16 @@ fn ck_operator(c0: Checker, op: int, left: string, right: string, line: int) -> 
     if ty_is_comparison(op) {
         if lk != "" and rk != "" and lk != rk {
             c = ck_error(c, "cannot compare " + left + " with " + right + " ('" + text + "')", line)
+        } else if (lk == "" or rk == "") and ty_known(left) and ty_known(right) {
+            -- Values that are not numbers, strings or bools: two of
+            -- one type are equal or not (EQUALITY in ir_gen_expr.dm
+            -- says how), and have no order unless the type has the
+            -- operator's method
+            if ty_fits(left, right) == false and ty_fits(right, left) == false {
+                c = ck_error(c, "cannot compare " + left + " with " + right + " ('" + text + "')", line)
+            } else if op != BINOP_EQ() and op != BINOP_NE() and ty_whole(left) and ty_whole(right) {
+                c = ck_error(c, "operator '" + text + "' does not take " + left + " and " + right, line)
+            }
         }
         return ck_typed(c, "bool")
     }
@@ -1098,7 +1108,13 @@ fn ck_binary(c0: Checker, e: Expr) -> Typed {
     let mut t_literal = is_int_literal_expr(cur)
     let mut i = ops.len() - 1
     while i >= 0 {
-        let right = ck_expr(c, rights[i])
+        let mut right = ck_expr(c, rights[i])
+        if (ops[i] == BINOP_EQ() or ops[i] == BINOP_NE()) and (ty_kind(t) == "" or ty_kind(right.t) == "") {
+            -- What says its type only in part takes the rest from the
+            -- other side: None in `o == None`, [] in `xs != []`
+            right.c = ck_settle(right.c, rights[i], t)
+            if i == ops.len() - 1 { right.c = ck_settle(right.c, cur, right.t) }
+        }
         let result = ck_operator(right.c, ops[i], t, right.t, lines[i])
         let mut result_t = result.t
         -- Two integers give the type code generation computes with

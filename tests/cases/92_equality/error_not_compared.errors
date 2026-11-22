@@ -1,0 +1,3 @@
+cannot compare Point with Other ('==') at line 16
+operator '<' does not take Point and Point at line 17
+operator '>=' does not take Option[int] and Option[int] at line 19

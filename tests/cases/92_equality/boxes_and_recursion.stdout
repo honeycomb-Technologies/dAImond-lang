@@ -1,0 +1,8 @@
+trees: true
+a deep difference: false
+trees differ: true
+the same box: true
+another box of an equal value: false
+what the boxes hold: true
+boxes: true
+null boxes: true

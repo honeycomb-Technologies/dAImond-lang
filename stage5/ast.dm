@@ -454,7 +454,11 @@ struct Pattern {
     -- Enum variant pattern
     enum_type: string,
     variant: string,
-    bindings: List[string]
+    bindings: List[string],
+    -- What must also hold for the pattern to match: `$lit == 1` for
+    -- each literal among a variant pattern's values, as Color.Blue(1)
+    -- has. The parser makes them part of the arm's guard.
+    tests: List[Expr]
 }
 
 fn pattern_new(kind: int) -> Pattern {
@@ -462,7 +466,7 @@ fn pattern_new(kind: int) -> Pattern {
         kind: kind,
         literal_expr: Box_null(),
         name: "", is_mut: false,
-        enum_type: "", variant: "", bindings: []
+        enum_type: "", variant: "", bindings: [], tests: []
     }
 }
 
@@ -504,6 +508,10 @@ struct FunctionDecl {
     link_name: string,
     is_async: bool,
     is_comptime: bool,
+    -- The ids of the expressions of the function: from expr_from up
+    -- to, and not including, expr_to
+    expr_from: int,
+    expr_to: int,
     line: int,
     col: int
 }
@@ -521,6 +529,8 @@ fn func_decl_new(name: string, line: int, col: int) -> FunctionDecl {
         link_name: "",
         is_async: false,
         is_comptime: false,
+        expr_from: 0,
+        expr_to: 0,
         line: line,
         col: col
     }

@@ -1996,6 +1996,258 @@ fn infer_expr_type_from_parts(gen: IRGenerator, expr: Expr) -> string {
 -- Handles arithmetic, comparison, logical, and string operators
 -- ============================================================
 
+-- ============================================================
+-- EQUALITY
+-- `==` and `!=` compare numbers, bools and strings directly, a Box and
+-- a function by its address, and an enum whose variants carry no
+-- values by its tag. Two structs are equal when their fields are, two
+-- enum values when they are the same variant with equal values, two
+-- Options or Results likewise, and two lists when they have the same
+-- length and equal elements: each such type gets a function that
+-- compares two of its values, written here as source and generated
+-- when the type is first compared (made_function). A struct or enum
+-- with a method `eq` is compared by that method. A Map, a `dyn` value
+-- and a SIMD vector are not compared.
+-- ============================================================
+
+-- A function the compiler writes: `source` is a file with the one
+-- function, which is generated under the name `mangled` the first time
+-- it is asked for. No source can name it (the name has a `$`).
+fn made_function(gen: IRGenerator, mangled: string, source: string) -> IRGenerator {
+    if gen.mono_generated.contains(mangled) { return gen }
+    -- Its lines are the runtime's, so it has no debug info of its own
+    let mut file = 0
+    let mut fi = 0
+    while fi < gen.ir_mod.files.len() {
+        if gen.ir_mod.files[fi] == PRELUDE_NAME() { file = fi }
+        fi = fi + 1
+    }
+    let sf = parse_source_file(parser_new(tokenize_file(source, PRELUDE_NAME(), file)))
+    if sf.declarations.len() == 0 { return gen }
+    let decl = sf.declarations[0]
+    if decl.kind != DECL_FUNCTION() { return gen }
+    let fd = *decl.func_decl
+
+    let caller = gen
+    let mut g = gen
+    g.mono_generated.insert(mangled, true)
+    g.type_substitutions = Map_new()
+    g.current_impl_type = ""
+    g.has_impl_type = false
+    g.unsafe_depth = 0
+    g.region_depth = 0
+    g.fn_src_return_types.insert(mangled, fd.return_type)
+    g.fn_src_param_types.insert(mangled, param_src_types(fd))
+    g.fn_return_types.insert(mangled, parse_type_to_ir(fd.return_type))
+    g.known_functions.insert(mangled, true)
+    g.var_src_types = Map_new()
+    g.var_struct_types = Map_new()
+    g.list_elem_kinds = Map_new()
+    g.list_elem_types = Map_new()
+    g.var_enum_types = Map_new()
+    g.box_inner_types = Map_new()
+    g.fn_ptr_vars = Map_new()
+    g.array_var_names = Map_new()
+    g = declare_function(g, fd, mangled)
+    g = generate_function_body(g, fd, mangled)
+    return back_to_caller(caller, g)
+}
+
+-- The name of the function the compiler writes for `what` ("eq",
+-- "contains") and the type
+fn made_function_name(what: string, t: string) -> string {
+    let a = string_replace(string_replace(t, ", ", "$$"), ",", "$$")
+    let b = string_replace(string_replace(a, "[", "$"), "]", "")
+    return what + "$" + string_replace(string_replace(b, "; ", "$x"), " ", "")
+}
+
+-- The type of a `[T; N]` array as the list it is, and any other type
+-- as it is
+fn eq_type(t: string) -> string {
+    if starts_with(t, "[") and ends_with(t, "]") {
+        let semi = string_find(t, ";")
+        if semi > 0 { return "List[" + string_trim(substr(t, 1, semi - 1)) + "]" }
+    }
+    return t
+}
+
+-- Whether the enum has a variant that carries values
+fn enum_carries_values(info: EnumInfo) -> bool {
+    let mut i = 0
+    while i < info.variant_payloads.len() {
+        if info.variant_payloads[i] != "" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn is_simd_type_name(t: string) -> bool {
+    return t == "f32x4" or t == "f32x8" or t == "f64x2" or t == "f64x4" or t == "i32x4" or t == "i32x8" or t == "i64x2" or t == "i64x4"
+}
+
+-- Whether two values of the type are compared by a function the
+-- compiler writes (eq_function_source)
+fn eq_by_function(g: IRGenerator, t: string) -> bool {
+    if starts_with(t, "List[") or starts_with(t, "Option[") or starts_with(t, "Result[") { return true }
+    if g.struct_defs.contains(t) and g.enum_defs.contains(t) == false {
+        return struct_has_method(g, t, "eq") == false
+    }
+    if g.enum_defs.contains(t) {
+        if struct_has_method(g, t, "eq") { return false }
+        return enum_carries_values(g.enum_defs.get(t))
+    }
+    return false
+}
+
+-- The first type among the type and its parts that `==` does not
+-- compare, or "". `seen` holds the types that are being looked at,
+-- for a type that contains itself.
+fn eq_unsupported(g: IRGenerator, t0: string, seen: List[string]) -> string {
+    let t = eq_type(t0)
+    if starts_with(t, "Map[") or is_map_type(g, t) or starts_with(t, "dyn ") or is_simd_type_name(t) { return t }
+    if starts_with(t, "Box[") or starts_with(t, "fn(") { return "" }
+    if eq_by_function(g, t) == false { return "" }
+    let mut si = 0
+    while si < seen.len() {
+        if seen[si] == t { return "" }
+        si = si + 1
+    }
+    let mut inner = seen
+    inner.push(t)
+    let mut parts: List[string] = []
+    if g.enum_defs.contains(t) {
+        let info = g.enum_defs.get(t)
+        let mut vi = 0
+        while vi < info.variant_payloads.len() {
+            if info.variant_payloads[vi] != "" {
+                let values = string_split(info.variant_payloads[vi], "|")
+                let mut k = 0
+                while k < values.len() {
+                    parts.push(values[k])
+                    k = k + 1
+                }
+            }
+            vi = vi + 1
+        }
+    } else if g.struct_defs.contains(t) {
+        let info = g.struct_defs.get(t)
+        parts = info.field_src_types
+    } else {
+        let bracket = string_find(t, "[")
+        parts = split_type_args(substr(t, bracket + 1, len(t) - bracket - 2))
+    }
+    let mut pi = 0
+    while pi < parts.len() {
+        let found = eq_unsupported(g, canon_type(g, parts[pi]), inner)
+        if found != "" { return found }
+        pi = pi + 1
+    }
+    return ""
+}
+
+-- A type as a program writes it, for a message: Pair[int, string] for
+-- the instance Pair_i64_string
+fn shown_type(g: IRGenerator, t: string) -> string {
+    let mut base = t
+    let mut args: List[string] = []
+    if g.generic_instances.contains(t) {
+        base = g.generic_instances.get(t)
+        args = string_split(g.generic_instance_args.get(t), "|")
+    } else {
+        let bracket = string_find(t, "[")
+        if bracket <= 0 or ends_with(t, "]") == false { return t }
+        base = substr(t, 0, bracket)
+        args = split_type_args(substr(t, bracket + 1, len(t) - bracket - 2))
+    }
+    let mut out = base + "["
+    let mut i = 0
+    while i < args.len() {
+        if i > 0 { out = out + ", " }
+        out = out + shown_type(g, args[i])
+        i = i + 1
+    }
+    return out + "]"
+}
+
+-- "a0 == b0 and a1 == b1" for n values, or "true" for none
+fn eq_values_source(n: int) -> string {
+    if n == 0 { return "true" }
+    let mut out = ""
+    let mut k = 0
+    while k < n {
+        if k > 0 { out = out + " and " }
+        out = out + "a" + int_to_string(k) + " == b" + int_to_string(k)
+        k = k + 1
+    }
+    return out
+}
+
+-- "(a0, a1)" for n values of a variant's pattern, or "" for none
+fn eq_bindings_source(prefix: string, n: int) -> string {
+    if n == 0 { return "" }
+    let mut out = "("
+    let mut k = 0
+    while k < n {
+        if k > 0 { out = out + ", " }
+        out = out + prefix + int_to_string(k)
+        k = k + 1
+    }
+    return out + ")"
+}
+
+-- The function that compares two values of the type, as source
+fn eq_function_source(g: IRGenerator, t: string) -> string {
+    let head = "module eq\nfn eq(a: " + t + ", b: " + t + ") -> bool {\n"
+    if starts_with(t, "List[") {
+        return head + "    if a.len() != b.len() { return false }\n    let mut i = 0\n    while i < a.len() {\n        if a[i] != b[i] { return false }\n        i = i + 1\n    }\n    return true\n}\n"
+    }
+    if starts_with(t, "Option[") {
+        return head + "    let mut same = false\n    match a {\n        Some(x) => { match b { Some(y) => { same = x == y } None => { same = false } } }\n        None => { match b { Some(y) => { same = false } None => { same = true } } }\n    }\n    return same\n}\n"
+    }
+    if starts_with(t, "Result[") {
+        return head + "    let mut same = false\n    match a {\n        Ok(x) => { match b { Ok(y) => { same = x == y } Err(y) => { same = false } } }\n        Err(x) => { match b { Ok(y) => { same = false } Err(y) => { same = x == y } } }\n    }\n    return same\n}\n"
+    }
+    if g.enum_defs.contains(t) {
+        let info = g.enum_defs.get(t)
+        let mut body = "    let mut same = false\n    match a {\n"
+        let mut vi = 0
+        while vi < info.variant_names.len() {
+            let n = enum_payload_count(info, vi)
+            let v = "E." + info.variant_names[vi]
+            body = body + "        " + v + eq_bindings_source("a", n) + " => { match b { " + v + eq_bindings_source("b", n) + " => { same = " + eq_values_source(n) + " } _ => { same = false } } }\n"
+            vi = vi + 1
+        }
+        return head + body + "    }\n    return same\n}\n"
+    }
+    let info = g.struct_defs.get(t)
+    let mut all = ""
+    let mut fi = 0
+    while fi < info.field_names.len() {
+        if fi > 0 { all = all + " and " }
+        all = all + "a." + info.field_names[fi] + " == b." + info.field_names[fi]
+        fi = fi + 1
+    }
+    if all == "" { all = "true" }
+    return head + "    return " + all + "\n}\n"
+}
+
+-- The type two operands of `==` are compared as: the left operand's,
+-- or the right one's where the left does not say (None == o)
+fn eq_operand_type(g: IRGenerator, expr: Expr) -> string {
+    let mut t = static_type(g, *expr.left)
+    if t == "" or string_contains(t, "?") { t = static_type(g, *expr.right) }
+    if t == "" { return "" }
+    return eq_type(canon_type(g, t))
+}
+
+-- `xs.contains(v)` for a list whose elements `==` compares by a
+-- function: a function for the list's type that looks for an equal
+-- element
+fn contains_function_source(t: string) -> string {
+    let elem = substr(t, 5, len(t) - 6)
+    return "module contains\nfn contains(xs: " + t + ", v: " + elem + ") -> bool {\n    let mut i = 0\n    while i < xs.len() {\n        if xs[i] == v { return true }\n        i = i + 1\n    }\n    return false\n}\n"
+}
+
 fn generate_binary(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> ExprResult {
     -- A chain such as a + b + c + ... nests to the left, one level
     -- for each operator. Its levels are generated in a loop, from the
@@ -2247,6 +2499,71 @@ fn generate_binary_level(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_
         g.builder.next_id = g.builder.next_id + 1
 
         return expr_result(g, join_block, load_id)
+    }
+
+    -- --------------------------------------------------------
+    -- EQUALITY of structs, enums, Options, Results and lists (see
+    -- EQUALITY above)
+    -- --------------------------------------------------------
+    if op == BINOP_EQ() or op == BINOP_NE() {
+        let eq_t = eq_operand_type(g, expr)
+        if eq_t != "" {
+            let seen: List[string] = []
+            let unsupported = eq_unsupported(g, eq_t, seen)
+            if unsupported != "" {
+                let mut what = "cannot compare " + shown_type(g, eq_t) + " with '" + ty_op_text(op) + "'"
+                if unsupported != eq_t { what = what + ": it holds a " + shown_type(g, unsupported) }
+                g = ir_type_error(g, what, expr.line)
+                return expr_result(g, b, 0)
+            }
+            -- A type with a method `eq` is compared by it, and `!=`
+            -- is `not eq` where the type has no `ne`. (A struct's
+            -- own `eq` and `ne` are called below, with the other
+            -- operators' methods.)
+            let own_eq = (g.struct_defs.contains(eq_t) or g.enum_defs.contains(eq_t)) and struct_has_method(g, eq_t, "eq")
+            let mut method = ""
+            let mut negate = false
+            if own_eq {
+                if op == BINOP_NE() and struct_has_method(g, eq_t, "ne") == false {
+                    method = "eq"
+                    negate = true
+                } else if g.enum_defs.contains(eq_t) {
+                    method = "eq"
+                    if op == BINOP_NE() { method = "ne" }
+                }
+            }
+            if eq_by_function(g, eq_t) or method != "" {
+                let mut left_arg = *expr.left
+                if lhs_done >= 0 {
+                    let held = bind_hidden_value(g, b, "%operand.left", lhs_done, map_type_name(eq_t), eq_t)
+                    g = held.gen
+                    b = held.block
+                    left_arg = expr_ident("%operand.left", expr.line, expr.col)
+                }
+                let mut compared = expr_bool(true, expr.line, expr.col)
+                if method != "" {
+                    let mut eq_args: List[Expr] = []
+                    eq_args.push(*expr.right)
+                    compared = expr_method_call(left_arg, method, eq_args, expr.line, expr.col)
+                } else {
+                    let eq_name = made_function_name("eq", eq_t)
+                    g = made_function(g, eq_name, eq_function_source(g, eq_t))
+                    let mut eq_args: List[Expr] = []
+                    eq_args.push(left_arg)
+                    eq_args.push(*expr.right)
+                    compared = expr_call(expr_ident(eq_name, expr.line, expr.col), eq_args, expr.line, expr.col)
+                    negate = op == BINOP_NE()
+                }
+                if negate {
+                    compared = expr_unary(UNOP_NOT(), compared, expr.line, expr.col)
+                }
+                let result = generate_expr(g, b, compared)
+                if lhs_done >= 0 {
+                    return expr_result(unbind_hidden_value(result.gen, "%operand.left"), result.block, result.val_id)
+                }
+                return result
+            }
+        }
     }
 
     -- --------------------------------------------------------
@@ -2642,6 +2959,10 @@ fn emit_binary_op(gen: IRGenerator, block: IRBasicBlock, expr: Expr, lhs_val_id:
         if g.var_enum_types.contains(right_expr.name) {
             is_enum_cmp = true
         }
+    }
+    -- Any other expressions whose type is an enum
+    if is_enum_cmp == false and (op == BINOP_EQ() or op == BINOP_NE()) {
+        if g.enum_defs.contains(eq_operand_type(g, expr)) { is_enum_cmp = true }
     }
 
     if is_enum_cmp and (op == BINOP_EQ() or op == BINOP_NE()) {
@@ -3957,6 +4278,29 @@ fn generate_method_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> Ex
         return generate_function_call(g, b, method_as_call(g, expr))
     }
 
+    -- xs.contains(v) for a list of what `==` compares in parts looks
+    -- for an equal element (see EQUALITY)
+    if method_name == "contains" and args.len() == 1 {
+        let list_src = static_type(g, obj_expr)
+        if list_src != "" {
+            let list_t = eq_type(canon_type(g, list_src))
+            if starts_with(list_t, "List[") and classify_list_elem(substr(list_t, 5, len(list_t) - 6)) == LIST_ELEM_OTHER() and string_contains(list_t, "?") == false {
+                let seen: List[string] = []
+                let unsupported = eq_unsupported(g, list_t, seen)
+                if unsupported != "" {
+                    g = ir_type_error(g, "contains() cannot look for a value in a " + shown_type(g, list_t) + ": '==' does not compare " + shown_type(g, unsupported), expr.line)
+                    return expr_result(g, b, 0)
+                }
+                let contains_name = made_function_name("contains", list_t)
+                g = made_function(g, contains_name, contains_function_source(list_t))
+                let mut contains_args: List[Expr] = []
+                contains_args.push(obj_expr)
+                contains_args.push(args[0])
+                return generate_expr(g, b, expr_call(expr_ident(contains_name, expr.line, expr.col), contains_args, expr.line, expr.col))
+            }
+        }
+    }
+
     -- Region escape: push/insert/set store their argument into the
     -- container, so a region-born argument must not land in a
     -- container declared outside the region
@@ -4528,6 +4872,31 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 -- Handles both self-by-value and mut self (pass-by-pointer).
 -- ============================================================
 
+-- The caller's generator after another function was generated in the
+-- middle of its own: its function's state, and what the new function
+-- added to the program
+fn back_to_caller(caller: IRGenerator, g: IRGenerator) -> IRGenerator {
+    let mut out = caller
+    out.ir_mod = g.ir_mod
+    out.struct_defs = g.struct_defs
+    out.mono_generated = g.mono_generated
+    out.lambda_captures = g.lambda_captures
+    out.mut_param_fns = g.mut_param_fns
+    out.user_extern_fns = g.user_extern_fns
+    out.fn_return_types = g.fn_return_types
+    out.fn_src_return_types = g.fn_src_return_types
+    out.fn_src_param_types = g.fn_src_param_types
+    out.field_list_elem_kinds = g.field_list_elem_kinds
+    out.field_list_elem_types = g.field_list_elem_types
+    out.label_counter = g.label_counter
+    out.lambda_counter = g.lambda_counter
+    out.known_functions = g.known_functions
+    out.type_errors = g.type_errors
+    out.generic_instances = g.generic_instances
+    out.generic_instance_args = g.generic_instance_args
+    return out
+}
+
 -- Generate Instance_method for a generic struct instance from its
 -- generic impl, with the instance's type arguments substituted.
 -- Only signature-wide state survives; the caller's function state
@@ -4587,26 +4956,7 @@ fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: strin
     g = declare_function(g, mono_fd, mangled)
     g = generate_function_body(g, mono_fd, mangled)
 
-    -- Back to the caller's function, keeping what the new function added
-    let mut out = caller
-    out.ir_mod = g.ir_mod
-    out.struct_defs = g.struct_defs
-    out.mono_generated = g.mono_generated
-    out.lambda_captures = g.lambda_captures
-    out.mut_param_fns = g.mut_param_fns
-    out.user_extern_fns = g.user_extern_fns
-    out.fn_return_types = g.fn_return_types
-    out.fn_src_return_types = g.fn_src_return_types
-    out.fn_src_param_types = g.fn_src_param_types
-    out.field_list_elem_kinds = g.field_list_elem_kinds
-    out.field_list_elem_types = g.field_list_elem_types
-    out.label_counter = g.label_counter
-    out.lambda_counter = g.lambda_counter
-    out.known_functions = g.known_functions
-    out.type_errors = g.type_errors
-    out.generic_instances = g.generic_instances
-    out.generic_instance_args = g.generic_instance_args
-    return out
+    return back_to_caller(caller, g)
 }
 
 fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_type: string, obj_expr: Expr, method_name: string, args: List[Expr]) -> ExprResult {
@@ -6480,6 +6830,14 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     let mut elem_ir_type = infer_expr_type(g, elements[0])
     let nested = nested_list_elem_type(g, expr)
     if nested != "" { elem_ir_type = nested }
+    -- An Option or a Result is stored whole; the first element may be
+    -- a None, so its type is the one the checker found for the list
+    let mut whole_elem = false
+    let lit_src = checked_type(g, expr)
+    if starts_with(lit_src, "List[Option[") or starts_with(lit_src, "List[Result[") {
+        elem_ir_type = map_type_name(substr(lit_src, 5, len(lit_src) - 6))
+        whole_elem = true
+    }
 
     -- Determine which list new/push functions to use
     let mut new_fn = "dm_list_int64_new"
@@ -6490,7 +6848,7 @@ fn generate_array_literal(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> 
     } else if elem_ir_type == "string" {
         new_fn = "dm_list_string_new"
         push_fn = "dm_list_string_push"
-    } else if g.struct_defs.contains(elem_ir_type) or g.enum_defs.contains(elem_ir_type) or nested != "" {
+    } else if g.struct_defs.contains(elem_ir_type) or g.enum_defs.contains(elem_ir_type) or nested != "" or whole_elem {
         -- Structs, enum values and lists are stored whole
         new_fn = "dm_list_generic_new"
         push_fn = "dm_list_generic_push"

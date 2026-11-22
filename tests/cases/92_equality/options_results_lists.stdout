@@ -1,0 +1,38 @@
+Some(3) == Some(3): true
+Some(3) == Some(4): false
+Some(3) == None: false
+None == None: true
+None on the left: true
+o != None: true
+calls: true
+calls that differ: false
+strings: true
+structs: true
+other structs: false
+Ok(2) == Ok(2): true
+Ok(2) == Ok(3): false
+Ok == Err: false
+Err == Err: true
+Err and a variable: true
+!=: true
+a shorter list: false
+equal lists: true
+a list and a literal: true
+another element: false
+an empty list: false
+two empty lists: true
+!=: true
+strings: true
+lists of lists: true
+other lists of lists: false
+lists of structs: true
+lists of options: true
+other lists of options: false
+contains a struct: true
+contains another struct: false
+contains a variant: true
+contains another variant: false
+contains a list: true
+contains an option: true
+contains a string: true
+contains an int: false
