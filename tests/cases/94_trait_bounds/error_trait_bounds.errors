@@ -1,0 +1,6 @@
+undefined trait 'Missing' at line 37
+'shown' takes for T a type that implements Show, which Plain does not at line 43
+'shown' takes for T a type that implements Show, which int does not at line 44
+'described' takes for T a type that implements Named, which Point does not at line 45
+'all' takes for T a type that implements Show, which Plain does not at line 46
+'all' takes for T a type that implements Show, which string does not at line 47

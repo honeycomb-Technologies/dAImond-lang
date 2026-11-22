@@ -982,24 +982,6 @@ fn generate_impl_block(gen: IRGenerator, ib: ImplBlock) -> IRGenerator {
 fn generate_constant(gen: IRGenerator, cd: ConstDecl) -> IRGenerator {
     let mut g = gen
 
-    -- Pre-grow globals list to avoid realloc during comptime evaluation.
-    -- Comptime recursion copies the generator by value, sharing the list buffer.
-    -- A realloc in a callee would free the buffer the caller is still using.
-    -- By pre-growing, we ensure enough capacity for comptime variable pushes.
-    let mut prealloc_i = 0
-    while prealloc_i < 1024 {
-        let mut dummy = ir_global_new("__comptime_prealloc__", "i64")
-        dummy.has_init = false
-        dummy.is_const = false
-        g.ir_mod.globals.push(dummy)
-        prealloc_i = prealloc_i + 1
-    }
-    let mut pop_i = 0
-    while pop_i < 1024 {
-        g.ir_mod.globals.pop()
-        pop_i = pop_i + 1
-    }
-
     -- A constant's value is found at compile time, with `comptime` or
     -- without it: every operator, and calls of functions
     let val = eval_comptime_expr(g, *cd.value)

@@ -53,9 +53,9 @@ fn describe(e: Either[string, int]) -> string {
 
 -- A generic function over a generic enum
 fn or_else[T](o: Opt[T], fallback: T) -> T {
-    match o {
-        Opt.Has(v) => { return v }
-        Opt.Empty => { return fallback }
+    return match o {
+        Opt.Has(v) => v,
+        Opt.Empty => fallback
     }
 }
 

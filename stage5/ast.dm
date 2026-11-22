@@ -498,6 +498,9 @@ struct FunctionDecl {
     params: List[FuncParam],
     return_type: string,
     generic_params: List[string],
+    -- The traits each type parameter must implement, joined with "+":
+    -- "Show+Named" for T in fn f[T: Show + Named]; "" for none
+    generic_bounds: List[string],
     body: List[Stmt],
     effects: List[string],
     is_extern: bool,
@@ -522,6 +525,7 @@ fn func_decl_new(name: string, line: int, col: int) -> FunctionDecl {
         params: [],
         return_type: "void",
         generic_params: [],
+        generic_bounds: [],
         body: [],
         effects: [],
         is_extern: false,
@@ -1479,5 +1483,153 @@ fn unshadowed_declarations(decls: List[Declaration]) -> List[Declaration] {
         out.push(d)
         i = i + 1
     }
+    return out
+}
+
+-- ============================================================
+-- COPIES WITH IDS OF THEIR OWN
+-- A copy of a function whose expressions are numbered anew, so that
+-- the checker records the types of the copy's expressions apart from
+-- the original's: a trait's method with a body becomes a method of
+-- each type that implements the trait and does not define it
+-- (TRAITS in main_split.dm).
+-- ============================================================
+
+fn fresh_exprs(exprs: List[Expr]) -> List[Expr] {
+    let mut out: List[Expr] = []
+    let mut i = 0
+    while i < exprs.len() {
+        out.push(fresh_expr(exprs[i]))
+        i = i + 1
+    }
+    return out
+}
+
+fn fresh_expr(e: Expr) -> Expr {
+    let mut out = e
+    out.id = expr_next_id()
+    let k = e.kind
+    if k == EXPR_BINARY() or k == EXPR_RANGE() {
+        out.left = Box_new(fresh_expr(*e.left))
+        out.right = Box_new(fresh_expr(*e.right))
+    } else if k == EXPR_PIPELINE() {
+        out.left = Box_new(fresh_expr(*e.left))
+        out.pipe_right = Box_new(fresh_expr(*e.pipe_right))
+    } else if k == EXPR_UNARY() or k == EXPR_ERROR_PROPAGATE() or k == EXPR_CAST() or k == EXPR_GROUPED() or k == EXPR_COMPTIME() or k == EXPR_AWAIT() {
+        out.operand = Box_new(fresh_expr(*e.operand))
+    } else if k == EXPR_FIELD_ACCESS() {
+        out.object = Box_new(fresh_expr(*e.object))
+    } else if k == EXPR_INDEX_ACCESS() {
+        out.object = Box_new(fresh_expr(*e.object))
+        out.index = Box_new(fresh_expr(*e.index))
+    } else if k == EXPR_METHOD_CALL() {
+        out.object = Box_new(fresh_expr(*e.object))
+        out.args = fresh_exprs(e.args)
+    } else if k == EXPR_FUNCTION_CALL() {
+        out.callee = Box_new(fresh_expr(*e.callee))
+        out.args = fresh_exprs(e.args)
+    } else if k == EXPR_STRUCT_LITERAL() {
+        out.field_values = fresh_exprs(e.field_values)
+    } else if k == EXPR_ENUM_LITERAL() {
+        out.payload = fresh_exprs(e.payload)
+    } else if k == EXPR_ARRAY_LITERAL() {
+        out.elements = fresh_exprs(e.elements)
+    } else if k == EXPR_STRING_INTERP() {
+        out.interp_parts = fresh_exprs(e.interp_parts)
+    } else if k == EXPR_IF() {
+        out.condition = Box_new(fresh_expr(*e.condition))
+        out.then_branch = Box_new(fresh_expr(*e.then_branch))
+        if e.has_else {
+            out.else_branch = Box_new(fresh_expr(*e.else_branch))
+        }
+    } else if k == EXPR_MATCH() {
+        out.scrutinee = Box_new(fresh_expr(*e.scrutinee))
+        let mut arms: List[MatchArm] = []
+        let mut i = 0
+        while i < e.match_arms.len() {
+            let mut arm = e.match_arms[i]
+            let mut pattern = arm.pattern
+            if pattern.kind == PAT_LITERAL() {
+                pattern.literal_expr = Box_new(fresh_expr(*pattern.literal_expr))
+            }
+            arm.pattern = pattern
+            if arm.has_guard {
+                arm.guard = Box_new(fresh_expr(*arm.guard))
+            }
+            if arm.is_expr_body {
+                arm.body_expr = Box_new(fresh_expr(*arm.body_expr))
+            } else {
+                arm.body = fresh_stmts(arm.body)
+            }
+            arms.push(arm)
+            i = i + 1
+        }
+        out.match_arms = arms
+    } else if k == EXPR_BLOCK() {
+        out.stmts = fresh_stmts(e.stmts)
+        if e.has_result {
+            out.result = Box_new(fresh_expr(*e.result))
+        }
+    } else if k == EXPR_LAMBDA() {
+        out.lambda_body = Box_new(fresh_expr(*e.lambda_body))
+    }
+    return out
+}
+
+fn fresh_stmts(stmts: List[Stmt]) -> List[Stmt] {
+    let mut result: List[Stmt] = []
+    let mut i = 0
+    while i < stmts.len() {
+        let st = stmts[i]
+        let mut out = st
+        let k = st.kind
+        if k == STMT_LET() {
+            out.let_value = Box_new(fresh_expr(*st.let_value))
+        } else if k == STMT_RETURN() {
+            if st.has_ret_value {
+                out.ret_value = Box_new(fresh_expr(*st.ret_value))
+            }
+        } else if k == STMT_IF() {
+            if st.has_if_expr {
+                out = if_stmt_of(fresh_expr(*st.if_expr))
+                out.line = st.line
+                out.col = st.col
+            } else {
+                out.if_cond = Box_new(fresh_expr(*st.if_cond))
+                out.if_then = fresh_stmts(st.if_then)
+                if st.has_else_branch {
+                    out.if_else = fresh_stmts(st.if_else)
+                }
+            }
+        } else if k == STMT_MATCH() {
+            out.match_expr = Box_new(fresh_expr(*st.match_expr))
+        } else if k == STMT_FOR() {
+            out.for_iter = Box_new(fresh_expr(*st.for_iter))
+            out.for_body = fresh_stmts(st.for_body)
+        } else if k == STMT_WHILE() {
+            out.while_cond = Box_new(fresh_expr(*st.while_cond))
+            out.while_body = fresh_stmts(st.while_body)
+        } else if k == STMT_LOOP() {
+            out.loop_body = fresh_stmts(st.loop_body)
+        } else if k == STMT_REGION() {
+            out.region_body = fresh_stmts(st.region_body)
+        } else if k == STMT_EXPRESSION() {
+            out.expr = Box_new(fresh_expr(*st.expr))
+        } else if k == STMT_ASSIGNMENT() {
+            out.assign_target = Box_new(fresh_expr(*st.assign_target))
+            out.assign_value = Box_new(fresh_expr(*st.assign_value))
+        }
+        result.push(out)
+        i = i + 1
+    }
+    return result
+}
+
+-- The function with expressions of its own
+fn fresh_function(fd: FunctionDecl) -> FunctionDecl {
+    let mut out = fd
+    out.expr_from = expr_id_count()
+    out.body = fresh_stmts(fd.body)
+    out.expr_to = expr_id_count()
     return out
 }

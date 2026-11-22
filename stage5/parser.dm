@@ -1037,24 +1037,59 @@ fn parse_fstring(p: Parser) -> ParseExprResult {
 
     while i < tlen {
         let ch = char_at(template, i)
-        if ch == "{" {
+        if ch == "\\" and i + 1 < tlen {
+            -- An escape stays as it is written until the text is whole
+            current_lit = current_lit + ch + char_at(template, i + 1)
+            i = i + 2
+        } else if ch == "{" and i + 1 < tlen and char_at(template, i + 1) == "{" {
+            -- {{ is a brace of the text, and so is }}
+            current_lit = current_lit + "{"
+            i = i + 2
+        } else if ch == "}" and i + 1 < tlen and char_at(template, i + 1) == "}" {
+            current_lit = current_lit + "}"
+            i = i + 2
+        } else if ch == "{" {
             -- Emit accumulated literal
             if len(current_lit) > 0 {
-                parts.push(expr_string(current_lit, tok.line, tok.col))
+                parts.push(expr_string(unescape_string(current_lit), tok.line, tok.col))
                 is_literal.push(true)
                 current_lit = ""
             }
-            -- Find matching }
+            -- Find the matching }. A string in the expression is
+            -- written with \" (a plain " would end the f-string), and
+            -- a brace in such a string is not the expression's.
             i = i + 1
             let start = i
             let mut depth = 1
+            let mut in_string = false
             while i < tlen and depth > 0 {
                 let c2 = char_at(template, i)
-                if c2 == "{" { depth = depth + 1 }
-                if c2 == "}" { depth = depth - 1 }
-                if depth > 0 { i = i + 1 }
+                if c2 == "\\" and i + 1 < tlen {
+                    if char_at(template, i + 1) == "\"" { in_string = in_string == false }
+                    i = i + 2
+                } else {
+                    if in_string == false {
+                        if c2 == "{" { depth = depth + 1 }
+                        if c2 == "}" { depth = depth - 1 }
+                    }
+                    if depth > 0 { i = i + 1 }
+                }
             }
-            let expr_text = substr(template, start, i - start)
+            let expr_text = unescape_string(substr(template, start, i - start))
+            if depth > 0 or in_string or string_trim(expr_text) == "" {
+                let mut what = "an f-string has a '{' without a '}' (write {{ for a brace)"
+                if in_string { what = "a string in an f-string's expression has no end" }
+                if depth == 0 and in_string == false { what = "an f-string has an empty {}" }
+                -- The error is at the f-string
+                let mut at_fstring = pp
+                at_fstring.pos = pp.pos - 1
+                at_fstring = p_error(at_fstring, what)
+                pp.errors = at_fstring.errors
+                parts.push(expr_string("", tok.line, tok.col))
+                is_literal.push(true)
+                i = tlen
+                continue
+            }
             -- Tokenize and parse the expression. Its tokens are at the
             -- f-string's place, which is where its errors are reported.
             let lexed = tokenize(expr_text)
@@ -1081,7 +1116,7 @@ fn parse_fstring(p: Parser) -> ParseExprResult {
     }
     -- Emit trailing literal
     if len(current_lit) > 0 {
-        parts.push(expr_string(current_lit, tok.line, tok.col))
+        parts.push(expr_string(unescape_string(current_lit), tok.line, tok.col))
         is_literal.push(true)
     }
 
@@ -1757,7 +1792,24 @@ fn parse_fn_decl_parts(p: Parser) -> ParseDeclResult {
             pp = p_need_name(pp, "a type parameter")
             let gp = p_cur(pp)
             pp = p_advance(pp)
+            -- T: Show + Named
+            let mut bound = ""
+            if p_peek(pp) == TK_COLON() {
+                pp = p_advance(pp)
+                let mut more = true
+                while more {
+                    pp = p_need_name(pp, "a trait name")
+                    if p_peek(pp) == TK_IDENT() {
+                        if bound != "" { bound = bound + "+" }
+                        bound = bound + p_cur(pp).value
+                        pp = p_advance(pp)
+                    }
+                    more = p_peek(pp) == TK_PLUS()
+                    if more { pp = p_advance(pp) }
+                }
+            }
             fd.generic_params.push(gp.value)
+            fd.generic_bounds.push(bound)
             pp = p_comma_or(pp, TK_RBRACKET())
         }
         pp = p_expect(pp, TK_RBRACKET())

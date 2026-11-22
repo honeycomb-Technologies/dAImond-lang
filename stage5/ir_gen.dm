@@ -218,6 +218,11 @@ struct IRGenerator {
     -- What a method call calls where it is no method, at the call's
     -- id: "call:f" for x.f(a), which is f(x, a)
     checked_targets: List[string],
+    -- The checker of the program, for the instances of generic
+    -- functions (see INSTANCES in check.dm); none when has_checker is
+    -- false
+    checker: Box[Checker],
+    has_checker: bool,
     -- -g: say where each variable lives (OP_DEBUG_VAR)
     debug_info: bool,
     -- Declared source return types of functions and impl methods
@@ -297,6 +302,8 @@ fn ir_generator_new() -> IRGenerator {
         checked_types: [],
         checked_type_args: [],
         checked_targets: [],
+        checker: Box_null(),
+        has_checker: false,
         debug_info: false,
         fn_src_return_types: Map_new(),
         fn_src_param_types: Map_new(),
@@ -326,7 +333,15 @@ fn param_src_types(fd: FunctionDecl) -> string {
 
 fn ir_type_error(gen: IRGenerator, msg: string, line: int) -> IRGenerator {
     let mut g = gen
-    g.type_errors.push(error_at(g.ir_mod.files, msg, line))
+    let text = error_at(g.ir_mod.files, msg, line)
+    -- Not what the checker reported already for this instance of a
+    -- generic function ("... at line 7 (in first[Point])")
+    let mut i = 0
+    while i < g.type_errors.len() {
+        if starts_with(g.type_errors[i], text + " (in ") { return g }
+        i = i + 1
+    }
+    g.type_errors.push(text)
     return g
 }
 

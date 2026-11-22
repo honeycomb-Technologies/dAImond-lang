@@ -39,6 +39,9 @@ struct FnSig {
     ret: string,
     -- The type parameters of the impl block, then the function's own
     generics: List[string],
+    -- The traits each type parameter must implement, joined with "+"
+    -- ("" for none): the bounds of fn f[T: Show + Named]
+    bounds: List[string],
     has_self: bool,
     is_async: bool,
     -- Whether each parameter is `mut`: the function changes the
@@ -121,7 +124,11 @@ struct Checked {
     type_args: List[string],
     -- What a method call calls, at the call's id, where it is not a
     -- method: "call:f" for x.f(a), which is f(x, a)
-    targets: List[string]
+    targets: List[string],
+    -- The checker as it was at the end, with the program's functions
+    -- and types: code generation checks each instance of a generic
+    -- function with it (check_instance)
+    checker: Box[Checker]
 }
 
 -- A checker and the type of the expression it has just checked
@@ -623,14 +630,21 @@ fn ck_sig(fd: FunctionDecl, self_type: string, outer_generics: List[string]) -> 
     let mut repls: List[string] = []
     repls.push(self_type)
     let mut generics: List[string] = []
+    let mut bounds: List[string] = []
     let mut gi = 0
     while gi < outer_generics.len() {
         generics.push(outer_generics[gi])
+        bounds.push("")
         gi = gi + 1
     }
     gi = 0
     while gi < fd.generic_params.len() {
         generics.push(fd.generic_params[gi])
+        if gi < fd.generic_bounds.len() {
+            bounds.push(fd.generic_bounds[gi])
+        } else {
+            bounds.push("")
+        }
         gi = gi + 1
     }
     let mut params: List[string] = []
@@ -649,6 +663,7 @@ fn ck_sig(fd: FunctionDecl, self_type: string, outer_generics: List[string]) -> 
         params: params,
         ret: ty_rewrite(fd.return_type, names, repls),
         generics: generics,
+        bounds: bounds,
         has_self: has_self,
         is_async: fd.is_async,
         changes: changes,
@@ -1082,8 +1097,20 @@ fn ck_operator(c0: Checker, op: int, left: string, right: string, line: int) -> 
         return ck_typed(c, left)
     }
     if lk == "string" and op == BINOP_ADD() { return ck_typed(c, "string") }
+    -- Two values that are not numbers or strings, of a type without
+    -- the operator's method
+    if lk == "" and rk == "" and ty_whole(left) and ty_whole(right) and (method != "" or op == BINOP_MOD()) {
+        if starts_with(left, "fn(") == false and ck_names_simd(left) == false {
+            c = ck_error(c, "operator '" + text + "' does not take " + left + " and " + right, line)
+            return ck_typed(c, "")
+        }
+    }
     if ty_known(left) and left == right { return ck_typed(c, left) }
     return ck_typed(c, "")
+}
+
+fn ck_names_simd(t: string) -> bool {
+    return t == "f32x4" or t == "f32x8" or t == "f64x2" or t == "f64x4" or t == "i32x4" or t == "i32x8" or t == "i64x2" or t == "i64x4"
 }
 
 -- a op b op c ... nests one level per operator on the left, so the
@@ -1450,12 +1477,34 @@ fn ck_note_type_args(c: Checker, id: int, binds: List[string]) -> Checker {
     return out
 }
 
+-- Whether the type has an `impl Trait for` it
+fn ck_implements(c: Checker, t: string, trait_name: string) -> bool {
+    let head = ty_head(t)
+    if head == "" or c.type_traits.contains(head) == false { return false }
+    return string_contains(c.type_traits.get(head), "|" + trait_name + "|")
+}
+
 -- Check the arguments of a call against the signature, starting at
 -- its parameter `first`, and give what the call returns. `binds` is
 -- what the signature's type parameters are known to stand for.
-fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[string], arg_types: List[string], args: List[Expr]) -> Typed {
+fn ck_apply(c0: Checker, sig: FnSig, shown: string, first: int, binds0: List[string], arg_types: List[string], args: List[Expr], line: int) -> Typed {
     let mut c = c0
     let binds = ck_binds(sig, first, binds0, arg_types)
+    -- What a type parameter stands for must implement the parameter's traits
+    let mut bi = 0
+    while bi < sig.bounds.len() and bi < binds.len() {
+        if sig.bounds[bi] != "" and ty_whole(binds[bi]) {
+            let wanted = string_split(sig.bounds[bi], "+")
+            let mut wi = 0
+            while wi < wanted.len() {
+                if c.traits.contains(wanted[wi]) and ck_implements(c, binds[bi], wanted[wi]) == false {
+                    c = ck_error(c, "'" + shown + "' takes for " + sig.generics[bi] + " a type that implements " + wanted[wi] + ", which " + binds[bi] + " does not", line)
+                }
+                wi = wi + 1
+            }
+        }
+        bi = bi + 1
+    }
     let mut i = 0
     while i < arg_types.len() and first + i < sig.params.len() {
         let want = ty_apply(sig.params[first + i], sig.generics, binds)
@@ -1545,7 +1594,7 @@ fn ck_call_named(c0: Checker, name: string, generic_args: List[string], arg_type
         counted = ck_async_call(counted, sig, name, call_id, line)
         counted = ck_effects(counted, name, sig.effects, " not in caller's effects", "calls", line)
         counted = ck_mut_args(counted, sig, name, 0, args)
-        let applied = ck_apply(counted, sig, name, 0, binds, arg_types, args)
+        let applied = ck_apply(counted, sig, name, 0, binds, arg_types, args, line)
         if sig.generics.len() == 0 { return applied }
         return ck_typed(ck_note_type_args(applied.c, call_id, ck_binds(sig, 0, binds, arg_types)), applied.t)
     }
@@ -1715,7 +1764,7 @@ fn ck_static_call(c: Checker, type_name: string, e: Expr, arg_types: List[string
         counted = ck_async_call(counted, sig, type_name + "." + method, e.id, e.line)
         counted = ck_effects(counted, type_name + "." + method, sig.effects, " not in caller's effects", "calls", e.line)
         counted = ck_mut_args(counted, sig, type_name + "." + method, 0, e.args)
-        return ck_apply(counted, sig, type_name + "." + method, 0, ty_unbound(sig.generics.len()), arg_types, e.args)
+        return ck_apply(counted, sig, type_name + "." + method, 0, ty_unbound(sig.generics.len()), arg_types, e.args, e.line)
     }
     return ck_typed(c, "")
 }
@@ -1809,7 +1858,7 @@ fn ck_method_call(c0: Checker, e: Expr) -> Typed {
         if sig.has_self { first = 1 }
         c = ck_arity(c, sig, head + "." + method, first, arg_types.len(), e.line)
         c = ck_mut_args(c, sig, head + "." + method, first, e.args)
-        return ck_apply(c, sig, head + "." + method, first, binds, arg_types, e.args)
+        return ck_apply(c, sig, head + "." + method, first, binds, arg_types, e.args, e.line)
     }
     if head == "List" {
         let elem = ty_arg(recv, 0)
@@ -1923,7 +1972,7 @@ fn ck_enum_literal(c0: Checker, e: Expr) -> Typed {
     if c.fns.contains(key) {
         let sig = c.fns.get(key)
         let counted = ck_arity(c, sig, name + "." + e.variant_name, 0, values.types.len(), e.line)
-        return ck_apply(counted, sig, name + "." + e.variant_name, 0, ty_unbound(sig.generics.len()), values.types, e.payload)
+        return ck_apply(counted, sig, name + "." + e.variant_name, 0, ty_unbound(sig.generics.len()), values.types, e.payload, e.line)
     }
     return ck_typed(c, "")
 }
@@ -2637,7 +2686,16 @@ fn ck_always_returns(stmts: List[Stmt]) -> bool {
 -- Check a function's body. self_type is the type of the impl block it
 -- is in, "" for a function; outer_generics are that block's type
 -- parameters.
-fn ck_function(c0: Checker, fd: FunctionDecl, self_type: string, outer_generics: List[string]) -> Checker {
+-- What type parameter `i` stands for in an instance; "?", any type,
+-- where the function is checked for all its instances at once
+fn ck_bound(binds: List[string], i: int) -> string {
+    if i < binds.len() and binds[i] != "" { return binds[i] }
+    return "?"
+}
+
+-- `binds` are what the type parameters stand for, the outer ones and
+-- then the function's own, when one instance is checked (`instance`)
+fn ck_function(c0: Checker, fd: FunctionDecl, self_type: string, outer_generics: List[string], binds: List[string], instance: bool) -> Checker {
     let mut c = c0
     let mut names: List[string] = []
     names.push("Self")
@@ -2646,21 +2704,22 @@ fn ck_function(c0: Checker, fd: FunctionDecl, self_type: string, outer_generics:
     let mut gi = 0
     while gi < outer_generics.len() {
         names.push(outer_generics[gi])
-        repls.push("?")
+        repls.push(ck_bound(binds, gi))
         gi = gi + 1
     }
     gi = 0
     while gi < fd.generic_params.len() {
         names.push(fd.generic_params[gi])
-        repls.push("?")
+        repls.push(ck_bound(binds, outer_generics.len() + gi))
         gi = gi + 1
     }
     c.norm_names = names
     c.norm_repls = repls
     -- A generic function is compiled once for each set of type
     -- arguments, and a trait's own method once for each type that
-    -- takes it: its expressions have no one type
-    c.record = outer_generics.len() == 0 and fd.generic_params.len() == 0 and self_type != "?"
+    -- takes it: its expressions have no one type, until one instance
+    -- is checked
+    c.record = instance or (outer_generics.len() == 0 and fd.generic_params.len() == 0 and self_type != "?")
     let no_names: List[string] = []
     let no_types: List[string] = []
     let no_flags: List[int] = []
@@ -2678,6 +2737,22 @@ fn ck_function(c0: Checker, fd: FunctionDecl, self_type: string, outer_generics:
         i = i + 1
     }
     c = ck_type_exists(c, fd.return_type, fd.line)
+    if instance == false {
+        let mut bi = 0
+        while bi < fd.generic_bounds.len() {
+            if fd.generic_bounds[bi] != "" {
+                let wanted = string_split(fd.generic_bounds[bi], "+")
+                let mut wi = 0
+                while wi < wanted.len() {
+                    if c.traits.contains(wanted[wi]) == false {
+                        c = ck_error(c, "undefined trait '" + wanted[wi] + "'", fd.line)
+                    }
+                    wi = wi + 1
+                }
+            }
+            bi = bi + 1
+        }
+    }
     if fd.is_extern { return c }
 
     let ret = ck_norm(c, fd.return_type)
@@ -2752,9 +2827,10 @@ fn ck_impl(c0: Checker, ib: ImplBlock) -> Checker {
     let mut c = c0
     -- Inside the block its type parameters stand for any type
     let self_type = ty_apply(ck_generic_type(ib.target_type, ib.generic_params), ib.generic_params, ty_unbound(0))
+    let no_binds: List[string] = []
     let mut i = 0
     while i < ib.methods.len() {
-        c = ck_function(c, ib.methods[i], self_type, ib.generic_params)
+        c = ck_function(c, ib.methods[i], self_type, ib.generic_params, no_binds, false)
         i = i + 1
     }
     return c
@@ -2762,11 +2838,12 @@ fn ck_impl(c0: Checker, ib: ImplBlock) -> Checker {
 
 fn ck_trait(c0: Checker, td: TraitDecl) -> Checker {
     let mut c = c0
+    let no_binds: List[string] = []
     let mut i = 0
     while i < td.methods.len() {
         -- A method without a body is only a signature
         if td.methods[i].body.len() > 0 {
-            c = ck_function(c, td.methods[i], "?", td.generic_params)
+            c = ck_function(c, td.methods[i], "?", td.generic_params, no_binds, false)
         }
         i = i + 1
     }
@@ -2827,7 +2904,7 @@ fn check_program(sf: SourceFile) -> Checked {
     while i < sf.declarations.len() {
         let decl = sf.declarations[i]
         if decl.kind == DECL_FUNCTION() {
-            c = ck_function(c, *decl.func_decl, "", no_generics)
+            c = ck_function(c, *decl.func_decl, "", no_generics, no_generics, false)
         } else if decl.kind == DECL_IMPL() {
             c = ck_impl(c, *decl.impl_block)
         } else if decl.kind == DECL_TRAIT() {
@@ -2839,5 +2916,193 @@ fn check_program(sf: SourceFile) -> Checked {
         }
         i = i + 1
     }
-    return Checked { errors: c.errors, types: c.types, type_args: c.type_args, targets: c.targets }
+    return Checked { errors: c.errors, types: c.types, type_args: c.type_args, targets: c.targets, checker: Box_new(c) }
+}
+
+-- ============================================================
+-- INSTANCES
+-- The body of a generic function, and of a method of a generic struct
+-- or enum, is checked above with its type parameters standing for any
+-- type, and no types are recorded for its expressions. Code generation
+-- makes one copy of the function for each set of type arguments, and
+-- before it generates a copy it has the function checked again with
+-- the type parameters standing for those arguments
+-- (instance_types_begin). The types are recorded at the same
+-- expression ids for every instance, so the ones that were there are
+-- kept and put back when the instance is generated
+-- (instance_types_end): an instance may be generated in the middle of
+-- another of the same function.
+-- ============================================================
+
+-- Whether every name in the type is one the checker knows
+fn ck_knows_type(c: Checker, t: string) -> bool {
+    if t == "" or string_contains(t, "?") { return false }
+    let n = len(t)
+    let mut i = 0
+    let mut in_size = false
+    while i < n {
+        let b = byte_at(t, i)
+        if b == 59 { in_size = true }
+        if b == 93 { in_size = false }
+        if ty_ident_byte(b) == false {
+            i = i + 1
+            continue
+        }
+        let start = i
+        while i < n and ty_ident_byte(byte_at(t, i)) {
+            i = i + 1
+        }
+        if in_size or (b >= 48 and b <= 57) { continue }
+        let word = substr(t, start, i - start)
+        if ck_builtin_type_name(word) { continue }
+        if c.structs.contains(word) or c.enums.contains(word) or c.traits.contains(word) { continue }
+        return false
+    }
+    return true
+}
+
+-- Check one instance of the function: `binds` are what the type
+-- parameters stand for (outer_generics, then the function's own), ""
+-- for one that is not known. The lists of types grow to hold the
+-- expressions made since the program was checked.
+fn check_instance(c0: Checker, fd: FunctionDecl, self_type: string, outer_generics: List[string], binds: List[string]) -> Checker {
+    let mut c = c0
+    let count = expr_id_count()
+    while c.types.len() < count {
+        c.types.push("")
+        c.type_args.push("")
+        c.targets.push("")
+    }
+    let mut id = fd.expr_from
+    while id < fd.expr_to and id < count {
+        c.types[id] = ""
+        c.type_args[id] = ""
+        c.targets[id] = ""
+        id = id + 1
+    }
+    return ck_function(c, fd, self_type, outer_generics, binds, true)
+}
+
+-- The checked types of a function's expressions as they were before
+-- one of its instances was checked
+struct InstanceTypes {
+    gen: IRGenerator,
+    active: bool,
+    from: int,
+    types: List[string],
+    type_args: List[string],
+    targets: List[string]
+}
+
+-- A type of code generation (canon_type: i64, Pair_i64_string) as the
+-- checker writes it (int, Pair[int, string])
+fn checker_type(gen: IRGenerator, t: string) -> string {
+    if t == "i64" { return "int" }
+    if t == "f64" { return "float" }
+    if t == "String" { return "string" }
+    let mut base = t
+    let mut args: List[string] = []
+    if gen.generic_instances.contains(t) {
+        base = gen.generic_instances.get(t)
+        args = string_split(gen.generic_instance_args.get(t), "|")
+    } else {
+        let bracket = string_find(t, "[")
+        if bracket <= 0 or ends_with(t, "]") == false { return t }
+        base = substr(t, 0, bracket)
+        args = split_type_args(substr(t, bracket + 1, len(t) - bracket - 2))
+    }
+    let mut out = base + "["
+    let mut i = 0
+    while i < args.len() {
+        if i > 0 { out = out + ", " }
+        out = out + checker_type(gen, args[i])
+        i = i + 1
+    }
+    return out + "]"
+}
+
+-- Check the instance of `fd` that is about to be generated. `binds`
+-- are the type arguments as code generation has them, `self_type` the
+-- type the method is of ("" for a function) and `what` names the
+-- instance in an error. Give the result to instance_types_end when
+-- the instance is generated.
+fn instance_types_begin(gen: IRGenerator, fd: FunctionDecl, self_type: string, outer_generics: List[string], binds: List[string], what: string) -> InstanceTypes {
+    let mut out = InstanceTypes { gen: gen, active: false, from: fd.expr_from, types: [], type_args: [], targets: [] }
+    if gen.has_checker == false or fd.expr_to <= fd.expr_from { return out }
+    let mut g = gen
+    let mut c = *g.checker
+    c.types = g.checked_types
+    c.type_args = g.checked_type_args
+    c.targets = g.checked_targets
+    let no_errors: List[string] = []
+    c.errors = no_errors
+
+    let mut id = fd.expr_from
+    while id < fd.expr_to {
+        if id < g.checked_types.len() {
+            out.types.push(g.checked_types[id])
+            out.type_args.push(g.checked_type_args[id])
+            out.targets.push(g.checked_targets[id])
+        } else {
+            out.types.push("")
+            out.type_args.push("")
+            out.targets.push("")
+        }
+        id = id + 1
+    }
+
+    -- A type argument code generation only guessed, or has in a form
+    -- the checker does not know, stands for any type
+    let mut known: List[string] = []
+    let mut bi = 0
+    while bi < binds.len() {
+        let t = checker_type(g, binds[bi])
+        if ck_knows_type(c, t) {
+            known.push(t)
+        } else {
+            known.push("")
+        }
+        bi = bi + 1
+    }
+    let mut self_known = ""
+    if self_type != "" {
+        self_known = checker_type(g, self_type)
+        if ck_knows_type(c, self_known) == false { self_known = "?" }
+    }
+    c = check_instance(c, fd, self_known, outer_generics, known)
+    g.checked_types = c.types
+    g.checked_type_args = c.type_args
+    g.checked_targets = c.targets
+    let mut ei = 0
+    while ei < c.errors.len() {
+        let text = c.errors[ei] + " (in " + what + ")"
+        let mut have = false
+        let mut hi = 0
+        while hi < g.type_errors.len() {
+            if g.type_errors[hi] == text { have = true }
+            hi = hi + 1
+        }
+        if have == false { g.type_errors.push(text) }
+        ei = ei + 1
+    }
+    out.gen = g
+    out.active = true
+    return out
+}
+
+-- Put back the types that were recorded before the instance was checked
+fn instance_types_end(gen: IRGenerator, saved: InstanceTypes) -> IRGenerator {
+    if saved.active == false { return gen }
+    let mut g = gen
+    let mut i = 0
+    while i < saved.types.len() {
+        let id = saved.from + i
+        if id < g.checked_types.len() {
+            g.checked_types[id] = saved.types[i]
+            g.checked_type_args[id] = saved.type_args[i]
+            g.checked_targets[id] = saved.targets[i]
+        }
+        i = i + 1
+    }
+    return g
 }

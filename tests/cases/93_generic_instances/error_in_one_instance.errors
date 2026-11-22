@@ -1,0 +1,2 @@
+operator '+' does not take Point and Point at line 14 (in total[Point])
+type mismatch in the value of 'text': expected string, found int at line 20 (in describe[int])

@@ -4088,7 +4088,10 @@ fn generate_generic_call(gen: IRGenerator, block: IRBasicBlock, expr: Expr) -> E
                     mono_fd.return_type = resolved_ret
 
                     g = declare_function(g, mono_fd, mangled_name)
-                    g = generate_function_body(g, mono_fd, mangled_name)
+                    let no_outer: List[string] = []
+                    let instance_types = instance_types_begin(g, fd, "", no_outer, type_args, instance_text(g, fn_name, type_args))
+                    g = generate_function_body(instance_types.gen, mono_fd, mangled_name)
+                    g = instance_types_end(g, instance_types)
 
                     -- Restore previous generator state
                     g.variable_map = saved_variable_map
@@ -4872,11 +4875,26 @@ fn generate_list_method_call(gen: IRGenerator, block: IRBasicBlock, ek: int, lis
 -- Handles both self-by-value and mut self (pass-by-pointer).
 -- ============================================================
 
+-- "first[Point]" for the instance of a generic function, for a message
+fn instance_text(gen: IRGenerator, name: string, type_args: List[string]) -> string {
+    let mut out = name + "["
+    let mut i = 0
+    while i < type_args.len() {
+        if i > 0 { out = out + ", " }
+        out = out + checker_type(gen, type_args[i])
+        i = i + 1
+    }
+    return out + "]"
+}
+
 -- The caller's generator after another function was generated in the
 -- middle of its own: its function's state, and what the new function
 -- added to the program
 fn back_to_caller(caller: IRGenerator, g: IRGenerator) -> IRGenerator {
     let mut out = caller
+    out.checked_types = g.checked_types
+    out.checked_type_args = g.checked_type_args
+    out.checked_targets = g.checked_targets
     out.ir_mod = g.ir_mod
     out.struct_defs = g.struct_defs
     out.mono_generated = g.mono_generated
@@ -4954,7 +4972,12 @@ fn ensure_instance_method(gen: IRGenerator, instance: string, method_name: strin
     g.fn_ptr_vars = Map_new()
     g.array_var_names = Map_new()
     g = declare_function(g, mono_fd, mangled)
-    g = generate_function_body(g, mono_fd, mangled)
+    let base = g.generic_instances.get(instance)
+    let outer = string_split(g.generic_struct_params.get(base), "|")
+    let outer_args = string_split(g.generic_instance_args.get(instance), "|")
+    let instance_types = instance_types_begin(g, fd, instance, outer, outer_args, checker_type(g, instance) + "." + method_name)
+    g = generate_function_body(instance_types.gen, mono_fd, mangled)
+    g = instance_types_end(g, instance_types)
 
     return back_to_caller(caller, g)
 }
@@ -5107,7 +5130,10 @@ fn generate_struct_method_call(gen: IRGenerator, block: IRBasicBlock, struct_typ
                     g.type_substitutions.insert(struct_type, mono_struct)
 
                     g = declare_function(g, mono_fd, mono_name)
-                    g = generate_function_body(g, mono_fd, mono_name)
+                    let no_outer: List[string] = []
+                    let instance_types = instance_types_begin(g, fd, struct_type, no_outer, type_args, instance_text(g, struct_type + "." + method_name, type_args))
+                    g = generate_function_body(instance_types.gen, mono_fd, mono_name)
+                    g = instance_types_end(g, instance_types)
 
                     -- Restore state
                     g.variable_map = saved_variable_map

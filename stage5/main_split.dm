@@ -531,6 +531,8 @@ fn build_runtime_object(prelude_sf: SourceFile, checked: Checked, obj_file: stri
     ir_gen.checked_types = checked.types
     ir_gen.checked_type_args = checked.type_args
     ir_gen.checked_targets = checked.targets
+    ir_gen.checker = checked.checker
+    ir_gen.has_checker = true
     ir_gen = generate_module(ir_gen, prelude_sf)
     if ir_gen.type_errors.len() > 0 { return 1 }
     let mut lg = llvm_gen_new(ir_gen.ir_mod, "daimond_runtime")
@@ -1044,7 +1046,20 @@ fn type_parameters_text(names: List[string]) -> string {
 
 -- A function as its declaration starts: "fn add(a: int, b: int) -> int"
 fn function_signature(fd: FunctionDecl) -> string {
-    let mut sig = "fn " + fd.name + type_parameters_text(fd.generic_params) + "("
+    -- The type parameters with their bounds: [T: Show + Named, U]
+    let mut type_params: List[string] = []
+    let mut gpi = 0
+    while gpi < fd.generic_params.len() {
+        let mut one = fd.generic_params[gpi]
+        if gpi < fd.generic_bounds.len() {
+            if fd.generic_bounds[gpi] != "" {
+                one = one + ": " + string_replace(fd.generic_bounds[gpi], "+", " + ")
+            }
+        }
+        type_params.push(one)
+        gpi = gpi + 1
+    }
+    let mut sig = "fn " + fd.name + type_parameters_text(type_params) + "("
     if fd.is_extern {
         sig = "extern " + sig
     }
@@ -1328,6 +1343,8 @@ fn compile(cli: CLIArgs) -> int {
     ir_gen.checked_types = checked.types
     ir_gen.checked_type_args = checked.type_args
     ir_gen.checked_targets = checked.targets
+    ir_gen.checker = checked.checker
+    ir_gen.has_checker = true
     ir_gen = generate_module(ir_gen, sf)
     if ir_gen.type_errors.len() > 0 {
         let mut te = 0

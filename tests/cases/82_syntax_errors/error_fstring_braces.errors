@@ -1,0 +1,3 @@
+Error at 4:13: an f-string has a '{' without a '}' (write {{ for a brace)
+Error at 8:13: an f-string has an empty {}
+Error at 12:13: a string in an f-string's expression has no end
